@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
 import type { ApiClient } from '@/api/client'
 import type { DecryptedMessage } from '@/types/api'
 import {
@@ -62,6 +62,29 @@ export function useMessages(api: ApiClient | null, sessionId: string | null): {
         }
         void fetchLatestMessages(api, sessionId)
     }, [api, sessionId])
+
+    // Retry fetching messages when initial load returns empty.
+    // This handles the race condition during session resume where the CLI scanner
+    // hasn't sent historical messages to the hub yet when the web first fetches.
+    const retryCountRef = useRef(0)
+    useEffect(() => {
+        if (!api || !sessionId) {
+            retryCountRef.current = 0
+            return
+        }
+        if (state.isLoading || state.messages.length > 0) {
+            retryCountRef.current = 0
+            return
+        }
+        if (retryCountRef.current >= 5) {
+            return
+        }
+        const timer = setTimeout(() => {
+            retryCountRef.current += 1
+            void fetchLatestMessages(api, sessionId)
+        }, 2000)
+        return () => clearTimeout(timer)
+    }, [api, sessionId, state.isLoading, state.messages.length])
 
     useEffect(() => {
         if (!sessionId) {

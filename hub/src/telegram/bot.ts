@@ -9,7 +9,7 @@ import { Bot, Context, InlineKeyboard } from 'grammy'
 import { SyncEngine, Session } from '../sync/syncEngine'
 import { handleCallback, CallbackContext } from './callbacks'
 import { formatSessionNotification, createNotificationKeyboard } from './sessionView'
-import { getAgentName } from '../notifications/sessionInfo'
+import { getAgentName, getSessionName } from '../notifications/sessionInfo'
 import type { NotificationChannel } from '../notifications/notificationTypes'
 import type { Store } from '../store'
 
@@ -193,6 +193,18 @@ export class HappyBot implements NotificationChannel {
         }
 
         const agentName = getAgentName(session)
+        const sessionName = getSessionName(session)
+        const sessionPath = session.metadata?.path || ''
+        const projectDir = sessionPath ? sessionPath.split('/').filter(Boolean).slice(-2).join('/') : ''
+
+        const lines: string[] = [`${agentName} is ready`]
+        if (sessionName && sessionName !== session.id.slice(0, 8)) {
+            lines.push(`📋 ${sessionName}`)
+        }
+        if (projectDir) {
+            lines.push(`📁 ${projectDir}`)
+        }
+
         const url = buildMiniAppDeepLink(this.publicUrl, `session_${session.id}`)
         const keyboard = new InlineKeyboard()
             .webApp('Open Session', url)
@@ -206,7 +218,7 @@ export class HappyBot implements NotificationChannel {
             try {
                 await this.bot.api.sendMessage(
                     chatId,
-                    `It's ready!\n\n${agentName} is waiting for your command`,
+                    lines.join('\n'),
                     { reply_markup: keyboard }
                 )
             } catch (error) {

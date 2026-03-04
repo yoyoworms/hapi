@@ -14,7 +14,7 @@ import {
 } from 'react'
 import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
-import type { ConversationStatus } from '@/realtime/types'
+// import type { ConversationStatus } from '@/realtime/types' // voice disabled
 import { useActiveWord } from '@/hooks/useActiveWord'
 import { useActiveSuggestions } from '@/hooks/useActiveSuggestions'
 import { applySuggestion } from '@/utils/applySuggestion'
@@ -38,7 +38,11 @@ export interface TextInputState {
 
 const defaultSuggestionHandler = async (): Promise<Suggestion[]> => []
 
+// Draft store: persist composer text per session across switches
+const draftStore = new Map<string, string>()
+
 export function HappyComposer(props: {
+    sessionId?: string
     disabled?: boolean
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
@@ -60,11 +64,6 @@ export function HappyComposer(props: {
     terminalUnsupported?: boolean
     autocompletePrefixes?: string[]
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
-    // Voice assistant props
-    voiceStatus?: ConversationStatus
-    voiceMicMuted?: boolean
-    onVoiceToggle?: () => void
-    onVoiceMicToggle?: () => void
 }) {
     const { t } = useTranslation()
     const {
@@ -89,10 +88,6 @@ export function HappyComposer(props: {
         terminalUnsupported = false,
         autocompletePrefixes = ['@', '/', '$'],
         autocompleteSuggestions = defaultSuggestionHandler,
-        voiceStatus = 'disconnected',
-        voiceMicMuted = false,
-        onVoiceToggle,
-        onVoiceMicToggle
     } = props
 
     // Use ?? so missing values fall back to default (destructuring defaults only handle undefined)
@@ -101,11 +96,38 @@ export function HappyComposer(props: {
     const model = rawModel ?? null
     const effort = rawEffort ?? null
 
+    const { sessionId } = props
     const api = useAssistantApi()
     const composerText = useAssistantState(({ composer }) => composer.text)
     const attachments = useAssistantState(({ composer }) => composer.attachments)
     const threadIsRunning = useAssistantState(({ thread }) => thread.isRunning)
     const threadIsDisabled = useAssistantState(({ thread }) => thread.isDisabled)
+
+    // Save draft on unmount or session change, restore on mount
+    const composerTextRef = useRef(composerText)
+    composerTextRef.current = composerText
+    const prevSessionIdRef = useRef(sessionId)
+
+    useEffect(() => {
+        if (sessionId) {
+            const draft = draftStore.get(sessionId)
+            if (draft) {
+                api.composer().setText(draft)
+            }
+        }
+        return () => {
+            const id = prevSessionIdRef.current
+            if (id) {
+                const text = composerTextRef.current
+                if (text.trim()) {
+                    draftStore.set(id, text)
+                } else {
+                    draftStore.delete(id)
+                }
+            }
+        }
+    }, [sessionId, api])
+    prevSessionIdRef.current = sessionId
 
     const controlsDisabled = disabled || (!active && !allowSendWhenInactive) || threadIsDisabled
     const trimmed = composerText.trim()
@@ -443,11 +465,12 @@ export function HappyComposer(props: {
     const showEffortSettings = Boolean(onEffortChange && supportsEffort(agentFlavor))
     const showSettingsButton = Boolean(showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)
     const showAbortButton = true
-    const voiceEnabled = Boolean(onVoiceToggle)
+    const voiceEnabled = false
 
     const handleSend = useCallback(() => {
+        if (sessionId) draftStore.delete(sessionId)
         api.composer().send()
-    }, [api])
+    }, [api, sessionId])
 
     const overlays = useMemo(() => {
         if (showSettings && (showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)) {
@@ -673,7 +696,7 @@ export function HappyComposer(props: {
                         permissionMode={permissionMode}
                         collaborationMode={collaborationMode}
                         agentFlavor={agentFlavor}
-                        voiceStatus={voiceStatus}
+                        voiceStatus={undefined}
                     />
 
                     <div className="overflow-hidden rounded-[20px] bg-[var(--app-secondary-bg)]">
@@ -717,11 +740,10 @@ export function HappyComposer(props: {
                             switchDisabled={switchDisabled}
                             isSwitching={isSwitching}
                             onSwitch={handleSwitch}
-                            voiceEnabled={voiceEnabled}
-                            voiceStatus={voiceStatus}
-                            voiceMicMuted={voiceMicMuted}
-                            onVoiceToggle={onVoiceToggle ?? (() => {})}
-                            onVoiceMicToggle={onVoiceMicToggle}
+                            voiceEnabled={false}
+                            voiceStatus={'disconnected'}
+                            onVoiceToggle={() => {}}
+
                             onSend={handleSend}
                         />
                     </div>

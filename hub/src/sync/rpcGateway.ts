@@ -174,6 +174,31 @@ export class RpcGateway {
         return exists
     }
 
+    async listAgentSessions(
+        machineId: string,
+        directory: string,
+        agent: string
+    ): Promise<{
+        success: boolean
+        sessions?: Array<{
+            sessionId: string
+            modifiedAt: number
+            sizeBytes: number
+            valid: boolean
+        }>
+        error?: string
+    }> {
+        try {
+            const result = await this.machineRpc(machineId, 'list-agent-sessions', { directory, agent }) as any
+            if (!result || typeof result !== 'object') {
+                return { success: false, error: 'Unexpected result' }
+            }
+            return result
+        } catch (error) {
+            return { success: false, error: error instanceof Error ? error.message : String(error) }
+        }
+    }
+
     async getGitStatus(sessionId: string, cwd?: string): Promise<RpcCommandResponse> {
         return await this.sessionRpc(sessionId, 'git-status', { cwd }) as RpcCommandResponse
     }

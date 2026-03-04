@@ -96,7 +96,7 @@ function createWebApp(options: {
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createGitRoutes(options.getSyncEngine))
     app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
-    app.route('/api', createVoiceRoutes())
+    // app.route('/api', createVoiceRoutes()) // voice disabled
 
     // Skip static serving in relay mode, show helpful message on root
     if (options.relayMode) {
@@ -138,7 +138,7 @@ from GitHub Pages instead of through the relay tunnel.
         }
 
         app.use('*', async (c, next) => {
-            if (c.req.path.startsWith('/api')) {
+            if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
                 return await next()
             }
 
@@ -155,7 +155,7 @@ from GitHub Pages instead of through the relay tunnel.
         })
 
         app.get('*', async (c, next) => {
-            if (c.req.path.startsWith('/api')) {
+            if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
                 await next()
                 return
             }
@@ -178,10 +178,20 @@ from GitHub Pages instead of through the relay tunnel.
         return app
     }
 
+    // Cache control middleware: no-cache for HTML/SW, long cache for hashed assets
+    app.use('*', async (c, next) => {
+        await next()
+        if (c.req.path.startsWith('/assets/')) {
+            c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable')
+        } else if (c.req.path === '/' || c.req.path.endsWith('.html') || c.req.path.endsWith('sw.js')) {
+            c.res.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+        }
+    })
+
     app.use('/assets/*', serveStatic({ root: distDir }))
 
     app.use('*', async (c, next) => {
-        if (c.req.path.startsWith('/api')) {
+        if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
             await next()
             return
         }
@@ -190,7 +200,7 @@ from GitHub Pages instead of through the relay tunnel.
     })
 
     app.get('*', async (c, next) => {
-        if (c.req.path.startsWith('/api')) {
+        if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
             await next()
             return
         }
@@ -234,7 +244,7 @@ export async function startWebServer(options: {
         hostname: configuration.listenHost,
         port: configuration.listenPort,
         idleTimeout: Math.max(30, socketHandler.idleTimeout),
-        maxRequestBodySize: Math.max(socketHandler.maxRequestBodySize, 68 * 1024 * 1024),
+        maxRequestBodySize: Math.max(socketHandler.maxRequestBodySize, 100 * 1024 * 1024),
         websocket: socketHandler.websocket,
         fetch: (req, server) => {
             const url = new URL(req.url)

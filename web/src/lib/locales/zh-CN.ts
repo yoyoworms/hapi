@@ -273,6 +273,12 @@ export default {
   'settings.about.website': '官方网站',
   'settings.about.appVersion': '应用版本',
   'settings.about.protocolVersion': '协议版本',
+  'settings.account.title': '账户',
+  'settings.account.signOut': '退出登录',
+  'settings.account.signOutConfirm': '确定要退出登录吗？',
+  'settings.cache.title': '缓存',
+  'settings.cache.clear': '清除应用缓存',
+  'settings.cache.clearConfirm': '将清除所有缓存数据并重新加载页面，确定继续？',
 
   // Misc
   'misc.noMachines': '无可用机器',
@@ -291,4 +297,19 @@ export default {
   'misc.permissionRequired': '需要权限',
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
+
+  // Resume session picker
+  'resume.inactiveBanner': '会话已停止。发送消息将自动恢复。',
+  'resume.chooseSession': '选择会话',
+  'resume.pickerTitle': '恢复会话',
+  'resume.pickerDescription': '选择一个之前的对话来恢复',
+  'resume.scanning': '扫描可用会话…',
+  'resume.noSessions': '未找到可恢复的会话',
+  'resume.current': '当前',
+  'resume.resuming': '恢复中…',
+  'resume.resumeButton': '恢复',
+  'resume.resumeFailed': '恢复失败',
+
+  // Session action - resume
+  'session.action.resume': '恢复',
 } as const

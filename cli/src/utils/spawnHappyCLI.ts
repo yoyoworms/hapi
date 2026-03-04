@@ -102,6 +102,15 @@ export function getHappyCliCommand(args: string[]): HappyCliCommand {
   };
 }
 
+/**
+ * Get the real working directory for spawned CLI processes.
+ * In dev mode, spawnHappyCLI overrides cwd to cli/ for tsconfig resolution
+ * and passes the real project directory via HAPI_SPAWN_CWD.
+ */
+export function getSpawnedWorkingDirectory(): string {
+  return process.env.HAPI_SPAWN_CWD || process.cwd();
+}
+
 export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): ChildProcess {
 
   let directory: string | URL | undefined;

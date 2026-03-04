@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useTranslation, type Locale } from '@/lib/use-translation'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
+import { useAppContext } from '@/lib/app-context'
 import { getElevenLabsSupportedLanguages, getLanguageDisplayName, type Language } from '@/lib/languages'
 import { getFontScaleOptions, useFontScale, type FontScale } from '@/hooks/useFontScale'
 import { getTerminalFontSizeOptions, useTerminalFontSize, type TerminalFontSize } from '@/hooks/useTerminalFontSize'
@@ -74,6 +75,7 @@ function ChevronDownIcon(props: { className?: string }) {
 export default function SettingsPage() {
     const { t, locale, setLocale } = useTranslation()
     const goBack = useAppGoBack()
+    const { signOut } = useAppContext()
     const [isOpen, setIsOpen] = useState(false)
     const [isAppearanceOpen, setIsAppearanceOpen] = useState(false)
     const [isFontOpen, setIsFontOpen] = useState(false)
@@ -488,6 +490,51 @@ export default function SettingsPage() {
                             <span className="text-[var(--app-hint)]">{PROTOCOL_VERSION}</span>
                         </div>
                     </div>
+
+                    {/* Cache section */}
+                    <div className="border-b border-[var(--app-divider)]">
+                        <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
+                            {t('settings.cache.title')}
+                        </div>
+                        <button
+                            type="button"
+                            onClick={async () => {
+                                if (!window.confirm(t('settings.cache.clearConfirm'))) return
+                                try {
+                                    const regs = await navigator.serviceWorker?.getRegistrations()
+                                    for (const reg of regs ?? []) await reg.unregister()
+                                    const keys = await caches?.keys()
+                                    for (const key of keys ?? []) await caches.delete(key)
+                                    window.location.reload()
+                                } catch {
+                                    window.location.reload()
+                                }
+                            }}
+                            className="flex w-full items-center px-3 py-3 text-left text-[var(--app-fg)] transition-colors hover:bg-[var(--app-subtle-bg)]"
+                        >
+                            {t('settings.cache.clear')}
+                        </button>
+                    </div>
+
+                    {/* Sign Out section */}
+                    {signOut && (
+                        <div className="border-b border-[var(--app-divider)]">
+                            <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
+                                {t('settings.account.title')}
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    if (window.confirm(t('settings.account.signOutConfirm'))) {
+                                        signOut()
+                                    }
+                                }}
+                                className="flex w-full items-center px-3 py-3 text-left text-red-500 transition-colors hover:bg-[var(--app-subtle-bg)]"
+                            >
+                                {t('settings.account.signOut')}
+                            </button>
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

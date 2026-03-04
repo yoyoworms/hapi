@@ -7,7 +7,7 @@ import { convertAgentMessage } from '@/agent/messageConverter';
 import { PermissionAdapter } from '@/agent/permissionAdapter';
 import type { AgentBackend, PromptContent } from '@/agent/types';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
-import { getHappyCliCommand } from '@/utils/spawnHappyCLI';
+import { getHappyCliCommand, getSpawnedWorkingDirectory } from '@/utils/spawnHappyCLI';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { bootstrapSession } from '@/agent/sessionFactory';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';

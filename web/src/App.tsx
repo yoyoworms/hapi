@@ -16,14 +16,14 @@ import { AppContextProvider } from '@/lib/app-context'
 import { fetchLatestMessages } from '@/lib/message-window-store'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useTranslation } from '@/lib/use-translation'
-import { VoiceProvider } from '@/lib/voice-context'
+// import { VoiceProvider } from '@/lib/voice-context' // voice disabled
 import { requireHubUrlForLogin } from '@/lib/runtime-config'
 import { LoginPrompt } from '@/components/LoginPrompt'
 import { InstallPrompt } from '@/components/InstallPrompt'
 import { OfflineBanner } from '@/components/OfflineBanner'
 import { SyncingBanner } from '@/components/SyncingBanner'
 import { ReconnectingBanner } from '@/components/ReconnectingBanner'
-import { VoiceErrorBanner } from '@/components/VoiceErrorBanner'
+// import { VoiceErrorBanner } from '@/components/VoiceErrorBanner' // voice disabled
 import { LoadingState } from '@/components/LoadingState'
 import { ToastContainer } from '@/components/ToastContainer'
 import { ToastProvider, useToast } from '@/lib/toast-context'
@@ -44,7 +44,7 @@ export function App() {
 function AppInner() {
     const { t } = useTranslation()
     const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
-    const { authSource, isLoading: isAuthSourceLoading, setAccessToken } = useAuthSource(baseUrl)
+    const { authSource, isLoading: isAuthSourceLoading, setAccessToken, clearAuth } = useAuthSource(baseUrl)
     const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
     const goBack = useAppGoBack()
     const pathname = useLocation({ select: (location) => location.pathname })
@@ -342,21 +342,18 @@ function AppInner() {
     }
 
     return (
-        <AppContextProvider value={{ api, token, baseUrl }}>
-            <VoiceProvider>
+        <AppContextProvider value={{ api, token, baseUrl, signOut: clearAuth }}>
                 <SyncingBanner isSyncing={isSyncing} />
                 <ReconnectingBanner
                     isReconnecting={sseDisconnected && !isSyncing}
                     reason={sseDisconnectReason}
                 />
-                <VoiceErrorBanner />
                 <OfflineBanner />
                 <div className="h-full min-h-0 flex flex-col">
                     <Outlet />
                 </div>
                 <ToastContainer />
                 <InstallPrompt />
-            </VoiceProvider>
         </AppContextProvider>
     )
 }

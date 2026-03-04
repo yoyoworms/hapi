@@ -271,6 +271,12 @@ export default {
   'settings.about.website': 'Website',
   'settings.about.appVersion': 'App Version',
   'settings.about.protocolVersion': 'Protocol Version',
+  'settings.account.title': 'Account',
+  'settings.account.signOut': 'Sign Out',
+  'settings.account.signOutConfirm': 'Are you sure you want to sign out?',
+  'settings.cache.title': 'Cache',
+  'settings.cache.clear': 'Clear App Cache',
+  'settings.cache.clearConfirm': 'This will clear all cached data and reload the page. Continue?',
 
   // Misc
   'misc.noMachines': 'No machines available',
@@ -289,4 +295,19 @@ export default {
   'misc.permissionRequired': 'permission required',
   'misc.percentLeft': '{percent}% left',
   'misc.online': 'online',
+
+  // Resume session picker
+  'resume.inactiveBanner': 'Session is inactive. Sending will resume it automatically.',
+  'resume.chooseSession': 'Choose session',
+  'resume.pickerTitle': 'Resume Session',
+  'resume.pickerDescription': 'Choose a previous conversation to resume',
+  'resume.scanning': 'Scanning for sessions…',
+  'resume.noSessions': 'No resumable sessions found',
+  'resume.current': 'current',
+  'resume.resuming': 'Resuming…',
+  'resume.resumeButton': 'Resume',
+  'resume.resumeFailed': 'Resume failed',
+
+  // Session action - resume
+  'session.action.resume': 'Resume',
 } as const

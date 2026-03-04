@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from '@tanstack/react-router'
 import type { SessionSummary } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { useLongPress } from '@/hooks/useLongPress'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
+import { seedMessageWindowFromSession, fetchLatestMessages } from '@/lib/message-window-store'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
@@ -217,11 +219,35 @@ function SessionItem(props: {
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
-    const { archiveSession, renameSession, deleteSession, isPending } = useSessionActions(
+    const navigate = useNavigate()
+    const { archiveSession, renameSession, deleteSession, resumeSession, isPending } = useSessionActions(
         api,
         s.id,
         s.metadata?.flavor ?? null
     )
+
+    const handleResume = useCallback(async () => {
+        try {
+            const resolvedId = await resumeSession()
+            if (resolvedId !== s.id) {
+                seedMessageWindowFromSession(s.id, resolvedId)
+            }
+            if (api) {
+                try {
+                    await fetchLatestMessages(api, resolvedId)
+                } catch {
+                    // Messages will be retried by useMessages hook
+                }
+            }
+            navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId: resolvedId },
+                replace: true
+            })
+        } catch (e) {
+            console.error('Resume failed:', e)
+        }
+    }, [resumeSession, navigate, s.id, api])
 
     const longPressHandlers = useLongPress({
         onLongPress: (point) => {
@@ -291,6 +317,14 @@ function SessionItem(props: {
                     </div>
                 ) : null}
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--app-hint)]">
+                    {s.metadata?.host ? (
+                        <span className="inline-flex items-center gap-1">
+                            <span className="flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden="true">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" /><circle cx="7" cy="6" r="1" /><circle cx="7" cy="18" r="1" /></svg>
+                            </span>
+                            {((h) => h.length > 10 ? h.slice(0, 10) + '...' : h)(s.metadata.host.split('.')[0])}
+                        </span>
+                    ) : null}
                     <span className="inline-flex items-center gap-2">
                         <span className="flex h-4 w-4 items-center justify-center" aria-hidden="true">
                             ❖
@@ -311,6 +345,7 @@ function SessionItem(props: {
                 onClose={() => setMenuOpen(false)}
                 sessionActive={s.active}
                 onRename={() => setRenameOpen(true)}
+                onResume={handleResume}
                 onArchive={() => setArchiveOpen(true)}
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}
@@ -449,6 +484,8 @@ export function SessionList(props: {
                 {groups.map((group) => {
                     const isCollapsed = isGroupCollapsed(group)
                     const machineLabel = resolveMachineLabel(group.machineId)
+                    const thinkingCount = group.sessions.filter(s => s.thinking).length
+                    const pendingCount = group.sessions.reduce((sum, s) => sum + (s.pendingRequestsCount ?? 0), 0)
                     return (
                         <div key={group.key} className="mt-2 first:mt-0">
                             <button
@@ -476,6 +513,18 @@ export function SessionList(props: {
                                     <span className="min-w-0 flex-1 truncate" title={group.directory}>
                                         {group.directory}
                                     </span>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0 text-xs">
+                                    {thinkingCount > 0 ? (
+                                        <span className="text-[#007AFF] animate-pulse">
+                                            {t('session.item.thinking')}{thinkingCount > 1 ? ` ${thinkingCount}` : ''}
+                                        </span>
+                                    ) : null}
+                                    {pendingCount > 0 ? (
+                                        <span className="text-[var(--app-badge-warning-text)]">
+                                            {t('session.item.pending')} {pendingCount}
+                                        </span>
+                                    ) : null}
                                 </div>
                             </button>
                             {!isCollapsed ? (

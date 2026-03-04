@@ -343,10 +343,8 @@ export class SessionCache {
             throw new Error('Cannot delete active session')
         }
 
-        const deleted = this.store.sessions.deleteSession(sessionId, session.namespace)
-        if (!deleted) {
-            throw new Error('Failed to delete session')
-        }
+        // Delete from DB (may return false if session only exists in memory cache)
+        this.store.sessions.deleteSession(sessionId, session.namespace)
 
         this.sessions.delete(sessionId)
         this.lastBroadcastAtBySessionId.delete(sessionId)

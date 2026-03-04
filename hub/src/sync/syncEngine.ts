@@ -341,7 +341,19 @@ export class SyncEngine {
         )
     }
 
-    async resumeSession(sessionId: string, namespace: string): Promise<ResumeSessionResult> {
+    private findTargetMachine(onlineMachines: Array<{ id: string; metadata?: { host?: string } | null }>, metadata: { machineId?: string; host?: string }) {
+        if (metadata.machineId) {
+            const exact = onlineMachines.find((machine) => machine.id === metadata.machineId)
+            if (exact) return exact
+        }
+        if (metadata.host) {
+            const hostMatch = onlineMachines.find((machine) => machine.metadata?.host === metadata.host)
+            if (hostMatch) return hostMatch
+        }
+        return null
+    }
+
+    async resumeSession(sessionId: string, namespace: string, overrideResumeToken?: string): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -353,7 +365,12 @@ export class SyncEngine {
 
         const session = access.session
         if (session.active) {
-            return { type: 'success', sessionId: access.sessionId }
+            // Archive the active session first so we can resume with a fresh spawn
+            try {
+                await this.archiveSession(access.sessionId)
+            } catch {
+                // Best-effort: if archive fails, continue anyway
+            }
         }
 
         const metadata = session.metadata
@@ -364,42 +381,52 @@ export class SyncEngine {
         const flavor = metadata.flavor === 'codex' || metadata.flavor === 'gemini' || metadata.flavor === 'opencode' || metadata.flavor === 'cursor'
             ? metadata.flavor
             : 'claude'
-        const resumeToken = flavor === 'codex'
-            ? metadata.codexSessionId
-            : flavor === 'gemini'
-                ? metadata.geminiSessionId
-                : flavor === 'opencode'
-                    ? metadata.opencodeSessionId
-                    : flavor === 'cursor'
-                        ? metadata.cursorSessionId
-                        : metadata.claudeSessionId
 
-        if (!resumeToken) {
-            return { type: 'error', message: 'Resume session ID unavailable', code: 'resume_unavailable' }
-        }
+        // Use override token if provided, otherwise read from metadata
+        let resumeToken = overrideResumeToken || (
+            flavor === 'codex'
+                ? metadata.codexSessionId
+                : flavor === 'gemini'
+                    ? metadata.geminiSessionId
+                    : flavor === 'opencode'
+                        ? metadata.opencodeSessionId
+                        : flavor === 'cursor'
+                            ? metadata.cursorSessionId
+                            : metadata.claudeSessionId
+        )
 
         const onlineMachines = this.machineCache.getOnlineMachinesByNamespace(namespace)
         if (onlineMachines.length === 0) {
             return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
         }
 
-        const targetMachine = (() => {
-            if (metadata.machineId) {
-                const exact = onlineMachines.find((machine) => machine.id === metadata.machineId)
-                if (exact) return exact
-            }
-            if (metadata.host) {
-                const hostMatch = onlineMachines.find((machine) => machine.metadata?.host === metadata.host)
-                if (hostMatch) return hostMatch
-            }
-            return null
-        })()
-
+        const targetMachine = this.findTargetMachine(onlineMachines, metadata)
         if (!targetMachine) {
             return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
         }
 
-        const spawnResult = await this.rpcGateway.spawnSession(
+        // Auto-discovery fallback: if no resume token, scan for available sessions
+        if (!resumeToken) {
+            try {
+                const scanResult = await this.rpcGateway.listAgentSessions(
+                    targetMachine.id,
+                    metadata.path,
+                    flavor
+                )
+
+                if (scanResult.success && scanResult.sessions?.length) {
+                    const validSessions = scanResult.sessions.filter(s => s.valid)
+                    if (validSessions.length > 0) {
+                        resumeToken = validSessions[0].sessionId
+                    }
+                }
+            } catch {
+                // Scan failed, continue without resume token
+            }
+
+        }
+
+        let spawnResult = await this.rpcGateway.spawnSession(
             targetMachine.id,
             metadata.path,
             flavor,
@@ -411,6 +438,15 @@ export class SyncEngine {
             resumeToken,
             session.effort ?? undefined
         )
+
+        // Fallback: if resume spawn fails, retry without resume token (start fresh session)
+        if (spawnResult.type !== 'success') {
+            spawnResult = await this.rpcGateway.spawnSession(
+                targetMachine.id,
+                metadata.path,
+                flavor
+            )
+        }
 
         if (spawnResult.type !== 'success') {
             return { type: 'error', message: spawnResult.message, code: 'resume_failed' }
@@ -431,6 +467,66 @@ export class SyncEngine {
         }
 
         return { type: 'success', sessionId: spawnResult.sessionId }
+    }
+
+    async listResumeOptions(sessionId: string, namespace: string): Promise<
+        | { type: 'success'; sessions: Array<{ sessionId: string; modifiedAt: number; sizeBytes: number; valid: boolean }>; currentSessionId: string | null }
+        | { type: 'error'; message: string; code: string }
+    > {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return {
+                type: 'error',
+                message: access.reason === 'access-denied' ? 'Session access denied' : 'Session not found',
+                code: access.reason === 'access-denied' ? 'access_denied' : 'session_not_found'
+            }
+        }
+
+        const session = access.session
+        const metadata = session.metadata
+        if (!metadata || typeof metadata.path !== 'string') {
+            return { type: 'error', message: 'Session metadata missing path', code: 'resume_unavailable' }
+        }
+
+        const flavor = metadata.flavor === 'codex' || metadata.flavor === 'gemini' || metadata.flavor === 'opencode' || metadata.flavor === 'cursor'
+            ? metadata.flavor
+            : 'claude'
+
+        const onlineMachines = this.machineCache.getOnlineMachinesByNamespace(namespace)
+        if (onlineMachines.length === 0) {
+            return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
+        }
+
+        const targetMachine = this.findTargetMachine(onlineMachines, metadata)
+        if (!targetMachine) {
+            return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
+        }
+
+        const scanResult = await this.rpcGateway.listAgentSessions(
+            targetMachine.id,
+            metadata.path,
+            flavor
+        )
+
+        if (!scanResult.success || !scanResult.sessions) {
+            return { type: 'error', message: scanResult.error || 'Failed to scan sessions', code: 'resume_failed' }
+        }
+
+        const currentSessionId = flavor === 'codex'
+            ? metadata.codexSessionId
+            : flavor === 'gemini'
+                ? metadata.geminiSessionId
+                : flavor === 'opencode'
+                    ? metadata.opencodeSessionId
+                    : flavor === 'cursor'
+                        ? metadata.cursorSessionId
+                        : metadata.claudeSessionId
+
+        return {
+            type: 'success',
+            sessions: scanResult.sessions,
+            currentSessionId: currentSessionId || null
+        }
     }
 
     async waitForSessionActive(sessionId: string, timeoutMs: number = 15_000): Promise<boolean> {
