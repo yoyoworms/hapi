@@ -8,6 +8,7 @@ import type {
     FileSearchResponse,
     GitCommandResponse,
     MachinePathsExistsResponse,
+    EffortLevel,
     MachinesResponse,
     MessagesResponse,
     PermissionMode,
@@ -266,22 +267,12 @@ export class ApiClient {
         })
     }
 
-    async resumeSession(sessionId: string, resumeWithSessionId?: string): Promise<string> {
+    async resumeSession(sessionId: string): Promise<string> {
         const response = await this.request<{ sessionId: string }>(
             `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
-            {
-                method: 'POST',
-                ...(resumeWithSessionId ? { body: JSON.stringify({ resumeWithSessionId }) } : {})
-            }
+            { method: 'POST' }
         )
         return response.sessionId
-    }
-
-    async getResumeOptions(sessionId: string): Promise<{
-        sessions: Array<{ sessionId: string; modifiedAt: number; sizeBytes: number; valid: boolean }>
-        currentSessionId: string | null
-    }> {
-        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/resume-options`)
     }
 
     async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[]): Promise<void> {

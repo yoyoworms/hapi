@@ -1,5 +1,5 @@
 import { EnhancedMode, PermissionMode } from "./loop";
-import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, type SDKResultMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
@@ -27,7 +27,7 @@ export async function claudeRemote(opts: {
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
-    onReady: () => void,
+    onReady: () => void | Promise<void>,
     isAborted: (toolCallId: string) => boolean,
 
     // Callbacks
@@ -35,7 +35,8 @@ export async function claudeRemote(opts: {
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
     onCompletionEvent?: (message: string) => void,
-    onSessionReset?: () => void
+    onSessionReset?: () => void,
+    onUsage?: (usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
@@ -139,6 +140,7 @@ export async function claudeRemote(opts: {
         pathToClaudeCodeExecutable: getDefaultClaudeCodePath(),
         settingsPath: opts.hookSettingsPath,
         additionalDirectories: [getHapiBlobsDir()],
+        effort: initial.mode.effort,
     }
 
     // Track thinking state
@@ -257,11 +259,20 @@ export async function claudeRemote(opts: {
             // Handle result messages
             if (message.type === 'result') {
                 resultSeq += 1;
-                updateThinking(false);
                 logger.debug(
                     `${debugPrefix} result #${resultSeq} received; scheduling next user message ` +
                     `(nextInFlight=${nextMessageFetchInFlight}, inputEnded=${inputEnded})`
                 );
+
+                // Forward usage data
+                const resultMsg = message as SDKResultMessage;
+                if (opts.onUsage && resultMsg.usage) {
+                    opts.onUsage({
+                        totalCostUsd: resultMsg.total_cost_usd,
+                        totalInputTokens: resultMsg.usage.input_tokens,
+                        totalOutputTokens: resultMsg.usage.output_tokens
+                    });
+                }
 
                 // Send completion messages
                 if (isCompactCommand) {
@@ -272,8 +283,13 @@ export async function claudeRemote(opts: {
                     isCompactCommand = false;
                 }
 
-                // Send ready event
-                opts.onReady();
+                // Send ready event (await to ensure message queue is flushed first)
+                // IMPORTANT: flush messages before updating thinking state to prevent
+                // a race where the frontend sees thinking=false (via keepAlive) before
+                // all response messages have been stored in the hub, allowing the user
+                // to send a new message that gets a lower seq than the remaining response.
+                await opts.onReady();
+                updateThinking(false);
                 logger.debug(`${debugPrefix} onReady emitted for result #${resultSeq}`);
 
                 // Pull next user message without blocking response stream processing.

@@ -20,6 +20,7 @@ export interface EnhancedMode {
     appendSystemPrompt?: string;
     allowedTools?: string[];
     disallowedTools?: string[];
+    effort?: string;
 }
 
 interface LoopOptions {

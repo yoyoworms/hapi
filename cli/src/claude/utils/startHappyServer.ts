@@ -16,6 +16,13 @@ export async function startHappyServer(client: ApiSessionClient) {
     // Handler that sends title updates via the client
     const handler = async (title: string) => {
         logger.debug('[hapiMCP] Changing title to:', title);
+
+        // Skip if session was manually renamed by user
+        if (client.hasCustomName()) {
+            logger.debug('[hapiMCP] Skipping title change - session has been manually renamed');
+            return { success: true, skipped: true };
+        }
+
         try {
             // Send title as a summary message, similar to title generator
             client.sendClaudeSessionMessage({
@@ -23,10 +30,10 @@ export async function startHappyServer(client: ApiSessionClient) {
                 summary: title,
                 leafUuid: randomUUID()
             });
-            
-            return { success: true };
+
+            return { success: true, skipped: false };
         } catch (error) {
-            return { success: false, error: String(error) };
+            return { success: false, skipped: false, error: String(error) };
         }
     };
 
@@ -52,7 +59,17 @@ export async function startHappyServer(client: ApiSessionClient) {
         const response = await handler(args.title);
         logger.debug('[hapiMCP] Response:', response);
         
-        if (response.success) {
+        if (response.success && response.skipped) {
+            return {
+                content: [
+                    {
+                        type: 'text' as const,
+                        text: `Title not changed - this session has been manually renamed by the user. Auto-renaming is disabled for manually renamed sessions.`,
+                    },
+                ],
+                isError: false,
+            };
+        } else if (response.success) {
             return {
                 content: [
                     {

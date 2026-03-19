@@ -81,6 +81,10 @@ function createWebApp(options: {
         allowHeaders: ['authorization', 'content-type']
     })
     app.use('/api/*', corsMiddleware)
+    app.use('/api/*', async (c, next) => {
+        await next()
+        c.res.headers.set('Cache-Control', 'no-store')
+    })
     app.use('/cli/*', corsMiddleware)
 
     app.route('/cli', createCliRoutes(options.getSyncEngine))

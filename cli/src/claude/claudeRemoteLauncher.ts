@@ -347,7 +347,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                             logger.debug('[remote]: Session reset');
                             session.clearSessionId();
                         },
-                        onReady: () => {
+                        onUsage: (usage) => {
+                            session.client.sendSessionEvent({
+                                type: 'usage',
+                                totalCostUsd: usage.totalCostUsd,
+                                totalInputTokens: usage.totalInputTokens,
+                                totalOutputTokens: usage.totalOutputTokens
+                            });
+                        },
+                        onReady: async () => {
+                            // Flush the outgoing message queue before sending ready event
+                            // to prevent delayed messages from arriving after the user's next message
+                            await messageQueue.flush();
                             logger.debug(
                                 `[claudeRemoteLauncher][async-debug] onReady callback ` +
                                 `(hasPending=${Boolean(pending)}, queueSize=${session.queue.size()})`

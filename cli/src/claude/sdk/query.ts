@@ -315,7 +315,8 @@ export function query(config: {
             settingsPath,
             strictMcpConfig,
             canCallTool,
-            promptFailureCleanupTimeoutMs = DEFAULT_PROMPT_FAILURE_CLEANUP_TIMEOUT_MS
+            promptFailureCleanupTimeoutMs = DEFAULT_PROMPT_FAILURE_CLEANUP_TIMEOUT_MS,
+            effort
         } = {}
     } = config
 
@@ -347,6 +348,7 @@ export function query(config: {
     if (additionalDirectories.length > 0) args.push('--add-dir', ...additionalDirectories)
     if (strictMcpConfig) args.push('--strict-mcp-config')
     if (permissionMode) args.push('--permission-mode', permissionMode)
+    if (effort) args.push('--effort', effort)
 
     if (fallbackModel) {
         if (model && fallbackModel === model) {

@@ -17,6 +17,9 @@ export type LatestUsage = {
     cacheRead: number
     contextSize: number
     timestamp: number
+    totalCostUsd?: number
+    totalInputTokens?: number
+    totalOutputTokens?: number
 }
 
 export function reduceChatBlocks(
@@ -102,6 +105,32 @@ export function reduceChatBlocks(
                 cacheRead: msg.usage.cache_read_input_tokens ?? 0,
                 contextSize: calculateContextSize(msg.usage),
                 timestamp: msg.createdAt
+            }
+            break
+        }
+    }
+
+    // Extract cost/total from usage events (find the most recent one)
+    for (let i = normalized.length - 1; i >= 0; i--) {
+        const msg = normalized[i]
+        if (msg.role === 'event' && msg.content.type === 'usage') {
+            const event = msg.content as { type: 'usage'; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }
+            if (latestUsage) {
+                latestUsage.totalCostUsd = event.totalCostUsd
+                latestUsage.totalInputTokens = event.totalInputTokens
+                latestUsage.totalOutputTokens = event.totalOutputTokens
+            } else {
+                latestUsage = {
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheCreation: 0,
+                    cacheRead: 0,
+                    contextSize: 0,
+                    timestamp: msg.createdAt,
+                    totalCostUsd: event.totalCostUsd,
+                    totalInputTokens: event.totalInputTokens,
+                    totalOutputTokens: event.totalOutputTokens
+                }
             }
             break
         }

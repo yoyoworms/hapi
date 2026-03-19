@@ -297,19 +297,4 @@ export default {
   'misc.permissionRequired': '需要权限',
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
-
-  // Resume session picker
-  'resume.inactiveBanner': '会话已停止。发送消息将自动恢复。',
-  'resume.chooseSession': '选择会话',
-  'resume.pickerTitle': '恢复会话',
-  'resume.pickerDescription': '选择一个之前的对话来恢复',
-  'resume.scanning': '扫描可用会话…',
-  'resume.noSessions': '未找到可恢复的会话',
-  'resume.current': '当前',
-  'resume.resuming': '恢复中…',
-  'resume.resumeButton': '恢复',
-  'resume.resumeFailed': '恢复失败',
-
-  // Session action - resume
-  'session.action.resume': '恢复',
 } as const

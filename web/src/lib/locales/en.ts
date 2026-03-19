@@ -295,19 +295,4 @@ export default {
   'misc.permissionRequired': 'permission required',
   'misc.percentLeft': '{percent}% left',
   'misc.online': 'online',
-
-  // Resume session picker
-  'resume.inactiveBanner': 'Session is inactive. Sending will resume it automatically.',
-  'resume.chooseSession': 'Choose session',
-  'resume.pickerTitle': 'Resume Session',
-  'resume.pickerDescription': 'Choose a previous conversation to resume',
-  'resume.scanning': 'Scanning for sessions…',
-  'resume.noSessions': 'No resumable sessions found',
-  'resume.current': 'current',
-  'resume.resuming': 'Resuming…',
-  'resume.resumeButton': 'Resume',
-  'resume.resumeFailed': 'Resume failed',
-
-  // Session action - resume
-  'session.action.resume': 'Resume',
 } as const
