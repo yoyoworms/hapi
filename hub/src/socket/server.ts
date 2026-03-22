@@ -61,6 +61,8 @@ export function createSocketServer(deps: SocketServerDeps): {
 
     const engine = new Engine({
         path: '/socket.io/',
+        pingInterval: 10_000,
+        pingTimeout: 30_000,
         cors: corsOptions,
         allowRequest: async (req) => {
             const origin = req.headers.get('origin')

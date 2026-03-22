@@ -10,6 +10,7 @@ import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
+import { spawn } from 'child_process';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeRunnerState, RunnerLocallyPersistedState, readRunnerState, acquireRunnerLock, releaseRunnerLock } from '@/persistence';
 import { isProcessAlive, isWindows, killProcess, killProcessByChildProcess } from '@/utils/process';
@@ -392,15 +393,43 @@ export async function startRunner(): Promise<void> {
           logger.debug('[RUNNER RUN] Child stderr tail', trimmed);
         };
 
-        happyProcess = spawnHappyCLI(args, {
-          cwd: spawnDirectory,
-          detached: true,  // Sessions stay alive when runner stops
-          stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
-          env: {
-            ...process.env,
-            ...extraEnv
+        if (options.sandbox) {
+          // Sandbox mode: run inside Docker container with only the project directory mounted
+          const containerName = `hapi-sandbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const dockerArgs = [
+            'run', '--rm',
+            '--name', containerName,
+            '-v', `${spawnDirectory}:/workspace`,
+            '-w', '/workspace',
+            '--network', 'host',
+            // Pass essential env vars
+            '-e', `HAPI_API_URL=${process.env.HAPI_API_URL || ''}`,
+            '-e', `CLI_API_TOKEN=${process.env.CLI_API_TOKEN || ''}`,
+            '-e', `HAPI_HOME=/tmp/.hapi`,
+            ...Object.entries(extraEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+            'hapi-sandbox:latest',
+            'hapi', ...args
+          ];
+          logger.debug(`[RUNNER RUN] Spawning sandboxed session: docker ${dockerArgs.join(' ')}`);
+          happyProcess = spawn('docker', dockerArgs, {
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          // Track container name for cleanup
+          if (happyProcess.pid) {
+            (happyProcess as any).__sandboxContainer = containerName;
           }
-        });
+        } else {
+          happyProcess = spawnHappyCLI(args, {
+            cwd: spawnDirectory,
+            detached: true,  // Sessions stay alive when runner stops
+            stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
+            env: {
+              ...process.env,
+              ...extraEnv
+            }
+          });
+        }
 
         happyProcess.stderr?.on('data', (data) => {
           stderrTail = appendTail(stderrTail, data);
@@ -583,6 +612,12 @@ export async function startRunner(): Promise<void> {
 
           if (session.startedBy === 'runner' && session.childProcess) {
             try {
+              // If this is a sandbox session, kill the Docker container
+              const containerName = (session.childProcess as any).__sandboxContainer;
+              if (containerName) {
+                spawn('docker', ['kill', containerName], { detached: true, stdio: 'ignore' });
+                logger.debug(`[RUNNER RUN] Killed sandbox container ${containerName}`);
+              }
               void killProcessByChildProcess(session.childProcess);
               logger.debug(`[RUNNER RUN] Requested termination for runner-spawned session ${sessionId}`);
             } catch (error) {

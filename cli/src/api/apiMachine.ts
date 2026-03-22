@@ -102,7 +102,7 @@ export class ApiMachineClient {
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {
-            const { directory, sessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, token, sessionType, worktreeName } = params || {}
+            const { directory, sessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, token, sessionType, worktreeName, sandbox } = params || {}
 
             if (!directory) {
                 throw new Error('Directory is required')
@@ -121,7 +121,8 @@ export class ApiMachineClient {
                 yolo,
                 token,
                 sessionType,
-                worktreeName
+                worktreeName,
+                sandbox
             })
 
             switch (result.type) {
@@ -306,6 +307,11 @@ export class ApiMachineClient {
 
     private startKeepAlive(): void {
         this.stopKeepAlive()
+        // Send immediately on connect/reconnect so hub marks machine active right away
+        this.socket.emit('machine-alive', {
+            machineId: this.machine.id,
+            time: Date.now()
+        })
         this.keepAliveInterval = setInterval(() => {
             this.socket.emit('machine-alive', {
                 machineId: this.machine.id,
