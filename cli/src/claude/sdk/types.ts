@@ -175,6 +175,7 @@ export interface QueryOptions {
     settingsPath?: string
     strictMcpConfig?: boolean
     canCallTool?: CanCallToolCallback
+    promptFailureCleanupTimeoutMs?: number
 }
 
 /**
