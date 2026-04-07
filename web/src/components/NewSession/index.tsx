@@ -24,6 +24,7 @@ import {
     savePreferredYoloMode,
 } from './preferences'
 import { SessionTypeSelector } from './SessionTypeSelector'
+import { SandboxToggle } from './SandboxToggle'
 import { YoloToggle } from './YoloToggle'
 import { formatRunnerSpawnError } from '../../utils/formatRunnerSpawnError'
 
@@ -50,6 +51,7 @@ export function NewSession(props: {
     const [effort, setEffort] = useState<ClaudeEffort>('auto')
     const [modelReasoningEffort, setModelReasoningEffort] = useState<CodexReasoningEffort>('default')
     const [yoloMode, setYoloMode] = useState(loadPreferredYoloMode)
+    const [sandbox, setSandbox] = useState(false)
     const [sessionType, setSessionType] = useState<SessionType>('simple')
     const [worktreeName, setWorktreeName] = useState('')
     const [directoryCreationConfirmed, setDirectoryCreationConfirmed] = useState(false)
@@ -259,6 +261,7 @@ export function NewSession(props: {
                 effort: resolvedEffort,
                 modelReasoningEffort: resolvedModelReasoningEffort,
                 yolo: yoloMode,
+                sandbox,
                 sessionType,
                 worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined
             })
@@ -345,6 +348,11 @@ export function NewSession(props: {
                 yoloMode={yoloMode}
                 isDisabled={isFormDisabled}
                 onToggle={setYoloMode}
+            />
+            <SandboxToggle
+                sandbox={sandbox}
+                isDisabled={isFormDisabled}
+                onToggle={setSandbox}
             />
 
             {(error ?? spawnError) ? (

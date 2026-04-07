@@ -140,7 +140,6 @@ export async function claudeRemote(opts: {
         pathToClaudeCodeExecutable: getDefaultClaudeCodePath(),
         settingsPath: opts.hookSettingsPath,
         additionalDirectories: [getHapiBlobsDir()],
-        effort: initial.mode.effort,
     }
 
     // Track thinking state

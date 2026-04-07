@@ -122,8 +122,9 @@ export class ApiMachineClient {
                 if (!resp.ok) return null
 
                 const data = await resp.json()
+                if (!data || typeof data !== 'object') return null
                 return {
-                    ...data,
+                    ...(data as Record<string, unknown>),
                     subscriptionType: oauth.subscriptionType,
                     rateLimitTier: oauth.rateLimitTier
                 }

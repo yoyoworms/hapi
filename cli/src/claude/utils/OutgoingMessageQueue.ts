@@ -175,7 +175,11 @@ export class OutgoingMessageQueue {
             this.queue.sort((a, b) => a.id - b.id);
             const promises: Promise<void>[] = [];
             for (const item of this.queue) {
-                if (!item.sent && item.logMessage.type !== 'system') {
+                if (!item.sent) {
+                    if (item.logMessage.type === 'system' || item.logMessage.isMeta || item.logMessage.isCompactSummary) {
+                        item.sent = true;
+                        continue;
+                    }
                     const result = this.sendFunction(item.logMessage);
                     if (result instanceof Promise) {
                         promises.push(result);

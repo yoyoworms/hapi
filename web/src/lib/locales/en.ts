@@ -60,6 +60,7 @@ export default {
 
   // Session actions
   'session.action.rename': 'Rename',
+  'session.action.resume': 'Resume',
   'session.action.archive': 'Archive',
   'session.action.delete': 'Delete',
   'session.action.copy': 'Copy',
@@ -109,6 +110,9 @@ export default {
   'newSession.yolo': 'YOLO mode',
   'newSession.yolo.title': 'Bypass approvals and sandbox',
   'newSession.yolo.desc': 'Uses dangerous agent flags when spawning.',
+  'newSession.sandbox': 'Sandbox',
+  'newSession.sandbox.title': 'Run inside Docker sandbox',
+  'newSession.sandbox.desc': 'Starts the session in an isolated container with only the project directory mounted.',
   'newSession.create': 'Create',
   'newSession.creating': 'Creating…',
 
@@ -303,4 +307,16 @@ export default {
   'misc.permissionRequired': 'permission required',
   'misc.percentLeft': '{percent}% left',
   'misc.online': 'online',
+
+  // Resume session picker
+  'resume.inactiveBanner': 'Session is inactive. Sending will resume it automatically.',
+  'resume.chooseSession': 'Choose session',
+  'resume.pickerTitle': 'Resume Session',
+  'resume.pickerDescription': 'Choose a previous conversation to resume',
+  'resume.scanning': 'Scanning for sessions…',
+  'resume.noSessions': 'No resumable sessions found',
+  'resume.current': 'current',
+  'resume.resuming': 'Resuming…',
+  'resume.resumeButton': 'Resume',
+  'resume.resumeFailed': 'Resume failed',
 } as const

@@ -60,6 +60,7 @@ export default {
 
   // Session actions
   'session.action.rename': '重命名',
+  'session.action.resume': '恢复',
   'session.action.archive': '归档',
   'session.action.delete': '删除',
   'session.action.copy': '复制',
@@ -111,6 +112,9 @@ export default {
   'newSession.yolo': 'YOLO 模式',
   'newSession.yolo.title': '跳过审批和沙箱',
   'newSession.yolo.desc': '启动时使用危险的代理标志。',
+  'newSession.sandbox': '沙箱',
+  'newSession.sandbox.title': '在 Docker 沙箱中运行',
+  'newSession.sandbox.desc': '仅挂载项目目录，在隔离容器中启动会话。',
   'newSession.create': '创建',
   'newSession.creating': '创建中…',
 
@@ -305,4 +309,16 @@ export default {
   'misc.permissionRequired': '需要权限',
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
+
+  // Resume session picker
+  'resume.inactiveBanner': '会话已停止。发送消息将自动恢复。',
+  'resume.chooseSession': '选择会话',
+  'resume.pickerTitle': '恢复会话',
+  'resume.pickerDescription': '选择一个之前的对话来恢复',
+  'resume.scanning': '扫描可用会话…',
+  'resume.noSessions': '未找到可恢复的会话',
+  'resume.current': '当前',
+  'resume.resuming': '恢复中…',
+  'resume.resumeButton': '恢复',
+  'resume.resumeFailed': '恢复失败',
 } as const

@@ -29,7 +29,6 @@ export type {
     OpencodePermissionMode,
     PermissionMode,
     PermissionModeOption,
-    EffortLevel,
     PermissionModeTone
 } from './modes'
 

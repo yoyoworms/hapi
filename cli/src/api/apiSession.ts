@@ -395,14 +395,14 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        const ackPromise = new Promise<void>((resolve) => {
-            this.socket.emit('message', {
+        const ackPromise = (this.socket as any)
+            .timeout(2_000)
+            .emitWithAck('message', {
                 sid: this.sessionId,
                 message: content
-            }, () => resolve())
-            // Resolve after timeout to avoid blocking if hub doesn't ack
-            setTimeout(resolve, 2000)
-        })
+            })
+            .then(() => {})
+            .catch(() => {})
 
         if (body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
             this.updateMetadata((metadata) => ({
@@ -468,6 +468,14 @@ export class ApiSessionClient extends EventEmitter {
         mode: SessionPermissionMode
     } | {
         type: 'ready'
+    } | {
+        type: 'rate_limit'
+        data: unknown
+    } | {
+        type: 'usage'
+        totalCostUsd: number
+        totalInputTokens: number
+        totalOutputTokens: number
     }, id?: string): void {
         const content = {
             role: 'agent',

@@ -10,7 +10,6 @@ import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types
 import type { ConversationStatus } from '@/realtime/types'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { getClaudeModelLabel } from '@hapi/protocol'
-import { isClaudeFlavor } from '@/lib/agentFlavorUtils'
 import { useTranslation } from '@/lib/use-translation'
 
 // Vibing messages for thinking state

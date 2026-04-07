@@ -17,29 +17,36 @@ export interface UsageData {
     rateLimitTier?: string
 }
 
+type CachedUsageEntry = {
+    data: UsageData
+    timestamp: number
+}
+
 // Cache usage data to avoid rate limiting (endpoint allows ~5 requests per token)
-let cachedUsage: UsageData | null = null
-let cacheTimestamp = 0
+const cachedUsageByNamespace = new Map<string, CachedUsageEntry>()
 const CACHE_TTL = 120_000 // 2 minutes
 
-async function fetchUsageViaRpc(getSyncEngine: () => SyncEngine | null): Promise<UsageData | null> {
+async function fetchUsageViaRpc(getSyncEngine: () => SyncEngine | null, namespace: string): Promise<UsageData | null> {
     const now = Date.now()
-    if (cachedUsage && (now - cacheTimestamp) < CACHE_TTL) {
-        return cachedUsage
+    const cachedEntry = cachedUsageByNamespace.get(namespace)
+    if (cachedEntry && (now - cachedEntry.timestamp) < CACHE_TTL) {
+        return cachedEntry.data
     }
 
     const syncEngine = getSyncEngine()
-    if (!syncEngine) return cachedUsage
+    if (!syncEngine) return cachedEntry?.data ?? null
 
     try {
-        const data = await syncEngine.getUsage() as UsageData | null
+        const data = await syncEngine.getUsage(namespace) as UsageData | null
         if (data) {
-            cachedUsage = data
-            cacheTimestamp = now
+            cachedUsageByNamespace.set(namespace, {
+                data,
+                timestamp: now
+            })
         }
-        return data ?? cachedUsage
+        return data ?? cachedEntry?.data ?? null
     } catch {
-        return cachedUsage
+        return cachedEntry?.data ?? null
     }
 }
 
@@ -47,7 +54,7 @@ export function createUsageRoutes(getSyncEngine: () => SyncEngine | null) {
     const app = new Hono<WebAppEnv>()
 
     app.get('/usage', async (c) => {
-        const usage = await fetchUsageViaRpc(getSyncEngine)
+        const usage = await fetchUsageViaRpc(getSyncEngine, c.get('namespace'))
         if (!usage) {
             return c.json({ error: 'Unable to fetch usage data' }, 503)
         }

@@ -30,7 +30,6 @@ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { RealtimeVoiceSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
-import { useTranslation } from '@/lib/use-translation'
 import { HappyChatProvider } from '@/components/AssistantChat/context'
 
 export function SessionChat(props: {

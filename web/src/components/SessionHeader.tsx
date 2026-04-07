@@ -1,8 +1,10 @@
-import { useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useId, useMemo, useRef, useState } from 'react'
+import { useNavigate } from '@tanstack/react-router'
 import type { Session } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { isTelegramApp } from '@/hooks/useTelegram'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
+import { fetchLatestMessages, seedMessageWindowFromSession } from '@/lib/message-window-store'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
@@ -66,6 +68,7 @@ export function SessionHeader(props: {
     onViewFiles?: () => void
     api: ApiClient | null
     onSessionDeleted?: () => void
+    onResuming?: (resuming: boolean) => void
 }) {
     const { t } = useTranslation()
     const { session, api, onSessionDeleted } = props
@@ -81,11 +84,36 @@ export function SessionHeader(props: {
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
-    const { archiveSession, renameSession, deleteSession, isPending } = useSessionActions(
+    const navigate = useNavigate()
+    const { archiveSession, renameSession, deleteSession, resumeSession, isPending } = useSessionActions(
         api,
         session.id,
         session.metadata?.flavor ?? null
     )
+
+    const handleResume = useCallback(async () => {
+        props.onResuming?.(true)
+        try {
+            const resolvedId = await resumeSession()
+            if (resolvedId !== session.id) {
+                seedMessageWindowFromSession(session.id, resolvedId)
+            }
+            if (api) {
+                try {
+                    await fetchLatestMessages(api, resolvedId)
+                } catch {
+                }
+            }
+            navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId: resolvedId },
+                replace: true
+            })
+        } catch (error) {
+            console.error('Resume failed:', error)
+            props.onResuming?.(false)
+        }
+    }, [api, navigate, props, resumeSession, session.id])
 
     const handleDelete = async () => {
         await deleteSession()
@@ -183,6 +211,7 @@ export function SessionHeader(props: {
                 onClose={() => setMenuOpen(false)}
                 sessionActive={session.active}
                 onRename={() => setRenameOpen(true)}
+                onResume={handleResume}
                 onArchive={() => setArchiveOpen(true)}
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}

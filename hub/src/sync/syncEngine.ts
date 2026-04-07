@@ -137,8 +137,8 @@ export class SyncEngine {
         return this.machineCache.getMachineByNamespace(machineId, namespace)
     }
 
-    async getUsage(): Promise<unknown> {
-        const machines = this.machineCache.getOnlineMachines()
+    async getUsage(namespace: string): Promise<unknown> {
+        const machines = this.machineCache.getOnlineMachinesByNamespace(namespace)
         if (machines.length === 0) {
             console.log('[usage] no machines online')
             return null
