@@ -62,6 +62,9 @@ export function useSendMessage(
     const [isResolving, setIsResolving] = useState(false)
     const resolveGuardRef = useRef(false)
     const drainingRef = useRef(false)
+    const releaseTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    const thinkingRef = useRef(Boolean(options?.thinking))
+    const mutationPendingRef = useRef(false)
 
     // Subscribe to queue changes
     const queueState = useSyncExternalStore(
@@ -70,6 +73,39 @@ export function useSendMessage(
     )
     const queuedCount = queueState.items.length
     const hasPaused = queueState.items.some(m => m.phase === 'paused')
+
+    const clearTurnReleaseTimer = useCallback(() => {
+        if (releaseTurnTimerRef.current !== null) {
+            clearTimeout(releaseTurnTimerRef.current)
+            releaseTurnTimerRef.current = null
+        }
+    }, [])
+
+    const clearTurnLock = useCallback((sid: string) => {
+        clearTurnReleaseTimer()
+        queue.setInFlight(sid, null)
+    }, [clearTurnReleaseTimer])
+
+    const scheduleTurnLockRelease = useCallback((sid: string, localId: string) => {
+        clearTurnReleaseTimer()
+        releaseTurnTimerRef.current = setTimeout(() => {
+            if (mutationPendingRef.current || resolveGuardRef.current || thinkingRef.current) {
+                return
+            }
+            if (queue.getState(sid).inFlightLocalId !== localId) {
+                return
+            }
+            clearTurnLock(sid)
+        }, 1500)
+    }, [clearTurnLock, clearTurnReleaseTimer])
+
+    useEffect(() => {
+        thinkingRef.current = Boolean(options?.thinking)
+    }, [options?.thinking])
+
+    useEffect(() => () => {
+        clearTurnReleaseTimer()
+    }, [clearTurnReleaseTimer])
 
     const mutation = useMutation({
         mutationFn: async (input: SendMessageInput) => {
@@ -80,7 +116,9 @@ export function useSendMessage(
         },
         onSuccess: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'sent')
-            if (sessionId) queue.setInFlight(sessionId, null)
+            if (!thinkingRef.current) {
+                scheduleTurnLockRelease(input.sessionId, input.localId)
+            }
             haptic.notification('success')
             if (api) {
                 const doFetch = () => fetchLatestMessages(api, input.sessionId, { incremental: true }).catch(() => {})
@@ -91,13 +129,15 @@ export function useSendMessage(
         },
         onError: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'failed')
-            if (sessionId) {
-                queue.setInFlight(sessionId, null)
-                queue.pauseQueue(sessionId)
-            }
+            clearTurnLock(input.sessionId)
+            queue.pauseQueue(input.sessionId)
             haptic.notification('error')
         },
     })
+
+    useEffect(() => {
+        mutationPendingRef.current = mutation.isPending
+    }, [mutation.isPending])
 
     // Dispatch a single message through the resolve → fetch → send pipeline
     const dispatchMessage = useCallback(async (
@@ -122,7 +162,7 @@ export function useSendMessage(
             } catch (error) {
                 haptic.notification('error')
                 console.error('Failed to resolve session before send:', error)
-                queue.setInFlight(sid, null)
+                clearTurnLock(sid)
                 queue.pauseQueue(sid)
                 return
             } finally {
@@ -142,12 +182,12 @@ export function useSendMessage(
             createdAt,
             attachments,
         })
-    }, [mutation, options, haptic])
+    }, [clearTurnLock, mutation, options, haptic])
 
     // Try to drain the queue — called when Claude finishes or dispatch completes
     const drainQueue = useCallback(() => {
         if (!api || !sessionId) return
-        if (mutation.isPending || resolveGuardRef.current || drainingRef.current) return
+        if (mutation.isPending || resolveGuardRef.current || drainingRef.current || queueState.inFlightLocalId) return
         if (options?.thinking) return
 
         const next = queue.peek(sessionId)
@@ -159,27 +199,32 @@ export function useSendMessage(
 
         void dispatchMessage(api, sessionId, item.text, item.localId, item.createdAt, item.attachments)
             .finally(() => { drainingRef.current = false })
-    }, [api, sessionId, mutation.isPending, options?.thinking, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, options?.thinking, queueState.inFlightLocalId, dispatchMessage])
 
-    // Drain when thinking transitions to false, or when mutation completes
+    // Release the current turn lock and try the next queued item when Claude
+    // actually finishes thinking.
     const prevThinkingRef = useRef(options?.thinking)
     useEffect(() => {
         const wasThinking = prevThinkingRef.current
         prevThinkingRef.current = options?.thinking
+        if (options?.thinking) {
+            clearTurnReleaseTimer()
+            return
+        }
         if (wasThinking && !options?.thinking) {
+            if (sessionId && queueState.inFlightLocalId) {
+                clearTurnLock(sessionId)
+            }
             drainQueue()
         }
-    }, [options?.thinking, drainQueue])
+    }, [options?.thinking, sessionId, queueState.inFlightLocalId, clearTurnLock, clearTurnReleaseTimer, drainQueue])
 
-    // Also drain when mutation finishes (isPending goes false)
-    const prevPendingRef = useRef(mutation.isPending)
+    // Also try draining on mount/reconnect once the queue exists and the session is idle.
     useEffect(() => {
-        const wasPending = prevPendingRef.current
-        prevPendingRef.current = mutation.isPending
-        if (wasPending && !mutation.isPending) {
+        if (queuedCount > 0) {
             drainQueue()
         }
-    }, [mutation.isPending, drainQueue])
+    }, [queuedCount, queueState.inFlightLocalId, mutation.isPending, options?.thinking, drainQueue])
 
     const sendMessage = useCallback((text: string, attachments?: AttachmentMetadata[]) => {
         if (!api) {
@@ -196,7 +241,7 @@ export function useSendMessage(
         const localId = makeClientSideId('local')
         const createdAt = Date.now()
 
-        const busy = mutation.isPending || resolveGuardRef.current || options?.thinking
+        const busy = mutation.isPending || resolveGuardRef.current || options?.thinking || Boolean(queueState.inFlightLocalId)
 
         if (busy) {
             // Enqueue and show optimistic bubble with 'queued' status
@@ -233,11 +278,11 @@ export function useSendMessage(
             queue.setInFlight(sessionId, localId)
             void dispatchMessage(api, sessionId, text, localId, createdAt, attachments)
         }
-    }, [api, sessionId, mutation.isPending, options?.thinking, options?.onBlocked, haptic, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, options?.thinking, options?.onBlocked, queueState.inFlightLocalId, haptic, dispatchMessage])
 
     const retryMessage = useCallback((localId: string) => {
         if (!api || !sessionId) return
-        if (mutation.isPending || resolveGuardRef.current) return
+        if (mutation.isPending || resolveGuardRef.current || queueState.inFlightLocalId) return
 
         const message = findMessageByLocalId(sessionId, localId)
         if (!message?.originalText) return
@@ -246,7 +291,7 @@ export function useSendMessage(
         queue.setInFlight(sessionId, localId)
 
         void dispatchMessage(api, sessionId, message.originalText, localId, message.createdAt)
-    }, [api, sessionId, mutation.isPending, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, queueState.inFlightLocalId, dispatchMessage])
 
     const cancelQueued = useCallback((localId: string) => {
         if (!sessionId) return

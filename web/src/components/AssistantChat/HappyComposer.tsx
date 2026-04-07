@@ -12,7 +12,7 @@ import {
     useRef,
     useState
 } from 'react'
-import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { AgentState, AttachmentMetadata, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 // import type { ConversationStatus } from '@/realtime/types' // voice disabled
 import { useActiveWord } from '@/hooks/useActiveWord'
@@ -28,6 +28,7 @@ import { StatusBar } from '@/components/AssistantChat/StatusBar'
 import { useHappyChatContext } from '@/components/AssistantChat/context'
 import { ComposerButtons } from '@/components/AssistantChat/ComposerButtons'
 import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
+import { collectComposerAttachmentMetadata } from '@/lib/composerAttachments'
 import { useTranslation } from '@/lib/use-translation'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
@@ -162,7 +163,6 @@ export function HappyComposer(props: {
     const composerText = useAssistantState(({ composer }) => composer.text)
     const attachments = useAssistantState(({ composer }) => composer.attachments)
     const threadIsRunning = useAssistantState(({ thread }) => thread.isRunning)
-    const threadIsDisabled = useAssistantState(({ thread }) => thread.isDisabled)
 
     // Save draft on unmount or session change, restore on mount
     const composerTextRef = useRef(composerText)
@@ -538,13 +538,14 @@ export function HappyComposer(props: {
         // Bypass it by reading text directly and calling onDirectSend.
         if (thinking && props.onDirectSend) {
             const text = composerTextRef.current.trim()
-            if (!text) return
-            props.onDirectSend(text)
-            api.composer().setText('')
+            const attachmentMetadata = collectComposerAttachmentMetadata(attachments)
+            if (!text && attachmentMetadata.length === 0) return
+            props.onDirectSend(text, attachmentMetadata.length > 0 ? attachmentMetadata : undefined)
+            void api.composer().reset()
             return
         }
         api.composer().send()
-    }, [api, sessionId, thinking, props.onDirectSend])
+    }, [api, attachments, sessionId, thinking, props.onDirectSend])
 
     const overlays = useMemo(() => {
         if (showSettings && (showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)) {
