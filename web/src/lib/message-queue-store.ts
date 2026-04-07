@@ -15,8 +15,55 @@ interface SessionQueueState {
 
 type Listener = () => void
 
+const STORAGE_KEY = 'hapi-message-queue'
+
 const queues = new Map<string, SessionQueueState>()
 const listeners = new Map<string, Set<Listener>>()
+
+// --- localStorage persistence ---
+
+function loadFromStorage(): void {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY)
+        if (!raw) return
+        const data = JSON.parse(raw) as Record<string, { items: QueuedMessage[] }>
+        for (const [sessionId, state] of Object.entries(data)) {
+            if (state.items && state.items.length > 0) {
+                queues.set(sessionId, { items: state.items, inFlightLocalId: null })
+            }
+        }
+    } catch {
+        // ignore corrupt storage
+    }
+}
+
+function saveToStorage(): void {
+    try {
+        const data: Record<string, { items: QueuedMessage[] }> = {}
+        for (const [sessionId, state] of queues) {
+            if (state.items.length > 0) {
+                // Strip attachments from persisted messages (paths are ephemeral)
+                const items = state.items.map(m => ({
+                    ...m,
+                    attachments: undefined
+                }))
+                data[sessionId] = { items }
+            }
+        }
+        if (Object.keys(data).length > 0) {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
+        } else {
+            localStorage.removeItem(STORAGE_KEY)
+        }
+    } catch {
+        // ignore storage errors
+    }
+}
+
+// Load on module init
+loadFromStorage()
+
+// --- core functions ---
 
 function getOrCreate(sessionId: string): SessionQueueState {
     let state = queues.get(sessionId)
@@ -37,6 +84,7 @@ function notify(sessionId: string): void {
 export function enqueue(sessionId: string, message: Omit<QueuedMessage, 'phase'>): void {
     const state = getOrCreate(sessionId)
     state.items.push({ ...message, phase: 'queued' })
+    saveToStorage()
     notify(sessionId)
 }
 
@@ -50,6 +98,7 @@ export function dequeue(sessionId: string): QueuedMessage | null {
     const state = queues.get(sessionId)
     if (!state || state.items.length === 0) return null
     const item = state.items.shift()!
+    saveToStorage()
     notify(sessionId)
     return item
 }
@@ -58,6 +107,7 @@ export function cancel(sessionId: string, localId: string): void {
     const state = queues.get(sessionId)
     if (!state) return
     state.items = state.items.filter(m => m.localId !== localId)
+    saveToStorage()
     notify(sessionId)
 }
 
@@ -66,6 +116,7 @@ export function clearAll(sessionId: string): QueuedMessage[] {
     if (!state) return []
     const removed = [...state.items]
     state.items = []
+    saveToStorage()
     notify(sessionId)
     return removed
 }
@@ -76,6 +127,7 @@ export function pauseQueue(sessionId: string): void {
     for (const item of state.items) {
         if (item.phase === 'queued') item.phase = 'paused'
     }
+    saveToStorage()
     notify(sessionId)
 }
 
@@ -85,12 +137,14 @@ export function resumeQueue(sessionId: string): void {
     for (const item of state.items) {
         if (item.phase === 'paused') item.phase = 'queued'
     }
+    saveToStorage()
     notify(sessionId)
 }
 
 export function setInFlight(sessionId: string, localId: string | null): void {
     const state = getOrCreate(sessionId)
     state.inFlightLocalId = localId
+    // inFlightLocalId is not persisted (runtime-only state)
     notify(sessionId)
 }
 
@@ -121,6 +175,7 @@ export function moveSession(fromSessionId: string, toSessionId: string): void {
         listeners.set(toSessionId, subs)
         listeners.delete(fromSessionId)
     }
+    saveToStorage()
     notify(toSessionId)
 }
 
