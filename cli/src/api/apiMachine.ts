@@ -98,6 +98,39 @@ export class ApiMachineClient {
 
             return { exists }
         })
+
+        this.rpcHandlerManager.registerHandler('getOAuthUsage', async () => {
+            try {
+                const { execSync } = await import('child_process')
+                const raw = execSync(
+                    'security find-generic-password -s "Claude Code-credentials" -w',
+                    { encoding: 'utf-8', timeout: 5000 }
+                ).trim()
+                const parsed = JSON.parse(raw)
+                const oauth = parsed.claudeAiOauth
+                if (!oauth?.accessToken) return null
+
+                const resp = await fetch('https://api.anthropic.com/api/oauth/usage', {
+                    headers: {
+                        'Authorization': `Bearer ${oauth.accessToken}`,
+                        'anthropic-beta': 'oauth-2025-04-20',
+                        'Content-Type': 'application/json'
+                    },
+                    signal: AbortSignal.timeout(10_000)
+                })
+
+                if (!resp.ok) return null
+
+                const data = await resp.json()
+                return {
+                    ...data,
+                    subscriptionType: oauth.subscriptionType,
+                    rateLimitTier: oauth.rateLimitTier
+                }
+            } catch {
+                return null
+            }
+        })
     }
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
@@ -227,7 +260,8 @@ export class ApiMachineClient {
             auth: {
                 token: this.token,
                 clientType: 'machine-scoped' as const,
-                machineId: this.machine.id
+                machineId: this.machine.id,
+                clientTime: Date.now()
             },
             path: '/socket.io/',
             reconnection: true,

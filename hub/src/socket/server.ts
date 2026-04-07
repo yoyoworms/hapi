@@ -38,6 +38,7 @@ export type SocketServerDeps = {
     onWebappEvent?: (event: SyncEvent) => void
     onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote' }) => void
     onSessionEnd?: (payload: { sid: string; time: number }) => void
+    onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onMachineAlive?: (payload: { machineId: string; time: number }) => void
 }
 
@@ -56,13 +57,15 @@ export function createSocketServer(deps: SocketServerDeps): {
     }
 
     const io = new Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, SocketData>({
-        cors: corsOptions
+        cors: corsOptions,
+        maxHttpBufferSize: 100 * 1024 * 1024  // 100MB for file uploads
     })
 
     const engine = new Engine({
         path: '/socket.io/',
         pingInterval: 10_000,
         pingTimeout: 30_000,
+        maxHttpBufferSize: 100 * 1024 * 1024,  // 100MB for file uploads
         cors: corsOptions,
         allowRequest: async (req) => {
             const origin = req.headers.get('origin')
@@ -105,6 +108,11 @@ export function createSocketServer(deps: SocketServerDeps): {
             return next(new Error('Invalid token'))
         }
         socket.data.namespace = parsedToken.namespace
+        // Calculate clock offset between CLI and Hub for timestamp normalization
+        const clientTime = typeof auth?.clientTime === 'number' ? auth.clientTime : null
+        if (clientTime) {
+            socket.data.clockOffset = Date.now() - clientTime
+        }
         next()
     })
     cliNs.on('connection', (socket) => registerCliHandlers(socket as CliSocketWithData, {
@@ -114,6 +122,7 @@ export function createSocketServer(deps: SocketServerDeps): {
         terminalRegistry,
         onSessionAlive: deps.onSessionAlive,
         onSessionEnd: deps.onSessionEnd,
+        onSessionUsage: deps.onSessionUsage,
         onMachineAlive: deps.onMachineAlive,
         onWebappEvent: deps.onWebappEvent
     }))

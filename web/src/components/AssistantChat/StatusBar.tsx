@@ -9,6 +9,8 @@ import { useMemo } from 'react'
 import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
+import { getClaudeModelLabel } from '@hapi/protocol'
+import { isClaudeFlavor } from '@/lib/agentFlavorUtils'
 import { useTranslation } from '@/lib/use-translation'
 
 // Vibing messages for thinking state
@@ -106,16 +108,32 @@ function getContextWarning(contextSize: number, maxContextSize: number, t: (key:
     }
 }
 
+function formatTokenCount(tokens: number): string {
+    if (tokens >= 1_000_000) {
+        return `${(tokens / 1_000_000).toFixed(1)}M`
+    }
+    if (tokens >= 1_000) {
+        return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1)}K`
+    }
+    return String(tokens)
+}
+
+function formatCost(cost: number): string {
+    return `$${cost.toFixed(2)}`
+}
+
 export function StatusBar(props: {
     active: boolean
     thinking: boolean
     agentState: AgentState | null | undefined
     contextSize?: number
+    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
     model?: string | null
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     agentFlavor?: string | null
     voiceStatus?: ConversationStatus
+    onModelChange?: (model: string | null) => void
 }) {
     const { t } = useTranslation()
     const connectionStatus = useMemo(
@@ -169,6 +187,16 @@ export function StatusBar(props: {
             </div>
 
             <div className="flex items-center gap-2">
+                {props.usage ? (
+                    <span className="text-[10px] text-[var(--app-hint)]">
+                        {formatCost(props.usage.totalCostUsd)}
+                    </span>
+                ) : null}
+                {props.model ? (
+                    <span className="text-[10px] text-[var(--app-hint)]">
+                        {getClaudeModelLabel(props.model)}
+                    </span>
+                ) : null}
                 {collaborationModeLabel ? (
                     <span className="text-xs text-blue-500">
                         {collaborationModeLabel}
@@ -179,6 +207,9 @@ export function StatusBar(props: {
                         {permissionModeLabel}
                     </span>
                 ) : null}
+                <span className="text-[10px] text-[var(--app-hint)]">
+                    v{__APP_VERSION__}
+                </span>
             </div>
         </div>
     )

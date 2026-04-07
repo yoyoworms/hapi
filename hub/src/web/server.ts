@@ -18,6 +18,7 @@ import { createMachinesRoutes } from './routes/machines'
 import { createGitRoutes } from './routes/git'
 import { createCliRoutes } from './routes/cli'
 import { createPushRoutes } from './routes/push'
+import { createUsageRoutes } from './routes/usage'
 import { createVoiceRoutes } from './routes/voice'
 import type { SSEManager } from '../sse/sseManager'
 import type { VisibilityTracker } from '../visibility/visibilityTracker'
@@ -27,6 +28,9 @@ import type { WebSocketData } from '@socket.io/bun-engine'
 import { loadEmbeddedAssetMap, type EmbeddedWebAsset } from './embeddedAssets'
 import { isBunCompiled } from '../utils/bunCompiled'
 import type { Store } from '../store'
+
+// One-time tokens for internal upload downloads (no JWT needed)
+export const uploadDownloadTokens = new Set<string>()
 
 function findWebappDistDir(): { distDir: string; indexHtmlPath: string } {
     const candidates = [
@@ -92,6 +96,43 @@ function createWebApp(options: {
     app.route('/api', createAuthRoutes(options.jwtSecret, options.store))
     app.route('/api', createBindRoutes(options.jwtSecret, options.store))
 
+    // Internal upload download endpoint (no JWT auth, uses one-time token)
+    app.get('/api/sessions/:id/upload/download/:filename', async (c) => {
+        const token = c.req.query('token')
+        if (!token || !uploadDownloadTokens.has(token)) {
+            return c.json({ error: 'Invalid or expired token' }, 401)
+        }
+        uploadDownloadTokens.delete(token)
+
+        const { join, resolve, sep } = await import('path')
+        const { tmpdir } = await import('os')
+        const { rm } = await import('fs/promises')
+        const sessionId = c.req.param('id')
+        const filename = c.req.param('filename')
+        const hubBlobsDir = join(tmpdir(), 'hapi-hub-blobs')
+        const filePath = join(hubBlobsDir, sessionId, filename)
+
+        const resolvedPath = resolve(filePath)
+        const resolvedDir = resolve(hubBlobsDir)
+        if (!resolvedPath.startsWith(resolvedDir + sep)) {
+            return c.json({ error: 'Invalid path' }, 400)
+        }
+
+        try {
+            const file = Bun.file(filePath)
+            if (!await file.exists()) {
+                return c.json({ error: 'File not found' }, 404)
+            }
+            const arrayBuffer = await file.arrayBuffer()
+            await rm(filePath, { force: true }).catch(() => {})
+            return new Response(arrayBuffer, {
+                headers: { 'content-type': 'application/octet-stream' }
+            })
+        } catch {
+            return c.json({ error: 'Failed to read file' }, 500)
+        }
+    })
+
     app.use('/api/*', createAuthMiddleware(options.jwtSecret))
     app.route('/api', createEventsRoutes(options.getSseManager, options.getSyncEngine, options.getVisibilityTracker))
     app.route('/api', createSessionsRoutes(options.getSyncEngine))
@@ -100,6 +141,7 @@ function createWebApp(options: {
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createGitRoutes(options.getSyncEngine))
     app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
+    app.route('/api', createUsageRoutes(options.getSyncEngine))
     // app.route('/api', createVoiceRoutes()) // voice disabled
 
     // Skip static serving in relay mode, show helpful message on root

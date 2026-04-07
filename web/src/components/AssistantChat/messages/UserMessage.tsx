@@ -8,6 +8,12 @@ import { CliOutputBlock } from '@/components/CliOutputBlock'
 import { CopyIcon, CheckIcon } from '@/components/icons'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 
+function formatTimestamp(date: Date): string {
+    const h = date.getHours().toString().padStart(2, '0')
+    const m = date.getMinutes().toString().padStart(2, '0')
+    return `${h}:${m}`
+}
+
 export function HappyUserMessage() {
     const ctx = useHappyChatContext()
     const { copied, copy } = useCopyToClipboard()
@@ -31,6 +37,12 @@ export function HappyUserMessage() {
         const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.attachments
     })
+    const showTimestamp = useAssistantState(({ message }) => {
+        if (message.role !== 'user') return false
+        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+        return custom?.showTimestamp ?? false
+    })
+    const createdAt = useAssistantState(({ message }) => message.createdAt)
     const isCliOutput = useAssistantState(({ message }) => {
         const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.kind === 'cli-output'
@@ -61,30 +73,37 @@ export function HappyUserMessage() {
     const hasAttachments = attachments && attachments.length > 0
 
     return (
-        <MessagePrimitive.Root className={`${userBubbleClass} group/msg`}>
-            <div className="flex items-end gap-2">
-                <div className="flex-1 min-w-0">
-                    {hasText && <LazyRainbowText text={text} />}
-                    {hasAttachments && <MessageAttachments attachments={attachments} />}
+        <>
+            {showTimestamp && createdAt && (
+                <div className="w-full text-center text-xs text-[var(--app-hint)] py-1 -mb-1">
+                    {formatTimestamp(createdAt)}
                 </div>
-                {(hasText || status) && (
-                    <div className="shrink-0 self-end pb-0.5 flex items-center gap-1">
-                        {hasText && (
-                            <button
-                                type="button"
-                                title="Copy"
-                                className="opacity-60 sm:opacity-0 sm:group-hover/msg:opacity-100 transition-[opacity,background-color] p-0.5 rounded hover:bg-[var(--app-subtle-bg)]"
-                                onClick={() => copy(text)}
-                            >
-                                {copied
-                                    ? <CheckIcon className="h-3.5 w-3.5 text-green-500" />
-                                    : <CopyIcon className="h-3.5 w-3.5 text-[var(--app-hint)]" />}
-                            </button>
-                        )}
-                        {status && <MessageStatusIndicator status={status} onRetry={onRetry} />}
+            )}
+            <MessagePrimitive.Root className={`${userBubbleClass} group/msg`}>
+                <div className="flex items-end gap-2">
+                    <div className="flex-1 min-w-0">
+                        {hasText && <LazyRainbowText text={text} />}
+                        {hasAttachments && <MessageAttachments attachments={attachments} />}
                     </div>
-                )}
-            </div>
-        </MessagePrimitive.Root>
+                    {(hasText || status) && (
+                        <div className="shrink-0 self-end pb-0.5 flex items-center gap-1">
+                            {hasText && (
+                                <button
+                                    type="button"
+                                    title="Copy"
+                                    className="opacity-60 sm:opacity-0 sm:group-hover/msg:opacity-100 transition-[opacity,background-color] p-0.5 rounded hover:bg-[var(--app-subtle-bg)]"
+                                    onClick={() => copy(text)}
+                                >
+                                    {copied
+                                        ? <CheckIcon className="h-3.5 w-3.5 text-green-500" />
+                                        : <CopyIcon className="h-3.5 w-3.5 text-[var(--app-hint)]" />}
+                                </button>
+                            )}
+                            {status && <MessageStatusIndicator status={status} onRetry={onRetry} />}
+                        </div>
+                    )}
+                </div>
+            </MessagePrimitive.Root>
+        </>
     )
 }

@@ -64,7 +64,7 @@ export async function loop(opts: LoopOptions) {
         startedBy,
         startingMode,
         hookSettingsPath: opts.hookSettingsPath,
-        permissionMode: opts.permissionMode ?? 'default',
+        permissionMode: opts.permissionMode ?? 'bypassPermissions',
         model: opts.model,
         effort: opts.effort
     });

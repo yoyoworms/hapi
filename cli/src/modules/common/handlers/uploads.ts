@@ -2,6 +2,7 @@ import { logger } from '@/ui/logger'
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
 import { join, resolve, sep } from 'path'
 import { rmSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager'
 import { getErrorMessage, rpcError } from '../rpcResponses'
 import { getHapiBlobsDir } from '@/constants/uploadPaths'
@@ -34,6 +35,35 @@ const uploadDirPromises = new Map<string, Promise<string>>()
 const uploadDirCleanupRequested = new Set<string>()
 let cleanupRegistered = false
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+const MAX_IMAGE_DIMENSION = 2000
+
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'image/bmp'])
+
+/**
+ * Resize image if any dimension exceeds MAX_IMAGE_DIMENSION (2000px).
+ * Uses macOS `sips` (no external deps). Returns the (possibly modified) file path.
+ */
+function resizeImageIfNeeded(filePath: string, mimeType: string): void {
+    if (!IMAGE_MIME_TYPES.has(mimeType)) return
+    try {
+        const info = execSync(`sips -g pixelWidth -g pixelHeight "${filePath}" 2>/dev/null`, { encoding: 'utf-8' })
+        const wMatch = info.match(/pixelWidth:\s*(\d+)/)
+        const hMatch = info.match(/pixelHeight:\s*(\d+)/)
+        if (!wMatch || !hMatch) return
+        const w = parseInt(wMatch[1], 10)
+        const h = parseInt(hMatch[1], 10)
+        if (w <= MAX_IMAGE_DIMENSION && h <= MAX_IMAGE_DIMENSION) return
+        // Resize longest edge to MAX_IMAGE_DIMENSION, maintaining aspect ratio
+        if (w >= h) {
+            execSync(`sips --resampleWidth ${MAX_IMAGE_DIMENSION} "${filePath}" 2>/dev/null`)
+        } else {
+            execSync(`sips --resampleHeight ${MAX_IMAGE_DIMENSION} "${filePath}" 2>/dev/null`)
+        }
+        logger.debug(`[upload] Resized image from ${w}x${h} to fit ${MAX_IMAGE_DIMENSION}px: ${filePath}`)
+    } catch (error) {
+        logger.debug('[upload] Image resize failed (non-fatal):', error)
+    }
+}
 
 function sanitizeFilename(filename: string): string {
     // Remove path separators and limit length
@@ -194,12 +224,57 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
                 return rpcError('File too large (max 50MB)')
             }
             await writeFile(filePath, buffer)
+            resizeImageIfNeeded(filePath, data.mimeType)
 
             logger.debug('File uploaded successfully:', filePath)
             return { success: true, path: filePath }
         } catch (error) {
             logger.debug('Failed to upload file:', error)
             return rpcError(getErrorMessage(error, 'Failed to upload file'))
+        }
+    })
+
+    // Handler for large files: hub stores the file, runner downloads via HTTP
+    rpcHandlerManager.registerHandler<{
+        sessionId?: string
+        filename: string
+        downloadUrl: string
+        mimeType: string
+    }, UploadFileResponse>('uploadFileFromHub', async (data) => {
+        logger.debug('Upload from hub request:', data.filename, 'downloadUrl:', data.downloadUrl)
+
+        if (!data.filename || !data.downloadUrl) {
+            return rpcError('Filename and downloadUrl are required')
+        }
+
+        try {
+            // Download file content from hub (downloadUrl is a full URL)
+            const hubUrl = data.downloadUrl
+            logger.debug('Downloading file from hub:', hubUrl)
+            const response = await fetch(hubUrl)
+            if (!response.ok) {
+                const errText = await response.text().catch(() => '')
+                return rpcError(`Failed to download from hub: ${response.status} ${errText}`)
+            }
+
+            const buffer = Buffer.from(await response.arrayBuffer())
+            if (buffer.length > MAX_UPLOAD_BYTES) {
+                return rpcError('File too large (max 50MB)')
+            }
+
+            const dir = await getOrCreateUploadDir(data.sessionId)
+            const sanitizedFilename = sanitizeFilename(data.filename)
+            const timestamp = Date.now()
+            const uniqueFilename = `${timestamp}-${sanitizedFilename}`
+            const filePath = join(dir, uniqueFilename)
+            await writeFile(filePath, buffer)
+            resizeImageIfNeeded(filePath, data.mimeType)
+
+            logger.debug('File uploaded from hub successfully:', filePath)
+            return { success: true, path: filePath }
+        } catch (error) {
+            logger.debug('Failed to upload file from hub:', error)
+            return rpcError(getErrorMessage(error, 'Failed to upload file from hub'))
         }
     })
 

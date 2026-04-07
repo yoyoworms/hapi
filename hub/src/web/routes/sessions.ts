@@ -2,9 +2,15 @@ import { getPermissionModesForFlavor, isPermissionModeAllowedForFlavor, toSessio
 import { CodexCollaborationModeSchema, PermissionModeSchema } from '@hapi/protocol/schemas'
 import { Hono } from 'hono'
 import { z } from 'zod'
+import { mkdir, writeFile } from 'fs/promises'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import { randomUUID } from 'crypto'
 import type { SyncEngine, Session } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
+import { uploadDownloadTokens } from '../server'
+import { configuration } from '../../configuration'
 
 const permissionModeSchema = z.object({
     mode: PermissionModeSchema
@@ -148,6 +154,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         })
     })
 
+    // Hub-side file upload: write to hub's temp dir, then notify runner via small RPC
     app.post('/sessions/:id/upload', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {
@@ -171,13 +178,50 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         try {
-            const result = await engine.uploadFile(
-                sessionResult.sessionId,
-                parsed.data.filename,
-                parsed.data.content,
-                parsed.data.mimeType
-            )
-            return c.json(result)
+            // Check if runner supports uploadFileFromHub (new method)
+            if (engine.hasSessionMethod(sessionResult.sessionId, 'uploadFileFromHub')) {
+                // New path: save to hub temp dir, runner downloads via HTTP
+                const hubBlobsDir = join(tmpdir(), 'hapi-hub-blobs')
+                await mkdir(hubBlobsDir, { recursive: true })
+                const sessionDir = join(hubBlobsDir, sessionResult.sessionId)
+                await mkdir(sessionDir, { recursive: true })
+
+                const sanitizedFilename = parsed.data.filename
+                    .replace(/[/\\]/g, '_')
+                    .replace(/\.\./g, '_')
+                    .replace(/\s+/g, '_')
+                    .slice(0, 255) || 'upload'
+                const uniqueFilename = `${Date.now()}-${sanitizedFilename}`
+                const hubFilePath = join(sessionDir, uniqueFilename)
+
+                const buffer = Buffer.from(parsed.data.content, 'base64')
+                if (buffer.length > MAX_UPLOAD_BYTES) {
+                    return c.json({ success: false, error: 'File too large (max 50MB)' }, 413)
+                }
+                await writeFile(hubFilePath, buffer)
+
+                const downloadToken = randomUUID()
+                uploadDownloadTokens.add(downloadToken)
+                setTimeout(() => uploadDownloadTokens.delete(downloadToken), 120_000)
+                const downloadUrl = `${configuration.publicUrl}/api/sessions/${encodeURIComponent(sessionResult.sessionId)}/upload/download/${encodeURIComponent(uniqueFilename)}?token=${downloadToken}`
+                const result = await engine.uploadFileFromHub(
+                    sessionResult.sessionId,
+                    parsed.data.filename,
+                    downloadUrl,
+                    parsed.data.mimeType
+                )
+                return c.json(result)
+            } else {
+                // Fallback: send base64 content directly via RPC (for old runners)
+                console.log(`[upload] falling back to uploadFile RPC for session ${sessionResult.sessionId}`)
+                const result = await engine.uploadFile(
+                    sessionResult.sessionId,
+                    parsed.data.filename,
+                    parsed.data.content,
+                    parsed.data.mimeType
+                )
+                return c.json(result)
+            }
         } catch (error) {
             return c.json({
                 success: false,

@@ -6,6 +6,13 @@ type RoleWrappedRecord = {
     meta?: unknown
 }
 
+const VISIBLE_CLAUDE_MESSAGE_TYPES = new Set([
+    'assistant',
+    'user',
+    'summary',
+    'system'
+])
+
 const VISIBLE_CLAUDE_SYSTEM_SUBTYPES = new Set([
     'api_error',
     'turn_duration',
@@ -39,6 +46,11 @@ export function isClaudeChatVisibleSystemSubtype(subtype: unknown): subtype is s
 }
 
 export function isClaudeChatVisibleMessage(message: { type: unknown; subtype?: unknown }): boolean {
+    // Only known message types are visible
+    if (typeof message.type !== 'string' || !VISIBLE_CLAUDE_MESSAGE_TYPES.has(message.type)) {
+        return false
+    }
+
     if (message.type !== 'system') {
         return true
     }

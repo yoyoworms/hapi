@@ -92,6 +92,21 @@ export type MessagesResponse = {
     }
 }
 
+export type UsageResponse = {
+    five_hour: { utilization: number; resets_at: string } | null
+    seven_day: { utilization: number; resets_at: string } | null
+    seven_day_opus: { utilization: number; resets_at: string } | null
+    seven_day_sonnet: { utilization: number; resets_at: string } | null
+    extra_usage: {
+        is_enabled: boolean
+        monthly_limit: number | null
+        used_credits: number | null
+        utilization: number | null
+    } | null
+    subscriptionType?: string
+    rateLimitTier?: string
+}
+
 export type MachinesResponse = { machines: Machine[] }
 export type MachinePathsExistsResponse = { exists: Record<string, boolean> }
 

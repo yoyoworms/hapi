@@ -2,11 +2,21 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const base = process.env.VITE_BASE_URL || '/'
 const hubTarget = process.env.VITE_HUB_PROXY || 'http://127.0.0.1:3006'
+
+function getBuildNumber(): number {
+    try {
+        const data = JSON.parse(readFileSync(resolve(__dirname, 'build-number.json'), 'utf-8'))
+        return data.build ?? 1
+    } catch {
+        return 1
+    }
+}
 
 function getVendorChunkName(id: string): string | undefined {
     if (!id.includes('/node_modules/')) {
@@ -34,7 +44,10 @@ function getVendorChunkName(id: string): string | undefined {
 
 export default defineConfig({
     define: {
-        __APP_VERSION__: JSON.stringify(require('../cli/package.json').version),
+        __APP_VERSION__: JSON.stringify(
+            require('../cli/package.json').version + '.' + getBuildNumber()
+        ),
+        __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
     },
     server: {
         host: true,

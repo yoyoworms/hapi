@@ -136,7 +136,8 @@ export class SessionCache {
             model: stored.model,
             effort: stored.effort,
             permissionMode: existing?.permissionMode,
-            collaborationMode: existing?.collaborationMode
+            collaborationMode: existing?.collaborationMode,
+            usage: existing?.usage ?? null
         }
 
         this.sessions.set(sessionId, session)
@@ -245,6 +246,30 @@ export class SessionCache {
         session.thinkingAt = t
 
         this.publisher.emit({ type: 'session-updated', sessionId: session.id, data: { active: false, thinking: false } })
+    }
+
+    handleSessionUsage(payload: {
+        sid: string
+        totalCostUsd: number
+        totalInputTokens: number
+        totalOutputTokens: number
+    }): void {
+        const session = this.sessions.get(payload.sid)
+        if (!session) return
+
+        session.usage = {
+            totalCostUsd: payload.totalCostUsd,
+            totalInputTokens: payload.totalInputTokens,
+            totalOutputTokens: payload.totalOutputTokens
+        }
+
+        this.publisher.emit({
+            type: 'session-updated',
+            sessionId: session.id,
+            data: {
+                usage: session.usage
+            }
+        })
     }
 
     expireInactive(now: number = Date.now()): void {

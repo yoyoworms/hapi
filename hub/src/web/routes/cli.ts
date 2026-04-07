@@ -183,5 +183,32 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         return c.json({ machine: resolved.machine })
     })
 
+    // File upload to COS
+    app.post('/files/upload', async (c) => {
+        const { uploadToCos, isCosConfigured } = await import('../../services/cosUpload')
+        if (!isCosConfigured()) {
+            return c.json({ error: 'COS not configured' }, 503)
+        }
+
+        const buffer = Buffer.from(await c.req.arrayBuffer())
+        if (buffer.length === 0) {
+            return c.json({ error: 'Empty file' }, 400)
+        }
+        if (buffer.length > 50 * 1024 * 1024) {
+            return c.json({ error: 'File too large' }, 413)
+        }
+
+        const filename = c.req.header('x-filename') || undefined
+        const mimeType = c.req.header('x-mime-type') || c.req.header('content-type')?.split(';')[0] || undefined
+        const namespace = c.get('namespace')
+
+        const result = await uploadToCos(buffer, { filename, mimeType, namespace })
+        if (!result.success) {
+            return c.json({ error: result.error }, 500)
+        }
+
+        return c.json({ url: result.url, key: result.key })
+    })
+
     return app
 }

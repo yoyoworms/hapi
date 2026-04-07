@@ -17,12 +17,6 @@ export async function startHappyServer(client: ApiSessionClient) {
     const handler = async (title: string) => {
         logger.debug('[hapiMCP] Changing title to:', title);
 
-        // Skip if session was manually renamed by user
-        if (client.hasCustomName()) {
-            logger.debug('[hapiMCP] Skipping title change - session has been manually renamed');
-            return { success: true, skipped: true };
-        }
-
         try {
             // Send title as a summary message, similar to title generator
             client.sendClaudeSessionMessage({

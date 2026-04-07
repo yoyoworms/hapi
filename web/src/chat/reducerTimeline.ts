@@ -269,6 +269,9 @@ export function reduceTimeline(
                     block.tool.result = c.content
                     block.tool.completedAt = msg.createdAt
                     block.tool.state = c.is_error ? 'error' : 'completed'
+                    if (c.cosFileUrl) {
+                        block.tool.cosFileUrl = c.cosFileUrl
+                    }
                     continue
                 }
 

@@ -183,6 +183,18 @@ function AppInner() {
         void run()
     }, [api, isPushSupported, pushPermission, requestPermission, subscribe, token])
 
+    // When app returns from background, fetch any missed messages
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === 'visible' && api && selectedSessionId) {
+                fetchLatestMessages(api, selectedSessionId, { incremental: true })
+                    .catch(() => {})
+            }
+        }
+        document.addEventListener('visibilitychange', handleVisibilityChange)
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }, [api, selectedSessionId])
+
     const handleSseConnect = useCallback(() => {
         // Clear disconnected state on successful connection
         setSseDisconnected(false)
@@ -191,10 +203,13 @@ function AppInner() {
         // Increment token to track this specific connection
         const token = ++syncTokenRef.current
 
+        // Capture before mutating - used to decide incremental vs full fetch
+        const isFirstConnect = isFirstConnectRef.current
+
         // Only force show banner on first connect (page load)
         // Subsequent connects (session switches) use non-forced mode
         // which only shows banner when returning from background
-        if (isFirstConnectRef.current) {
+        if (isFirstConnect) {
             isFirstConnectRef.current = false
             startSync({ force: true })
         } else {
@@ -206,8 +221,10 @@ function AppInner() {
                 queryClient.invalidateQueries({ queryKey: queryKeys.session(selectedSessionId) })
             ] : [])
         ]
+        // Use incremental fetch on reconnect (not first connect) to avoid
+        // re-displaying old messages that were already shown before disconnect
         const refreshMessages = (selectedSessionId && api)
-            ? fetchLatestMessages(api, selectedSessionId)
+            ? fetchLatestMessages(api, selectedSessionId, { incremental: !isFirstConnect })
             : Promise.resolve()
         Promise.all([...invalidations, refreshMessages])
             .catch((error) => {

@@ -98,16 +98,22 @@ export class Store {
             return
         }
 
-        if (currentVersion === 1 && SCHEMA_VERSION === 2) {
-            this.migrateFromV1ToV2()
-            this.setUserVersion(SCHEMA_VERSION)
-            return
+        const migrations: Record<number, () => void> = {
+            1: () => this.migrateFromV1ToV2(),
+            2: () => this.migrateFromV2ToV3(),
+            3: () => this.migrateFromV3ToV4(),
+            4: () => this.migrateFromV4ToV5(),
         }
 
-        if (currentVersion === 2 && SCHEMA_VERSION === 3) {
-            this.migrateFromV2ToV3()
-            this.setUserVersion(SCHEMA_VERSION)
-            return
+        let version = currentVersion
+        while (version < SCHEMA_VERSION) {
+            const migrate = migrations[version]
+            if (!migrate) {
+                throw this.buildSchemaMismatchError(version)
+            }
+            migrate()
+            version++
+            this.setUserVersion(version)
         }
 
         if (currentVersion === 3 && SCHEMA_VERSION === 4) {

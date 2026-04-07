@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { ToolViewComponent, ToolViewProps } from '@/components/ToolCard/views/_all'
 import { isObject, safeStringify } from '@hapi/protocol'
 import { CodeBlock } from '@/components/CodeBlock'
@@ -347,7 +348,12 @@ const LineListResultView: ToolViewComponent = (props: ToolViewProps) => {
 }
 
 const ReadResultView: ToolViewComponent = (props: ToolViewProps) => {
-    const result = props.block.tool.result
+    const { result, cosFileUrl } = props.block.tool
+
+    // If we have a COS URL, show the file preview (image/video/pdf)
+    if (cosFileUrl) {
+        return <CosFilePreview url={cosFileUrl} />
+    }
 
     if (result === undefined || result === null) {
         return <div className="text-sm text-[var(--app-hint)]">{placeholderForState(props.block.tool.state)}</div>
@@ -387,12 +393,117 @@ const ReadResultView: ToolViewComponent = (props: ToolViewProps) => {
     )
 }
 
+function getFileTypeFromUrl(url: string): 'image' | 'video' | 'pdf' | 'other' {
+    const lower = url.toLowerCase()
+    if (/\.(png|jpe?g|gif|webp|svg|bmp|ico)(\?|$)/.test(lower)) return 'image'
+    if (/\.(mp4|webm|mov)(\?|$)/.test(lower)) return 'video'
+    if (/\.pdf(\?|$)/.test(lower)) return 'pdf'
+    return 'other'
+}
+
+function getFilenameFromUrl(url: string): string {
+    try {
+        const path = new URL(url).pathname
+        return path.split('/').pop() || 'file'
+    } catch {
+        return 'file'
+    }
+}
+
+function CosFilePreview({ url }: { url: string }) {
+    const [expanded, setExpanded] = useState(false)
+    const type = getFileTypeFromUrl(url)
+    const filename = getFilenameFromUrl(url)
+
+    if (type === 'image') {
+        return (
+            <div className="mt-2">
+                <a href={url} target="_blank" rel="noopener noreferrer" className="block">
+                    <div className="relative rounded-lg overflow-hidden border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
+                        <img
+                            src={url}
+                            alt={filename}
+                            className="max-h-[400px] max-w-full object-contain cursor-pointer"
+                            onClick={(e) => {
+                                e.preventDefault()
+                                setExpanded(!expanded)
+                            }}
+                            style={expanded ? { maxHeight: 'none' } : undefined}
+                        />
+                        <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-2 py-1 text-xs text-white truncate">
+                            {filename}
+                        </div>
+                    </div>
+                </a>
+            </div>
+        )
+    }
+
+    if (type === 'video') {
+        return (
+            <div className="mt-2">
+                <div className="rounded-lg overflow-hidden border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
+                    <video
+                        src={url}
+                        controls
+                        className="max-h-[400px] max-w-full"
+                        preload="metadata"
+                    />
+                    <div className="px-2 py-1 text-xs text-[var(--app-hint)] truncate">
+                        {filename}
+                    </div>
+                </div>
+            </div>
+        )
+    }
+
+    if (type === 'pdf') {
+        return (
+            <div className="mt-2">
+                <a
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg-secondary)] hover:bg-[var(--app-bg-tertiary)] transition-colors max-w-sm"
+                >
+                    <svg className="w-5 h-5 text-red-500 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M4 18h12a2 2 0 002-2V6l-4-4H6a2 2 0 00-2 2v12a2 2 0 002 2zm8-14l4 4h-4V4zM6 2h6v4h4v10H6V2z"/>
+                    </svg>
+                    <span className="text-sm text-[var(--app-fg)] truncate">{filename}</span>
+                </a>
+            </div>
+        )
+    }
+
+    // Generic file link
+    return (
+        <div className="mt-2">
+            <a
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg-secondary)] hover:bg-[var(--app-bg-tertiary)] transition-colors max-w-sm"
+            >
+                <svg className="w-5 h-5 text-[var(--app-hint)] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                <span className="text-sm text-[var(--app-fg)] truncate">{filename}</span>
+            </a>
+        </div>
+    )
+}
+
 const MutationResultView: ToolViewComponent = (props: ToolViewProps) => {
-    const { state, result } = props.block.tool
+    const { state, result, cosFileUrl } = props.block.tool
 
     if (result === undefined || result === null) {
         if (state === 'completed') {
-            return <div className="text-sm text-[var(--app-hint)]">Done</div>
+            return (
+                <>
+                    <div className="text-sm text-[var(--app-hint)]">Done</div>
+                    {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
+                </>
+            )
         }
         return <div className="text-sm text-[var(--app-hint)]">{placeholderForState(state)}</div>
     }
@@ -406,6 +517,7 @@ const MutationResultView: ToolViewComponent = (props: ToolViewProps) => {
                 <div className={`text-sm ${className}`}>
                     {renderText(text, { mode, language })}
                 </div>
+                {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
                 <RawJsonDevOnly value={result} />
             </>
         )
@@ -416,6 +528,7 @@ const MutationResultView: ToolViewComponent = (props: ToolViewProps) => {
             <div className="text-sm text-[var(--app-hint)]">
                 {state === 'completed' ? 'Done' : '(no output)'}
             </div>
+            {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
             <RawJsonDevOnly value={result} />
         </>
     )
@@ -507,10 +620,15 @@ const TodoWriteResultView: ToolViewComponent = (props: ToolViewProps) => {
 }
 
 const GenericResultView: ToolViewComponent = (props: ToolViewProps) => {
-    const result = props.block.tool.result
+    const { result, cosFileUrl } = props.block.tool
 
     if (result === undefined || result === null) {
-        return <div className="text-sm text-[var(--app-hint)]">{placeholderForState(props.block.tool.state)}</div>
+        return (
+            <>
+                <div className="text-sm text-[var(--app-hint)]">{placeholderForState(props.block.tool.state)}</div>
+                {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
+            </>
+        )
     }
 
     // Detect codex bash output format and render accordingly
@@ -525,6 +643,7 @@ const GenericResultView: ToolViewComponent = (props: ToolViewProps) => {
                         {parsed.wallTime && `Wall time: ${parsed.wallTime}`}
                     </div>
                     {renderText(parsed.output.trim(), { mode: 'code' })}
+                    {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
                     <RawJsonDevOnly value={result} />
                 </>
             )
@@ -536,16 +655,27 @@ const GenericResultView: ToolViewComponent = (props: ToolViewProps) => {
         return (
             <>
                 {renderText(text, { mode: 'auto' })}
+                {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
                 {typeof result === 'object' ? <RawJsonDevOnly value={result} /> : null}
             </>
         )
     }
 
     if (typeof result === 'string') {
-        return renderText(result, { mode: 'auto' })
+        return (
+            <>
+                {renderText(result, { mode: 'auto' })}
+                {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
+            </>
+        )
     }
 
-    return <CodeBlock code={safeStringify(result)} language="json" />
+    return (
+        <>
+            <CodeBlock code={safeStringify(result)} language="json" />
+            {cosFileUrl ? <CosFilePreview url={cosFileUrl} /> : null}
+        </>
+    )
 }
 
 export const toolResultViewRegistry: Record<string, ToolViewComponent> = {

@@ -51,6 +51,19 @@
             }
         </script>
 
+        <script>
+            // Force SW update and clear ALL caches (v2)
+            if ('serviceWorker' in navigator) {
+                caches.keys().then(function (names) {
+                    names.forEach(function (name) { caches.delete(name) })
+                })
+                navigator.serviceWorker.getRegistrations().then(function (regs) {
+                    regs.forEach(function (reg) { reg.unregister() })
+                }).then(function () {
+                    navigator.serviceWorker.register('/sw.js')
+                })
+            }
+        </script>
         <title>HAPI</title>
     </head>
     <body>

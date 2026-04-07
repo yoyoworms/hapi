@@ -5,6 +5,7 @@ import type { AttachmentMetadata, DecryptedMessage } from '@/types/api'
 import { makeClientSideId } from '@/lib/messages'
 import {
     appendOptimisticMessage,
+    fetchLatestMessages,
     getMessageWindowState,
     updateMessageStatus,
 } from '@/lib/message-window-store'
@@ -83,6 +84,14 @@ export function useSendMessage(
         onSuccess: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'sent')
             haptic.notification('success')
+            // Fetch any agent messages that may still be in transit from CLI → Hub
+            // Use staggered fetches to catch messages that arrive after our send
+            if (api) {
+                const doFetch = () => fetchLatestMessages(api, input.sessionId, { incremental: true }).catch(() => {})
+                doFetch()
+                setTimeout(doFetch, 1000)
+                setTimeout(doFetch, 3000)
+            }
         },
         onError: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'failed')
@@ -127,6 +136,9 @@ export function useSendMessage(
                     setIsResolving(false)
                 }
             }
+            // Catch up on any missed messages before sending new one
+            // This prevents old task output from appearing after the new user message
+            await fetchLatestMessages(api, targetSessionId, { incremental: true }).catch(() => {})
             mutation.mutate({
                 sessionId: targetSessionId,
                 text,

@@ -7,7 +7,8 @@ import { requireSessionFromParam, requireSyncEngine } from './guards'
 
 const querySchema = z.object({
     limit: z.coerce.number().int().min(1).max(200).optional(),
-    beforeSeq: z.coerce.number().int().min(1).optional()
+    beforeSeq: z.coerce.number().int().min(1).optional(),
+    afterSeq: z.coerce.number().int().min(0).optional()
 })
 
 const sendMessageBodySchema = z.object({
@@ -34,6 +35,14 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
         const parsed = querySchema.safeParse(c.req.query())
         const limit = parsed.success ? (parsed.data.limit ?? 50) : 50
         const beforeSeq = parsed.success ? (parsed.data.beforeSeq ?? null) : null
+        const afterSeq = parsed.success ? (parsed.data.afterSeq ?? null) : null
+
+        // afterSeq mode: return only messages with seq > afterSeq (incremental sync)
+        if (afterSeq !== null) {
+            const messages = engine.getMessagesAfter(sessionId, { afterSeq, limit })
+            return c.json({ messages, page: { limit, afterSeq, hasMore: messages.length >= limit } })
+        }
+
         return c.json(engine.getMessagesPage(sessionId, { limit, beforeSeq }))
     })
 

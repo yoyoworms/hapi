@@ -137,6 +137,28 @@ export class SyncEngine {
         return this.machineCache.getMachineByNamespace(machineId, namespace)
     }
 
+    async getUsage(): Promise<unknown> {
+        const machines = this.machineCache.getOnlineMachines()
+        if (machines.length === 0) {
+            console.log('[usage] no machines online')
+            return null
+        }
+        // Try each online machine until one succeeds
+        for (const machine of machines) {
+            try {
+                console.log(`[usage] calling getOAuthUsage on machine ${machine.id}`)
+                const result = await this.rpcGateway.getOAuthUsage(machine.id)
+                if (result) {
+                    console.log(`[usage] result: ok`)
+                    return result
+                }
+            } catch (err) {
+                console.log(`[usage] error on ${machine.id}: ${err instanceof Error ? err.message : String(err)}`)
+            }
+        }
+        return null
+    }
+
     getOnlineMachines(): Machine[] {
         return this.machineCache.getOnlineMachines()
     }
@@ -198,6 +220,15 @@ export class SyncEngine {
         this.sessionCache.handleSessionEnd(payload)
     }
 
+    handleSessionUsage(payload: {
+        sid: string
+        totalCostUsd: number
+        totalInputTokens: number
+        totalOutputTokens: number
+    }): void {
+        this.sessionCache.handleSessionUsage(payload)
+    }
+
     handleMachineAlive(payload: { machineId: string; time: number }): void {
         this.machineCache.handleMachineAlive(payload)
     }
@@ -243,6 +274,11 @@ export class SyncEngine {
             sentFrom?: 'telegram-bot' | 'webapp'
         }
     ): Promise<void> {
+        // Flush CLI's outgoing message queue before storing the user message.
+        // This ensures any pending assistant responses get a lower seq number
+        // than the new user message, preventing the "reply appears after next
+        // message" ordering issue visible in the web UI.
+        await this.rpcGateway.flushMessages(sessionId)
         await this.messageService.sendMessage(sessionId, payload)
     }
 
@@ -310,6 +346,12 @@ export class SyncEngine {
         const applied = obj.applied
         if (!applied || typeof applied !== 'object') {
             throw new Error('Missing applied session config')
+        }
+
+        // If CLI returned legacy "modelMode" instead of "model", use the requested
+        // config.model value directly since legacy CLI normalizes away the [1m] suffix
+        if (applied.model === undefined && config.model !== undefined) {
+            applied.model = config.model
         }
 
         this.sessionCache.applySessionConfig(sessionId, applied)
@@ -569,6 +611,14 @@ export class SyncEngine {
 
     async uploadFile(sessionId: string, filename: string, content: string, mimeType: string): Promise<RpcUploadFileResponse> {
         return await this.rpcGateway.uploadFile(sessionId, filename, content, mimeType)
+    }
+
+    async uploadFileFromHub(sessionId: string, filename: string, downloadUrl: string, mimeType: string): Promise<RpcUploadFileResponse> {
+        return await this.rpcGateway.uploadFileFromHub(sessionId, filename, downloadUrl, mimeType)
+    }
+
+    hasSessionMethod(sessionId: string, method: string): boolean {
+        return this.rpcGateway.hasSessionMethod(sessionId, method)
     }
 
     async deleteUploadFile(sessionId: string, path: string): Promise<RpcDeleteUploadResponse> {

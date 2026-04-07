@@ -10,8 +10,8 @@ export class MessageStore {
         this.db = db
     }
 
-    addMessage(sessionId: string, content: unknown, localId?: string): StoredMessage {
-        return addMessage(this.db, sessionId, content, localId)
+    addMessage(sessionId: string, content: unknown, localId?: string, clockOffset?: number): StoredMessage {
+        return addMessage(this.db, sessionId, content, localId, clockOffset)
     }
 
     getMessages(sessionId: string, limit: number = 200, beforeSeq?: number): StoredMessage[] {

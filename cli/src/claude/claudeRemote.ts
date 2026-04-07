@@ -33,7 +33,7 @@ export async function claudeRemote(opts: {
     // Callbacks
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
-    onMessage: (message: SDKMessage) => void,
+    onMessage: (message: SDKMessage) => void | Promise<void>,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
     onUsage?: (usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
@@ -227,6 +227,16 @@ export async function claudeRemote(opts: {
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
+        // When resuming a session, the SDK outputs:
+        //   1. system/init
+        //   2. Residual assistant messages from the previous turn (stale)
+        //   3. result (previous turn ends)
+        //   4. Waits for new user message
+        //   5. Real new assistant messages
+        // We skip everything before the first result to avoid stale responses
+        // appearing in the chat as if they're replies to the current message.
+        let resumeComplete = !startFrom; // If not resuming, already complete
+
         for await (const message of response) {
             streamMessageSeq += 1;
             logger.debug(
@@ -235,8 +245,21 @@ export async function claudeRemote(opts: {
             );
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
 
-            // Handle messages
-            opts.onMessage(message);
+            // During resume: skip all messages until the first result (end of previous turn)
+            if (!resumeComplete) {
+                if (message.type === 'result') {
+                    resumeComplete = true;
+                    logger.debug('[claudeRemote] Resume complete - first result received, forwarding messages from now on');
+                    // Fall through to process result (usage, nextMessage) but don't forward to Hub
+                } else if (message.type === 'system') {
+                    // Forward system messages (init event needed for session setup)
+                    await opts.onMessage(message);
+                }
+                // Skip forwarding all other messages (stale assistant/user + stale result)
+            } else {
+                // Forward message to Hub
+                await opts.onMessage(message);
+            }
 
             // Handle special system messages
             if (message.type === 'system' && message.subtype === 'init') {

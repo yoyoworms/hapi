@@ -16,11 +16,22 @@ export type HappyChatMessageMetadata = {
     event?: AgentEvent
     source?: CliOutputBlock['source']
     attachments?: AttachmentMetadata[]
+    showTimestamp?: boolean
 }
 
+let prevBlockCreatedAt = 0
+
 function toThreadMessageLike(block: ChatBlock): ThreadMessageLike {
+    const gap = prevBlockCreatedAt > 0 ? block.createdAt - prevBlockCreatedAt : 0
+    prevBlockCreatedAt = block.createdAt
+
     if (block.kind === 'user-text') {
         const messageId = `user:${block.id}`
+        // Show timestamp above user message when there's a gap > 60s from previous block
+        const showTimestamp = gap > 60_000
+        const timestampPrefix = showTimestamp
+            ? `\u200B` // zero-width space as marker — timestamp rendered in component via createdAt
+            : undefined
         return {
             role: 'user',
             id: messageId,
@@ -32,7 +43,8 @@ function toThreadMessageLike(block: ChatBlock): ThreadMessageLike {
                     status: block.status,
                     localId: block.localId,
                     originalText: block.originalText,
-                    attachments: block.attachments
+                    attachments: block.attachments,
+                    showTimestamp
                 } satisfies HappyChatMessageMetadata
             }
         }

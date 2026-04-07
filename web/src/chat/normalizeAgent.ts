@@ -27,8 +27,12 @@ function normalizeToolResultPermissions(value: unknown): ToolResultPermission | 
     }
 }
 
+// Internal event types that should not be rendered as chat messages
+const HIDDEN_EVENT_TYPES = new Set(['usage', 'ready'])
+
 function normalizeAgentEvent(value: unknown): AgentEvent | null {
     if (!isObject(value) || typeof value.type !== 'string') return null
+    if (HIDDEN_EVENT_TYPES.has(value.type)) return null
     return value as AgentEvent
 }
 
@@ -195,6 +199,7 @@ function normalizeUserOutput(
                 const embeddedToolUseResult = 'toolUseResult' in data ? (data as Record<string, unknown>).toolUseResult : null
 
                 const permissions = normalizeToolResultPermissions(block.permissions)
+                const cosFileUrl = typeof block.cosFileUrl === 'string' ? block.cosFileUrl : undefined
 
                 blocks.push({
                     type: 'tool-result',
@@ -203,7 +208,8 @@ function normalizeUserOutput(
                     is_error: isError,
                     uuid,
                     parentUUID,
-                    permissions
+                    permissions,
+                    cosFileUrl,
                 })
             }
         }
@@ -221,7 +227,13 @@ function normalizeUserOutput(
 }
 
 export function isSkippableAgentContent(content: unknown): boolean {
-    if (!isObject(content) || content.type !== 'output') return false
+    if (!isObject(content) || typeof content.type !== 'string') return false
+
+    // Skip internal event types that should never be displayed
+    const internalTypes = new Set(['usage', 'ready', 'rate_limit_event', 'rate_limit_info', 'event'])
+    if (internalTypes.has(content.type)) return true
+
+    if (content.type !== 'output') return false
     const data = isObject(content.data) ? content.data : null
     if (!data) return false
     if (Boolean(data.isMeta) || Boolean(data.isCompactSummary)) return true

@@ -7,6 +7,7 @@ import { getFontScaleOptions, useFontScale, type FontScale } from '@/hooks/useFo
 import { getTerminalFontSizeOptions, useTerminalFontSize, type TerminalFontSize } from '@/hooks/useTerminalFontSize'
 import { useAppearance, getAppearanceOptions, type AppearancePreference } from '@/hooks/useTheme'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
+import type { UsageResponse } from '@/types/api'
 
 const locales: { value: Locale; nativeLabel: string }[] = [
     { value: 'en', nativeLabel: 'English' },
@@ -72,6 +73,45 @@ function ChevronDownIcon(props: { className?: string }) {
     )
 }
 
+function formatResetTime(isoString: string): string {
+    const date = new Date(isoString)
+    const now = new Date()
+    const diffMs = date.getTime() - now.getTime()
+    if (diffMs <= 0) return 'now'
+    const hours = Math.floor(diffMs / 3_600_000)
+    const minutes = Math.floor((diffMs % 3_600_000) / 60_000)
+    if (hours > 24) {
+        const days = Math.floor(hours / 24)
+        return `${days}d ${hours % 24}h`
+    }
+    if (hours > 0) return `${hours}h ${minutes}m`
+    return `${minutes}m`
+}
+
+function UsageBar({ label, utilization, resetsAt, t }: {
+    label: string
+    utilization: number
+    resetsAt: string
+    t: (key: string) => string
+}) {
+    const pct = Math.min(100, Math.max(0, utilization))
+    const color = pct >= 80 ? 'var(--app-error, #ef4444)' : pct >= 50 ? 'var(--app-warning, #f59e0b)' : 'var(--app-success, #22c55e)'
+    return (
+        <div className="py-1">
+            <div className="flex items-center justify-between mb-1">
+                <span className="text-[var(--app-fg)] text-sm">{label}</span>
+                <span className="text-[var(--app-hint)] text-xs">{pct}% · {t('settings.usage.resetsIn')} {formatResetTime(resetsAt)}</span>
+            </div>
+            <div className="h-2 rounded-full bg-[var(--app-secondary-bg)] overflow-hidden">
+                <div
+                    className="h-full rounded-full transition-all duration-500"
+                    style={{ width: `${pct}%`, backgroundColor: color }}
+                />
+            </div>
+        </div>
+    )
+}
+
 export default function SettingsPage() {
     const { t, locale, setLocale } = useTranslation()
     const goBack = useAppGoBack()
@@ -89,6 +129,17 @@ export default function SettingsPage() {
     const { fontScale, setFontScale } = useFontScale()
     const { terminalFontSize, setTerminalFontSize } = useTerminalFontSize()
     const { appearance, setAppearance } = useAppearance()
+    const { api } = useAppContext()
+    const [usage, setUsage] = useState<UsageResponse | null>(null)
+    const [usageLoading, setUsageLoading] = useState(true)
+
+    useEffect(() => {
+        if (!api) return
+        api.getUsage()
+            .then(setUsage)
+            .catch(() => setUsage(null))
+            .finally(() => setUsageLoading(false))
+    }, [api])
 
     // Voice language state - read from localStorage
     const [voiceLanguage, setVoiceLanguage] = useState<string | null>(() => {
@@ -463,6 +514,59 @@ export default function SettingsPage() {
                                 </div>
                             )}
                         </div>
+                    </div>
+
+                    {/* Usage section */}
+                    <div className="border-b border-[var(--app-divider)]">
+                        <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
+                            {t('settings.usage.title')}
+                        </div>
+                        {usageLoading ? (
+                            <div className="px-3 py-3 text-[var(--app-hint)] text-sm">Loading...</div>
+                        ) : usage ? (
+                            <div className="px-3 py-2 space-y-3">
+                                {usage.subscriptionType && (
+                                    <div className="flex items-center justify-between py-1">
+                                        <span className="text-[var(--app-fg)] text-sm">{t('settings.usage.plan')}</span>
+                                        <span className="text-[var(--app-hint)] text-sm capitalize">{usage.subscriptionType}</span>
+                                    </div>
+                                )}
+                                {usage.five_hour && (
+                                    <UsageBar
+                                        label={t('settings.usage.fiveHour')}
+                                        utilization={usage.five_hour.utilization}
+                                        resetsAt={usage.five_hour.resets_at}
+                                        t={t}
+                                    />
+                                )}
+                                {usage.seven_day && (
+                                    <UsageBar
+                                        label={t('settings.usage.sevenDay')}
+                                        utilization={usage.seven_day.utilization}
+                                        resetsAt={usage.seven_day.resets_at}
+                                        t={t}
+                                    />
+                                )}
+                                {usage.seven_day_opus && (
+                                    <UsageBar
+                                        label={t('settings.usage.sevenDayOpus')}
+                                        utilization={usage.seven_day_opus.utilization}
+                                        resetsAt={usage.seven_day_opus.resets_at}
+                                        t={t}
+                                    />
+                                )}
+                                {usage.seven_day_sonnet && (
+                                    <UsageBar
+                                        label={t('settings.usage.sevenDaySonnet')}
+                                        utilization={usage.seven_day_sonnet.utilization}
+                                        resetsAt={usage.seven_day_sonnet.resets_at}
+                                        t={t}
+                                    />
+                                )}
+                            </div>
+                        ) : (
+                            <div className="px-3 py-3 text-[var(--app-hint)] text-sm">{t('settings.usage.unavailable')}</div>
+                        )}
                     </div>
 
                     {/* About section */}

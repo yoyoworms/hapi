@@ -25,6 +25,7 @@ import { markSkillUsed } from '@/lib/recent-skills'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
 import { StatusBar } from '@/components/AssistantChat/StatusBar'
+import { useHappyChatContext } from '@/components/AssistantChat/context'
 import { ComposerButtons } from '@/components/AssistantChat/ComposerButtons'
 import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
 import { useTranslation } from '@/lib/use-translation'
@@ -37,6 +38,60 @@ export interface TextInputState {
 }
 
 const defaultSuggestionHandler = async (): Promise<Suggestion[]> => []
+
+function QuickPermissionBar({ agentState }: { agentState?: AgentState | null }) {
+    const ctx = useHappyChatContext()
+    const [loading, setLoading] = useState(false)
+
+    const pendingRequests = useMemo(() => {
+        if (!agentState?.requests) return []
+        return Object.keys(agentState.requests)
+    }, [agentState?.requests])
+
+    if (pendingRequests.length === 0) return null
+
+    const handleApprove = async () => {
+        setLoading(true)
+        try {
+            for (const id of pendingRequests) {
+                await ctx.api.approvePermission(ctx.sessionId, id)
+            }
+        } catch {}
+        setLoading(false)
+    }
+
+    const handleDeny = async () => {
+        setLoading(true)
+        try {
+            for (const id of pendingRequests) {
+                await ctx.api.denyPermission(ctx.sessionId, id)
+            }
+        } catch {}
+        setLoading(false)
+    }
+
+    return (
+        <div className="flex items-center gap-2 px-1 py-1.5">
+            <span className="text-xs text-[#FF9500] flex-1">{pendingRequests.length} permission{pendingRequests.length > 1 ? 's' : ''} pending</span>
+            <button
+                type="button"
+                disabled={loading}
+                onClick={handleApprove}
+                className="px-3 py-1 text-xs rounded-full bg-emerald-500/15 text-emerald-600 font-medium disabled:opacity-50"
+            >
+                Allow
+            </button>
+            <button
+                type="button"
+                disabled={loading}
+                onClick={handleDeny}
+                className="px-3 py-1 text-xs rounded-full bg-red-500/15 text-red-600 font-medium disabled:opacity-50"
+            >
+                Deny
+            </button>
+        </div>
+    )
+}
 
 // Draft store: persist composer text per session across switches
 const draftStore = new Map<string, string>()
@@ -53,6 +108,7 @@ export function HappyComposer(props: {
     thinking?: boolean
     agentState?: AgentState | null
     contextSize?: number
+    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
     controlledByUser?: boolean
     agentFlavor?: string | null
     onCollaborationModeChange?: (mode: CodexCollaborationMode) => void
@@ -687,11 +743,14 @@ export function HappyComposer(props: {
                 <ComposerPrimitive.Root className="relative" onSubmit={handleSubmit}>
                     {overlays}
 
+                    {/* QuickPermissionBar removed: PermissionFooter inside tool cards handles approvals */}
+
                     <StatusBar
                         active={active}
                         thinking={thinking}
                         agentState={agentState}
                         contextSize={contextSize}
+                        usage={props.usage}
                         model={model}
                         permissionMode={permissionMode}
                         collaborationMode={collaborationMode}

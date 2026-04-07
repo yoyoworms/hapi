@@ -24,7 +24,7 @@ export class OutgoingMessageQueue {
     private processTimer?: NodeJS.Timeout;
     private delayTimers = new Map<number, NodeJS.Timeout>();
     
-    constructor(private sendFunction: (message: any) => void) {}
+    constructor(private sendFunction: (message: any) => void | Promise<void>) {}
     
     /**
      * Add message to queue
@@ -106,30 +106,44 @@ export class OutgoingMessageQueue {
      * Process queue - send messages in ID order that are released
      * (Internal implementation without lock)
      */
-    private processQueueInternal(): void {
+    private async processQueueInternal(): Promise<void> {
         // Sort by ID to ensure order
         this.queue.sort((a, b) => a.id - b.id);
-        
-        // Process from front of queue
-        while (this.queue.length > 0) {
-            const item = this.queue[0];
-            
-            // If not released yet, stop processing (maintain order)
+
+        // Collect all released items to send
+        const toSend: QueueItem[] = [];
+        for (const item of this.queue) {
             if (!item.released) {
-                break;
+                continue;
             }
-            
-            // Send if not already sent
             if (!item.sent) {
                 if (item.logMessage.type !== 'system' && !item.logMessage.isMeta && !item.logMessage.isCompactSummary) {
-                    this.sendFunction(item.logMessage);
+                    toSend.push(item);
                 }
                 item.sent = true;
             }
-            
-            // Remove from queue
-            this.queue.shift();
         }
+
+        // Send all messages and await acks to ensure Hub has stored them
+        // before flush() returns (which signals onReady that it's safe to
+        // accept the next user message)
+        if (toSend.length > 0) {
+            const promises: Promise<void>[] = [];
+            for (const item of toSend) {
+                if (item.logMessage.type !== 'system') {
+                    const result = this.sendFunction(item.logMessage);
+                    if (result instanceof Promise) {
+                        promises.push(result);
+                    }
+                }
+            }
+            if (promises.length > 0) {
+                await Promise.all(promises);
+            }
+        }
+
+        // Remove all sent items
+        this.queue = this.queue.filter(item => !item.sent);
     }
     
     /**
@@ -137,7 +151,7 @@ export class OutgoingMessageQueue {
      */
     private async processQueue(): Promise<void> {
         await this.lock.inLock(async () => {
-            this.processQueueInternal();
+            await this.processQueueInternal();
         });
     }
     
@@ -151,14 +165,30 @@ export class OutgoingMessageQueue {
                 clearTimeout(timer);
             }
             this.delayTimers.clear();
-            
+
             // Mark all as released
             for (const item of this.queue) {
                 item.released = true;
             }
-            
-            // Process everything - use internal method since we already have the lock
-            this.processQueueInternal();
+
+            // Send all and WAIT for acks (unlike processQueueInternal which is fire-and-forget)
+            this.queue.sort((a, b) => a.id - b.id);
+            const promises: Promise<void>[] = [];
+            for (const item of this.queue) {
+                if (!item.sent && item.logMessage.type !== 'system') {
+                    const result = this.sendFunction(item.logMessage);
+                    if (result instanceof Promise) {
+                        promises.push(result);
+                    }
+                    item.sent = true;
+                }
+            }
+            this.queue = this.queue.filter(item => !item.sent);
+
+            // Wait for all sends to be acked (each has 2-second timeout)
+            if (promises.length > 0) {
+                await Promise.all(promises);
+            }
         });
     }
     

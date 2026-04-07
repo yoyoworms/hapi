@@ -30,7 +30,7 @@ const RECONNECT_MAX_DELAY_MS = 30_000
 const RECONNECT_JITTER_MS = 500
 const INVALIDATION_BATCH_MS = 16
 
-type SessionPatch = Partial<Pick<Session, 'active' | 'thinking' | 'activeAt' | 'updatedAt' | 'model' | 'effort' | 'permissionMode' | 'collaborationMode'>>
+type SessionPatch = Partial<Pick<Session, 'active' | 'thinking' | 'activeAt' | 'updatedAt' | 'model' | 'effort' | 'permissionMode' | 'collaborationMode' | 'usage'>>
 
 function sortSessionSummaries(left: SessionSummary, right: SessionSummary): number {
     if (left.active !== right.active) {
@@ -97,6 +97,10 @@ function getSessionPatch(value: unknown): SessionPatch | null {
         patch.collaborationMode = value.collaborationMode as Session['collaborationMode']
         hasKnownPatch = true
     }
+    if (value.usage !== undefined) {
+        patch.usage = value.usage as Session['usage']
+        hasKnownPatch = true
+    }
 
     return hasKnownPatch ? patch : null
 }
@@ -105,7 +109,7 @@ function hasUnknownSessionPatchKeys(value: unknown): boolean {
     if (!hasRecordShape(value)) {
         return false
     }
-    const knownKeys = new Set(['active', 'thinking', 'activeAt', 'updatedAt', 'model', 'effort', 'permissionMode', 'collaborationMode'])
+    const knownKeys = new Set(['active', 'thinking', 'activeAt', 'updatedAt', 'model', 'effort', 'permissionMode', 'collaborationMode', 'usage'])
     return Object.keys(value).some((key) => !knownKeys.has(key))
 }
 
@@ -587,10 +591,9 @@ export function useSSE(options: {
             if (eventSourceRef.current !== eventSource) {
                 return
             }
-            if (getVisibilityState() === 'hidden') {
-                return
-            }
-            if (Date.now() - lastActivityAtRef.current < HEARTBEAT_STALE_MS) {
+            // Check heartbeat even when hidden, but with a longer timeout
+            const staleMs = getVisibilityState() === 'hidden' ? HEARTBEAT_STALE_MS * 3 : HEARTBEAT_STALE_MS
+            if (Date.now() - lastActivityAtRef.current < staleMs) {
                 return
             }
             requestReconnect('heartbeat-timeout')

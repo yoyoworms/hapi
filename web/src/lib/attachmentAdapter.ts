@@ -48,7 +48,7 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     yield {
                         id,
                         type: 'file',
-                        name: file.name,
+                        name: `${file.name} (file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB)`,
                         contentType,
                         file,
                         status: { type: 'incomplete', reason: 'error' }
@@ -79,10 +79,11 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                 }
 
                 if (!result.success || !result.path) {
+                    const serverErr = (result as { error?: string }).error ?? 'upload failed'
                     yield {
                         id,
                         type: 'file',
-                        name: file.name,
+                        name: `${file.name} (${serverErr})`,
                         contentType,
                         file,
                         status: { type: 'incomplete', reason: 'error' }
@@ -106,11 +107,13 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     path: result.path,
                     previewUrl
                 } as PendingUploadAttachment
-            } catch {
+            } catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err)
+                console.error('[upload] attachment failed:', errMsg)
                 yield {
                     id,
                     type: 'file',
-                    name: file.name,
+                    name: `${file.name} (${errMsg})`,
                     contentType,
                     file,
                     status: { type: 'incomplete', reason: 'error' }

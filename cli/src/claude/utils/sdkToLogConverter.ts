@@ -216,12 +216,8 @@ export class SDKToLogConverter {
             }
 
             default:
-                // Unknown message type - pass through with all fields
-                logMessage = {
-                    ...baseFields,
-                    ...sdkMessage,
-                    type: (sdkMessage as any).type // Override type last to ensure it's set
-                } as any
+                // Unknown/internal message types (e.g. rate_limit_event) - skip
+                break
         }
 
         // Update last UUID for parent tracking

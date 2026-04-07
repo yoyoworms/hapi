@@ -368,7 +368,7 @@ export function seedMessageWindowFromSession(fromSessionId: string, toSessionId:
     setState(toSessionId, next)
 }
 
-export async function fetchLatestMessages(api: ApiClient, sessionId: string): Promise<void> {
+export async function fetchLatestMessages(api: ApiClient, sessionId: string, options?: { incremental?: boolean }): Promise<void> {
     const initial = getState(sessionId)
     if (initial.isLoading) {
         return
@@ -376,7 +376,12 @@ export async function fetchLatestMessages(api: ApiClient, sessionId: string): Pr
     updateState(sessionId, (prev) => buildState(prev, { isLoading: true, warning: null }))
 
     try {
-        const response = await api.getMessages(sessionId, { limit: PAGE_SIZE, beforeSeq: null })
+        // If incremental mode and we have existing messages, only fetch new ones
+        const useIncremental = options?.incremental && initial.newestSeq !== null && initial.newestSeq > 0
+        const response = useIncremental
+            ? await api.getMessages(sessionId, { afterSeq: initial.newestSeq!, limit: PAGE_SIZE })
+            : await api.getMessages(sessionId, { limit: PAGE_SIZE, beforeSeq: null })
+
         updateState(sessionId, (prev) => {
             if (prev.atBottom) {
                 const merged = mergeMessages(prev.messages, [...prev.pending, ...response.messages])
@@ -387,7 +392,7 @@ export async function fetchLatestMessages(api: ApiClient, sessionId: string): Pr
                     pendingOverflowCount: 0,
                     pendingVisibleCount: 0,
                     pendingOverflowVisibleCount: 0,
-                    hasMore: response.page.hasMore,
+                    hasMore: useIncremental ? prev.hasMore : response.page.hasMore,
                     isLoading: false,
                     warning: null,
                 })

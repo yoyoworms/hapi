@@ -24,11 +24,63 @@ function toStoredMessage(row: DbMessageRow): StoredMessage {
     }
 }
 
+function extractContentUuid(content: unknown): string | null {
+    if (typeof content !== 'object' || content === null) return null
+    const c = content as Record<string, unknown>
+    // agent output messages: { role: 'agent', content: { type: 'output', data: { uuid: '...' } } }
+    if (c.role === 'agent' && typeof c.content === 'object' && c.content !== null) {
+        const inner = c.content as Record<string, unknown>
+        if (inner.type === 'output' && typeof inner.data === 'object' && inner.data !== null) {
+            const data = inner.data as Record<string, unknown>
+            if (typeof data.uuid === 'string') return data.uuid
+        }
+    }
+    return null
+}
+
+/**
+ * Extract the generation timestamp from an agent message's content.
+ * Agent messages have: { role: 'agent', content: { type: 'output', data: { timestamp: '2026-...' } } }
+ * or top-level: { timestamp: '...' }
+ */
+function extractAgentTimestamp(content: unknown): number | null {
+    if (typeof content !== 'object' || content === null) return null
+    const c = content as Record<string, unknown>
+    // Check top-level timestamp
+    if (typeof c.timestamp === 'string') {
+        const ts = new Date(c.timestamp).getTime()
+        if (!isNaN(ts)) return ts
+    }
+    // Check nested content.data.timestamp
+    if (c.role === 'agent' && typeof c.content === 'object' && c.content !== null) {
+        const inner = c.content as Record<string, unknown>
+        if (typeof inner.data === 'object' && inner.data !== null) {
+            const data = inner.data as Record<string, unknown>
+            if (typeof data.timestamp === 'string') {
+                const ts = new Date(data.timestamp).getTime()
+                if (!isNaN(ts)) return ts
+            }
+        }
+    }
+    return null
+}
+
+function isAgentMessage(content: unknown): boolean {
+    if (typeof content !== 'object' || content === null) return false
+    return (content as Record<string, unknown>).role === 'agent'
+}
+
+function isUserMessage(content: unknown): boolean {
+    if (typeof content !== 'object' || content === null) return false
+    return (content as Record<string, unknown>).role === 'user'
+}
+
 export function addMessage(
     db: Database,
     sessionId: string,
     content: unknown,
-    localId?: string
+    localId?: string,
+    clockOffset?: number
 ): StoredMessage {
     const now = Date.now()
 
@@ -41,10 +93,15 @@ export function addMessage(
         }
     }
 
+    // Deduplicate agent messages by content uuid (handles concurrent inserts via retry)
+    const contentUuid = extractContentUuid(content)
+
     const msgSeqRow = db.prepare(
         'SELECT COALESCE(MAX(seq), 0) + 1 AS nextSeq FROM messages WHERE session_id = ?'
     ).get(sessionId) as { nextSeq: number }
     const msgSeq = msgSeqRow.nextSeq
+
+    const createdAt = now
 
     const id = randomUUID()
     const json = JSON.stringify(content)
@@ -59,7 +116,7 @@ export function addMessage(
         id,
         session_id: sessionId,
         content: json,
-        created_at: now,
+        created_at: createdAt,
         seq: msgSeq,
         local_id: localId ?? null
     })

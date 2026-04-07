@@ -30,6 +30,8 @@ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { RealtimeVoiceSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
+import { useTranslation } from '@/lib/use-translation'
+import { HappyChatProvider } from '@/components/AssistantChat/context'
 
 export function SessionChat(props: {
     api: ApiClient
@@ -254,6 +256,14 @@ export function SessionChat(props: {
             ) : null}
 
             <AssistantRuntimeProvider runtime={runtime}>
+                <HappyChatProvider value={{
+                    api: props.api,
+                    sessionId: props.session.id,
+                    metadata: props.session.metadata ?? null,
+                    disabled: sessionInactive,
+                    onRefresh: props.onRefresh,
+                    onRetryMessage: props.onRetryMessage
+                }}>
                 <div className="relative flex min-h-0 flex-1 flex-col">
                     <HappyThread
                         key={props.session.id}
@@ -290,6 +300,7 @@ export function SessionChat(props: {
                         thinking={props.session.thinking}
                         agentState={props.session.agentState}
                         contextSize={reduced.latestUsage?.contextSize}
+                        usage={props.session.usage}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
                             codexCollaborationModeSupported && props.session.active && !controlledByUser
@@ -305,6 +316,7 @@ export function SessionChat(props: {
                         autocompleteSuggestions={props.autocompleteSuggestions}
                     />
                 </div>
+                </HappyChatProvider>
             </AssistantRuntimeProvider>
 
         </div>

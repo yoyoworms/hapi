@@ -10,6 +10,7 @@ import { AsyncLock } from '@/utils/lock'
 import type { RawJSONLines } from '@/claude/types'
 import { configuration } from '@/configuration'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from "@hapi/protocol"
+import { isClaudeChatVisibleMessage } from "@hapi/protocol/messages"
 import type { ClientToServerEvents, ServerToClientEvents, Update } from '@hapi/protocol'
 import {
     TerminalClosePayloadSchema,
@@ -110,7 +111,8 @@ export class ApiSessionClient extends EventEmitter {
             auth: {
                 token: this.token,
                 clientType: 'session-scoped' as const,
-                sessionId: this.sessionId
+                sessionId: this.sessionId,
+                clientTime: Date.now()
             },
             path: '/socket.io/',
             reconnection: true,
@@ -361,7 +363,12 @@ export class ApiSessionClient extends EventEmitter {
         await this.backfillInFlight
     }
 
-    sendClaudeSessionMessage(body: RawJSONLines): void {
+    sendClaudeSessionMessage(body: RawJSONLines): Promise<void> | void {
+        // Skip internal/non-visible message types (e.g. rate_limit_event)
+        if (!isClaudeChatVisibleMessage({ type: body.type, subtype: (body as { subtype?: string }).subtype })) {
+            return
+        }
+
         let content: MessageContent
 
         if (isExternalUserMessage(body)) {
@@ -388,9 +395,13 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: content
+        const ackPromise = new Promise<void>((resolve) => {
+            this.socket.emit('message', {
+                sid: this.sessionId,
+                message: content
+            }, () => resolve())
+            // Resolve after timeout to avoid blocking if hub doesn't ack
+            setTimeout(resolve, 2000)
         })
 
         if (body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
@@ -402,6 +413,8 @@ export class ApiSessionClient extends EventEmitter {
                 }
             }))
         }
+
+        return ackPromise
     }
 
     sendUserMessage(text: string, meta?: MessageMeta): void {

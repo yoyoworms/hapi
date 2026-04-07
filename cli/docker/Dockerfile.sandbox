@@ -1,0 +1,13 @@
+FROM docker.1ms.run/node:20-slim
+
+# System tools required by Claude Code
+RUN apt-get update && apt-get install -y --no-install-recommends git bash curl ripgrep ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install HAPI CLI globally
+RUN npm install -g @twsxtd/hapi --registry=https://registry.npmjs.org
+
+# Default working directory (project will be mounted here)
+WORKDIR /workspace
+
+# No entrypoint - command provided at runtime
+ENTRYPOINT []

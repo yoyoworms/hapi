@@ -101,6 +101,14 @@ export class RpcGateway {
         return await this.sessionRpc(sessionId, 'set-session-config', config)
     }
 
+    async flushMessages(sessionId: string): Promise<void> {
+        try {
+            await this.sessionRpc(sessionId, 'flushQueue', {}, 3000)
+        } catch {
+            // Non-fatal: if flush fails (timeout, no session), proceed anyway
+        }
+    }
+
     async killSession(sessionId: string): Promise<void> {
         await this.sessionRpc(sessionId, 'killSession', {})
     }
@@ -221,7 +229,15 @@ export class RpcGateway {
     }
 
     async uploadFile(sessionId: string, filename: string, content: string, mimeType: string): Promise<RpcUploadFileResponse> {
-        return await this.sessionRpc(sessionId, 'uploadFile', { sessionId, filename, content, mimeType }) as RpcUploadFileResponse
+        return await this.sessionRpc(sessionId, 'uploadFile', { sessionId, filename, content, mimeType }, 120_000) as RpcUploadFileResponse
+    }
+
+    async uploadFileFromHub(sessionId: string, filename: string, downloadUrl: string, mimeType: string): Promise<RpcUploadFileResponse> {
+        return await this.sessionRpc(sessionId, 'uploadFileFromHub', { sessionId, filename, downloadUrl, mimeType }, 120_000) as RpcUploadFileResponse
+    }
+
+    hasSessionMethod(sessionId: string, method: string): boolean {
+        return this.rpcRegistry.getSocketIdForMethod(`${sessionId}:${method}`) !== null
     }
 
     async deleteUploadFile(sessionId: string, path: string): Promise<RpcDeleteUploadResponse> {
@@ -256,15 +272,19 @@ export class RpcGateway {
         }
     }
 
-    private async sessionRpc(sessionId: string, method: string, params: unknown): Promise<unknown> {
-        return await this.rpcCall(`${sessionId}:${method}`, params)
+    async getOAuthUsage(machineId: string): Promise<unknown> {
+        return await this.machineRpc(machineId, 'getOAuthUsage', {})
+    }
+
+    private async sessionRpc(sessionId: string, method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
+        return await this.rpcCall(`${sessionId}:${method}`, params, timeoutMs)
     }
 
     private async machineRpc(machineId: string, method: string, params: unknown): Promise<unknown> {
         return await this.rpcCall(`${machineId}:${method}`, params)
     }
 
-    private async rpcCall(method: string, params: unknown): Promise<unknown> {
+    private async rpcCall(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
         const socketId = this.rpcRegistry.getSocketIdForMethod(method)
         if (!socketId) {
             throw new Error(`RPC handler not registered: ${method}`)
@@ -275,9 +295,13 @@ export class RpcGateway {
             throw new Error(`RPC socket disconnected: ${method}`)
         }
 
-        const response = await socket.timeout(30_000).emitWithAck('rpc-request', {
+        const serialized = JSON.stringify(params)
+        const payloadKB = Math.round(serialized.length / 1024)
+        console.log(`[RPC] ${method} payload=${payloadKB}KB timeout=${timeoutMs}ms socketId=${socketId}`)
+
+        const response = await socket.timeout(timeoutMs).emitWithAck('rpc-request', {
             method,
-            params: JSON.stringify(params)
+            params: serialized
         }) as unknown
 
         if (typeof response !== 'string') {

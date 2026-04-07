@@ -56,15 +56,20 @@ export type SessionHandlersDeps = {
     emitAccessError: EmitAccessError
     onSessionAlive?: (payload: SessionAlivePayload) => void
     onSessionEnd?: (payload: SessionEndPayload) => void
+    onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onWebappEvent?: (event: SyncEvent) => void
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onWebappEvent } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onSessionUsage, onWebappEvent } = deps
 
-    socket.on('message', (data: unknown) => {
+    // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
+    const recentContentUuids = new Set<string>()
+
+    socket.on('message', (data: unknown, ack?: () => void) => {
         const parsed = messageSchema.safeParse(data)
         if (!parsed.success) {
+            ack?.()
             return
         }
 
@@ -88,7 +93,51 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
         const session = sessionAccess.value
 
-        const msg = store.messages.addMessage(sid, content, localId)
+        // Extract usage data from event messages before dropping them
+        const _c = content as any
+        if (_c?.role === 'agent' && _c?.content?.type === 'event' && _c?.content?.data?.type === 'usage') {
+            const usage = _c.content.data
+            onSessionUsage?.({
+                sid,
+                totalCostUsd: usage.totalCostUsd,
+                totalInputTokens: usage.totalInputTokens,
+                totalOutputTokens: usage.totalOutputTokens
+            })
+            ack?.()
+            return
+        }
+        // Skip other internal event messages (ready, rate_limit_event, etc.)
+        // These are not user-visible and should not be stored or forwarded
+        if (_c?.type === 'event' || (_c?.role === 'agent' && _c?.content?.type === 'event')) {
+            ack?.()
+            return
+        }
+        const INTERNAL_TYPES = ['usage', 'ready', 'rate_limit_event', 'rate_limit_info']
+        if (typeof _c?.type === 'string' && INTERNAL_TYPES.includes(_c.type)) {
+            ack?.()
+            return
+        }
+        if (_c?.role === 'agent' && typeof _c?.content?.type === 'string' && INTERNAL_TYPES.includes(_c.content.type)) {
+            ack?.()
+            return
+        }
+
+        // Deduplicate by content uuid (prevents duplicates from Socket.IO reconnect buffer)
+        const _uuid = _c?.content?.data?.uuid
+        if (typeof _uuid === 'string') {
+            const dedupKey = `${sid}:${_uuid}`
+            if (recentContentUuids.has(dedupKey)) {
+                ack?.()
+                return
+            }
+            recentContentUuids.add(dedupKey)
+            // Cap set size to prevent memory leak
+            if (recentContentUuids.size > 5000) {
+                const first = recentContentUuids.values().next().value
+                if (first) recentContentUuids.delete(first)
+            }
+        }
+        const msg = store.messages.addMessage(sid, content, localId, socket.data.clockOffset)
 
         const todos = extractTodoWriteTodosFromMessageContent(content)
         if (todos) {
@@ -138,6 +187,8 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 createdAt: msg.createdAt
             }
         })
+
+        ack?.()
     })
 
     const handleUpdateMetadata: UpdateMetadataHandler = (data, cb) => {

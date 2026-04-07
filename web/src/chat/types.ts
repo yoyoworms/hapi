@@ -48,6 +48,7 @@ export type ToolResult = {
     uuid: string
     parentUUID: string | null
     permissions?: ToolResultPermission
+    cosFileUrl?: string
 }
 
 export type NormalizedAgentContent =
@@ -112,6 +113,7 @@ export type ChatToolCall = {
     description: string | null
     result?: unknown
     permission?: ToolPermission
+    cosFileUrl?: string
 }
 
 export type UserTextBlock = {
