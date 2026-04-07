@@ -554,11 +554,15 @@ export function HappyComposer(props: {
             }
             props.onDirectSend(text, attachmentMetas.length > 0 ? attachmentMetas : undefined)
             api.composer().setText('')
-            // Clear attachments after send
-            for (const att of [...attachments]) {
-                uploadedAttachmentPaths.delete(att.id)
-                api.composer().removeAttachment(att.id)
+            // Clear attachments after send - try multiple approaches since
+            // assistant-ui may block some operations during thinking state
+            const attIds = attachments.map(a => a.id)
+            for (const id of attIds) {
+                uploadedAttachmentPaths.delete(id)
+                try { api.composer().removeAttachment(id) } catch {}
             }
+            // Fallback: reset the entire composer if attachments persist
+            try { api.composer().reset() } catch {}
             return
         }
         api.composer().send()
