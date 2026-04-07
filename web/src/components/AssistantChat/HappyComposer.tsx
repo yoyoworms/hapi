@@ -18,6 +18,7 @@ import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import { useActiveWord } from '@/hooks/useActiveWord'
 import { useActiveSuggestions } from '@/hooks/useActiveSuggestions'
 import { applySuggestion } from '@/utils/applySuggestion'
+import { uploadedAttachmentPaths } from '@/lib/attachmentAdapter'
 import { usePlatform } from '@/hooks/usePlatform'
 import { usePWAInstall } from '@/hooks/usePWAInstall'
 import { supportsEffort, supportsModelChange } from '@hapi/protocol'
@@ -536,18 +537,18 @@ export function HappyComposer(props: {
         if (thinking && props.onDirectSend) {
             const text = composerTextRef.current.trim()
             if (!text && attachments.length === 0) return
-            // Extract attachment metadata from completed uploads
+            // Extract attachment metadata from the shared upload map
             const attachmentMetas: AttachmentMetadata[] = []
             for (const att of attachments) {
-                const pending = att as any
-                if (pending.path) {
+                const uploaded = uploadedAttachmentPaths.get(att.id)
+                if (uploaded) {
                     attachmentMetas.push({
                         id: att.id,
                         filename: att.name,
                         mimeType: att.contentType ?? 'application/octet-stream',
-                        size: pending.file?.size ?? 0,
-                        path: pending.path,
-                        previewUrl: pending.previewUrl
+                        size: (att as any).file?.size ?? 0,
+                        path: uploaded.path,
+                        previewUrl: uploaded.previewUrl
                     })
                 }
             }
@@ -555,12 +556,13 @@ export function HappyComposer(props: {
             api.composer().setText('')
             // Clear attachments after send
             for (const att of [...attachments]) {
+                uploadedAttachmentPaths.delete(att.id)
                 api.composer().removeAttachment(att.id)
             }
             return
         }
         api.composer().send()
-    }, [api, sessionId, thinking, props.onDirectSend])
+    }, [api, sessionId, thinking, props.onDirectSend, attachments])
 
     const overlays = useMemo(() => {
         if (showSettings && (showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)) {

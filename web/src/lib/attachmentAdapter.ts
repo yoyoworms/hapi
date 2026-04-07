@@ -11,6 +11,11 @@ type PendingUploadAttachment = PendingAttachment & {
     previewUrl?: string
 }
 
+// Shared map of uploaded attachment paths, keyed by attachment ID.
+// Used by directSend (thinking mode) to retrieve paths that may not
+// survive assistant-ui's internal state serialization.
+export const uploadedAttachmentPaths = new Map<string, { path: string; previewUrl?: string }>()
+
 export function createAttachmentAdapter(api: ApiClient, sessionId: string): AttachmentAdapter {
     const cancelledAttachmentIds = new Set<string>()
 
@@ -96,6 +101,9 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                 if (isImageMimeType(contentType) && file.size <= MAX_PREVIEW_BYTES) {
                     previewUrl = await fileToDataUrl(file)
                 }
+
+                // Save path for directSend access
+                uploadedAttachmentPaths.set(id, { path: result.path!, previewUrl })
 
                 yield {
                     id,
