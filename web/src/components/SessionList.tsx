@@ -13,10 +13,8 @@ import { getSessionModelLabel } from '@/lib/sessionModelLabel'
 import { useTranslation } from '@/lib/use-translation'
 
 type SessionGroup = {
-    key: string
     directory: string
     displayName: string
-    machineId: string | null
     sessions: SessionSummary[]
     latestUpdatedAt: number
     hasActiveSession: boolean
@@ -30,49 +28,33 @@ function getGroupDisplayName(directory: string): string {
     return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`
 }
 
-export const UNKNOWN_MACHINE_ID = '__unknown__'
-
 function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
-    const groups = new Map<string, { directory: string; machineId: string | null; sessions: SessionSummary[] }>()
+    const groups = new Map<string, SessionSummary[]>()
 
     sessions.forEach(session => {
         const path = session.metadata?.worktree?.basePath ?? session.metadata?.path ?? 'Other'
-        const machineId = session.metadata?.machineId ?? null
-        const key = `${machineId ?? UNKNOWN_MACHINE_ID}::${path}`
-        if (!groups.has(key)) {
-            groups.set(key, {
-                directory: path,
-                machineId,
-                sessions: []
-            })
+        if (!groups.has(path)) {
+            groups.set(path, [])
         }
-        groups.get(key)!.sessions.push(session)
+        groups.get(path)!.push(session)
     })
 
     return Array.from(groups.entries())
-        .map(([key, group]) => {
-            const sortedSessions = [...group.sessions].sort((a, b) => {
+        .map(([directory, groupSessions]) => {
+            const sortedSessions = [...groupSessions].sort((a, b) => {
                 const rankA = a.active ? (a.pendingRequestsCount > 0 ? 0 : 1) : 2
                 const rankB = b.active ? (b.pendingRequestsCount > 0 ? 0 : 1) : 2
                 if (rankA !== rankB) return rankA - rankB
                 return b.updatedAt - a.updatedAt
             })
-            const latestUpdatedAt = group.sessions.reduce(
+            const latestUpdatedAt = groupSessions.reduce(
                 (max, s) => (s.updatedAt > max ? s.updatedAt : max),
                 -Infinity
             )
-            const hasActiveSession = group.sessions.some(s => s.active)
-            const displayName = getGroupDisplayName(group.directory)
+            const hasActiveSession = groupSessions.some(s => s.active)
+            const displayName = getGroupDisplayName(directory)
 
-            return {
-                key,
-                directory: group.directory,
-                displayName,
-                machineId: group.machineId,
-                sessions: sortedSessions,
-                latestUpdatedAt,
-                hasActiveSession
-            }
+            return { directory, displayName, sessions: sortedSessions, latestUpdatedAt, hasActiveSession }
         })
         .sort((a, b) => {
             if (a.hasActiveSession !== b.hasActiveSession) {
@@ -168,27 +150,6 @@ function getAgentLabel(session: SessionSummary): string {
     return 'unknown'
 }
 
-function MachineIcon(props: { className?: string }) {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
-            <rect x="2" y="3" width="20" height="14" rx="2" />
-            <line x1="8" y1="21" x2="16" y2="21" />
-            <line x1="12" y1="17" x2="12" y2="21" />
-        </svg>
-    )
-}
-
 function formatRelativeTime(value: number, t: (key: string, params?: Record<string, string | number>) => string): string | null {
     const ms = value < 1_000_000_000_000 ? value * 1000 : value
     if (!Number.isFinite(ms)) return null
@@ -268,7 +229,6 @@ function SessionItem(props: {
     const statusDotClass = s.active
         ? (s.thinking ? 'bg-[#007AFF]' : 'bg-[var(--app-badge-success-text)]')
         : 'bg-[var(--app-hint)]'
-    const todoProgress = getTodoProgress(s)
     return (
         <>
             <button
@@ -295,12 +255,16 @@ function SessionItem(props: {
                                 {t('session.item.thinking')}
                             </span>
                         ) : null}
-                        {todoProgress ? (
-                            <span className="flex items-center gap-1 text-[var(--app-hint)]">
-                                <BulbIcon className="h-3 w-3" />
-                                {todoProgress.completed}/{todoProgress.total}
-                            </span>
-                        ) : null}
+                        {(() => {
+                            const progress = getTodoProgress(s)
+                            if (!progress) return null
+                            return (
+                                <span className="flex items-center gap-1 text-[var(--app-hint)]">
+                                    <BulbIcon className="h-3 w-3" />
+                                    {progress.completed}/{progress.total}
+                                </span>
+                            )
+                        })()}
                         {s.pendingRequestsCount > 0 ? (
                             <span className="text-[var(--app-badge-warning-text)]">
                                 {t('session.item.pending')} {s.pendingRequestsCount}
@@ -394,11 +358,10 @@ export function SessionList(props: {
     isLoading: boolean
     renderHeader?: boolean
     api: ApiClient | null
-    machineLabelsById?: Record<string, string>
     selectedSessionId?: string | null
 }) {
     const { t } = useTranslation()
-    const { renderHeader = true, api, selectedSessionId, machineLabelsById = {} } = props
+    const { renderHeader = true, api, selectedSessionId } = props
     const groups = useMemo(
         () => groupSessionsByDirectory(props.sessions),
         [props.sessions]
@@ -407,54 +370,28 @@ export function SessionList(props: {
         () => new Map()
     )
     const isGroupCollapsed = (group: SessionGroup): boolean => {
-        const override = collapseOverrides.get(group.key)
+        const override = collapseOverrides.get(group.directory)
         if (override !== undefined) return override
-        const hasSelectedSession = selectedSessionId
-            ? group.sessions.some(session => session.id === selectedSessionId)
-            : false
-        return !group.hasActiveSession && !hasSelectedSession
+        return true
     }
 
-    const toggleGroup = (groupKey: string, isCollapsed: boolean) => {
+    const toggleGroup = (directory: string, isCollapsed: boolean) => {
         setCollapseOverrides(prev => {
             const next = new Map(prev)
-            next.set(groupKey, !isCollapsed)
+            next.set(directory, !isCollapsed)
             return next
         })
     }
-
-    const resolveMachineLabel = (machineId: string | null): string => {
-        if (machineId && machineLabelsById[machineId]) {
-            return machineLabelsById[machineId]
-        }
-        if (machineId) {
-            return machineId.slice(0, 8)
-        }
-        return t('machine.unknown')
-    }
-
-    useEffect(() => {
-        if (!selectedSessionId) return
-        setCollapseOverrides(prev => {
-            const group = groups.find(g =>
-                g.sessions.some(s => s.id === selectedSessionId)
-            )
-            if (!group || !prev.has(group.key) || !prev.get(group.key)) return prev
-            const next = new Map(prev)
-            next.delete(group.key)
-            return next
-        })
-    }, [selectedSessionId, groups])
 
     useEffect(() => {
         setCollapseOverrides(prev => {
             if (prev.size === 0) return prev
             const next = new Map(prev)
-            const knownGroups = new Set(groups.map(group => group.key))
+            const knownGroups = new Set(groups.map(group => group.directory))
             let changed = false
-            for (const groupKey of next.keys()) {
-                if (!knownGroups.has(groupKey)) {
-                    next.delete(groupKey)
+            for (const directory of next.keys()) {
+                if (!knownGroups.has(directory)) {
+                    next.delete(directory)
                     changed = true
                 }
             }
@@ -483,36 +420,38 @@ export function SessionList(props: {
             <div className="flex flex-col">
                 {groups.map((group) => {
                     const isCollapsed = isGroupCollapsed(group)
-                    const machineLabel = resolveMachineLabel(group.machineId)
                     const thinkingCount = group.sessions.filter(s => s.thinking).length
                     const pendingCount = group.sessions.reduce((sum, s) => sum + (s.pendingRequestsCount ?? 0), 0)
                     return (
-                        <div key={group.key} className="mt-2 first:mt-0">
+                        <div key={group.directory}>
                             <button
                                 type="button"
-                                onClick={() => toggleGroup(group.key, isCollapsed)}
-                                className="sticky top-0 z-10 flex w-full flex-col gap-1 px-3 py-2.5 text-left bg-[var(--app-secondary-bg)] border-b border-[var(--app-border)] border-l-[3px] border-l-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)]"
+                                onClick={() => toggleGroup(group.directory, isCollapsed)}
+                                className="sticky top-0 z-10 flex w-full items-center gap-2 px-3 py-2 text-left bg-[var(--app-bg)] border-b border-[var(--app-divider)] transition-colors hover:bg-[var(--app-secondary-bg)]"
                             >
-                                <div className="flex items-center gap-2 min-w-0 w-full">
-                                    <ChevronIcon
-                                        className="h-4 w-4 text-[var(--app-hint)] shrink-0"
-                                        collapsed={isCollapsed}
-                                    />
-                                    <span className="font-semibold text-sm break-words min-w-0" title={group.directory}>
+                                <ChevronIcon
+                                    className="h-4 w-4 text-[var(--app-hint)]"
+                                    collapsed={isCollapsed}
+                                />
+                                <div className="flex items-center gap-2 min-w-0 flex-1">
+                                    <span className="font-medium text-base break-words" title={group.directory}>
                                         {group.displayName}
                                     </span>
-                                    <span className="shrink-0 rounded-full bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--app-hint)]">
-                                        {group.sessions.length}
+                                    <span className="shrink-0 text-xs text-[var(--app-hint)]">
+                                        ({group.sessions.length})
                                     </span>
                                 </div>
-                                <div className="flex min-w-0 w-full flex-wrap items-center gap-2 pl-6 text-xs text-[var(--app-hint)]">
-                                    <span className="inline-flex items-center gap-1 rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-0.5">
-                                        <MachineIcon className="h-3 w-3 shrink-0" />
-                                        {machineLabel}
-                                    </span>
-                                    <span className="min-w-0 flex-1 truncate" title={group.directory}>
-                                        {group.directory}
-                                    </span>
+                                <div className="flex items-center gap-2 shrink-0 text-xs">
+                                    {thinkingCount > 0 ? (
+                                        <span className="text-[#007AFF] animate-pulse">
+                                            {t('session.item.thinking')}{thinkingCount > 1 ? ` ${thinkingCount}` : ''}
+                                        </span>
+                                    ) : null}
+                                    {pendingCount > 0 ? (
+                                        <span className="text-[var(--app-badge-warning-text)]">
+                                            {t('session.item.pending')} {pendingCount}
+                                        </span>
+                                    ) : null}
                                 </div>
                                 <div className="flex items-center gap-2 shrink-0 text-xs">
                                     {thinkingCount > 0 ? (
@@ -528,7 +467,7 @@ export function SessionList(props: {
                                 </div>
                             </button>
                             {!isCollapsed ? (
-                                <div className="flex flex-col divide-y divide-[var(--app-divider)] border-b border-[var(--app-divider)] border-l border-l-[var(--app-divider)]">
+                                <div className="flex flex-col divide-y divide-[var(--app-divider)] border-b border-[var(--app-divider)]">
                                     {group.sessions.map((s) => (
                                         <SessionItem
                                             key={s.id}
