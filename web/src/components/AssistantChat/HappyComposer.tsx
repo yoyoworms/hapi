@@ -535,9 +535,28 @@ export function HappyComposer(props: {
         // Bypass by reading text directly and calling onDirectSend.
         if (thinking && props.onDirectSend) {
             const text = composerTextRef.current.trim()
-            if (!text) return
-            props.onDirectSend(text)
+            if (!text && attachments.length === 0) return
+            // Extract attachment metadata from completed uploads
+            const attachmentMetas: AttachmentMetadata[] = []
+            for (const att of attachments) {
+                const pending = att as any
+                if (pending.path) {
+                    attachmentMetas.push({
+                        id: att.id,
+                        filename: att.name,
+                        mimeType: att.contentType ?? 'application/octet-stream',
+                        size: pending.file?.size ?? 0,
+                        path: pending.path,
+                        previewUrl: pending.previewUrl
+                    })
+                }
+            }
+            props.onDirectSend(text, attachmentMetas.length > 0 ? attachmentMetas : undefined)
             api.composer().setText('')
+            // Clear attachments after send
+            for (const att of [...attachments]) {
+                api.composer().removeAttachment(att.id)
+            }
             return
         }
         api.composer().send()
