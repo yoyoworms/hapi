@@ -94,8 +94,10 @@ export function setInFlight(sessionId: string, localId: string | null): void {
     notify(sessionId)
 }
 
+const EMPTY_STATE: SessionQueueState = { items: [], inFlightLocalId: null }
+
 export function getState(sessionId: string): SessionQueueState {
-    return queues.get(sessionId) ?? { items: [], inFlightLocalId: null }
+    return queues.get(sessionId) ?? EMPTY_STATE
 }
 
 export function getQueuedCount(sessionId: string): number {

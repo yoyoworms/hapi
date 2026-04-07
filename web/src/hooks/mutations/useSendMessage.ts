@@ -66,10 +66,10 @@ export function useSendMessage(
     const thinkingRef = useRef(Boolean(options?.thinking))
     const mutationPendingRef = useRef(false)
 
-    // Subscribe to queue changes
+    // Subscribe to queue changes — getState returns a stable reference when empty
     const queueState = useSyncExternalStore(
         useCallback((cb) => sessionId ? queue.subscribe(sessionId, cb) : () => {}, [sessionId]),
-        useCallback(() => sessionId ? queue.getState(sessionId) : { items: [], inFlightLocalId: null }, [sessionId])
+        useCallback(() => queue.getState(sessionId ?? ''), [sessionId])
     )
     const queuedCount = queueState.items.length
     const hasPaused = queueState.items.some(m => m.phase === 'paused')
