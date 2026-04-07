@@ -120,6 +120,11 @@ export function HappyComposer(props: {
     terminalUnsupported?: boolean
     autocompletePrefixes?: string[]
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
+    onDirectSend?: (text: string, attachments?: AttachmentMetadata[]) => void
+    queuedCount?: number
+    hasPausedQueue?: boolean
+    onClearQueue?: () => void
+    onResumeQueue?: () => void
 }) {
     const { t } = useTranslation()
     const {
@@ -185,7 +190,7 @@ export function HappyComposer(props: {
     }, [sessionId, api])
     prevSessionIdRef.current = sessionId
 
-    const controlsDisabled = disabled || (!active && !allowSendWhenInactive) || threadIsDisabled
+    const controlsDisabled = disabled || (!active && !allowSendWhenInactive)
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
     const hasAttachments = attachments.length > 0
@@ -199,7 +204,7 @@ export function HappyComposer(props: {
         const path = (attachment as { path?: string }).path
         return typeof path === 'string' && path.length > 0
     })
-    const canSend = (hasText || hasAttachments) && attachmentsReady && !controlsDisabled && !threadIsRunning
+    const canSend = (hasText || hasAttachments) && attachmentsReady && !controlsDisabled
 
     const [inputState, setInputState] = useState<TextInputState>({
         text: '',
@@ -298,7 +303,7 @@ export function HappyComposer(props: {
         haptic('light')
     }, [api, suggestions, inputState, autocompletePrefixes, haptic, agentFlavor])
 
-    const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
+    const abortDisabled = controlsDisabled || isAborting || !thinking
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
     const showSwitchButton = Boolean(controlledByUser && onSwitchToRemote)
     const showTerminalButton = Boolean(onTerminal || terminalUnsupported)
@@ -307,9 +312,9 @@ export function HappyComposer(props: {
 
     useEffect(() => {
         if (!isAborting) return
-        if (threadIsRunning) return
+        if (thinking) return
         setIsAborting(false)
-    }, [isAborting, threadIsRunning])
+    }, [isAborting, thinking])
 
     useEffect(() => {
         if (!isSwitching) return
@@ -364,13 +369,17 @@ export function HappyComposer(props: {
             return
         }
 
-        // Shift+Enter sends the message (works on all platforms including iPadOS with keyboard)
-        if (key === 'Enter' && e.shiftKey) {
-            e.preventDefault()
-            if (!canSend) return
-            api.composer().send()
-            setShowContinueHint(false)
-            return
+        // Enter sends the message (Shift+Enter on touch, plain Enter on desktop)
+        if (key === 'Enter' && (e.shiftKey || !isTouch) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            if (suggestions.length > 0) {
+                // Let suggestion handler below deal with it
+            } else {
+                e.preventDefault()
+                if (!canSend) return
+                handleSend()
+                setShowContinueHint(false)
+                return
+            }
         }
 
         if (suggestions.length > 0) {
@@ -397,7 +406,7 @@ export function HappyComposer(props: {
             }
         }
 
-        if (key === 'Escape' && threadIsRunning) {
+        if (key === 'Escape' && thinking) {
             e.preventDefault()
             handleAbort()
             return
@@ -525,8 +534,17 @@ export function HappyComposer(props: {
 
     const handleSend = useCallback(() => {
         if (sessionId) draftStore.delete(sessionId)
+        // When Claude is thinking, the library's composer.send() is a no-op.
+        // Bypass it by reading text directly and calling onDirectSend.
+        if (thinking && props.onDirectSend) {
+            const text = composerTextRef.current.trim()
+            if (!text) return
+            props.onDirectSend(text)
+            api.composer().setText('')
+            return
+        }
         api.composer().send()
-    }, [api, sessionId])
+    }, [api, sessionId, thinking, props.onDirectSend])
 
     const overlays = useMemo(() => {
         if (showSettings && (showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)) {
@@ -745,6 +763,36 @@ export function HappyComposer(props: {
 
                     {/* QuickPermissionBar removed: PermissionFooter inside tool cards handles approvals */}
 
+                    {(props.queuedCount ?? 0) > 0 && (
+                        <div className="flex items-center justify-between rounded-lg bg-[var(--app-subtle-bg)] px-3 py-1.5 mb-1 text-xs text-[var(--app-hint)]">
+                            <span>
+                                {props.hasPausedQueue
+                                    ? t('queue.paused')
+                                    : t('queue.count', { n: props.queuedCount ?? 0 })}
+                            </span>
+                            <div className="flex items-center gap-2">
+                                {props.hasPausedQueue && props.onResumeQueue && (
+                                    <button
+                                        type="button"
+                                        className="text-[var(--app-link)] hover:underline"
+                                        onClick={props.onResumeQueue}
+                                    >
+                                        {t('queue.resume')}
+                                    </button>
+                                )}
+                                {props.onClearQueue && (
+                                    <button
+                                        type="button"
+                                        className="text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:underline"
+                                        onClick={props.onClearQueue}
+                                    >
+                                        {t('queue.clear')}
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
                     <StatusBar
                         active={active}
                         thinking={thinking}
@@ -772,7 +820,7 @@ export function HappyComposer(props: {
                                 placeholder={showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage')}
                                 disabled={controlsDisabled}
                                 maxRows={5}
-                                submitOnEnter={!isTouch}
+                                submitOnEnter={false}
                                 cancelOnEscape={false}
                                 onChange={handleChange}
                                 onSelect={handleSelect}

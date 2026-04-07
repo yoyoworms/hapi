@@ -308,6 +308,12 @@ export default {
   'misc.percentLeft': '{percent}% left',
   'misc.online': 'online',
 
+  // Message queue
+  'queue.count': '{n} messages queued',
+  'queue.paused': 'Queue paused',
+  'queue.clear': 'Clear all',
+  'queue.resume': 'Resume',
+
   // Resume session picker
   'resume.inactiveBanner': 'Session is inactive. Sending will resume it automatically.',
   'resume.chooseSession': 'Choose session',

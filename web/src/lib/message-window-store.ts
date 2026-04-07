@@ -516,6 +516,18 @@ export function appendOptimisticMessage(sessionId: string, message: DecryptedMes
     }, true)
 }
 
+export function removeOptimisticMessage(sessionId: string, localId: string): void {
+    if (!localId) return
+    updateState(sessionId, (prev) => {
+        const messages = prev.messages.filter(m => m.localId !== localId || !isOptimisticMessage(m))
+        const pending = prev.pending.filter(m => m.localId !== localId || !isOptimisticMessage(m))
+        if (messages.length === prev.messages.length && pending.length === prev.pending.length) {
+            return prev
+        }
+        return buildState(prev, { messages, pending })
+    }, true)
+}
+
 export function updateMessageStatus(sessionId: string, localId: string, status: MessageStatus): void {
     if (!localId) {
         return

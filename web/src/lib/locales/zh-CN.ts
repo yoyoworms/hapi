@@ -310,6 +310,12 @@ export default {
   'misc.percentLeft': '剩余 {percent}%',
   'misc.online': '在线',
 
+  // Message queue
+  'queue.count': '{n} 条消息排队中',
+  'queue.paused': '队列已暂停',
+  'queue.clear': '清空',
+  'queue.resume': '继续',
+
   // Resume session picker
   'resume.inactiveBanner': '会话已停止。发送消息将自动恢复。',
   'resume.chooseSession': '选择会话',

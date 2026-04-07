@@ -224,7 +224,13 @@ function SessionPage() {
         sendMessage,
         retryMessage,
         isSending,
+        queuedCount,
+        hasPaused,
+        cancelQueued,
+        clearQueue,
+        resumeQueue,
     } = useSendMessage(api, sessionId, {
+        thinking: session?.thinking,
         resolveSessionId: async (currentSessionId) => {
             if (!api || !session || session.active) {
                 return currentSessionId
@@ -331,6 +337,11 @@ function SessionPage() {
             onFlushPending={flushPending}
             onAtBottomChange={setAtBottom}
             onRetryMessage={retryMessage}
+            onCancelQueued={cancelQueued}
+            queuedCount={queuedCount}
+            hasPausedQueue={hasPaused}
+            onClearQueue={clearQueue}
+            onResumeQueue={resumeQueue}
             autocompleteSuggestions={getAutocompleteSuggestions}
             availableSlashCommands={slashCommands}
         />

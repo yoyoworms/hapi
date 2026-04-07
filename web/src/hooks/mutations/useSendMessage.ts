@@ -1,5 +1,5 @@
 import { useMutation } from '@tanstack/react-query'
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { ApiClient } from '@/api/client'
 import type { AttachmentMetadata, DecryptedMessage } from '@/types/api'
 import { makeClientSideId } from '@/lib/messages'
@@ -7,8 +7,10 @@ import {
     appendOptimisticMessage,
     fetchLatestMessages,
     getMessageWindowState,
+    removeOptimisticMessage,
     updateMessageStatus,
 } from '@/lib/message-window-store'
+import * as queue from '@/lib/message-queue-store'
 import { usePlatform } from '@/hooks/usePlatform'
 
 type SendMessageInput = {
@@ -19,12 +21,13 @@ type SendMessageInput = {
     attachments?: AttachmentMetadata[]
 }
 
-type BlockedReason = 'no-api' | 'no-session' | 'pending'
+type BlockedReason = 'no-api' | 'no-session'
 
 type UseSendMessageOptions = {
     resolveSessionId?: (sessionId: string) => Promise<string>
     onSessionResolved?: (sessionId: string) => void
     onBlocked?: (reason: BlockedReason) => void
+    thinking?: boolean
 }
 
 function findMessageByLocalId(
@@ -49,10 +52,24 @@ export function useSendMessage(
     sendMessage: (text: string, attachments?: AttachmentMetadata[]) => void
     retryMessage: (localId: string) => void
     isSending: boolean
+    queuedCount: number
+    hasPaused: boolean
+    cancelQueued: (localId: string) => void
+    clearQueue: () => void
+    resumeQueue: () => void
 } {
     const { haptic } = usePlatform()
     const [isResolving, setIsResolving] = useState(false)
     const resolveGuardRef = useRef(false)
+    const drainingRef = useRef(false)
+
+    // Subscribe to queue changes
+    const queueState = useSyncExternalStore(
+        useCallback((cb) => sessionId ? queue.subscribe(sessionId, cb) : () => {}, [sessionId]),
+        useCallback(() => sessionId ? queue.getState(sessionId) : { items: [], inFlightLocalId: null }, [sessionId])
+    )
+    const queuedCount = queueState.items.length
+    const hasPaused = queueState.items.some(m => m.phase === 'paused')
 
     const mutation = useMutation({
         mutationFn: async (input: SendMessageInput) => {
@@ -61,31 +78,10 @@ export function useSendMessage(
             }
             await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments)
         },
-        onMutate: async (input) => {
-            const optimisticMessage: DecryptedMessage = {
-                id: input.localId,
-                seq: null,
-                localId: input.localId,
-                content: {
-                    role: 'user',
-                    content: {
-                        type: 'text',
-                        text: input.text,
-                        attachments: input.attachments
-                    }
-                },
-                createdAt: input.createdAt,
-                status: 'sending',
-                originalText: input.text,
-            }
-
-            appendOptimisticMessage(input.sessionId, optimisticMessage)
-        },
         onSuccess: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'sent')
+            if (sessionId) queue.setInFlight(sessionId, null)
             haptic.notification('success')
-            // Fetch any agent messages that may still be in transit from CLI → Hub
-            // Use staggered fetches to catch messages that arrive after our send
             if (api) {
                 const doFetch = () => fetchLatestMessages(api, input.sessionId, { incremental: true }).catch(() => {})
                 doFetch()
@@ -95,11 +91,97 @@ export function useSendMessage(
         },
         onError: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'failed')
+            if (sessionId) {
+                queue.setInFlight(sessionId, null)
+                queue.pauseQueue(sessionId)
+            }
             haptic.notification('error')
         },
     })
 
-    const sendMessage = (text: string, attachments?: AttachmentMetadata[]) => {
+    // Dispatch a single message through the resolve → fetch → send pipeline
+    const dispatchMessage = useCallback(async (
+        targetApi: ApiClient,
+        sid: string,
+        text: string,
+        localId: string,
+        createdAt: number,
+        attachments?: AttachmentMetadata[]
+    ) => {
+        let targetSessionId = sid
+        if (options?.resolveSessionId) {
+            resolveGuardRef.current = true
+            setIsResolving(true)
+            try {
+                const resolved = await options.resolveSessionId(sid)
+                if (resolved && resolved !== sid) {
+                    options.onSessionResolved?.(resolved)
+                    queue.moveSession(sid, resolved)
+                    targetSessionId = resolved
+                }
+            } catch (error) {
+                haptic.notification('error')
+                console.error('Failed to resolve session before send:', error)
+                queue.setInFlight(sid, null)
+                queue.pauseQueue(sid)
+                return
+            } finally {
+                resolveGuardRef.current = false
+                setIsResolving(false)
+            }
+        }
+        await fetchLatestMessages(targetApi, targetSessionId, { incremental: true }).catch(() => {})
+
+        // Update optimistic message status from queued to sending
+        updateMessageStatus(targetSessionId, localId, 'sending')
+
+        mutation.mutate({
+            sessionId: targetSessionId,
+            text,
+            localId,
+            createdAt,
+            attachments,
+        })
+    }, [mutation, options, haptic])
+
+    // Try to drain the queue — called when Claude finishes or dispatch completes
+    const drainQueue = useCallback(() => {
+        if (!api || !sessionId) return
+        if (mutation.isPending || resolveGuardRef.current || drainingRef.current) return
+        if (options?.thinking) return
+
+        const next = queue.peek(sessionId)
+        if (!next || next.phase === 'paused') return
+
+        drainingRef.current = true
+        const item = queue.dequeue(sessionId)!
+        queue.setInFlight(sessionId, item.localId)
+
+        void dispatchMessage(api, sessionId, item.text, item.localId, item.createdAt, item.attachments)
+            .finally(() => { drainingRef.current = false })
+    }, [api, sessionId, mutation.isPending, options?.thinking, dispatchMessage])
+
+    // Drain when thinking transitions to false, or when mutation completes
+    const prevThinkingRef = useRef(options?.thinking)
+    useEffect(() => {
+        const wasThinking = prevThinkingRef.current
+        prevThinkingRef.current = options?.thinking
+        if (wasThinking && !options?.thinking) {
+            drainQueue()
+        }
+    }, [options?.thinking, drainQueue])
+
+    // Also drain when mutation finishes (isPending goes false)
+    const prevPendingRef = useRef(mutation.isPending)
+    useEffect(() => {
+        const wasPending = prevPendingRef.current
+        prevPendingRef.current = mutation.isPending
+        if (wasPending && !mutation.isPending) {
+            drainQueue()
+        }
+    }, [mutation.isPending, drainQueue])
+
+    const sendMessage = useCallback((text: string, attachments?: AttachmentMetadata[]) => {
         if (!api) {
             options?.onBlocked?.('no-api')
             haptic.notification('error')
@@ -110,77 +192,90 @@ export function useSendMessage(
             haptic.notification('error')
             return
         }
-        if (mutation.isPending || resolveGuardRef.current) {
-            options?.onBlocked?.('pending')
-            return
-        }
+
         const localId = makeClientSideId('local')
         const createdAt = Date.now()
-        void (async () => {
-            let targetSessionId = sessionId
-            if (options?.resolveSessionId) {
-                resolveGuardRef.current = true
-                setIsResolving(true)
-                try {
-                    const resolved = await options.resolveSessionId(sessionId)
-                    if (resolved && resolved !== sessionId) {
-                        options.onSessionResolved?.(resolved)
-                        targetSessionId = resolved
-                    }
-                } catch (error) {
-                    haptic.notification('error')
-                    console.error('Failed to resolve session before send:', error)
-                    return
-                } finally {
-                    resolveGuardRef.current = false
-                    setIsResolving(false)
-                }
-            }
-            // Catch up on any missed messages before sending new one
-            // This prevents old task output from appearing after the new user message
-            await fetchLatestMessages(api, targetSessionId, { incremental: true }).catch(() => {})
-            mutation.mutate({
-                sessionId: targetSessionId,
-                text,
-                localId,
-                createdAt,
-                attachments,
-            })
-        })()
-    }
 
-    const retryMessage = (localId: string) => {
-        if (!api) {
-            options?.onBlocked?.('no-api')
-            haptic.notification('error')
-            return
+        const busy = mutation.isPending || resolveGuardRef.current || options?.thinking
+
+        if (busy) {
+            // Enqueue and show optimistic bubble with 'queued' status
+            queue.enqueue(sessionId, { localId, text, attachments, createdAt })
+            const optimisticMessage: DecryptedMessage = {
+                id: localId,
+                seq: null,
+                localId,
+                content: {
+                    role: 'user',
+                    content: { type: 'text', text, attachments }
+                },
+                createdAt,
+                status: 'queued',
+                originalText: text,
+            }
+            appendOptimisticMessage(sessionId, optimisticMessage)
+            haptic.impact('light')
+        } else {
+            // Dispatch immediately
+            const optimisticMessage: DecryptedMessage = {
+                id: localId,
+                seq: null,
+                localId,
+                content: {
+                    role: 'user',
+                    content: { type: 'text', text, attachments }
+                },
+                createdAt,
+                status: 'sending',
+                originalText: text,
+            }
+            appendOptimisticMessage(sessionId, optimisticMessage)
+            queue.setInFlight(sessionId, localId)
+            void dispatchMessage(api, sessionId, text, localId, createdAt, attachments)
         }
-        if (!sessionId) {
-            options?.onBlocked?.('no-session')
-            haptic.notification('error')
-            return
-        }
-        if (mutation.isPending || resolveGuardRef.current) {
-            options?.onBlocked?.('pending')
-            return
-        }
+    }, [api, sessionId, mutation.isPending, options?.thinking, options?.onBlocked, haptic, dispatchMessage])
+
+    const retryMessage = useCallback((localId: string) => {
+        if (!api || !sessionId) return
+        if (mutation.isPending || resolveGuardRef.current) return
 
         const message = findMessageByLocalId(sessionId, localId)
         if (!message?.originalText) return
 
         updateMessageStatus(sessionId, localId, 'sending')
+        queue.setInFlight(sessionId, localId)
 
-        mutation.mutate({
-            sessionId,
-            text: message.originalText,
-            localId,
-            createdAt: message.createdAt,
-        })
-    }
+        void dispatchMessage(api, sessionId, message.originalText, localId, message.createdAt)
+    }, [api, sessionId, mutation.isPending, dispatchMessage])
+
+    const cancelQueued = useCallback((localId: string) => {
+        if (!sessionId) return
+        queue.cancel(sessionId, localId)
+        removeOptimisticMessage(sessionId, localId)
+    }, [sessionId])
+
+    const clearQueueFn = useCallback(() => {
+        if (!sessionId) return
+        const removed = queue.clearAll(sessionId)
+        for (const item of removed) {
+            removeOptimisticMessage(sessionId, item.localId)
+        }
+    }, [sessionId])
+
+    const resumeQueueFn = useCallback(() => {
+        if (!sessionId) return
+        queue.resumeQueue(sessionId)
+        drainQueue()
+    }, [sessionId, drainQueue])
 
     return {
         sendMessage,
         retryMessage,
         isSending: mutation.isPending || isResolving,
+        queuedCount,
+        hasPaused,
+        cancelQueued,
+        clearQueue: clearQueueFn,
+        resumeQueue: resumeQueueFn,
     }
 }

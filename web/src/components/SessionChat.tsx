@@ -50,6 +50,11 @@ export function SessionChat(props: {
     onFlushPending: () => void
     onAtBottomChange: (atBottom: boolean) => void
     onRetryMessage?: (localId: string) => void
+    onCancelQueued?: (localId: string) => void
+    queuedCount?: number
+    hasPausedQueue?: boolean
+    onClearQueue?: () => void
+    onResumeQueue?: () => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
     availableSlashCommands?: readonly SlashCommand[]
 }) {
@@ -261,7 +266,8 @@ export function SessionChat(props: {
                     metadata: props.session.metadata ?? null,
                     disabled: sessionInactive,
                     onRefresh: props.onRefresh,
-                    onRetryMessage: props.onRetryMessage
+                    onRetryMessage: props.onRetryMessage,
+                    onCancelQueued: props.onCancelQueued
                 }}>
                 <div className="relative flex min-h-0 flex-1 flex-col">
                     <HappyThread
@@ -288,7 +294,7 @@ export function SessionChat(props: {
 
                     <HappyComposer
                         sessionId={props.session.id}
-                        disabled={props.isSending}
+                        disabled={false}
                         permissionMode={props.session.permissionMode}
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
                         model={props.session.model}
@@ -313,6 +319,11 @@ export function SessionChat(props: {
                         onTerminal={props.session.active && terminalSupported ? handleViewTerminal : undefined}
                         terminalUnsupported={props.session.active && !terminalSupported}
                         autocompleteSuggestions={props.autocompleteSuggestions}
+                        onDirectSend={handleSend}
+                        queuedCount={props.queuedCount ?? 0}
+                        hasPausedQueue={props.hasPausedQueue ?? false}
+                        onClearQueue={props.onClearQueue}
+                        onResumeQueue={props.onResumeQueue}
                     />
                 </div>
                 </HappyChatProvider>
