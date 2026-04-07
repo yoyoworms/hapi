@@ -210,10 +210,8 @@ export function useHappyRuntime(props: {
     // Memoize the adapter to avoid recreating on every render
     // useExternalStoreRuntime may use adapter identity for subscriptions
     const adapter = useMemo(() => ({
-        isDisabled: !props.session.active && !props.allowSendWhenInactive,
-        // Always false: the message queue handles ordering when Claude is thinking.
-        // Setting isRunning=true would cause @assistant-ui/react to block composer.send().
-        isRunning: false,
+        isDisabled: props.isSending || (!props.session.active && !props.allowSendWhenInactive),
+        isRunning: props.session.thinking,
         messages: convertedMessages,
         onNew,
         onCancel,
@@ -221,6 +219,7 @@ export function useHappyRuntime(props: {
         unstable_capabilities: { copy: true }
     }), [
         props.session.active,
+        props.isSending,
         props.allowSendWhenInactive,
         props.session.thinking,
         convertedMessages,

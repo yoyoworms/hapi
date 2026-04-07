@@ -30,6 +30,7 @@ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { RealtimeVoiceSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
+import { useTranslation } from '@/lib/use-translation'
 import { HappyChatProvider } from '@/components/AssistantChat/context'
 
 export function SessionChat(props: {
@@ -50,11 +51,6 @@ export function SessionChat(props: {
     onFlushPending: () => void
     onAtBottomChange: (atBottom: boolean) => void
     onRetryMessage?: (localId: string) => void
-    onCancelQueued?: (localId: string) => void
-    queuedCount?: number
-    hasPausedQueue?: boolean
-    onClearQueue?: () => void
-    onResumeQueue?: () => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
     availableSlashCommands?: readonly SlashCommand[]
 }) {
@@ -266,8 +262,7 @@ export function SessionChat(props: {
                     metadata: props.session.metadata ?? null,
                     disabled: sessionInactive,
                     onRefresh: props.onRefresh,
-                    onRetryMessage: props.onRetryMessage,
-                    onCancelQueued: props.onCancelQueued
+                    onRetryMessage: props.onRetryMessage
                 }}>
                 <div className="relative flex min-h-0 flex-1 flex-col">
                     <HappyThread
@@ -294,7 +289,7 @@ export function SessionChat(props: {
 
                     <HappyComposer
                         sessionId={props.session.id}
-                        disabled={false}
+                        disabled={props.isSending}
                         permissionMode={props.session.permissionMode}
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
                         model={props.session.model}

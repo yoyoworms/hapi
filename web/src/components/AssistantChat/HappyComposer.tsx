@@ -28,7 +28,6 @@ import { StatusBar } from '@/components/AssistantChat/StatusBar'
 import { useHappyChatContext } from '@/components/AssistantChat/context'
 import { ComposerButtons } from '@/components/AssistantChat/ComposerButtons'
 import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
-import { collectComposerAttachmentMetadata } from '@/lib/composerAttachments'
 import { useTranslation } from '@/lib/use-translation'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
@@ -163,6 +162,7 @@ export function HappyComposer(props: {
     const composerText = useAssistantState(({ composer }) => composer.text)
     const attachments = useAssistantState(({ composer }) => composer.attachments)
     const threadIsRunning = useAssistantState(({ thread }) => thread.isRunning)
+    const threadIsDisabled = useAssistantState(({ thread }) => thread.isDisabled)
 
     // Save draft on unmount or session change, restore on mount
     const composerTextRef = useRef(composerText)
@@ -190,6 +190,7 @@ export function HappyComposer(props: {
     }, [sessionId, api])
     prevSessionIdRef.current = sessionId
 
+    // threadIsDisabled kept for hook order but not used — queue allows sending while thinking
     const controlsDisabled = disabled || (!active && !allowSendWhenInactive)
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
@@ -369,17 +370,13 @@ export function HappyComposer(props: {
             return
         }
 
-        // Enter sends the message (Shift+Enter on touch, plain Enter on desktop)
-        if (key === 'Enter' && (e.shiftKey || !isTouch) && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            if (suggestions.length > 0) {
-                // Let suggestion handler below deal with it
-            } else {
-                e.preventDefault()
-                if (!canSend) return
-                handleSend()
-                setShowContinueHint(false)
-                return
-            }
+        // Enter sends, Shift+Enter inserts newline
+        if (key === 'Enter' && !e.shiftKey && !isTouch) {
+            e.preventDefault()
+            if (!canSend) return
+            handleSend()
+            setShowContinueHint(false)
+            return
         }
 
         if (suggestions.length > 0) {
@@ -534,18 +531,17 @@ export function HappyComposer(props: {
 
     const handleSend = useCallback(() => {
         if (sessionId) draftStore.delete(sessionId)
-        // When Claude is thinking, the library's composer.send() is a no-op.
-        // Bypass it by reading text directly and calling onDirectSend.
+        // When thinking, api.composer().send() is blocked by the library.
+        // Bypass by reading text directly and calling onDirectSend.
         if (thinking && props.onDirectSend) {
             const text = composerTextRef.current.trim()
-            const attachmentMetadata = collectComposerAttachmentMetadata(attachments)
-            if (!text && attachmentMetadata.length === 0) return
-            props.onDirectSend(text, attachmentMetadata.length > 0 ? attachmentMetadata : undefined)
-            void api.composer().reset()
+            if (!text) return
+            props.onDirectSend(text)
+            api.composer().setText('')
             return
         }
         api.composer().send()
-    }, [api, attachments, sessionId, thinking, props.onDirectSend])
+    }, [api, sessionId, thinking, props.onDirectSend])
 
     const overlays = useMemo(() => {
         if (showSettings && (showCollaborationSettings || showPermissionSettings || showModelSettings || showEffortSettings)) {
@@ -763,36 +759,6 @@ export function HappyComposer(props: {
                     {overlays}
 
                     {/* QuickPermissionBar removed: PermissionFooter inside tool cards handles approvals */}
-
-                    {(props.queuedCount ?? 0) > 0 && (
-                        <div className="flex items-center justify-between rounded-lg bg-[var(--app-subtle-bg)] px-3 py-1.5 mb-1 text-xs text-[var(--app-hint)]">
-                            <span>
-                                {props.hasPausedQueue
-                                    ? t('queue.paused')
-                                    : t('queue.count', { n: props.queuedCount ?? 0 })}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                {props.hasPausedQueue && props.onResumeQueue && (
-                                    <button
-                                        type="button"
-                                        className="text-[var(--app-link)] hover:underline"
-                                        onClick={props.onResumeQueue}
-                                    >
-                                        {t('queue.resume')}
-                                    </button>
-                                )}
-                                {props.onClearQueue && (
-                                    <button
-                                        type="button"
-                                        className="text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:underline"
-                                        onClick={props.onClearQueue}
-                                    >
-                                        {t('queue.clear')}
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    )}
 
                     <StatusBar
                         active={active}
