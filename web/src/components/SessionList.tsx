@@ -453,18 +453,6 @@ export function SessionList(props: {
                                         </span>
                                     ) : null}
                                 </div>
-                                <div className="flex items-center gap-2 shrink-0 text-xs">
-                                    {thinkingCount > 0 ? (
-                                        <span className="text-[#007AFF] animate-pulse">
-                                            {t('session.item.thinking')}{thinkingCount > 1 ? ` ${thinkingCount}` : ''}
-                                        </span>
-                                    ) : null}
-                                    {pendingCount > 0 ? (
-                                        <span className="text-[var(--app-badge-warning-text)]">
-                                            {t('session.item.pending')} {pendingCount}
-                                        </span>
-                                    ) : null}
-                                </div>
                             </button>
                             {!isCollapsed ? (
                                 <div className="flex flex-col divide-y divide-[var(--app-divider)] border-b border-[var(--app-divider)]">
