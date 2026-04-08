@@ -201,7 +201,7 @@ export async function claudeRemote(opts: {
                     return;
                 }
                 mode = next.mode;
-                waitingForNewTurn = false;
+                userMessagePushedAt = Date.now();
                 messages.push({ type: 'user', message: { role: 'user', content: next.message } });
                 logger.debug(
                     `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
@@ -233,7 +233,8 @@ export async function claudeRemote(opts: {
         //    user message is pushed (SDK may replay previous tool results when
         //    processing a new user message in --verbose mode)
         let resumeComplete = !startFrom; // If not resuming, already initialized
-        let waitingForNewTurn = false; // true after result, until new user msg is pushed
+        let waitingForNewTurn = false; // true after result, until new turn's real response
+        let userMessagePushedAt = 0; // timestamp when user message was pushed to SDK
 
         for await (const message of response) {
             streamMessageSeq += 1;
@@ -254,10 +255,18 @@ export async function claudeRemote(opts: {
                     await opts.onMessage(message);
                 }
                 // Skip forwarding all other messages (stale assistant/user + stale result)
-            } else if (waitingForNewTurn && message.type !== 'result' && message.type !== 'system') {
-                // Between turns: skip stale SDK replays (tool results from previous turn)
-                // that appear before the new user message is pushed
-                logger.debug(`[claudeRemote] Skipping stale between-turn message: ${message.type}`);
+            } else if (waitingForNewTurn) {
+                if (message.type === 'result' || message.type === 'system') {
+                    await opts.onMessage(message);
+                } else if (userMessagePushedAt > 0 && Date.now() - userMessagePushedAt > 2000) {
+                    // More than 2 seconds since user message was pushed —
+                    // this is a real new response, not a stale replay
+                    waitingForNewTurn = false;
+                    userMessagePushedAt = 0;
+                    await opts.onMessage(message);
+                } else {
+                    logger.debug(`[claudeRemote] Skipping stale between-turn message: ${message.type} (${Date.now() - userMessagePushedAt}ms after push)`);
+                }
             } else {
                 // Forward message to Hub
                 await opts.onMessage(message);
