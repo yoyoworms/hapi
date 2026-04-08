@@ -201,6 +201,7 @@ export async function claudeRemote(opts: {
                     return;
                 }
                 mode = next.mode;
+                waitingForNewTurn = false;
                 messages.push({ type: 'user', message: { role: 'user', content: next.message } });
                 logger.debug(
                     `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
@@ -226,15 +227,13 @@ export async function claudeRemote(opts: {
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
-        // When resuming a session, the SDK outputs:
-        //   1. system/init
-        //   2. Residual assistant messages from the previous turn (stale)
-        //   3. result (previous turn ends)
-        //   4. Waits for new user message
-        //   5. Real new assistant messages
-        // We skip everything before the first result to avoid stale responses
-        // appearing in the chat as if they're replies to the current message.
-        let resumeComplete = !startFrom; // If not resuming, already complete
+        // SDK message filtering:
+        // 1. On resume: skip all messages until the first result (stale history)
+        // 2. Between turns: after a result, skip stale messages until the next
+        //    user message is pushed (SDK may replay previous tool results when
+        //    processing a new user message in --verbose mode)
+        let resumeComplete = !startFrom; // If not resuming, already initialized
+        let waitingForNewTurn = false; // true after result, until new user msg is pushed
 
         for await (const message of response) {
             streamMessageSeq += 1;
@@ -255,6 +254,10 @@ export async function claudeRemote(opts: {
                     await opts.onMessage(message);
                 }
                 // Skip forwarding all other messages (stale assistant/user + stale result)
+            } else if (waitingForNewTurn && message.type !== 'result' && message.type !== 'system') {
+                // Between turns: skip stale SDK replays (tool results from previous turn)
+                // that appear before the new user message is pushed
+                logger.debug(`[claudeRemote] Skipping stale between-turn message: ${message.type}`);
             } else {
                 // Forward message to Hub
                 await opts.onMessage(message);
@@ -304,6 +307,10 @@ export async function claudeRemote(opts: {
                     }
                     isCompactCommand = false;
                 }
+
+                // After result, mark that we're between turns — any messages
+                // before the next user input are stale SDK replays and should be skipped.
+                waitingForNewTurn = true;
 
                 // Send ready event (await to ensure message queue is flushed first)
                 // IMPORTANT: flush messages before updating thinking state to prevent
