@@ -261,7 +261,7 @@ export function useSendMessage(
         const localId = makeClientSideId('local')
         const createdAt = Date.now()
 
-        const busy = mutation.isPending || resolveGuardRef.current || options?.thinking || Boolean(queueState.inFlightLocalId)
+        const busy = mutation.isPending || resolveGuardRef.current
 
         if (busy) {
             // Enqueue and show optimistic bubble with 'queued' status
