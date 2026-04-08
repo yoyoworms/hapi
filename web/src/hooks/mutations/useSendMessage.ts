@@ -219,6 +219,26 @@ export function useSendMessage(
         }
     }, [options?.thinking, sessionId, queueState.inFlightLocalId, clearTurnLock, clearTurnReleaseTimer, drainQueue])
 
+    // On mount, restore optimistic bubbles for any persisted queued messages
+    useEffect(() => {
+        if (!sessionId) return
+        const state = queue.getState(sessionId)
+        for (const item of state.items) {
+            appendOptimisticMessage(sessionId, {
+                id: item.localId,
+                seq: null,
+                localId: item.localId,
+                content: {
+                    role: 'user',
+                    content: { type: 'text', text: item.text, attachments: item.attachments }
+                },
+                createdAt: item.createdAt,
+                status: 'queued',
+                originalText: item.text,
+            })
+        }
+    }, [sessionId])
+
     // Also try draining on mount/reconnect once the queue exists and the session is idle.
     useEffect(() => {
         if (queuedCount > 0) {
