@@ -210,6 +210,17 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 }
             }
 
+            // Skip "No response requested." sentinel messages from SDK
+            if (msg.type === 'assistant') {
+                const content = (msg as any)?.message?.content;
+                if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text') {
+                    const text = content[0].text?.trim();
+                    if (text === 'No response requested.' || text === 'No response requested') {
+                        return;
+                    }
+                }
+            }
+
             const logMessage = sdkToLogConverter.convert(msg);
             if (logMessage) {
                 // Skip user text messages echoed back by SDK — these are already stored

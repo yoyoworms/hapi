@@ -226,9 +226,6 @@ export async function claudeRemote(opts: {
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
-        // On resume: skip all messages until the first result (stale history replay)
-        let resumeComplete = !startFrom; // If not resuming, already initialized
-
         for await (const message of response) {
             streamMessageSeq += 1;
             logger.debug(
@@ -237,21 +234,8 @@ export async function claudeRemote(opts: {
             );
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
 
-            // During resume: skip all messages until the first result (end of previous turn)
-            if (!resumeComplete) {
-                if (message.type === 'result') {
-                    resumeComplete = true;
-                    logger.debug('[claudeRemote] Resume complete - first result received, forwarding messages from now on');
-                    // Fall through to process result (usage, nextMessage) but don't forward to Hub
-                } else if (message.type === 'system') {
-                    // Forward system messages (init event needed for session setup)
-                    await opts.onMessage(message);
-                }
-                // Skip forwarding all other messages (stale assistant/user + stale result)
-            } else {
-                // Forward message to Hub
-                await opts.onMessage(message);
-            }
+            // Forward message to Hub
+            await opts.onMessage(message);
 
             // Handle special system messages
             if (message.type === 'system' && message.subtype === 'init') {
