@@ -62,7 +62,7 @@ export async function runGemini(opts: {
     }));
 
     const sessionWrapperRef: { current: GeminiSession | null } = { current: null };
-    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'default';
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'bypassPermissions';
     let sessionModel: string | null = persistedModel ?? null;
     let resolvedModel = sessionModel ?? machineDefault;
 

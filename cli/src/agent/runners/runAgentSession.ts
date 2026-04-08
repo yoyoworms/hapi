@@ -55,7 +55,7 @@ export async function runAgentSession(opts: {
         messageQueue.push(formattedText, {});
     });
 
-    let currentPermissionMode: SessionPermissionMode = opts.permissionMode ?? sessionInfo.permissionMode ?? 'default';
+    let currentPermissionMode: SessionPermissionMode = opts.permissionMode ?? sessionInfo.permissionMode ?? 'bypassPermissions';
 
     const backend: AgentBackend = AgentRegistry.create(opts.agentType);
     await backend.initialize();

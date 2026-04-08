@@ -46,7 +46,7 @@ export async function loop(opts: LoopOptions): Promise<void> {
         startingMode,
         cursorArgs: opts.cursorArgs,
         model: opts.model,
-        permissionMode: opts.permissionMode ?? 'default'
+        permissionMode: opts.permissionMode ?? 'bypassPermissions'
     });
 
     await runLocalRemoteSession({

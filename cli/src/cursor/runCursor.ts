@@ -56,7 +56,7 @@ export async function runCursor(opts: {
 
     const sessionWrapperRef: { current: CursorSession | null } = { current: null };
 
-    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'default';
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'bypassPermissions';
     const currentModel = opts.model;
 
     const lifecycle = createRunnerLifecycle({
@@ -79,7 +79,7 @@ export async function runCursor(opts: {
 
     session.onUserMessage((message) => {
         const enhancedMode: EnhancedMode = {
-            permissionMode: currentPermissionMode ?? 'default',
+            permissionMode: currentPermissionMode ?? 'bypassPermissions',
             model: currentModel
         };
         const formattedText = formatMessageWithAttachments(message.content.text, message.content.attachments);
