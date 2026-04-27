@@ -20,7 +20,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               <div className="h-8 w-8 rounded-lg bg-primary flex items-center justify-center border-2 border-border shadow-hard-sm group-hover:translate-y-0.5 group-hover:shadow-none transition-all">
                 <span className="text-primary-foreground font-bold text-lg">H</span>
               </div>
-              <span className="font-bold text-xl tracking-tight">HAPI</span>
+              <span className="font-bold text-xl tracking-tight">LXAPI</span>
             </Link>
           </div>
 
@@ -79,7 +79,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 <div className="h-8 w-8 rounded-lg bg-primary flex items-center justify-center border-2 border-border shadow-hard-sm">
                   <span className="text-primary-foreground font-bold text-lg">H</span>
                 </div>
-                <span className="font-bold text-xl tracking-tight">HAPI</span>
+                <span className="font-bold text-xl tracking-tight">LXAPI</span>
               </div>
               <p className="text-muted-foreground text-sm max-w-xs leading-relaxed" dangerouslySetInnerHTML={{ __html: t('footer.desc') }} />
             </div>

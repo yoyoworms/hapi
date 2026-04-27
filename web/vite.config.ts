@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const base = process.env.VITE_BASE_URL || '/'
+const manifestBase = base.endsWith('/') ? base : `${base}/`
 const hubTarget = process.env.VITE_HUB_PROXY || 'http://127.0.0.1:3006'
 
 function getBuildNumber(): number {
@@ -72,15 +73,20 @@ export default defineConfig({
             srcDir: 'src',
             filename: 'sw.ts',
             manifest: {
-                name: 'HAPI',
-                short_name: 'HAPI',
+                id: manifestBase,
+                name: 'LXAPI',
+                short_name: 'LXAPI',
                 description: 'AI-powered development assistant',
                 theme_color: '#ffffff',
                 background_color: '#ffffff',
                 display: 'standalone',
+                display_override: ['standalone', 'browser'],
                 orientation: 'portrait',
-                scope: base,
-                start_url: base,
+                scope: manifestBase,
+                start_url: manifestBase,
+                launch_handler: {
+                    client_mode: ['navigate-existing', 'auto']
+                },
                 icons: [
                     {
                         src: 'pwa-64x64.png',

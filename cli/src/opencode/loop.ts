@@ -39,7 +39,7 @@ export async function opencodeLoop(opts: OpencodeLoopOptions): Promise<void> {
         mode: startingMode,
         startedBy,
         startingMode,
-        permissionMode: opts.permissionMode ?? 'bypassPermissions'
+        permissionMode: opts.permissionMode ?? 'yolo'
     });
 
     if (opts.resumeSessionId) {

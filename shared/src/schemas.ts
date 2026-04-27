@@ -158,6 +158,23 @@ export const DecryptedMessageSchema = z.object({
 
 export type DecryptedMessage = z.infer<typeof DecryptedMessageSchema>
 
+export const AgentAccountLimitSchema = z.object({
+    remainingMs: z.number().nullable().optional(),
+    remainingPercent: z.number().nullable().optional(),
+    resetAt: z.number().nullable().optional()
+})
+
+export const AgentAccountStatusSchema = z.object({
+    provider: z.string(),
+    accountLabel: z.string().nullable().optional(),
+    window: AgentAccountLimitSchema.nullable().optional(),
+    weekly: AgentAccountLimitSchema.nullable().optional(),
+    updatedAt: z.number()
+})
+
+export type AgentAccountLimit = z.infer<typeof AgentAccountLimitSchema>
+export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>
+
 export const SessionSchema = z.object({
     id: z.string(),
     namespace: z.string(),
@@ -182,7 +199,8 @@ export const SessionSchema = z.object({
         totalCostUsd: z.number(),
         totalInputTokens: z.number(),
         totalOutputTokens: z.number()
-    }).nullable().optional()
+    }).nullable().optional(),
+    accountStatus: AgentAccountStatusSchema.nullable().optional()
 })
 
 export type Session = z.infer<typeof SessionSchema>

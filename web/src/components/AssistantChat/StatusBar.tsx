@@ -5,12 +5,13 @@ import {
     isPermissionModeAllowedForFlavor
 } from '@hapi/protocol'
 import type { PermissionModeTone } from '@hapi/protocol'
-import { useMemo } from 'react'
-import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import { useEffect, useMemo, useState } from 'react'
+import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode, UsageResponse } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { getClaudeModelLabel } from '@hapi/protocol'
 import { useTranslation } from '@/lib/use-translation'
+import { useAppContext } from '@/lib/app-context'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -121,12 +122,97 @@ function formatCost(cost: number): string {
     return `$${cost.toFixed(2)}`
 }
 
+function formatDuration(ms: number | null | undefined): string | null {
+    if (ms === null || ms === undefined || !Number.isFinite(ms)) return null
+    const hours = Math.max(0, Math.floor(ms / 3_600_000))
+    if (hours >= 24) {
+        const days = Math.floor(hours / 24)
+        const remainingHours = hours % 24
+        return remainingHours > 0 ? `${days}d${remainingHours}h` : `${days}d`
+    }
+    if (hours > 0) return `${hours}h`
+    const minutes = Math.max(0, Math.floor(ms / 60_000))
+    return `${minutes}m`
+}
+
+function formatReset(resetAt: number | null | undefined): string | null {
+    if (!resetAt) return null
+    return new Date(resetAt).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    })
+}
+
+function formatLimit(limit: AgentAccountStatus['window']): string | null {
+    if (!limit) return null
+    const duration = formatDuration(limit.remainingMs ?? (limit.resetAt ? limit.resetAt - Date.now() : null))
+    const pct = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
+        ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
+        : null
+    if (duration && pct) return `${duration} ${pct}`
+    return duration ?? pct
+}
+
+function accountStatusFromClaudeUsage(usage: UsageResponse | null): AgentAccountStatus | null {
+    if (!usage) return null
+    const toLimit = (entry: { utilization: number; resets_at: string } | null) => {
+        if (!entry) return null
+        const resetAt = Date.parse(entry.resets_at)
+        return {
+            resetAt: Number.isFinite(resetAt) ? resetAt : null,
+            remainingMs: Number.isFinite(resetAt) ? Math.max(0, resetAt - Date.now()) : null,
+            remainingPercent: Math.max(0, Math.min(100, 100 - entry.utilization))
+        }
+    }
+    return {
+        provider: 'claude',
+        accountLabel: usage.accountLabel ?? usage.subscriptionType ?? null,
+        window: toLimit(usage.five_hour),
+        weekly: toLimit(usage.seven_day ?? usage.seven_day_sonnet ?? usage.seven_day_opus),
+        updatedAt: Date.now()
+    }
+}
+
+function useClaudeAccountStatus(enabled: boolean): AgentAccountStatus | null {
+    const { api } = useAppContext()
+    const [status, setStatus] = useState<AgentAccountStatus | null>(null)
+
+    useEffect(() => {
+        if (!enabled || !api) {
+            setStatus(null)
+            return
+        }
+
+        let cancelled = false
+        const load = async () => {
+            try {
+                const usage = await api.getUsage()
+                if (!cancelled) setStatus(accountStatusFromClaudeUsage(usage))
+            } catch {
+                if (!cancelled) setStatus(null)
+            }
+        }
+
+        void load()
+        const timer = window.setInterval(load, 120_000)
+        return () => {
+            cancelled = true
+            window.clearInterval(timer)
+        }
+    }, [api, enabled])
+
+    return status
+}
+
 export function StatusBar(props: {
     active: boolean
     thinking: boolean
     agentState: AgentState | null | undefined
     contextSize?: number
     usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
+    accountStatus?: AgentAccountStatus | null
     model?: string | null
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
@@ -135,6 +221,7 @@ export function StatusBar(props: {
     onModelChange?: (model: string | null) => void
 }) {
     const { t } = useTranslation()
+    const claudeAccountStatus = useClaudeAccountStatus(props.agentFlavor === 'claude')
     const connectionStatus = useMemo(
         () => getConnectionStatus(props.active, props.thinking, props.agentState, props.voiceStatus, t),
         [props.active, props.thinking, props.agentState, props.voiceStatus, t]
@@ -166,6 +253,19 @@ export function StatusBar(props: {
     const collaborationModeLabel = displayCollaborationMode
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
+    const accountStatus = props.agentFlavor === 'claude'
+        ? claudeAccountStatus ?? props.accountStatus ?? null
+        : props.accountStatus ?? null
+    const accountLimitText = accountStatus
+        ? [formatLimit(accountStatus.window), formatLimit(accountStatus.weekly)].filter(Boolean).join(' · ')
+        : ''
+    const accountTitle = accountStatus
+        ? [
+            accountStatus.accountLabel ? `Account: ${accountStatus.accountLabel}` : null,
+            accountStatus.window?.resetAt ? `Window reset: ${formatReset(accountStatus.window.resetAt)}` : null,
+            accountStatus.weekly?.resetAt ? `Weekly reset: ${formatReset(accountStatus.weekly.resetAt)}` : null
+        ].filter(Boolean).join('\n')
+        : undefined
 
     return (
         <div className="flex items-center justify-between px-2 pb-1">
@@ -186,6 +286,11 @@ export function StatusBar(props: {
             </div>
 
             <div className="flex items-center gap-2">
+                {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
+                    <span className="max-w-[42vw] truncate text-[10px] text-[var(--app-hint)]" title={accountTitle}>
+                        {accountStatus.accountLabel ? `${accountStatus.accountLabel} ` : ''}{accountLimitText}
+                    </span>
+                ) : null}
                 {props.usage ? (
                     <span className="text-[10px] text-[var(--app-hint)]">
                         {formatCost(props.usage.totalCostUsd)}

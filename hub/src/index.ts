@@ -180,13 +180,15 @@ async function main() {
         onSessionAlive: (payload) => syncEngine?.handleSessionAlive(payload),
         onSessionEnd: (payload) => syncEngine?.handleSessionEnd(payload),
         onSessionUsage: (payload) => syncEngine?.handleSessionUsage(payload),
+        onSessionAccountStatus: (payload) => syncEngine?.handleSessionAccountStatus(payload),
+        onSessionMetadataUpdated: (payload) => void syncEngine?.handleSessionMetadataUpdated(payload),
         onMachineAlive: (payload) => syncEngine?.handleMachineAlive(payload)
     })
 
     syncEngine = new SyncEngine(store, socketServer.io, socketServer.rpcRegistry, sseManager)
 
     const notificationChannels: NotificationChannel[] = [
-        new PushNotificationChannel(pushService, sseManager, visibilityTracker, config.publicUrl)
+        new PushNotificationChannel(pushService, sseManager, config.publicUrl)
     ]
 
     // Initialize Telegram bot (optional)
@@ -212,6 +214,7 @@ async function main() {
         getVisibilityTracker: () => visibilityTracker,
         jwtSecret,
         store,
+        pushService,
         vapidPublicKey: vapidKeys.publicKey,
         socketEngine: socketServer.engine,
         corsOrigins,

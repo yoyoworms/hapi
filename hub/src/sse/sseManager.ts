@@ -70,13 +70,17 @@ export class SSEManager {
         }
     }
 
-    async sendToast(namespace: string, event: Extract<SyncEvent, { type: 'toast' }>): Promise<number> {
+    async sendToast(
+        namespace: string,
+        event: Extract<SyncEvent, { type: 'toast' }>,
+        options?: { includeHidden?: boolean }
+    ): Promise<number> {
         const deliveries: Array<Promise<{ id: string; ok: boolean }>> = []
         for (const connection of this.connections.values()) {
             if (connection.namespace !== namespace) {
                 continue
             }
-            if (!this.visibilityTracker.isVisibleConnection(connection.id)) {
+            if (!options?.includeHidden && !this.visibilityTracker.isVisibleConnection(connection.id)) {
                 continue
             }
 

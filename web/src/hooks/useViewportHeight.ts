@@ -23,6 +23,18 @@ export function useViewportHeight(): void {
         if (!viewport) return
 
         const root = document.documentElement
+        const isMobileStandalone = root.dataset.mobileStandaloneApp === 'true'
+        let rafId: number | null = null
+        const focusTimers: number[] = []
+
+        function resetWindowScroll() {
+            if (!isMobileStandalone) {
+                return
+            }
+            if (window.scrollX !== 0 || window.scrollY !== 0) {
+                window.scrollTo(0, 0)
+            }
+        }
 
         function update() {
             if (!viewport) return
@@ -35,12 +47,46 @@ export function useViewportHeight(): void {
             } else {
                 root.style.removeProperty('--app-viewport-height')
             }
+            resetWindowScroll()
         }
 
-        viewport.addEventListener('resize', update)
+        function scheduleUpdate() {
+            if (rafId !== null) {
+                return
+            }
+            rafId = window.requestAnimationFrame(() => {
+                rafId = null
+                update()
+            })
+        }
+
+        function scheduleFocusUpdates() {
+            scheduleUpdate()
+            focusTimers.push(window.setTimeout(scheduleUpdate, 50))
+            focusTimers.push(window.setTimeout(scheduleUpdate, 250))
+        }
+
+        update()
+        viewport.addEventListener('resize', scheduleUpdate)
+        viewport.addEventListener('scroll', scheduleUpdate)
+        window.addEventListener('resize', scheduleUpdate)
+        window.addEventListener('orientationchange', scheduleFocusUpdates)
+        document.addEventListener('focusin', scheduleFocusUpdates)
+        document.addEventListener('focusout', scheduleFocusUpdates)
 
         return () => {
-            viewport.removeEventListener('resize', update)
+            viewport.removeEventListener('resize', scheduleUpdate)
+            viewport.removeEventListener('scroll', scheduleUpdate)
+            window.removeEventListener('resize', scheduleUpdate)
+            window.removeEventListener('orientationchange', scheduleFocusUpdates)
+            document.removeEventListener('focusin', scheduleFocusUpdates)
+            document.removeEventListener('focusout', scheduleFocusUpdates)
+            if (rafId !== null) {
+                window.cancelAnimationFrame(rafId)
+            }
+            for (const timer of focusTimers) {
+                window.clearTimeout(timer)
+            }
             root.style.removeProperty('--app-viewport-height')
         }
     }, [])

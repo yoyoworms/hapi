@@ -104,6 +104,18 @@ body {
     -webkit-text-size-adjust: 100%;
 }
 
+html[data-mobile-standalone-app="true"],
+html[data-mobile-standalone-app="true"] body {
+    overflow: hidden;
+}
+
+html[data-mobile-standalone-app="true"] body {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: var(--app-viewport-height, 100dvh);
+}
+
 html[data-telegram-app="true"],
 html[data-telegram-app="true"] body {
     overflow: hidden;

@@ -21,6 +21,8 @@ export type MessageWindowState = {
 export const VISIBLE_WINDOW_SIZE = 400
 export const PENDING_WINDOW_SIZE = 200
 const PAGE_SIZE = 50
+const MIN_INITIAL_VISIBLE_MESSAGES = 8
+const MAX_INITIAL_HISTORY_PAGES = 4
 const PENDING_OVERFLOW_WARNING = 'New messages arrived while you were away. Scroll to bottom to refresh.'
 
 type InternalState = MessageWindowState & {
@@ -113,6 +115,29 @@ function countVisiblePendingMessages(sessionId: string, messages: DecryptedMessa
         }
     }
     return count
+}
+
+function countVisibleMessages(messages: DecryptedMessage[]): number {
+    let count = 0
+    for (const message of messages) {
+        if (normalizeDecryptedMessage(message) !== null) {
+            count += 1
+        }
+    }
+    return count
+}
+
+function getOldestSeq(messages: DecryptedMessage[]): number | null {
+    let oldestSeq: number | null = null
+    for (const message of messages) {
+        if (typeof message.seq !== 'number') {
+            continue
+        }
+        if (oldestSeq === null || message.seq < oldestSeq) {
+            oldestSeq = message.seq
+        }
+    }
+    return oldestSeq
 }
 
 function syncPendingVisibilityCache(sessionId: string, pending: DecryptedMessage[]): void {
@@ -380,7 +405,7 @@ export async function fetchLatestMessages(api: ApiClient, sessionId: string, opt
         const useIncremental = options?.incremental && initial.newestSeq !== null && initial.newestSeq > 0
         const response = useIncremental
             ? await api.getMessages(sessionId, { afterSeq: initial.newestSeq!, limit: PAGE_SIZE })
-            : await api.getMessages(sessionId, { limit: PAGE_SIZE, beforeSeq: null })
+            : await fetchLatestMessagesWithVisibleHistory(api, sessionId)
 
         updateState(sessionId, (prev) => {
             if (prev.atBottom) {
@@ -410,6 +435,42 @@ export async function fetchLatestMessages(api: ApiClient, sessionId: string, opt
     } catch (error) {
         const message = error instanceof Error ? error.message : 'Failed to load messages'
         updateState(sessionId, (prev) => buildState(prev, { isLoading: false, warning: message }))
+    }
+}
+
+async function fetchLatestMessagesWithVisibleHistory(api: ApiClient, sessionId: string): ReturnType<ApiClient['getMessages']> {
+    let response = await api.getMessages(sessionId, { limit: PAGE_SIZE, beforeSeq: null })
+    let messages = response.messages
+    let page = response.page
+    let pagesLoaded = 1
+
+    while (
+        page.hasMore
+        && pagesLoaded < MAX_INITIAL_HISTORY_PAGES
+        && countVisibleMessages(messages) < MIN_INITIAL_VISIBLE_MESSAGES
+    ) {
+        const beforeSeq = getOldestSeq(messages)
+        if (beforeSeq === null) {
+            break
+        }
+
+        const older = await api.getMessages(sessionId, { limit: PAGE_SIZE, beforeSeq })
+        messages = mergeMessages(older.messages, messages)
+        page = older.page
+        pagesLoaded += 1
+
+        if (older.messages.length === 0) {
+            break
+        }
+    }
+
+    return {
+        messages,
+        page: {
+            ...response.page,
+            nextBeforeSeq: page.nextBeforeSeq,
+            hasMore: page.hasMore,
+        }
     }
 }
 

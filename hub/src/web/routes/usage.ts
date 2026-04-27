@@ -15,6 +15,7 @@ export interface UsageData {
     } | null
     subscriptionType?: string
     rateLimitTier?: string
+    accountLabel?: string | null
 }
 
 type CachedUsageEntry = {

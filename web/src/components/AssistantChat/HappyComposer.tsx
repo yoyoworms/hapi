@@ -110,6 +110,7 @@ export function HappyComposer(props: {
     agentState?: AgentState | null
     contextSize?: number
     usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
+    accountStatus?: import('@/types/api').Session['accountStatus']
     controlledByUser?: boolean
     agentFlavor?: string | null
     onCollaborationModeChange?: (mode: CodexCollaborationMode) => void
@@ -559,7 +560,7 @@ export function HappyComposer(props: {
             const attIds = attachments.map(a => a.id)
             for (const id of attIds) {
                 uploadedAttachmentPaths.delete(id)
-                try { api.composer().removeAttachment(id) } catch {}
+                try { (api.composer() as unknown as { removeAttachment?: (id: string) => void }).removeAttachment?.(id) } catch {}
             }
             // Fallback: reset the entire composer if attachments persist
             try { api.composer().reset() } catch {}
@@ -791,6 +792,7 @@ export function HappyComposer(props: {
                         agentState={agentState}
                         contextSize={contextSize}
                         usage={props.usage}
+                        accountStatus={props.accountStatus}
                         model={model}
                         permissionMode={permissionMode}
                         collaborationMode={collaborationMode}

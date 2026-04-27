@@ -52,7 +52,7 @@ export async function loop(opts: LoopOptions): Promise<void> {
         startingMode,
         codexArgs: opts.codexArgs,
         codexCliOverrides: opts.codexCliOverrides,
-        permissionMode: opts.permissionMode ?? 'bypassPermissions',
+        permissionMode: opts.permissionMode ?? 'yolo',
         model: opts.model,
         collaborationMode: opts.collaborationMode ?? 'default'
     });

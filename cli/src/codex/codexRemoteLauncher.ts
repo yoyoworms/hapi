@@ -16,6 +16,8 @@ import { AppServerEventConverter } from './utils/appServerEventConverter';
 import { registerAppServerPermissionHandlers } from './utils/appServerPermissionAdapter';
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
+import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
+import type { AgentAccountStatus } from '@hapi/protocol/types';
 import {
     RemoteLauncherBase,
     type RemoteLauncherDisplayContext,
@@ -24,6 +26,29 @@ import {
 
 type HappyServer = Awaited<ReturnType<typeof buildHapiMcpBridge>>['server'];
 type QueuedMessage = { message: string; mode: EnhancedMode; isolate: boolean; hash: string };
+type TurnCompletion = { promise: Promise<void>; resolve: () => void };
+
+function createTurnCompletion(signal: AbortSignal): TurnCompletion {
+    let resolve!: () => void;
+    let settled = false;
+    let cleanup: (() => void) | null = null;
+    const promise = new Promise<void>((r) => {
+        resolve = () => {
+            if (settled) return;
+            settled = true;
+            cleanup?.();
+            r();
+        };
+    });
+    const onAbort = () => resolve();
+    cleanup = () => signal.removeEventListener('abort', onAbort);
+    if (signal.aborted) {
+        resolve();
+    } else {
+        signal.addEventListener('abort', onAbort, { once: true });
+    }
+    return { promise, resolve };
+}
 
 class CodexRemoteLauncher extends RemoteLauncherBase {
     private readonly session: CodexSession;
@@ -233,6 +258,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const diffProcessor = new DiffProcessor((message) => {
             session.sendAgentMessage(message);
         });
+        const emptyCompletionNoticeTracker = new EmptyCompletionNoticeTracker();
         this.permissionHandler = permissionHandler;
         this.reasoningProcessor = reasoningProcessor;
         this.diffProcessor = diffProcessor;
@@ -241,6 +267,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         let clearReadyAfterTurnTimer: (() => void) | null = null;
         let turnInFlight = false;
         let allowAnonymousTerminalEvent = false;
+        let turnCompletion: TurnCompletion | null = null;
+
+        const resolveTurnCompletion = () => {
+            const completion = turnCompletion;
+            turnCompletion = null;
+            completion?.resolve();
+        };
 
         const handleCodexEvent = (msg: Record<string, unknown>) => {
             const msgType = asString(msg.type);
@@ -258,6 +291,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
 
             if (msgType === 'task_started') {
+                emptyCompletionNoticeTracker.onTaskStarted();
                 const turnId = eventTurnId;
                 if (turnId) {
                     this.currentTurnId = turnId;
@@ -283,6 +317,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 }
                 this.currentTurnId = null;
                 allowAnonymousTerminalEvent = false;
+                resolveTurnCompletion();
             }
 
             if (msgType === 'agent_message') {
@@ -363,6 +398,11 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'agent_message') {
                 const message = asString(msg.message);
                 if (message) {
+                    emptyCompletionNoticeTracker.onConvertedMessage({
+                        type: 'message',
+                        message,
+                        id: randomUUID()
+                    });
                     session.sendAgentMessage({
                         type: 'message',
                         message,
@@ -378,6 +418,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     delete inputs.call_id;
                     delete inputs.callId;
 
+                    emptyCompletionNoticeTracker.onConvertedMessage({
+                        type: 'tool-call',
+                        name: 'CodexBash',
+                        callId,
+                        input: inputs,
+                        id: randomUUID()
+                    });
                     session.sendAgentMessage({
                         type: 'tool-call',
                         name: 'CodexBash',
@@ -395,6 +442,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     delete output.call_id;
                     delete output.callId;
 
+                    emptyCompletionNoticeTracker.onConvertedMessage({
+                        type: 'tool-call-result',
+                        callId,
+                        output,
+                        id: randomUUID()
+                    });
                     session.sendAgentMessage({
                         type: 'tool-call-result',
                         callId: callId,
@@ -403,11 +456,26 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     });
                 }
             }
+            if (msgType === 'task_complete') {
+                const notice = emptyCompletionNoticeTracker.maybeCreateNotice(msg);
+                if (notice) {
+                    session.sendAgentMessage(notice);
+                }
+            }
             if (msgType === 'token_count') {
                 session.sendAgentMessage({
                     ...msg,
                     id: randomUUID()
                 });
+            }
+            if (msgType === 'account_status') {
+                const accountStatus = asRecord(msg.accountStatus);
+                if (accountStatus) {
+                    session.sendSessionEvent({
+                        type: 'account-status',
+                        accountStatus: accountStatus as AgentAccountStatus
+                    });
+                }
             }
             if (msgType === 'patch_apply_begin') {
                 const callId = asString(msg.call_id ?? msg.callId);
@@ -689,8 +757,11 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 });
                 turnInFlight = true;
                 allowAnonymousTerminalEvent = false;
+                const turnSignal = this.abortController.signal;
+                const activeTurnCompletion = createTurnCompletion(turnSignal);
+                turnCompletion = activeTurnCompletion;
                 const turnResponse = await appServerClient.startTurn(turnParams, {
-                    signal: this.abortController.signal
+                    signal: turnSignal
                 });
                 const turnRecord = asRecord(turnResponse);
                 const turn = turnRecord ? asRecord(turnRecord.turn) : null;
@@ -700,12 +771,15 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 } else if (!this.currentTurnId) {
                     allowAnonymousTerminalEvent = true;
                 }
+
+                await activeTurnCompletion.promise;
             } catch (error) {
                 logger.warn('Error in codex session:', error);
                 const isAbortError = error instanceof Error && error.name === 'AbortError';
                 turnInFlight = false;
                 allowAnonymousTerminalEvent = false;
                 this.currentTurnId = null;
+                resolveTurnCompletion();
 
                 if (isAbortError) {
                     messageBuffer.addMessage('Aborted by user', 'status');

@@ -5,7 +5,10 @@ import type { EnhancedMode } from './loop';
 const harness = vi.hoisted(() => ({
     notifications: [] as Array<{ method: string; params: unknown }>,
     registerRequestCalls: [] as string[],
-    initializeCalls: [] as unknown[]
+    initializeCalls: [] as unknown[],
+    startTurnCalls: [] as unknown[],
+    manualTurns: false,
+    turnResolvers: [] as Array<() => void>
 }));
 
 vi.mock('./codexAppServerClient', () => {
@@ -35,10 +38,23 @@ vi.mock('./codexAppServerClient', () => {
             return { thread: { id: 'thread-anonymous' }, model: 'gpt-5.4' };
         }
 
-        async startTurn(): Promise<{ turn: Record<string, never> }> {
+        async startTurn(params?: unknown): Promise<{ turn: Record<string, never> }> {
+            harness.startTurnCalls.push(params);
             const started = { turn: {} };
             harness.notifications.push({ method: 'turn/started', params: started });
             this.notificationHandler?.('turn/started', started);
+
+            if (harness.manualTurns) {
+                await new Promise<void>((resolve) => {
+                    harness.turnResolvers.push(() => {
+                        const completed = { status: 'Completed', turn: {} };
+                        harness.notifications.push({ method: 'turn/completed', params: completed });
+                        this.notificationHandler?.('turn/completed', completed);
+                        resolve();
+                    });
+                });
+                return { turn: {} };
+            }
 
             const completed = { status: 'Completed', turn: {} };
             harness.notifications.push({ method: 'turn/completed', params: completed });
@@ -80,10 +96,12 @@ function createMode(): EnhancedMode {
     };
 }
 
-function createSessionStub() {
+function createSessionStub(options?: { closeQueue?: boolean }) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
     queue.push('hello from launcher test', createMode());
-    queue.close();
+    if (options?.closeQueue !== false) {
+        queue.close();
+    }
 
     const sessionEvents: Array<{ type: string; [key: string]: unknown }> = [];
     const codexMessages: unknown[] = [];
@@ -168,6 +186,9 @@ describe('codexRemoteLauncher', () => {
         harness.notifications = [];
         harness.registerRequestCalls = [];
         harness.initializeCalls = [];
+        harness.startTurnCalls = [];
+        harness.manualTurns = false;
+        harness.turnResolvers = [];
     });
 
     it('finishes a turn and emits ready when task lifecycle events omit turn_id', async () => {
@@ -197,5 +218,24 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(thinkingChanges).toContain(true);
         expect(session.thinking).toBe(false);
+    });
+
+    it('does not start a queued second turn until the first turn completes', async () => {
+        harness.manualTurns = true;
+        const { session } = createSessionStub({ closeQueue: false });
+
+        const launchPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnCalls.length).toBe(1));
+
+        session.queue.push('second message while first turn is active', createMode());
+        await new Promise(resolve => setTimeout(resolve, 20));
+        expect(harness.startTurnCalls.length).toBe(1);
+
+        harness.turnResolvers.shift()?.();
+        await vi.waitFor(() => expect(harness.startTurnCalls.length).toBe(2));
+        harness.turnResolvers.shift()?.();
+        session.queue.close();
+
+        await expect(launchPromise).resolves.toBe('exit');
     });
 });

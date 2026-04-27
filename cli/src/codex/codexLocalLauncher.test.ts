@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const harness = vi.hoisted(() => ({
     launches: [] as Array<Record<string, unknown>>,
     sessionScannerCalls: [] as Array<Record<string, unknown>>,
+    resolveActiveSessionCalls: 0,
+    launcherExitReason: 'exit' as 'exit' | 'switch',
     scannerFailureMessage: 'No Codex session found within 120000ms for cwd c:\\workspace\\project; refusing fallback.'
 }));
 
@@ -30,6 +32,10 @@ vi.mock('./utils/codexSessionScanner', () => ({
         return {
             cleanup: async () => {},
             onNewSession: () => {},
+            resolveActiveSession: async () => {
+                harness.resolveActiveSessionCalls += 1;
+                return null;
+            },
             triggerFailure: () => {
                 opts.onSessionMatchFailed?.(harness.scannerFailureMessage);
             }
@@ -45,9 +51,9 @@ vi.mock('@/modules/common/launcher/BaseLocalLauncher', () => ({
 
         constructor(private readonly opts: { launch: (signal: AbortSignal) => Promise<void> }) {}
 
-        async run(): Promise<'exit'> {
+        async run(): Promise<'exit' | 'switch'> {
             await this.opts.launch(new AbortController().signal);
-            return 'exit';
+            return harness.launcherExitReason;
         }
     }
 }));
@@ -99,6 +105,8 @@ describe('codexLocalLauncher', () => {
     afterEach(() => {
         harness.launches = [];
         harness.sessionScannerCalls = [];
+        harness.resolveActiveSessionCalls = 0;
+        harness.launcherExitReason = 'exit';
     });
 
     it('rebuilds approval and sandbox args from yolo mode', async () => {
@@ -185,5 +193,14 @@ describe('codexLocalLauncher', () => {
             type: 'message',
             message: `${harness.scannerFailureMessage} Keeping local Codex running; remote transcript sync may be unavailable for this launch.`
         });
+    });
+
+    it('resolves a pending Codex session before switching to remote', async () => {
+        harness.launcherExitReason = 'switch';
+        const { session } = createSessionStub('yolo');
+
+        await codexLocalLauncher(session as never);
+
+        expect(harness.resolveActiveSessionCalls).toBe(1);
     });
 });

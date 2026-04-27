@@ -54,7 +54,7 @@ export async function runCodex(opts: {
     const codexCliOverrides = parseCodexCliOverrides(opts.codexArgs);
     const sessionWrapperRef: { current: CodexSession | null } = { current: null };
 
-    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'bypassPermissions';
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'yolo';
     let currentModel = opts.model;
     const currentModelReasoningEffort = opts.modelReasoningEffort;
     let currentCollaborationMode: EnhancedMode['collaborationMode'] = 'default';
@@ -109,7 +109,7 @@ export async function runCodex(opts: {
         );
 
         const enhancedMode: EnhancedMode = {
-            permissionMode: messagePermissionMode ?? 'bypassPermissions',
+            permissionMode: messagePermissionMode ?? 'yolo',
             model: currentModel,
             modelReasoningEffort: currentModelReasoningEffort,
             collaborationMode: currentCollaborationMode

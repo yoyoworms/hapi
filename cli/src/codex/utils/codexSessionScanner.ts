@@ -9,8 +9,11 @@ interface CodexSessionScannerOptions {
     sessionId: string | null;
     onEvent: (event: CodexSessionEvent) => void;
     onSessionFound?: (sessionId: string) => void;
+    shouldImportHistory?: (sessionId: string) => boolean;
+    onHistoryImported?: (sessionId: string) => void;
     onSessionMatchFailed?: (message: string) => void;
     cwd?: string;
+    sessionMatchToken?: string;
     startupTimestampMs?: number;
     sessionStartWindowMs?: number;
 }
@@ -18,6 +21,7 @@ interface CodexSessionScannerOptions {
 interface CodexSessionScanner {
     cleanup: () => Promise<void>;
     onNewSession: (sessionId: string) => void;
+    resolveActiveSession: () => Promise<string | null>;
 }
 
 type PendingEvents = {
@@ -41,7 +45,8 @@ export async function createCodexSessionScanner(opts: CodexSessionScannerOptions
         opts.onSessionMatchFailed?.(message);
         return {
             cleanup: async () => {},
-            onNewSession: () => {}
+            onNewSession: () => {},
+            resolveActiveSession: async () => null
         };
     }
 
@@ -54,6 +59,9 @@ export async function createCodexSessionScanner(opts: CodexSessionScannerOptions
         },
         onNewSession: (sessionId: string) => {
             scanner.onNewSession(sessionId);
+        },
+        resolveActiveSession: async () => {
+            return await scanner.resolveActiveSession();
         }
     };
 }
@@ -62,14 +70,19 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
     private readonly sessionsRoot: string;
     private readonly onEvent: (event: CodexSessionEvent) => void;
     private readonly onSessionFound?: (sessionId: string) => void;
+    private readonly shouldImportHistory?: (sessionId: string) => boolean;
+    private readonly onHistoryImported?: (sessionId: string) => void;
     private readonly onSessionMatchFailed?: (message: string) => void;
     private readonly sessionIdByFile = new Map<string, string>();
     private readonly sessionCwdByFile = new Map<string, string>();
     private readonly sessionTimestampByFile = new Map<string, number>();
+    private readonly sessionMatchTokenByFile = new Map<string, string>();
     private readonly pendingEventsByFile = new Map<string, PendingEvents>();
+    private readonly historyEventsByFile = new Map<string, PendingEvents>();
     private readonly sessionMetaParsed = new Set<string>();
     private readonly fileEpochByPath = new Map<string, number>();
     private readonly targetCwd: string | null;
+    private readonly sessionMatchToken: string | null;
     private readonly referenceTimestampMs: number;
     private readonly sessionStartWindowMs: number;
     private readonly matchDeadlineMs: number;
@@ -90,10 +103,13 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
         this.sessionsRoot = join(codexHomeDir, 'sessions');
         this.onEvent = opts.onEvent;
         this.onSessionFound = opts.onSessionFound;
+        this.shouldImportHistory = opts.shouldImportHistory;
+        this.onHistoryImported = opts.onHistoryImported;
         this.onSessionMatchFailed = opts.onSessionMatchFailed;
         this.activeSessionId = opts.sessionId;
         this.reportedSessionId = opts.sessionId;
         this.targetCwd = targetCwd;
+        this.sessionMatchToken = opts.sessionMatchToken ?? null;
         this.referenceTimestampMs = opts.startupTimestampMs ?? Date.now();
         this.sessionStartWindowMs = opts.sessionStartWindowMs ?? DEFAULT_SESSION_START_WINDOW_MS;
         this.matchDeadlineMs = this.referenceTimestampMs + this.sessionStartWindowMs;
@@ -101,7 +117,7 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
             ? getSessionDatePrefixes(this.referenceTimestampMs, this.sessionStartWindowMs)
             : null;
 
-        logger.debug(`[CODEX_SESSION_SCANNER] Init: targetCwd=${this.targetCwd ?? 'none'} startupTs=${new Date(this.referenceTimestampMs).toISOString()} windowMs=${this.sessionStartWindowMs}`);
+        logger.debug(`[CODEX_SESSION_SCANNER] Init: targetCwd=${this.targetCwd ?? 'none'} startupTs=${new Date(this.referenceTimestampMs).toISOString()} windowMs=${this.sessionStartWindowMs} hasMatchToken=${this.sessionMatchToken ? 'yes' : 'no'}`);
     }
 
     public onNewSession(sessionId: string): void {
@@ -111,6 +127,39 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
         logger.debug(`[CODEX_SESSION_SCANNER] Switching to new session: ${sessionId}`);
         this.setActiveSessionId(sessionId);
         this.invalidate();
+    }
+
+    public async resolveActiveSession(): Promise<string | null> {
+        if (this.activeSessionId) {
+            return this.activeSessionId;
+        }
+        if (!this.targetCwd) {
+            return null;
+        }
+
+        await this.beforeScan();
+        const files = await this.findSessionFiles();
+        for (const filePath of files) {
+            const cursor = this.getCursor(filePath);
+            const { events, nextCursor } = await this.readSessionFile(filePath, cursor);
+            this.cacheHistoryEvents(filePath, events.map((entry) => entry.event));
+            await this.handleFileScan({
+                filePath,
+                events: events.map((entry) => entry.event),
+                parsedCount: events.length,
+                newCount: events.length,
+                skippedCount: 0,
+                cursor,
+                nextCursor
+            });
+            this.setCursor(filePath, nextCursor);
+        }
+        await this.afterScan();
+
+        if (this.activeSessionId) {
+            logger.debug(`[CODEX_SESSION_SCANNER] Resolved active session ${this.activeSessionId} during synchronous scan`);
+        }
+        return this.activeSessionId;
     }
 
     protected shouldScan(): boolean {
@@ -134,11 +183,15 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
     protected async initialize(): Promise<void> {
         const files = await this.listSessionFiles(this.sessionsRoot);
         for (const filePath of files) {
-            const { nextCursor } = await this.readSessionFile(filePath, 0);
+            const { events, nextCursor } = await this.readSessionFile(filePath, 0);
+            this.cacheHistoryEvents(filePath, events.map((entry) => entry.event));
             this.setCursor(filePath, nextCursor);
             if (this.shouldWatchFile(filePath)) {
                 this.ensureWatcher(filePath);
             }
+        }
+        if (this.activeSessionId) {
+            this.emitHistoryForSession(this.activeSessionId);
         }
     }
 
@@ -156,7 +209,9 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
         if (this.shouldSkipFile(filePath)) {
             return { events: [], nextCursor: cursor };
         }
-        return this.readSessionFile(filePath, cursor);
+        const result = await this.readSessionFile(filePath, cursor);
+        this.cacheHistoryEvents(filePath, result.events.map((entry) => entry.event));
+        return result;
     }
 
     protected generateEventKey(event: CodexSessionEvent, context: { filePath: string; lineIndex?: number }): string {
@@ -266,6 +321,7 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
 
     private setActiveSessionId(sessionId: string): void {
         this.activeSessionId = sessionId;
+        this.matchFailed = false;
         this.reportSessionId(sessionId);
         const candidateFiles = this.getFilesForSession(sessionId);
         for (const filePath of candidateFiles) {
@@ -274,11 +330,67 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
             }
         }
         this.pruneWatchers(this.getWatchedFiles().filter((filePath) => this.shouldWatchFile(filePath)));
+        this.emitHistoryForSession(sessionId);
         if (this.targetCwd) {
             this.flushPendingEventsForSession(sessionId);
         } else {
             this.pendingEventsByFile.clear();
         }
+    }
+
+    private cacheHistoryEvents(filePath: string, events: CodexSessionEvent[]): void {
+        if (!this.shouldImportHistory || events.length === 0) {
+            return;
+        }
+        if (this.historyEventsByFile.has(filePath)) {
+            return;
+        }
+
+        const sessionId = this.sessionIdByFile.get(filePath);
+        if (!sessionId) {
+            return;
+        }
+
+        if (this.activeSessionId && sessionId !== this.activeSessionId) {
+            return;
+        }
+
+        const fileCwd = this.sessionCwdByFile.get(filePath);
+        if (this.targetCwd && fileCwd !== this.targetCwd) {
+            return;
+        }
+
+        this.historyEventsByFile.set(filePath, {
+            events: [...events],
+            fileSessionId: sessionId
+        });
+    }
+
+    private emitHistoryForSession(sessionId: string): void {
+        if (!this.shouldImportHistory?.(sessionId)) {
+            return;
+        }
+
+        let emitted = 0;
+        let matched = false;
+        for (const [filePath, history] of this.historyEventsByFile.entries()) {
+            const matches = (history.fileSessionId && history.fileSessionId === sessionId)
+                || filePath.endsWith(`-${sessionId}.jsonl`);
+            if (!matches) {
+                continue;
+            }
+
+            matched = true;
+            emitted += this.emitEvents(history.events, history.fileSessionId);
+            this.historyEventsByFile.delete(filePath);
+        }
+
+        if (!matched) {
+            return;
+        }
+
+        this.onHistoryImported?.(sessionId);
+        logger.debug(`[CODEX_SESSION_SCANNER] Imported ${emitted} history events for session ${sessionId}`);
     }
 
     private async listSessionFiles(dir: string): Promise<string[]> {
@@ -287,18 +399,30 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
             const results: string[] = [];
             for (const entry of entries) {
                 const full = join(dir, entry.name);
-                if (!shouldIncludeSessionPath(full, this.sessionsRoot, this.sessionDatePrefixes)) {
-                    continue;
-                }
                 if (entry.isDirectory()) {
                     results.push(...await this.listSessionFiles(full));
-                } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+                } else if (entry.isFile() && entry.name.endsWith('.jsonl') && await this.shouldIncludeSessionFile(full)) {
                     results.push(full);
                 }
             }
             return results;
         } catch (error) {
             return [];
+        }
+    }
+
+    private async shouldIncludeSessionFile(filePath: string): Promise<boolean> {
+        if (shouldIncludeSessionPath(filePath, this.sessionsRoot, this.sessionDatePrefixes)) {
+            return true;
+        }
+        if (!this.targetCwd) {
+            return false;
+        }
+        try {
+            const stats = await stat(filePath);
+            return stats.mtimeMs >= this.referenceTimestampMs - this.sessionStartWindowMs;
+        } catch {
+            return false;
         }
     }
 
@@ -347,8 +471,19 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
                     if (sessionTimestamp !== null) {
                         this.sessionTimestampByFile.set(filePath, sessionTimestamp);
                     }
-                    logger.debug(`[CODEX_SESSION_SCANNER] Session meta: file=${filePath} cwd=${sessionCwd ?? 'none'} normalizedCwd=${normalizedCwd ?? 'none'} timestamp=${rawTimestamp ?? 'none'} parsedTs=${sessionTimestamp ?? 'none'}`);
+                    const baseInstructions = payload ? asRecord(payload.base_instructions) : null;
+                    const baseInstructionsText = baseInstructions ? asString(baseInstructions.text) : null;
+                    const matchedToken = this.extractSessionMatchToken(baseInstructionsText);
+                    if (matchedToken) {
+                        this.sessionMatchTokenByFile.set(filePath, matchedToken);
+                    }
+                    logger.debug(`[CODEX_SESSION_SCANNER] Session meta: file=${filePath} cwd=${sessionCwd ?? 'none'} normalizedCwd=${normalizedCwd ?? 'none'} timestamp=${rawTimestamp ?? 'none'} parsedTs=${sessionTimestamp ?? 'none'} hasMatchToken=${matchedToken ? 'yes' : 'no'}`);
                     this.sessionMetaParsed.add(filePath);
+                }
+                const eventMatchedToken = this.extractSessionMatchTokenFromEvent(parsed);
+                if (eventMatchedToken) {
+                    this.sessionMatchTokenByFile.set(filePath, eventMatchedToken);
+                    logger.debug(`[CODEX_SESSION_SCANNER] Session match token found outside session_meta: file=${filePath}`);
                 }
                 if (index >= effectiveStartLine) {
                     events.push({ event: parsed, lineIndex: index });
@@ -369,6 +504,9 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
 
         const fileCwd = this.sessionCwdByFile.get(filePath);
         if (this.targetCwd && fileCwd !== this.targetCwd) {
+            return null;
+        }
+        if (!this.fileMatchesSessionToken(filePath)) {
             return null;
         }
 
@@ -406,11 +544,67 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
         if (this.targetCwd && fileCwd !== this.targetCwd) {
             return null;
         }
+        if (!this.fileMatchesSessionToken(filePath)) {
+            return null;
+        }
 
         return {
             sessionId,
             score: 0
         };
+    }
+
+    private fileMatchesSessionToken(filePath: string): boolean {
+        if (!this.sessionMatchToken) {
+            return true;
+        }
+        return this.sessionMatchTokenByFile.get(filePath) === this.sessionMatchToken;
+    }
+
+    private extractSessionMatchToken(text: string | null): string | null {
+        if (!text) {
+            return null;
+        }
+        const match = text.match(/(?:hapi[-\s]+session[-\s]+match[-\s]+token|HAPI session match token)\s*:?\s*([a-f0-9-]+)/i);
+        return match?.[1] ?? null;
+    }
+
+    private extractSessionMatchTokenFromEvent(event: CodexSessionEvent): string | null {
+        const payload = asRecord(event.payload);
+        if (!payload) {
+            return null;
+        }
+
+        if (event.type === 'response_item') {
+            const itemType = asString(payload.type);
+            const role = asString(payload.role);
+            if (itemType !== 'message' || role !== 'developer') {
+                return null;
+            }
+
+            const content = payload.content;
+            if (!Array.isArray(content)) {
+                return null;
+            }
+
+            for (const part of content) {
+                const record = asRecord(part);
+                const text = record ? asString(record.text) : null;
+                const matchedToken = this.extractSessionMatchToken(text);
+                if (matchedToken) {
+                    return matchedToken;
+                }
+            }
+            return null;
+        }
+
+        if (event.type === 'turn_context') {
+            const collaborationMode = asRecord(payload.collaboration_mode);
+            const settings = collaborationMode ? asRecord(collaborationMode.settings) : null;
+            return this.extractSessionMatchToken(settings ? asString(settings.developer_instructions) : null);
+        }
+
+        return null;
     }
 
     private getFilesForSession(sessionId: string): string[] {

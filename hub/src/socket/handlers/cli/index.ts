@@ -1,4 +1,4 @@
-import type { CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
+import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
 import type { Store, StoredMachine, StoredSession } from '../../../store'
 import type { RpcRegistry } from '../../rpcRegistry'
 import type { SyncEvent } from '../../../sync/syncEngine'
@@ -39,12 +39,14 @@ export type CliHandlersDeps = {
     onSessionAlive?: (payload: SessionAlivePayload) => void
     onSessionEnd?: (payload: SessionEndPayload) => void
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
+    onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
+    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onMachineAlive?: (payload: MachineAlivePayload) => void
     onWebappEvent?: (event: SyncEvent) => void
 }
 
 export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlersDeps): void {
-    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionEnd, onSessionUsage, onMachineAlive, onWebappEvent } = deps
+    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onMachineAlive, onWebappEvent } = deps
     const terminalNamespace = io.of('/terminal')
     const namespace = typeof socket.data.namespace === 'string' ? socket.data.namespace : null
 
@@ -104,6 +106,8 @@ export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlers
         onSessionAlive,
         onSessionEnd,
         onSessionUsage,
+        onSessionAccountStatus,
+        onSessionMetadataUpdated,
         onWebappEvent
     })
     registerMachineHandlers(socket, {

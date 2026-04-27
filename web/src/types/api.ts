@@ -8,6 +8,7 @@ import type {
 
 export type {
     AgentState,
+    AgentAccountStatus,
     AttachmentMetadata,
     CodexCollaborationMode,
     PermissionMode,
@@ -105,6 +106,7 @@ export type UsageResponse = {
     } | null
     subscriptionType?: string
     rateLimitTier?: string
+    accountLabel?: string | null
 }
 
 export type MachinesResponse = { machines: Machine[] }

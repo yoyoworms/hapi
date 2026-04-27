@@ -50,6 +50,11 @@ export function SessionChat(props: {
     onFlushPending: () => void
     onAtBottomChange: (atBottom: boolean) => void
     onRetryMessage?: (localId: string) => void
+    onCancelQueued?: (localId: string) => void
+    queuedCount?: number
+    hasPausedQueue?: boolean
+    onClearQueue?: () => void
+    onResumeQueue?: () => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
     availableSlashCommands?: readonly SlashCommand[]
 }) {
@@ -261,7 +266,8 @@ export function SessionChat(props: {
                     metadata: props.session.metadata ?? null,
                     disabled: sessionInactive,
                     onRefresh: props.onRefresh,
-                    onRetryMessage: props.onRetryMessage
+                    onRetryMessage: props.onRetryMessage,
+                    onCancelQueued: props.onCancelQueued
                 }}>
                 <div className="relative flex min-h-0 flex-1 flex-col">
                     <HappyThread
@@ -300,6 +306,7 @@ export function SessionChat(props: {
                         agentState={props.session.agentState}
                         contextSize={reduced.latestUsage?.contextSize}
                         usage={props.session.usage}
+                        accountStatus={props.session.accountStatus}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
                             codexCollaborationModeSupported && props.session.active && !controlledByUser

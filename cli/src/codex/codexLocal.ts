@@ -3,6 +3,16 @@ import { spawnWithTerminalGuard } from '@/utils/spawnWithTerminalGuard';
 import { buildMcpServerConfigArgs, buildDeveloperInstructionsArg } from './utils/codexMcpConfig';
 import { codexSystemPrompt } from './utils/systemPrompt';
 
+export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
+    if (!sessionMatchToken) {
+        return instructions;
+    }
+    // Codex strips HTML comments from recorded session metadata, so keep this as
+    // plain text for the session scanner. It is only used to disambiguate
+    // concurrent local Codex launches in the same cwd.
+    return `${instructions}\n\nHAPI session match token: ${sessionMatchToken}`;
+}
+
 /**
  * Filter out 'resume' subcommand which is managed internally by hapi.
  * Codex CLI format is `codex resume <session-id>`, so subcommand is always first.
@@ -30,6 +40,7 @@ export async function codexLocal(opts: {
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
     onSessionFound: (id: string) => void;
     codexArgs?: string[];
+    sessionMatchToken?: string;
     mcpServers?: Record<string, { command: string; args: string[] }>;
 }): Promise<void> {
     const args: string[] = [];
@@ -52,8 +63,7 @@ export async function codexLocal(opts: {
         args.push(...buildMcpServerConfigArgs(opts.mcpServers));
     }
 
-    // Add developer instructions (system prompt)
-    args.push(...buildDeveloperInstructionsArg(codexSystemPrompt));
+    args.push(...buildDeveloperInstructionsArg(appendSessionMatchToken(codexSystemPrompt, opts.sessionMatchToken)));
 
     if (opts.codexArgs) {
         const safeArgs = filterResumeSubcommand(opts.codexArgs);

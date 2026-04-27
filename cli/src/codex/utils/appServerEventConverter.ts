@@ -24,6 +24,123 @@ function asNumber(value: unknown): number | null {
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function asNumberLike(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+function extractAccountLabel(params: Record<string, unknown>): string | null {
+    const account = asRecord(params.account) ?? asRecord(params.user) ?? asRecord(params.profile);
+    return asString(params.email ?? params.accountEmail ?? params.account_email ?? params.login ?? params.username)
+        ?? (account
+            ? asString(account.email ?? account.accountEmail ?? account.account_email ?? account.login ?? account.username ?? account.name)
+            : null);
+}
+
+function normalizeResetAt(value: unknown): number | null {
+    if (typeof value === 'string') {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    const numeric = asNumberLike(value);
+    if (numeric === null) return null;
+    return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+}
+
+function extractRemainingPercent(limit: Record<string, unknown>): number | null {
+    const direct = asNumberLike(
+        limit.remainingPercent
+        ?? limit.remaining_percent
+        ?? limit.percentRemaining
+        ?? limit.percent_remaining
+        ?? limit.remainingPct
+        ?? limit.remaining_pct
+    );
+    if (direct !== null) return Math.max(0, Math.min(100, direct > 1 ? direct : direct * 100));
+
+    const utilization = asNumberLike(limit.utilization ?? limit.usedPercent ?? limit.used_percent);
+    if (utilization !== null) {
+        const used = utilization > 1 ? utilization : utilization * 100;
+        return Math.max(0, Math.min(100, 100 - used));
+    }
+
+    const remaining = asNumberLike(limit.remaining ?? limit.remainingTokens ?? limit.remaining_tokens);
+    const total = asNumberLike(limit.limit ?? limit.total ?? limit.max ?? limit.quota);
+    if (remaining !== null && total !== null && total > 0) {
+        return Math.max(0, Math.min(100, (remaining / total) * 100));
+    }
+
+    return null;
+}
+
+function extractLimit(value: unknown): Record<string, unknown> | null {
+    const limit = asRecord(value);
+    if (!limit) return null;
+
+    const resetAt = normalizeResetAt(limit.resetAt ?? limit.reset_at ?? limit.resetsAt ?? limit.resets_at);
+    const remainingPercent = extractRemainingPercent(limit);
+    const remainingMs = resetAt ? Math.max(0, resetAt - Date.now()) : null;
+    if (resetAt === null && remainingPercent === null) return null;
+
+    return {
+        remainingMs,
+        remainingPercent,
+        resetAt
+    };
+}
+
+function extractAccountStatus(params: Record<string, unknown>): Record<string, unknown> | null {
+    const limitsRoot = asRecord(params.rateLimits)
+        ?? asRecord(params.rate_limits)
+        ?? asRecord(params.limits)
+        ?? params;
+    const candidates: Array<{ key: string; value: unknown }> = [];
+
+    if (Array.isArray(limitsRoot)) {
+        limitsRoot.forEach((value, index) => candidates.push({ key: String(index), value }));
+    } else if (limitsRoot && typeof limitsRoot === 'object') {
+        for (const [key, value] of Object.entries(limitsRoot as Record<string, unknown>)) {
+            if (value && typeof value === 'object') {
+                candidates.push({ key, value });
+            }
+        }
+    }
+
+    const normalized = candidates
+        .map(({ key, value }) => ({ key: key.toLowerCase(), limit: extractLimit(value) }))
+        .filter((entry): entry is { key: string; limit: Record<string, unknown> } => Boolean(entry.limit));
+
+    const byKey = (patterns: string[]) => normalized.find((entry) => patterns.some((pattern) => entry.key.includes(pattern)))?.limit ?? null;
+    const window = byKey(['five', '5h', 'hour', 'primary', 'short'])
+        ?? normalized.find((entry) => {
+            const resetAt = asNumber(entry.limit.resetAt);
+            return resetAt !== null && resetAt - Date.now() <= 36 * 3_600_000;
+        })?.limit
+        ?? normalized[0]?.limit
+        ?? null;
+    const weekly = byKey(['week', 'seven', '7d', 'secondary', 'long'])
+        ?? normalized.find((entry) => {
+            const resetAt = asNumber(entry.limit.resetAt);
+            return resetAt !== null && resetAt - Date.now() > 36 * 3_600_000;
+        })?.limit
+        ?? (normalized.length > 1 ? normalized[1]?.limit ?? null : null);
+
+    const accountLabel = extractAccountLabel(params);
+    if (!accountLabel && !window && !weekly) return null;
+
+    return {
+        provider: 'codex',
+        accountLabel,
+        window,
+        weekly,
+        updatedAt: Date.now()
+    };
+}
+
 function extractItemId(params: Record<string, unknown>): string | null {
     const direct = asString(params.itemId ?? params.item_id ?? params.id);
     if (direct) return direct;
@@ -253,7 +370,12 @@ export class AppServerEventConverter {
             return this.handleWrappedCodexEvent(paramsRecord) ?? events;
         }
 
-        if (method === 'account/rateLimits/updated' || method === 'turn/plan/updated' || method === 'thread/compacted') {
+        if (method === 'account/rateLimits/updated') {
+            const accountStatus = extractAccountStatus(paramsRecord);
+            return accountStatus ? [{ type: 'account_status', accountStatus }] : events;
+        }
+
+        if (method === 'turn/plan/updated' || method === 'thread/compacted') {
             return events;
         }
 

@@ -7,9 +7,12 @@ import { buildHapiMcpBridge } from './utils/buildHapiMcpBridge';
 import { stripCodexCliOverrides } from './utils/codexCliOverrides';
 import { buildCodexPermissionModeCliArgs } from './utils/permissionModeConfig';
 import { BaseLocalLauncher } from '@/modules/common/launcher/BaseLocalLauncher';
+import { randomUUID } from 'node:crypto';
+import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
 
 export async function codexLocalLauncher(session: CodexSession): Promise<'switch' | 'exit'> {
     const resumeSessionId = session.sessionId;
+    const sessionMatchToken = resumeSessionId ? undefined : randomUUID();
     let scanner: Awaited<ReturnType<typeof createCodexSessionScanner>> | null = null;
     const permissionMode = session.getPermissionMode();
     const managedPermissionMode = permissionMode === 'read-only' || permissionMode === 'safe-yolo' || permissionMode === 'yolo'
@@ -21,6 +24,7 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
             ...stripCodexCliOverrides(session.codexArgs)
         ]
         : session.codexArgs;
+    const emptyCompletionNoticeTracker = new EmptyCompletionNoticeTracker();
 
     // Start hapi hub for MCP bridge (same as remote mode)
     const { server: happyServer, mcpServers } = await buildHapiMcpBridge(session.client);
@@ -45,6 +49,7 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                 onSessionFound: handleSessionFound,
                 abort: abortSignal,
                 codexArgs,
+                sessionMatchToken,
                 mcpServers
             });
         },
@@ -69,7 +74,10 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
     scanner = await createCodexSessionScanner({
         sessionId: resumeSessionId,
         cwd: session.path,
+        sessionMatchToken,
         startupTimestampMs: Date.now(),
+        shouldImportHistory: session.shouldImportHistory,
+        onHistoryImported: session.markHistoryImported,
         onSessionMatchFailed: handleSessionMatchFailed,
         onSessionFound: (sessionId) => {
             session.onSessionFound(sessionId);
@@ -84,13 +92,30 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                 session.sendUserMessage(converted.userMessage);
             }
             if (converted?.message) {
+                emptyCompletionNoticeTracker.onConvertedMessage(converted.message);
                 session.sendAgentMessage(converted.message);
+            }
+            const eventPayload = event.payload && typeof event.payload === 'object'
+                ? event.payload as Record<string, unknown>
+                : null;
+            if (event.type === 'event_msg' && eventPayload?.type === 'task_started') {
+                emptyCompletionNoticeTracker.onTaskStarted();
+            }
+            if (event.type === 'event_msg' && eventPayload?.type === 'task_complete') {
+                const notice = emptyCompletionNoticeTracker.maybeCreateNotice(eventPayload);
+                if (notice) {
+                    session.sendAgentMessage(notice);
+                }
             }
         }
     });
 
     try {
-        return await launcher.run();
+        const exitReason = await launcher.run();
+        if (exitReason === 'switch' && !session.sessionId) {
+            await scanner?.resolveActiveSession();
+        }
+        return exitReason;
     } finally {
         await scanner?.cleanup();
         happyServer.stop();

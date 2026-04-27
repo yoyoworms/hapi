@@ -23,7 +23,9 @@
         "test:hub": "cd hub && bun run test",
         "test:web": "cd web && bun run test",
         "clean-session": "bun run hub/scripts/cleanup-sessions.ts",
-        "release-all": "cd cli && bun run release-all"
+        "release-all": "cd cli && bun run release-all",
+        "deploy:liuxin": "scripts/deploy-liuxinhapi.sh",
+        "deploy:liuxin:fast": "scripts/deploy-liuxinhapi.sh --skip-tests"
     },
     "devDependencies": {
         "concurrently": "^9.2.1",

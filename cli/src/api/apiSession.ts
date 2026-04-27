@@ -25,6 +25,7 @@ import type {
     Metadata,
     SessionCollaborationMode,
     Session,
+    AgentAccountStatus,
     SessionModel,
     SessionPermissionMode,
     UserMessage
@@ -476,6 +477,9 @@ export class ApiSessionClient extends EventEmitter {
         totalCostUsd: number
         totalInputTokens: number
         totalOutputTokens: number
+    } | {
+        type: 'account-status'
+        accountStatus: AgentAccountStatus
     }, id?: string): void {
         const content = {
             role: 'agent',

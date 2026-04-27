@@ -14,11 +14,33 @@ function base64UrlToUint8Array(base64Url: string): Uint8Array {
         .replace(/-/g, '+')
         .replace(/_/g, '/')
     const raw = atob(base64)
-    const output = new Uint8Array(raw.length)
+    const output = new Uint8Array(new ArrayBuffer(raw.length))
     for (let i = 0; i < raw.length; i += 1) {
         output[i] = raw.charCodeAt(i)
     }
     return output
+}
+
+function toUint8Array(value: BufferSource | null | undefined): Uint8Array | null {
+    if (!value) {
+        return null
+    }
+    if (value instanceof ArrayBuffer) {
+        return new Uint8Array(value)
+    }
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.byteLength !== b.byteLength) {
+        return false
+    }
+    for (let i = 0; i < a.byteLength; i += 1) {
+        if (a[i] !== b[i]) {
+            return false
+        }
+    }
+    return true
 }
 
 export function usePushNotifications(api: ApiClient | null) {
@@ -75,12 +97,19 @@ export function usePushNotifications(api: ApiClient | null) {
 
         try {
             const registration = await navigator.serviceWorker.ready
-            const existing = await registration.pushManager.getSubscription()
             const { publicKey } = await api.getPushVapidPublicKey()
-            const applicationServerKey = base64UrlToUint8Array(publicKey).buffer as ArrayBuffer
+            const applicationServerKey = base64UrlToUint8Array(publicKey)
+            const applicationServerKeyBuffer = applicationServerKey.buffer as ArrayBuffer
+            let existing = await registration.pushManager.getSubscription()
+            const existingKey = toUint8Array(existing?.options.applicationServerKey)
+            if (existing && existingKey && !bytesEqual(existingKey, applicationServerKey)) {
+                await existing.unsubscribe()
+                existing = null
+            }
+
             const subscription = existing ?? await registration.pushManager.subscribe({
                 userVisibleOnly: true,
-                applicationServerKey
+                applicationServerKey: applicationServerKeyBuffer
             })
 
             const json = subscription.toJSON()

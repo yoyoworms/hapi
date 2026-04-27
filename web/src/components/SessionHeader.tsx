@@ -10,6 +10,7 @@ import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { getSessionModelLabel } from '@/lib/sessionModelLabel'
 import { useTranslation } from '@/lib/use-translation'
+import { AgentIcon, agentIconColor, getAgentDisplayName } from '@/components/AgentIcon'
 
 function getSessionTitle(session: Session): string {
     if (session.metadata?.name) {
@@ -165,8 +166,11 @@ export function SessionHeader(props: {
                         </div>
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--app-hint)]">
                             <span className="inline-flex items-center gap-1">
-                                <span aria-hidden="true">❖</span>
-                                {session.metadata?.flavor?.trim() || 'unknown'}
+                                <AgentIcon
+                                    agent={session.metadata?.flavor}
+                                    className={`h-3.5 w-3.5 ${agentIconColor(session.metadata?.flavor)}`}
+                                />
+                                {getAgentDisplayName(session.metadata?.flavor)}
                             </span>
                             {modelLabel ? (
                                 <span>

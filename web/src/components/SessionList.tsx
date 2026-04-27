@@ -11,6 +11,7 @@ import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { getSessionModelLabel } from '@/lib/sessionModelLabel'
 import { useTranslation } from '@/lib/use-translation'
+import { AgentIcon, agentIconColor, getAgentDisplayName } from '@/components/AgentIcon'
 
 type SessionGroup = {
     directory: string
@@ -146,8 +147,7 @@ function getTodoProgress(session: SessionSummary): { completed: number; total: n
 
 function getAgentLabel(session: SessionSummary): string {
     const flavor = session.metadata?.flavor?.trim()
-    if (flavor) return flavor
-    return 'unknown'
+    return getAgentDisplayName(flavor)
 }
 
 function formatRelativeTime(value: number, t: (key: string, params?: Record<string, string | number>) => string): string | null {
@@ -170,6 +170,7 @@ function SessionItem(props: {
     showPath?: boolean
     api: ApiClient | null
     selected?: boolean
+    machineLabelsById?: Record<string, string>
 }) {
     const { t } = useTranslation()
     const { session: s, onSelect, showPath = true, api, selected = false } = props
@@ -290,9 +291,10 @@ function SessionItem(props: {
                         </span>
                     ) : null}
                     <span className="inline-flex items-center gap-2">
-                        <span className="flex h-4 w-4 items-center justify-center" aria-hidden="true">
-                            ❖
-                        </span>
+                        <AgentIcon
+                            agent={s.metadata?.flavor}
+                            className={`h-4 w-4 ${agentIconColor(s.metadata?.flavor)}`}
+                        />
                         {getAgentLabel(s)}
                     </span>
                     {modelLabel ? (
@@ -359,6 +361,7 @@ export function SessionList(props: {
     renderHeader?: boolean
     api: ApiClient | null
     selectedSessionId?: string | null
+    machineLabelsById?: Record<string, string>
 }) {
     const { t } = useTranslation()
     const { renderHeader = true, api, selectedSessionId } = props
@@ -464,6 +467,7 @@ export function SessionList(props: {
                                             showPath={false}
                                             api={api}
                                             selected={s.id === selectedSessionId}
+                                            machineLabelsById={props.machineLabelsById}
                                         />
                                     ))}
                                 </div>

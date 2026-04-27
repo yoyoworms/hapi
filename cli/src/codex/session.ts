@@ -17,6 +17,7 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
     readonly startedBy: 'runner' | 'terminal';
     readonly startingMode: 'local' | 'remote';
     localLaunchFailure: LocalLaunchFailure | null = null;
+    private readonly importedHistorySessionIds = new Set<string>();
 
     constructor(opts: {
         api: ApiClient;
@@ -78,6 +79,14 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
 
     recordLocalLaunchFailure = (message: string, exitReason: LocalLaunchExitReason): void => {
         this.localLaunchFailure = { message, exitReason };
+    };
+
+    shouldImportHistory = (sessionId: string): boolean => {
+        return !this.importedHistorySessionIds.has(sessionId);
+    };
+
+    markHistoryImported = (sessionId: string): void => {
+        this.importedHistorySessionIds.add(sessionId);
     };
 
     sendAgentMessage = (message: unknown): void => {

@@ -1,7 +1,7 @@
 import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
-import type { CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
+import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
 import type { Store, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
 import { extractTodoWriteTodosFromMessageContent } from '../../../sync/todos'
@@ -50,6 +50,41 @@ const updateStateSchema = z.object({
     agentState: z.unknown().nullable()
 })
 
+function getAgentEventType(content: unknown): string | null {
+    if (!content || typeof content !== 'object') {
+        return null
+    }
+
+    const record = content as {
+        type?: unknown
+        role?: unknown
+        content?: {
+            type?: unknown
+            data?: {
+                type?: unknown
+            }
+        }
+        data?: {
+            type?: unknown
+        }
+    }
+
+    if (record.type === 'event' && record.data && typeof record.data.type === 'string') {
+        return record.data.type
+    }
+
+    if (
+        record.role === 'agent'
+        && record.content?.type === 'event'
+        && record.content.data
+        && typeof record.content.data.type === 'string'
+    ) {
+        return record.content.data.type
+    }
+
+    return null
+}
+
 export type SessionHandlersDeps = {
     store: Store
     resolveSessionAccess: ResolveSessionAccess
@@ -57,11 +92,13 @@ export type SessionHandlersDeps = {
     onSessionAlive?: (payload: SessionAlivePayload) => void
     onSessionEnd?: (payload: SessionEndPayload) => void
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
+    onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
+    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onWebappEvent?: (event: SyncEvent) => void
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onSessionUsage, onWebappEvent } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onWebappEvent } = deps
 
     // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
     const recentContentUuids = new Set<string>()
@@ -106,8 +143,32 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             ack?.()
             return
         }
+        if (_c?.role === 'agent' && _c?.content?.type === 'event' && _c?.content?.data?.type === 'account-status') {
+            const accountStatus = _c.content.data.accountStatus
+            if (accountStatus && typeof accountStatus === 'object') {
+                onSessionAccountStatus?.({ sid, accountStatus })
+            }
+            ack?.()
+            return
+        }
         // Skip other internal event messages (ready, rate_limit_event, etc.)
         // These are not user-visible and should not be stored or forwarded
+        const agentEventType = getAgentEventType(_c)
+        if (agentEventType === 'ready') {
+            onWebappEvent?.({
+                type: 'message-received',
+                sessionId: sid,
+                message: {
+                    id: randomUUID(),
+                    seq: null,
+                    localId: null,
+                    content,
+                    createdAt: Date.now()
+                }
+            })
+            ack?.()
+            return
+        }
         if (_c?.type === 'event' || (_c?.role === 'agent' && _c?.content?.type === 'event')) {
             ack?.()
             return
@@ -220,6 +281,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         if (result.result === 'success') {
+            onSessionMetadataUpdated?.({ sid, namespace: sessionAccess.value.namespace, metadata: result.value })
             const update = {
                 id: randomUUID(),
                 seq: Date.now(),

@@ -15,6 +15,51 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
     } as unknown as EventPublisher
 }
 
+function userText(text: string): unknown {
+    return {
+        role: 'user',
+        content: {
+            type: 'text',
+            text
+        },
+        meta: {
+            sentFrom: 'cli'
+        }
+    }
+}
+
+function codexMessage(data: Record<string, unknown>): unknown {
+    return {
+        role: 'agent',
+        content: {
+            type: 'codex',
+            data
+        },
+        meta: {
+            sentFrom: 'cli'
+        }
+    }
+}
+
+function messageLabel(content: unknown): string {
+    if (!content || typeof content !== 'object') return 'unknown'
+    const record = content as Record<string, unknown>
+    const inner = record.content
+    if (!inner || typeof inner !== 'object') return 'unknown'
+    const payload = inner as Record<string, unknown>
+
+    if (payload.type === 'text' && typeof payload.text === 'string') {
+        return `${String(record.role)}:${payload.text}`
+    }
+
+    if (payload.type === 'codex' && payload.data && typeof payload.data === 'object') {
+        const data = payload.data as Record<string, unknown>
+        return `codex:${String(data.type)}:${String(data.message ?? data.callId ?? data.delta ?? '')}`
+    }
+
+    return 'unknown'
+}
+
 describe('session model', () => {
     it('includes explicit model in session summaries', () => {
         const store = new Store(':memory:')
@@ -75,6 +120,162 @@ describe('session model', () => {
 
         const merged = cache.getSession(newSession.id)
         expect(merged?.model).toBe('gpt-5.4')
+    })
+
+    it('deduplicates imported Codex history when merging a resumed session', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-codex-history-old',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                codexSessionId: 'codex-thread-history'
+            },
+            null,
+            'default',
+            'gpt-5.4'
+        )
+        const newSession = cache.getOrCreateSession(
+            'session-codex-history-new',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                codexSessionId: 'codex-thread-history'
+            },
+            null,
+            'default'
+        )
+
+        store.messages.addMessage(oldSession.id, userText('same prompt'), 'old-user')
+        store.messages.addMessage(oldSession.id, codexMessage({
+            type: 'message',
+            message: 'same answer',
+            id: 'old-random-id'
+        }))
+        store.messages.addMessage(oldSession.id, codexMessage({
+            type: 'tool-call-result',
+            callId: 'call-1',
+            output: 'same tool result',
+            id: 'old-random-tool-result-id'
+        }))
+
+        store.messages.addMessage(newSession.id, userText('same prompt'), 'new-user')
+        store.messages.addMessage(newSession.id, codexMessage({
+            type: 'message',
+            message: 'same answer',
+            id: 'new-random-id'
+        }))
+        store.messages.addMessage(newSession.id, codexMessage({
+            type: 'tool-call-result',
+            callId: 'call-1',
+            output: 'same tool result',
+            id: 'new-random-tool-result-id'
+        }))
+        store.messages.addMessage(newSession.id, codexMessage({
+            type: 'message',
+            message: 'new resume answer',
+            id: 'new-unique-random-id'
+        }))
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(cache.getSession(oldSession.id)).toBeUndefined()
+
+        const mergedMessages = store.messages.getMessages(newSession.id)
+        expect(mergedMessages.map((message) => message.seq)).toEqual([1, 2, 3, 4])
+        expect(mergedMessages.map((message) => messageLabel(message.content))).toEqual([
+            'user:same prompt',
+            'codex:message:same answer',
+            'codex:tool-call-result:call-1',
+            'codex:message:new resume answer'
+        ])
+    })
+
+    it('deduplicates adjacent imported Codex user messages within one session', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const session = cache.getOrCreateSession(
+            'session-codex-adjacent-history',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                codexSessionId: 'codex-thread-adjacent'
+            },
+            null,
+            'default'
+        )
+
+        const first = store.messages.addMessage(session.id, userText('same prompt'))
+        const second = store.messages.addMessage(session.id, userText('same prompt'))
+        store.messages.addMessage(session.id, codexMessage({
+            type: 'message',
+            message: 'same answer',
+            id: 'first-random-id'
+        }))
+        const repeatedLater = store.messages.addMessage(session.id, userText('same prompt'))
+
+        expect(second.id).toBe(first.id)
+        expect(repeatedLater.id).not.toBe(first.id)
+        expect(store.messages.getMessages(session.id).map((message) => messageLabel(message.content))).toEqual([
+            'user:same prompt',
+            'codex:message:same answer',
+            'user:same prompt'
+        ])
+    })
+
+    it('merges a terminal-started duplicate when native Codex session id matches', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const oldSession = engine.getOrCreateSession(
+                'session-codex-old',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    flavor: 'codex',
+                    codexSessionId: 'codex-thread-1'
+                },
+                null,
+                'default',
+                'gpt-5.4'
+            )
+            const newSession = engine.getOrCreateSession(
+                'session-codex-new',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    flavor: 'codex',
+                    codexSessionId: 'codex-thread-1'
+                },
+                null,
+                'default'
+            )
+
+            await engine.handleSessionMetadataUpdated({
+                sid: newSession.id,
+                namespace: 'default',
+                metadata: newSession.metadata
+            })
+
+            expect(engine.getSession(oldSession.id)).toBeUndefined()
+            expect(engine.getSession(newSession.id)?.model).toBe('gpt-5.4')
+        } finally {
+            engine.stop()
+        }
     })
 
     it('persists applied session model updates, including clear-to-auto', () => {

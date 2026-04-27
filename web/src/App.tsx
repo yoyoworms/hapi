@@ -33,6 +33,48 @@ type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
 
 const REQUIRE_SERVER_URL = requireHubUrlForLogin()
 
+function canUseBrowserNotifications(): boolean {
+    return typeof window !== 'undefined' && 'Notification' in window
+}
+
+async function showSystemNotificationForToast(event: ToastEvent): Promise<void> {
+    if (!canUseBrowserNotifications() || Notification.permission !== 'granted') {
+        return
+    }
+
+    const options: NotificationOptions = {
+        body: event.data.body,
+        tag: `toast-${event.data.sessionId}`,
+        data: { url: event.data.url },
+        icon: '/pwa-192x192.png',
+        badge: '/pwa-64x64.png'
+    }
+
+    if ('serviceWorker' in navigator) {
+        try {
+            const registration = await navigator.serviceWorker.ready
+            await registration.showNotification(event.data.title, options)
+            return
+        } catch {
+            // fall through to page Notification
+        }
+    }
+
+    const notification = new Notification(event.data.title, options)
+    notification.onclick = () => {
+        window.focus()
+        if (event.data.url) {
+            routerNavigate(event.data.url)
+        }
+        notification.close()
+    }
+}
+
+function routerNavigate(url: string): void {
+    if (!url) return
+    window.location.assign(url)
+}
+
 export function App() {
     return (
         <ToastProvider>
@@ -168,16 +210,25 @@ function AppInner() {
         pushPromptedRef.current = true
 
         const run = async () => {
-            if (pushPermission === 'granted') {
-                await subscribe()
+            const currentPermission = canUseBrowserNotifications() ? Notification.permission : pushPermission
+            if (currentPermission === 'granted') {
+                const subscribed = await subscribe()
+                if (!subscribed) {
+                    pushPromptedRef.current = false
+                }
                 return
             }
-            if (pushPermission === 'default') {
+            if (currentPermission === 'default') {
                 const granted = await requestPermission()
                 if (granted) {
-                    await subscribe()
+                    const subscribed = await subscribe()
+                    if (!subscribed) {
+                        pushPromptedRef.current = false
+                    }
+                    return
                 }
             }
+            pushPromptedRef.current = false
         }
 
         void run()
@@ -254,6 +305,7 @@ function AppInner() {
             sessionId: event.data.sessionId,
             url: event.data.url
         })
+        void showSystemNotificationForToast(event)
     }, [addToast])
 
     const eventSubscription = useMemo(() => {

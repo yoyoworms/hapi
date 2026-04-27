@@ -14,6 +14,7 @@ export type Usage = z.infer<typeof UsageSchema>
 
 export type {
     AgentState,
+    AgentAccountStatus,
     AttachmentMetadata,
     ClaudePermissionMode,
     CodexCollaborationMode,

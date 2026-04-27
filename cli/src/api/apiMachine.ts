@@ -64,6 +64,22 @@ interface PathExistsResponse {
     exists: Record<string, boolean>
 }
 
+function findStringDeep(value: unknown, keys: string[], depth = 0): string | null {
+    if (!value || typeof value !== 'object' || depth > 3) return null
+    const record = value as Record<string, unknown>
+    for (const key of keys) {
+        const candidate = record[key]
+        if (typeof candidate === 'string' && candidate.trim().length > 0) {
+            return candidate
+        }
+    }
+    for (const child of Object.values(record)) {
+        const found = findStringDeep(child, keys, depth + 1)
+        if (found) return found
+    }
+    return null
+}
+
 export class ApiMachineClient {
     private socket!: Socket<ServerToRunnerEvents, RunnerToServerEvents>
     private keepAliveInterval: NodeJS.Timeout | null = null
@@ -126,7 +142,8 @@ export class ApiMachineClient {
                 return {
                     ...(data as Record<string, unknown>),
                     subscriptionType: oauth.subscriptionType,
-                    rateLimitTier: oauth.rateLimitTier
+                    rateLimitTier: oauth.rateLimitTier,
+                    accountLabel: findStringDeep(parsed, ['email', 'accountEmail', 'account_email', 'login', 'username'])
                 }
             } catch {
                 return null

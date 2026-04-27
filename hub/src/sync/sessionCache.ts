@@ -1,5 +1,5 @@
 import { AgentStateSchema, MetadataSchema, TeamStateSchema } from '@hapi/protocol/schemas'
-import type { CodexCollaborationMode, PermissionMode, Session } from '@hapi/protocol/types'
+import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode, Session } from '@hapi/protocol/types'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
 import { EventPublisher } from './eventPublisher'
@@ -137,7 +137,8 @@ export class SessionCache {
             effort: stored.effort,
             permissionMode: existing?.permissionMode,
             collaborationMode: existing?.collaborationMode,
-            usage: existing?.usage ?? null
+            usage: existing?.usage ?? null,
+            accountStatus: existing?.accountStatus ?? null
         }
 
         this.sessions.set(sessionId, session)
@@ -268,6 +269,21 @@ export class SessionCache {
             sessionId: session.id,
             data: {
                 usage: session.usage
+            }
+        })
+    }
+
+    handleSessionAccountStatus(payload: { sid: string; accountStatus: AgentAccountStatus }): void {
+        const session = this.sessions.get(payload.sid)
+        if (!session) return
+
+        session.accountStatus = payload.accountStatus
+
+        this.publisher.emit({
+            type: 'session-updated',
+            sessionId: session.id,
+            data: {
+                accountStatus: session.accountStatus
             }
         })
     }

@@ -9,6 +9,7 @@ import { parseAccessToken } from '../utils/accessToken'
 import { registerCliHandlers } from './handlers/cli'
 import { registerTerminalHandlers } from './handlers/terminal'
 import { RpcRegistry } from './rpcRegistry'
+import type { AgentAccountStatus } from '@hapi/protocol/types'
 import type { SyncEvent } from '../sync/syncEngine'
 import { TerminalRegistry } from './terminalRegistry'
 import type { CliSocketWithData, SocketData, SocketServer } from './socketTypes'
@@ -39,6 +40,8 @@ export type SocketServerDeps = {
     onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote' }) => void
     onSessionEnd?: (payload: { sid: string; time: number }) => void
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
+    onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
+    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onMachineAlive?: (payload: { machineId: string; time: number }) => void
 }
 
@@ -123,6 +126,8 @@ export function createSocketServer(deps: SocketServerDeps): {
         onSessionAlive: deps.onSessionAlive,
         onSessionEnd: deps.onSessionEnd,
         onSessionUsage: deps.onSessionUsage,
+        onSessionAccountStatus: deps.onSessionAccountStatus,
+        onSessionMetadataUpdated: deps.onSessionMetadataUpdated,
         onMachineAlive: deps.onMachineAlive,
         onWebappEvent: deps.onWebappEvent
     }))

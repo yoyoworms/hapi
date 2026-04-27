@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { filterResumeSubcommand } from './codexLocal';
+import { appendSessionMatchToken, filterResumeSubcommand } from './codexLocal';
 
 describe('filterResumeSubcommand', () => {
     it('returns empty array unchanged', () => {
@@ -32,5 +32,15 @@ describe('filterResumeSubcommand', () => {
         // If resume appears after flags, it's not the subcommand position
         expect(filterResumeSubcommand(['--model', 'gpt-4', 'resume', '123']))
             .toEqual(['--model', 'gpt-4', 'resume', '123']);
+    });
+});
+
+describe('appendSessionMatchToken', () => {
+    it('uses visible text because Codex strips HTML comments from session metadata', () => {
+        const result = appendSessionMatchToken('base instructions', '11111111-1111-4111-8111-111111111111');
+
+        expect(result).toContain('base instructions');
+        expect(result).toContain('HAPI session match token: 11111111-1111-4111-8111-111111111111');
+        expect(result).not.toContain('<!--');
     });
 });

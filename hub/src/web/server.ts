@@ -28,6 +28,7 @@ import type { WebSocketData } from '@socket.io/bun-engine'
 import { loadEmbeddedAssetMap, type EmbeddedWebAsset } from './embeddedAssets'
 import { isBunCompiled } from '../utils/bunCompiled'
 import type { Store } from '../store'
+import type { PushService } from '../push/pushService'
 
 // One-time tokens for internal upload downloads (no JWT needed)
 export const uploadDownloadTokens = new Set<string>()
@@ -64,6 +65,7 @@ function createWebApp(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
+    pushService: PushService
     vapidPublicKey: string
     corsOrigins?: string[]
     embeddedAssetMap: Map<string, EmbeddedWebAsset> | null
@@ -140,7 +142,12 @@ function createWebApp(options: {
     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createGitRoutes(options.getSyncEngine))
-    app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
+    app.route('/api', createPushRoutes({
+        store: options.store,
+        vapidPublicKey: options.vapidPublicKey,
+        pushService: options.pushService,
+        getSseManager: options.getSseManager
+    }))
     app.route('/api', createUsageRoutes(options.getSyncEngine))
     // app.route('/api', createVoiceRoutes()) // voice disabled
 
@@ -263,6 +270,7 @@ export async function startWebServer(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
+    pushService: PushService
     vapidPublicKey: string
     socketEngine: SocketEngine
     corsOrigins?: string[]
@@ -277,6 +285,7 @@ export async function startWebServer(options: {
         getVisibilityTracker: options.getVisibilityTracker,
         jwtSecret: options.jwtSecret,
         store: options.store,
+        pushService: options.pushService,
         vapidPublicKey: options.vapidPublicKey,
         corsOrigins: options.corsOrigins,
         embeddedAssetMap,

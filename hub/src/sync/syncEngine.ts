@@ -7,7 +7,8 @@
  * - No E2E encryption; data is stored as JSON in SQLite
  */
 
-import type { CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+import type { AgentAccountStatus, CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+import { MetadataSchema } from '@hapi/protocol/schemas'
 import type { Server } from 'socket.io'
 import type { Store } from '../store'
 import type { RpcRegistry } from '../socket/rpcRegistry'
@@ -42,6 +43,21 @@ export type ResumeSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'no_machine_online' | 'resume_unavailable' | 'resume_failed' }
 
+function getNativeAgentSessionId(metadata: {
+    claudeSessionId?: string
+    codexSessionId?: string
+    geminiSessionId?: string
+    opencodeSessionId?: string
+    cursorSessionId?: string
+}): string | null {
+    return metadata.codexSessionId
+        ?? metadata.claudeSessionId
+        ?? metadata.geminiSessionId
+        ?? metadata.opencodeSessionId
+        ?? metadata.cursorSessionId
+        ?? null
+}
+
 export class SyncEngine {
     private readonly eventPublisher: EventPublisher
     private readonly sessionCache: SessionCache
@@ -51,7 +67,7 @@ export class SyncEngine {
     private inactivityTimer: NodeJS.Timeout | null = null
 
     constructor(
-        store: Store,
+        private readonly store: Store,
         io: Server,
         rpcRegistry: RpcRegistry,
         sseManager: SSEManager
@@ -227,6 +243,48 @@ export class SyncEngine {
         totalOutputTokens: number
     }): void {
         this.sessionCache.handleSessionUsage(payload)
+    }
+
+    handleSessionAccountStatus(payload: { sid: string; accountStatus: AgentAccountStatus }): void {
+        this.sessionCache.handleSessionAccountStatus(payload)
+    }
+
+    async handleSessionMetadataUpdated(payload: { sid: string; namespace: string; metadata: unknown }): Promise<void> {
+        const currentMetadata = MetadataSchema.safeParse(payload.metadata)
+        if (!currentMetadata.success) {
+            return
+        }
+
+        const nativeSessionId = getNativeAgentSessionId(currentMetadata.data)
+        if (!nativeSessionId) {
+            return
+        }
+
+        const current = this.store.sessions.getSessionByNamespace(payload.sid, payload.namespace)
+        if (!current) {
+            return
+        }
+
+        const duplicates = this.store.sessions.getSessionsByNamespace(payload.namespace)
+            .filter((session) => {
+                if (session.id === payload.sid) {
+                    return false
+                }
+                const metadata = MetadataSchema.safeParse(session.metadata)
+                if (!metadata.success) {
+                    return false
+                }
+                return getNativeAgentSessionId(metadata.data) === nativeSessionId
+            })
+            .sort((left, right) => left.updatedAt - right.updatedAt)
+
+        for (const duplicate of duplicates) {
+            try {
+                await this.sessionCache.mergeSessions(duplicate.id, current.id, payload.namespace)
+            } catch (error) {
+                console.warn('[SyncEngine] Failed to merge duplicate native agent session', error)
+            }
+        }
     }
 
     handleMachineAlive(payload: { machineId: string; time: number }): void {
