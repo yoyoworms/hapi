@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { writeFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { writeFileSync, mkdirSync, unlinkSync, existsSync, readFileSync } from 'node:fs';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { getHappyCliCommand } from '@/utils/spawnHappyCLI';
@@ -18,6 +19,11 @@ type HookSettings = {
     };
     hooks: {
         SessionStart: HookCommandConfig[];
+    };
+    statusLine?: {
+        type: 'command';
+        command: string;
+        padding?: number;
     };
 };
 
@@ -43,7 +49,21 @@ function shellJoin(parts: string[]): string {
     return parts.map(shellQuote).join(' ');
 }
 
-function buildHookSettings(command: string, hooksEnabled?: boolean): HookSettings {
+function readUserStatusLineCommand(): string | null {
+    try {
+        const settingsPath = join(homedir(), '.claude', 'settings.json');
+        if (!existsSync(settingsPath)) return null;
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8')) as { statusLine?: { command?: unknown } };
+        const command = parsed.statusLine?.command;
+        if (typeof command !== 'string' || !command.trim()) return null;
+        if (command.includes('statusline-forwarder')) return null;
+        return command;
+    } catch {
+        return null;
+    }
+}
+
+function buildHookSettings(command: string, statusLineCommand: string, hooksEnabled?: boolean): HookSettings {
     const hooks: HookSettings['hooks'] = {
         SessionStart: [
             {
@@ -58,7 +78,14 @@ function buildHookSettings(command: string, hooksEnabled?: boolean): HookSetting
         ]
     };
 
-    const settings: HookSettings = { hooks };
+    const settings: HookSettings = {
+        hooks,
+        statusLine: {
+            type: 'command',
+            command: statusLineCommand,
+            padding: 0
+        }
+    };
     if (hooksEnabled !== undefined) {
         settings.hooksConfig = {
             enabled: hooksEnabled
@@ -88,7 +115,20 @@ export function generateHookSettingsFile(
     ]);
     const hookCommand = shellJoin([command, ...args]);
 
-    const settings = buildHookSettings(hookCommand, options.hooksEnabled);
+    const originalStatusLineCommand = readUserStatusLineCommand();
+    const statusLineArgs = [
+        'statusline-forwarder',
+        '--port',
+        String(port),
+        '--token',
+        token
+    ];
+    if (originalStatusLineCommand) {
+        statusLineArgs.push('--fallback-command', originalStatusLineCommand);
+    }
+    const statusLineCommand = shellJoin([command, ...statusLineArgs]);
+
+    const settings = buildHookSettings(hookCommand, statusLineCommand, options.hooksEnabled);
 
     writeFileSync(filepath, JSON.stringify(settings, null, 4));
     logger.debug(`[${options.logLabel}] Created hook settings file: ${filepath}`);

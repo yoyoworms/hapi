@@ -4,6 +4,9 @@
 
 import { io, type Socket } from 'socket.io-client'
 import { stat } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { logger } from '@/ui/logger'
 import { configuration } from '@/configuration'
 import type { Update, UpdateMachineBody } from '@hapi/protocol'
@@ -64,21 +67,148 @@ interface PathExistsResponse {
     exists: Record<string, boolean>
 }
 
-function findStringDeep(value: unknown, keys: string[], depth = 0): string | null {
-    if (!value || typeof value !== 'object' || depth > 3) return null
-    const record = value as Record<string, unknown>
-    for (const key of keys) {
-        const candidate = record[key]
-        if (typeof candidate === 'string' && candidate.trim().length > 0) {
-            return candidate
-        }
+type CachedOAuthUsage = { data: Record<string, unknown>; fetchedAt: number }
+
+let cachedOAuthUsage: CachedOAuthUsage | null = null
+const OAUTH_USAGE_CACHE_TTL_MS = 30 * 60 * 1000
+
+const MACOS_USAGE_CREDENTIALS_SERVICE = 'Claude Code-credentials'
+const CCSTATUSLINE_USAGE_CACHE_FILE = join(homedir(), '.cache', 'ccstatusline', 'usage.json')
+
+type UsageFetchResult = { ok: true; data: Record<string, unknown> } | { ok: false; retryable: boolean }
+
+function parseUsageAccessToken(raw: string | null): string | null {
+    if (!raw) return null
+    try {
+        const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown } }
+        const token = parsed.claudeAiOauth?.accessToken
+        return typeof token === 'string' && token.length > 0 ? token : null
+    } catch {
+        return null
     }
-    for (const child of Object.values(record)) {
-        const found = findStringDeep(child, keys, depth + 1)
-        if (found) return found
+}
+
+function readMacKeychainSecret(service: string): string | null {
+    try {
+        const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+        return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+            encoding: 'utf-8',
+            timeout: 5000,
+            stdio: ['pipe', 'pipe', 'ignore']
+        }).trim()
+    } catch {
+        return null
+    }
+}
+
+function listMacKeychainCredentialCandidates(): string[] {
+    if (process.platform !== 'darwin') return []
+    try {
+        const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+        const rawDump = execFileSync('security', ['dump-keychain'], {
+            encoding: 'utf-8',
+            timeout: 8000,
+            maxBuffer: 8 * 1024 * 1024,
+            stdio: ['pipe', 'pipe', 'ignore']
+        })
+        const services: string[] = []
+        const seen = new Set<string>()
+        const re = /"svce"<blob>="([^"]+)"/g
+        let match: RegExpExecArray | null
+        while ((match = re.exec(rawDump)) !== null) {
+            const service = match[1]
+            if (!service.startsWith(MACOS_USAGE_CREDENTIALS_SERVICE)) continue
+            if (seen.has(service)) continue
+            seen.add(service)
+            services.push(service)
+        }
+        return services
+    } catch {
+        return []
+    }
+}
+
+function readUsageTokenFromCredentialsFile(): string | null {
+    const candidates = [
+        process.env.CLAUDE_CONFIG_DIR ? join(process.env.CLAUDE_CONFIG_DIR, '.credentials.json') : null,
+        join(homedir(), '.claude', '.credentials.json')
+    ].filter((path): path is string => Boolean(path))
+    for (const filePath of candidates) {
+        try {
+            if (!existsSync(filePath)) continue
+            const token = parseUsageAccessToken(readFileSync(filePath, 'utf-8'))
+            if (token) return token
+        } catch {}
     }
     return null
 }
+
+function getUsageTokens(): string[] {
+    const tokens: string[] = []
+    const seen = new Set<string>()
+    const add = (token: string | null) => {
+        if (!token || seen.has(token)) return
+        seen.add(token)
+        tokens.push(token)
+    }
+
+    if (process.platform === 'darwin') {
+        add(parseUsageAccessToken(readMacKeychainSecret(MACOS_USAGE_CREDENTIALS_SERVICE)))
+        for (const service of listMacKeychainCredentialCandidates()) {
+            add(parseUsageAccessToken(readMacKeychainSecret(service)))
+        }
+    }
+    add(readUsageTokenFromCredentialsFile())
+    return tokens
+}
+
+function readCcstatuslineUsageCache(): Record<string, unknown> | null {
+    try {
+        if (!existsSync(CCSTATUSLINE_USAGE_CACHE_FILE)) return null
+        const parsed = JSON.parse(readFileSync(CCSTATUSLINE_USAGE_CACHE_FILE, 'utf-8')) as Record<string, unknown>
+        const sessionUsage = typeof parsed.sessionUsage === 'number' ? parsed.sessionUsage : null
+        const sessionResetAt = typeof parsed.sessionResetAt === 'string' ? parsed.sessionResetAt : null
+        const weeklyUsage = typeof parsed.weeklyUsage === 'number' ? parsed.weeklyUsage : null
+        const weeklyResetAt = typeof parsed.weeklyResetAt === 'string' ? parsed.weeklyResetAt : null
+        if (sessionUsage === null && weeklyUsage === null) return null
+        return {
+            five_hour: sessionUsage === null ? null : { utilization: sessionUsage, resets_at: sessionResetAt },
+            seven_day: weeklyUsage === null ? null : { utilization: weeklyUsage, resets_at: weeklyResetAt },
+            seven_day_opus: null,
+            seven_day_sonnet: null,
+            extra_usage: {
+                is_enabled: typeof parsed.extraUsageEnabled === 'boolean' ? parsed.extraUsageEnabled : false,
+                monthly_limit: typeof parsed.extraUsageLimit === 'number' ? parsed.extraUsageLimit : null,
+                used_credits: typeof parsed.extraUsageUsed === 'number' ? parsed.extraUsageUsed : null,
+                utilization: typeof parsed.extraUsageUtilization === 'number' ? parsed.extraUsageUtilization : null
+            }
+        }
+    } catch {
+        return null
+    }
+}
+
+async function fetchOAuthUsageWithToken(token: string): Promise<UsageFetchResult> {
+    try {
+        const resp = await fetch('https://api.anthropic.com/api/oauth/usage', {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/json',
+                'anthropic-beta': 'oauth-2025-04-20'
+            },
+            signal: AbortSignal.timeout(10_000)
+        })
+        if (!resp.ok) {
+            return { ok: false, retryable: resp.status === 401 || resp.status === 403 || resp.status === 429 }
+        }
+        const data = await resp.json()
+        if (!data || typeof data !== 'object') return { ok: false, retryable: true }
+        return { ok: true, data: data as Record<string, unknown> }
+    } catch {
+        return { ok: false, retryable: true }
+    }
+}
+
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToRunnerEvents, RunnerToServerEvents>
@@ -116,37 +246,35 @@ export class ApiMachineClient {
         })
 
         this.rpcHandlerManager.registerHandler('getOAuthUsage', async () => {
+            const now = Date.now()
+            if (cachedOAuthUsage && now - cachedOAuthUsage.fetchedAt < OAUTH_USAGE_CACHE_TTL_MS) {
+                return cachedOAuthUsage.data
+            }
+
             try {
-                const { execSync } = await import('child_process')
-                const raw = execSync(
-                    'security find-generic-password -s "Claude Code-credentials" -w',
-                    { encoding: 'utf-8', timeout: 5000 }
-                ).trim()
-                const parsed = JSON.parse(raw)
-                const oauth = parsed.claudeAiOauth
-                if (!oauth?.accessToken) return null
-
-                const resp = await fetch('https://api.anthropic.com/api/oauth/usage', {
-                    headers: {
-                        'Authorization': `Bearer ${oauth.accessToken}`,
-                        'anthropic-beta': 'oauth-2025-04-20',
-                        'Content-Type': 'application/json'
-                    },
-                    signal: AbortSignal.timeout(10_000)
-                })
-
-                if (!resp.ok) return null
-
-                const data = await resp.json()
-                if (!data || typeof data !== 'object') return null
-                return {
-                    ...(data as Record<string, unknown>),
-                    subscriptionType: oauth.subscriptionType,
-                    rateLimitTier: oauth.rateLimitTier,
-                    accountLabel: findStringDeep(parsed, ['email', 'accountEmail', 'account_email', 'login', 'username'])
+                const tokens = getUsageTokens()
+                for (const token of tokens) {
+                    const result = await fetchOAuthUsageWithToken(token)
+                    if (result.ok) {
+                        const enriched = {
+                            ...result.data,
+                            accountLabel: null
+                        }
+                        cachedOAuthUsage = { data: enriched, fetchedAt: now }
+                        return enriched
+                    }
+                    if (!result.retryable) break
                 }
+
+                const ccstatuslineCache = readCcstatuslineUsageCache()
+                if (ccstatuslineCache) {
+                    cachedOAuthUsage = { data: ccstatuslineCache, fetchedAt: now }
+                    return ccstatuslineCache
+                }
+
+                return cachedOAuthUsage?.data ?? null
             } catch {
-                return null
+                return readCcstatuslineUsageCache() ?? cachedOAuthUsage?.data ?? null
             }
         })
     }

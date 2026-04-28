@@ -32,6 +32,7 @@ import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
 import { useTranslation } from '@/lib/use-translation'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
+import type { LatestUsage } from '@/chat/reducer'
 
 export interface TextInputState {
     text: string
@@ -96,6 +97,62 @@ function QuickPermissionBar({ agentState }: { agentState?: AgentState | null }) 
 
 // Draft store: persist composer text per session across switches
 const draftStore = new Map<string, string>()
+const inputHistoryStore: Record<string, string[]> = (() => {
+    if (typeof window === 'undefined') return {}
+    try {
+        const raw = window.localStorage.getItem('hapi:composer-input-history:v2')
+        const parsed = raw ? JSON.parse(raw) : {}
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+        const result: Record<string, string[]> = {}
+        for (const [sessionId, value] of Object.entries(parsed)) {
+            if (typeof sessionId !== 'string' || !Array.isArray(value)) continue
+            const history = value
+                .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                .slice(-100)
+            if (history.length > 0) {
+                result[sessionId] = history
+            }
+        }
+        return result
+    } catch {
+        return {}
+    }
+})()
+
+function persistInputHistory(): void {
+    if (typeof window === 'undefined') return
+    try {
+        window.localStorage.setItem('hapi:composer-input-history:v2', JSON.stringify(inputHistoryStore))
+    } catch {}
+}
+
+function getInputHistory(sessionId: string | undefined): string[] {
+    if (!sessionId) return []
+    return inputHistoryStore[sessionId] ?? []
+}
+
+function addInputHistory(sessionId: string | undefined, text: string): void {
+    if (!sessionId) return
+    const entry = text.trim()
+    if (!entry) return
+    const history = inputHistoryStore[sessionId] ?? []
+    const last = history[history.length - 1]
+    if (last === entry) return
+    history.push(entry)
+    if (history.length > 100) {
+        history.splice(0, history.length - 100)
+    }
+    inputHistoryStore[sessionId] = history
+    persistInputHistory()
+}
+
+function isCaretOnFirstLine(el: HTMLTextAreaElement): boolean {
+    return el.value.lastIndexOf('\n', Math.max(0, el.selectionStart - 1)) === -1
+}
+
+function isCaretOnLastLine(el: HTMLTextAreaElement): boolean {
+    return el.value.indexOf('\n', el.selectionEnd) === -1
+}
 
 export function HappyComposer(props: {
     sessionId?: string
@@ -109,6 +166,7 @@ export function HappyComposer(props: {
     thinking?: boolean
     agentState?: AgentState | null
     contextSize?: number
+    latestUsage?: LatestUsage | null
     usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
     accountStatus?: import('@/types/api').Session['accountStatus']
     controlledByUser?: boolean
@@ -172,6 +230,8 @@ export function HappyComposer(props: {
     const prevSessionIdRef = useRef(sessionId)
 
     useEffect(() => {
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
         if (sessionId) {
             const draft = draftStore.get(sessionId)
             if (draft) {
@@ -220,6 +280,8 @@ export function HappyComposer(props: {
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const prevControlledByUser = useRef(controlledByUser)
+    const historyIndexRef = useRef<number | null>(null)
+    const historyDraftRef = useRef('')
 
     useEffect(() => {
         setInputState((prev) => {
@@ -405,6 +467,54 @@ export function HappyComposer(props: {
             }
         }
 
+        const inputHistory = getInputHistory(sessionId)
+        if ((key === 'ArrowUp' || key === 'ArrowDown') && inputHistory.length > 0) {
+            const el = textareaRef.current
+            if (!el) return
+
+            const canNavigateUp = key === 'ArrowUp'
+                && el.selectionStart === el.selectionEnd
+                && isCaretOnFirstLine(el)
+            const canNavigateDown = key === 'ArrowDown'
+                && el.selectionStart === el.selectionEnd
+                && (historyIndexRef.current !== null || isCaretOnLastLine(el))
+
+            if (canNavigateUp || canNavigateDown) {
+                e.preventDefault()
+
+                if (key === 'ArrowUp') {
+                    if (historyIndexRef.current === null) {
+                        historyDraftRef.current = composerTextRef.current
+                        historyIndexRef.current = inputHistory.length - 1
+                    } else {
+                        historyIndexRef.current = Math.max(0, historyIndexRef.current - 1)
+                    }
+                } else if (historyIndexRef.current !== null) {
+                    if (historyIndexRef.current >= inputHistory.length - 1) {
+                        historyIndexRef.current = null
+                    } else {
+                        historyIndexRef.current += 1
+                    }
+                }
+
+                const nextText = historyIndexRef.current === null
+                    ? historyDraftRef.current
+                    : inputHistory[historyIndexRef.current] ?? ''
+                const cursorPosition = nextText.length
+                api.composer().setText(nextText)
+                setInputState({
+                    text: nextText,
+                    selection: { start: cursorPosition, end: cursorPosition }
+                })
+                setTimeout(() => {
+                    const input = textareaRef.current
+                    if (!input) return
+                    input.setSelectionRange(cursorPosition, cursorPosition)
+                }, 0)
+                return
+            }
+        }
+
         if (key === 'Escape' && thinking) {
             e.preventDefault()
             handleAbort()
@@ -433,7 +543,8 @@ export function HappyComposer(props: {
         permissionModes,
         canSend,
         api,
-        haptic
+        haptic,
+        sessionId
     ])
 
     useEffect(() => {
@@ -454,6 +565,8 @@ export function HappyComposer(props: {
             start: e.target.selectionStart,
             end: e.target.selectionEnd
         }
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
         setInputState({ text: e.target.value, selection })
     }, [])
 
@@ -533,6 +646,10 @@ export function HappyComposer(props: {
 
     const handleSend = useCallback(() => {
         if (sessionId) draftStore.delete(sessionId)
+        const textToRecord = composerTextRef.current
+        addInputHistory(sessionId, textToRecord)
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
         // When thinking, api.composer().send() is blocked by the library.
         // Bypass by reading text directly and calling onDirectSend.
         if (thinking && props.onDirectSend) {
@@ -789,6 +906,7 @@ export function HappyComposer(props: {
                     <StatusBar
                         active={active}
                         thinking={thinking}
+                        sessionId={props.sessionId}
                         agentState={agentState}
                         contextSize={contextSize}
                         usage={props.usage}
@@ -798,6 +916,7 @@ export function HappyComposer(props: {
                         collaborationMode={collaborationMode}
                         agentFlavor={agentFlavor}
                         voiceStatus={undefined}
+                        latestUsage={props.latestUsage}
                     />
 
                     <div className="overflow-hidden rounded-[20px] bg-[var(--app-secondary-bg)]">

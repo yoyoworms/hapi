@@ -24,6 +24,16 @@ export const claudeCommand: CommandDefinition = {
             args.shift()
         }
 
+        // Claude Code prints resume hints as:
+        //   claude --resume "alias"
+        // Users naturally run the HAPI equivalent as:
+        //   hapi resume "alias"
+        // Since `resume` is not a HAPI subcommand, normalize it to Claude's flag
+        // before the generic Claude-args passthrough below.
+        if (args.length > 0 && args[0] === 'resume') {
+            args[0] = '--resume'
+        }
+
         const options: StartOptions = {}
         let showHelp = false
         const unknownArgs: string[] = []
@@ -93,6 +103,7 @@ ${chalk.bold('Usage:')}
 
 ${chalk.bold('Examples:')}
   hapi                    Start session (will prompt for token if not set)
+  hapi resume "alias"     Resume a Claude Code session by alias
   hapi auth login         Configure CLI_API_TOKEN interactively
   hapi --yolo             Start with bypassing permissions
                             hapi sugar for --dangerously-skip-permissions

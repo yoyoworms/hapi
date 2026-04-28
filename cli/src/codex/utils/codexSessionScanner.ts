@@ -35,6 +35,7 @@ type Candidate = {
 };
 
 const DEFAULT_SESSION_START_WINDOW_MS = 2 * 60 * 1000;
+const HISTORY_IMPORT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export async function createCodexSessionScanner(opts: CodexSessionScannerOptions): Promise<CodexSessionScanner> {
     const targetCwd = opts.cwd && opts.cwd.trim().length > 0 ? normalizePath(opts.cwd) : null;
@@ -87,6 +88,7 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
     private readonly sessionStartWindowMs: number;
     private readonly matchDeadlineMs: number;
     private readonly sessionDatePrefixes: Set<string> | null;
+    private readonly historyCutoffMs: number;
 
     private activeSessionId: string | null;
     private reportedSessionId: string | null;
@@ -116,6 +118,7 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
         this.sessionDatePrefixes = this.targetCwd
             ? getSessionDatePrefixes(this.referenceTimestampMs, this.sessionStartWindowMs)
             : null;
+        this.historyCutoffMs = this.referenceTimestampMs - HISTORY_IMPORT_WINDOW_MS;
 
         logger.debug(`[CODEX_SESSION_SCANNER] Init: targetCwd=${this.targetCwd ?? 'none'} startupTs=${new Date(this.referenceTimestampMs).toISOString()} windowMs=${this.sessionStartWindowMs} hasMatchToken=${this.sessionMatchToken ? 'yes' : 'no'}`);
     }
@@ -360,8 +363,16 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
             return;
         }
 
+        const recentEvents = events.filter((event) => {
+            const timestampMs = parseTimestamp(event.timestamp);
+            return timestampMs === null || timestampMs >= this.historyCutoffMs;
+        });
+        if (recentEvents.length === 0) {
+            return;
+        }
+
         this.historyEventsByFile.set(filePath, {
-            events: [...events],
+            events: recentEvents,
             fileSessionId: sessionId
         });
     }
@@ -412,6 +423,9 @@ class CodexSessionScannerImpl extends BaseSessionScanner<CodexSessionEvent> {
     }
 
     private async shouldIncludeSessionFile(filePath: string): Promise<boolean> {
+        if (this.activeSessionId && filePath.endsWith(`-${this.activeSessionId}.jsonl`)) {
+            return true;
+        }
         if (shouldIncludeSessionPath(filePath, this.sessionsRoot, this.sessionDatePrefixes)) {
             return true;
         }

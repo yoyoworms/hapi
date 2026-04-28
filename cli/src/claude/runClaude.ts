@@ -1,6 +1,6 @@
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
-import { AgentState, SessionEffort, SessionModel } from '@/api/types';
+import { AgentAccountStatus, AgentState, SessionEffort, SessionModel } from '@/api/types';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -21,6 +21,135 @@ import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
 import { normalizeClaudeSessionModel } from './model';
 import { normalizeClaudeSessionEffort } from './effort';
 import { getInvokedCwd } from '@/utils/invokedCwd';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { extractClaudeResumeSessionId, extractClaudeResumeTitle } from '@/utils/resumeTitle';
+
+
+type ClaudeRateLimitEntry = {
+    usedPercentage: number
+    resetsAt: number | null
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function asNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+function asString(value: unknown): string | null {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function readClaudeSettingsModel(): string | null {
+    try {
+        const settingsPath = join(homedir(), '.claude', 'settings.json');
+        if (!existsSync(settingsPath)) return null;
+        const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8')) as { model?: unknown };
+        return asString(parsed.model);
+    } catch {
+        return null;
+    }
+}
+
+function modelFromStatusLine(data: Record<string, unknown>): string | null {
+    const model = data.model;
+    const direct = asString(model);
+    if (direct) return direct;
+    const modelRecord = asRecord(model);
+    if (modelRecord) {
+        return asString(modelRecord.id)
+            ?? asString(modelRecord.name)
+            ?? asString(modelRecord.display_name)
+            ?? asString(modelRecord.displayName);
+    }
+    return asString(data.model_id)
+        ?? asString(data.modelId)
+        ?? asString(data.model_name)
+        ?? asString(data.modelName);
+}
+
+
+function parseResetAt(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value < 10_000_000_000 ? value * 1000 : value;
+    }
+    if (typeof value === 'string' && value.trim()) {
+        const parsedNumber = Number(value);
+        if (Number.isFinite(parsedNumber)) return parsedNumber < 10_000_000_000 ? parsedNumber * 1000 : parsedNumber;
+        const parsedDate = Date.parse(value);
+        return Number.isFinite(parsedDate) ? parsedDate : null;
+    }
+    return null;
+}
+
+function findRateLimitRoot(data: Record<string, unknown>): Record<string, unknown> | null {
+    const direct = asRecord(data.rate_limits ?? data.rateLimits);
+    if (direct) return direct;
+    const usage = asRecord(data.usage);
+    if (usage) {
+        const nested = asRecord(usage.rate_limits ?? usage.rateLimits);
+        if (nested) return nested;
+    }
+    return null;
+}
+
+function normalizeRateLimitEntry(value: unknown): ClaudeRateLimitEntry | null {
+    const record = asRecord(value);
+    if (!record) return null;
+    const used = asNumber(
+        record.used_percentage
+        ?? record.usedPercentage
+        ?? record.utilization
+        ?? record.percent_used
+        ?? record.percentUsed
+    );
+    if (used === null) return null;
+    return {
+        usedPercentage: Math.max(0, Math.min(100, used <= 1 ? used * 100 : used)),
+        resetsAt: parseResetAt(record.resets_at ?? record.resetsAt ?? record.reset_at ?? record.resetAt)
+    };
+}
+
+function limitToStatus(entry: ClaudeRateLimitEntry | null): AgentAccountStatus['window'] {
+    if (!entry) return null;
+    return {
+        resetAt: entry.resetsAt,
+        remainingMs: entry.resetsAt ? Math.max(0, entry.resetsAt - Date.now()) : null,
+        remainingPercent: Math.max(0, Math.min(100, 100 - entry.usedPercentage))
+    };
+}
+
+function accountStatusFromStatusLine(data: Record<string, unknown>): AgentAccountStatus | null {
+    const root = findRateLimitRoot(data);
+    if (!root) return null;
+
+    const fiveHour = normalizeRateLimitEntry(root.five_hour ?? root.fiveHour);
+    const weekly = normalizeRateLimitEntry(
+        root.seven_day
+        ?? root.sevenDay
+        ?? root.seven_day_sonnet
+        ?? root.sevenDaySonnet
+        ?? root.seven_day_opus
+        ?? root.sevenDayOpus
+    );
+    if (!fiveHour && !weekly) return null;
+
+    return {
+        provider: 'claude',
+        window: limitToStatus(fiveHour),
+        weekly: limitToStatus(weekly),
+        updatedAt: Date.now()
+    };
+}
 
 export interface StartOptions {
     model?: string
@@ -50,15 +179,18 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     }
 
     const initialState: AgentState = {};
-    const initialModel = normalizeClaudeSessionModel(options.model);
+    const initialModel = normalizeClaudeSessionModel(options.model ?? readClaudeSettingsModel());
     const initialEffort = normalizeClaudeSessionEffort(options.effort);
+    const resumeTitle = extractClaudeResumeTitle(options.claudeArgs);
+    const resumeSessionId = extractClaudeResumeSessionId(options.claudeArgs);
     const { api, session, sessionInfo } = await bootstrapSession({
         flavor: 'claude',
         startedBy,
         workingDirectory,
         agentState: initialState,
         model: initialModel ?? undefined,
-        effort: initialEffort ?? undefined
+        effort: initialEffort ?? undefined,
+        metadataOverrides: resumeTitle ? { name: resumeTitle } : undefined
     });
     logger.debug(`Session created: ${sessionInfo.id}`);
 
@@ -85,6 +217,15 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     // Variable to track current session instance (updated via onSessionReady callback)
     const currentSessionRef: { current: Session | null } = { current: null };
 
+    let currentPermissionMode: PermissionMode = options.permissionMode ?? 'bypassPermissions';
+    let currentModel: SessionModel = initialModel;
+    let currentEffort: SessionEffort = initialEffort;
+    let currentFallbackModel: string | undefined = undefined;
+    let currentCustomSystemPrompt: string | undefined = undefined;
+    let currentAppendSystemPrompt: string | undefined = undefined;
+    let currentAllowedTools: string[] | undefined = undefined;
+    let currentDisallowedTools: string[] | undefined = undefined;
+
     const formatFailureReason = (message: string): string => {
         const maxLength = 200;
         if (message.length <= maxLength) {
@@ -103,9 +244,32 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
                 const previousSessionId = currentSession.sessionId;
                 if (previousSessionId !== sessionId) {
                     logger.debug(`[START] Claude session ID changed: ${previousSessionId} -> ${sessionId}`);
-                    currentSession.onSessionFound(sessionId);
+                    const sessionFilePath = typeof data.transcript_path === 'string' ? data.transcript_path : undefined;
+                    currentSession.onSessionFound(sessionId, sessionFilePath);
                 }
             }
+        },
+        onStatusLine: (data) => {
+            const currentSession = currentSessionRef.current;
+            if (!currentSession) return;
+
+            const statusLineModel = normalizeClaudeSessionModel(modelFromStatusLine(data));
+            if (statusLineModel !== undefined && statusLineModel !== currentModel) {
+                currentModel = statusLineModel;
+                currentSession.setModel(currentModel);
+                currentSession.client.keepAlive(currentSession.thinking, currentSession.mode, {
+                    permissionMode: currentSession.getPermissionMode(),
+                    model: currentModel,
+                    effort: currentSession.getEffort()
+                });
+            }
+
+            const accountStatus = accountStatusFromStatusLine(data);
+            if (!accountStatus) return;
+            currentSession.client.sendSessionEvent({
+                type: 'account-status',
+                accountStatus
+            });
         }
     });
     logger.debug(`[START] Hook server started on port ${hookServer.port}`);
@@ -152,15 +316,6 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     }));
 
     // Forward messages to the queue
-    let currentPermissionMode: PermissionMode = options.permissionMode ?? 'bypassPermissions';
-    let currentModel: SessionModel = initialModel;
-    let currentEffort: SessionEffort = initialEffort;
-    let currentFallbackModel: string | undefined = undefined; // Track current fallback model
-    let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
-    let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
-    let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
-    let currentDisallowedTools: string[] | undefined = undefined; // Track current disallowed tools
-
     const syncSessionModes = () => {
         const sessionInstance = currentSessionRef.current;
         if (!sessionInstance) {
@@ -378,6 +533,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
             session,
             claudeEnvVars: options.claudeEnvVars,
             claudeArgs: options.claudeArgs,
+            resumeSessionId,
             startedBy,
             hookSettingsPath
         });

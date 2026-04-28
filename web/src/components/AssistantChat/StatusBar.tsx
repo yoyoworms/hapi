@@ -12,6 +12,7 @@ import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { getClaudeModelLabel } from '@hapi/protocol'
 import { useTranslation } from '@/lib/use-translation'
 import { useAppContext } from '@/lib/app-context'
+import type { LatestUsage } from '@/chat/reducer'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -119,6 +120,7 @@ function formatTokenCount(tokens: number): string {
 }
 
 function formatCost(cost: number): string {
+    if (cost > 0 && cost < 0.01) return `$${cost.toFixed(3)}`
     return `$${cost.toFixed(2)}`
 }
 
@@ -151,26 +153,104 @@ function formatLimit(limit: AgentAccountStatus['window']): string | null {
     const pct = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
         ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
         : null
-    if (duration && pct) return `${duration} ${pct}`
-    return duration ?? pct
+    return duration && pct ? `${duration} ${pct}` : duration ?? pct
+}
+
+function formatUsageText(
+    usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null | undefined,
+    latestUsage: LatestUsage | null | undefined
+): { text: string; title: string } | null {
+    if (usage) {
+        const totalTokens = usage.totalInputTokens + usage.totalOutputTokens
+        return {
+            text: `${formatCost(usage.totalCostUsd)} · ${formatTokenCount(totalTokens)} tok`,
+            title: [
+                `Cost: ${formatCost(usage.totalCostUsd)}`,
+                `Input tokens: ${usage.totalInputTokens.toLocaleString()}`,
+                `Output tokens: ${usage.totalOutputTokens.toLocaleString()}`,
+                `Total tokens: ${totalTokens.toLocaleString()}`
+            ].join('\n')
+        }
+    }
+
+    if (!latestUsage) return null
+    const inputTokens = latestUsage.inputTokens + latestUsage.cacheCreation + latestUsage.cacheRead
+    const outputTokens = latestUsage.outputTokens
+    const totalTokens = inputTokens + outputTokens
+    if (totalTokens <= 0 && latestUsage.contextSize <= 0) return null
+
+    return {
+        text: `ctx ${formatTokenCount(latestUsage.contextSize)} · ${formatTokenCount(totalTokens)} tok`,
+        title: [
+            'Latest Claude Code usage from transcript',
+            `Context tokens: ${latestUsage.contextSize.toLocaleString()}`,
+            `Input tokens: ${latestUsage.inputTokens.toLocaleString()}`,
+            `Cache creation: ${latestUsage.cacheCreation.toLocaleString()}`,
+            `Cache read: ${latestUsage.cacheRead.toLocaleString()}`,
+            `Output tokens: ${latestUsage.outputTokens.toLocaleString()}`
+        ].join('\n')
+    }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function asNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Number(value)
+        return Number.isFinite(parsed) ? parsed : null
+    }
+    return null
+}
+
+function parseResetAt(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value < 10_000_000_000 ? value * 1000 : value
+    if (typeof value === 'string' && value.trim()) {
+        const asTimestamp = Number(value)
+        if (Number.isFinite(asTimestamp)) return asTimestamp < 10_000_000_000 ? asTimestamp * 1000 : asTimestamp
+        const parsed = Date.parse(value)
+        return Number.isFinite(parsed) ? parsed : null
+    }
+    return null
+}
+
+function getLimitEntry(root: Record<string, unknown>, ...keys: string[]): AgentAccountStatus['window'] {
+    for (const key of keys) {
+        const entry = asRecord(root[key])
+        if (!entry) continue
+        const used = asNumber(
+            entry.utilization
+            ?? entry.used_percentage
+            ?? entry.usedPercentage
+            ?? entry.percent_used
+            ?? entry.percentUsed
+        )
+        if (used === null) continue
+        const usedPercent = Math.max(0, Math.min(100, used <= 1 ? used * 100 : used))
+        const resetAt = parseResetAt(entry.resets_at ?? entry.resetsAt ?? entry.reset_at ?? entry.resetAt)
+        return {
+            resetAt,
+            remainingMs: resetAt ? Math.max(0, resetAt - Date.now()) : null,
+            remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent))
+        }
+    }
+    return null
 }
 
 function accountStatusFromClaudeUsage(usage: UsageResponse | null): AgentAccountStatus | null {
-    if (!usage) return null
-    const toLimit = (entry: { utilization: number; resets_at: string } | null) => {
-        if (!entry) return null
-        const resetAt = Date.parse(entry.resets_at)
-        return {
-            resetAt: Number.isFinite(resetAt) ? resetAt : null,
-            remainingMs: Number.isFinite(resetAt) ? Math.max(0, resetAt - Date.now()) : null,
-            remainingPercent: Math.max(0, Math.min(100, 100 - entry.utilization))
-        }
-    }
+    const root = asRecord(usage)
+    if (!root) return null
+    const rateLimits = asRecord(root.rate_limits ?? root.rateLimits) ?? root
+    const window = getLimitEntry(rateLimits, 'five_hour', 'fiveHour')
+    const weekly = getLimitEntry(rateLimits, 'seven_day', 'sevenDay', 'seven_day_sonnet', 'sevenDaySonnet', 'seven_day_opus', 'sevenDayOpus')
+    if (!window && !weekly) return null
     return {
         provider: 'claude',
-        accountLabel: usage.accountLabel ?? usage.subscriptionType ?? null,
-        window: toLimit(usage.five_hour),
-        weekly: toLimit(usage.seven_day ?? usage.seven_day_sonnet ?? usage.seven_day_opus),
+        accountLabel: usage?.accountLabel ?? usage?.subscriptionType ?? null,
+        window,
+        weekly,
         updatedAt: Date.now()
     }
 }
@@ -209,9 +289,11 @@ function useClaudeAccountStatus(enabled: boolean): AgentAccountStatus | null {
 export function StatusBar(props: {
     active: boolean
     thinking: boolean
+    sessionId?: string
     agentState: AgentState | null | undefined
     contextSize?: number
     usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
+    latestUsage?: LatestUsage | null
     accountStatus?: AgentAccountStatus | null
     model?: string | null
     permissionMode?: PermissionMode
@@ -221,7 +303,8 @@ export function StatusBar(props: {
     onModelChange?: (model: string | null) => void
 }) {
     const { t } = useTranslation()
-    const claudeAccountStatus = useClaudeAccountStatus(props.agentFlavor === 'claude')
+    const isClaudeFlavor = props.agentFlavor === 'claude' || props.agentFlavor === null
+    const claudeAccountStatus = useClaudeAccountStatus(isClaudeFlavor)
     const connectionStatus = useMemo(
         () => getConnectionStatus(props.active, props.thinking, props.agentState, props.voiceStatus, t),
         [props.active, props.thinking, props.agentState, props.voiceStatus, t]
@@ -253,8 +336,8 @@ export function StatusBar(props: {
     const collaborationModeLabel = displayCollaborationMode
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
-    const accountStatus = props.agentFlavor === 'claude'
-        ? claudeAccountStatus ?? props.accountStatus ?? null
+    const accountStatus = isClaudeFlavor
+        ? props.accountStatus ?? claudeAccountStatus ?? null
         : props.accountStatus ?? null
     const accountLimitText = accountStatus
         ? [formatLimit(accountStatus.window), formatLimit(accountStatus.weekly)].filter(Boolean).join(' · ')
@@ -266,6 +349,7 @@ export function StatusBar(props: {
             accountStatus.weekly?.resetAt ? `Weekly reset: ${formatReset(accountStatus.weekly.resetAt)}` : null
         ].filter(Boolean).join('\n')
         : undefined
+    const usageText = formatUsageText(props.usage, props.latestUsage)
 
     return (
         <div className="flex items-center justify-between px-2 pb-1">
@@ -285,19 +369,19 @@ export function StatusBar(props: {
                 ) : null}
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex min-w-0 items-center justify-end gap-2">
                 {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
-                    <span className="max-w-[42vw] truncate text-[10px] text-[var(--app-hint)]" title={accountTitle}>
+                    <span className="min-w-0 max-w-[46vw] truncate text-[10px] font-medium text-[var(--app-fg)]" title={accountTitle}>
                         {accountStatus.accountLabel ? `${accountStatus.accountLabel} ` : ''}{accountLimitText}
                     </span>
                 ) : null}
-                {props.usage ? (
-                    <span className="text-[10px] text-[var(--app-hint)]">
-                        {formatCost(props.usage.totalCostUsd)}
+                {usageText ? (
+                    <span className="shrink-0 text-[10px] text-[var(--app-hint)]" title={usageText.title}>
+                        {usageText.text}
                     </span>
                 ) : null}
                 {props.model ? (
-                    <span className="text-[10px] text-[var(--app-hint)]">
+                    <span className="hidden text-[10px] text-[var(--app-hint)] md:inline">
                         {getClaudeModelLabel(props.model)}
                     </span>
                 ) : null}
@@ -311,7 +395,7 @@ export function StatusBar(props: {
                         {permissionModeLabel}
                     </span>
                 ) : null}
-                <span className="text-[10px] text-[var(--app-hint)]">
+                <span className="hidden text-[10px] text-[var(--app-hint)] sm:inline">
                     v{__APP_VERSION__}
                 </span>
             </div>

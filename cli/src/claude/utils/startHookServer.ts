@@ -25,6 +25,8 @@ export interface SessionHookData {
 export interface HookServerOptions {
     /** Called when a session hook is received with a valid session ID. */
     onSessionHook: (sessionId: string, data: SessionHookData) => void;
+    /** Called when Claude statusLine JSON is received. */
+    onStatusLine?: (data: Record<string, unknown>) => void;
     /** Optional token to require for hook requests. */
     token?: string;
 }
@@ -50,12 +52,39 @@ function readHookToken(req: IncomingMessage): string | null {
  * Start a dedicated HTTP server for receiving Claude session hooks.
  */
 export async function startHookServer(options: HookServerOptions): Promise<HookServer> {
-    const { onSessionHook } = options;
+    const { onSessionHook, onStatusLine } = options;
     const hookToken = options.token || randomBytes(16).toString('hex');
 
     return new Promise((resolve, reject) => {
         const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
             const requestPath = req.url?.split('?')[0];
+
+            if (req.method === 'POST' && requestPath === '/hook/statusline') {
+                const providedToken = readHookToken(req);
+                if (providedToken !== hookToken) {
+                    res.writeHead(401, { 'Content-Type': 'text/plain' }).end('unauthorized');
+                    req.resume();
+                    return;
+                }
+
+                try {
+                    const chunks: Buffer[] = [];
+                    for await (const chunk of req) {
+                        chunks.push(chunk as Buffer);
+                    }
+                    const body = Buffer.concat(chunks).toString('utf-8');
+                    const parsed = JSON.parse(body);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                        onStatusLine?.(parsed as Record<string, unknown>);
+                    }
+                    res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+                } catch (error) {
+                    logger.debug('[hookServer] Error handling statusline hook:', error);
+                    res.writeHead(400, { 'Content-Type': 'text/plain' }).end('invalid json');
+                }
+                return;
+            }
+
             if (req.method === 'POST' && requestPath === '/hook/session-start') {
                 const providedToken = readHookToken(req);
                 if (providedToken !== hookToken) {

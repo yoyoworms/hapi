@@ -305,6 +305,7 @@ export function SessionChat(props: {
                         thinking={props.session.thinking}
                         agentState={props.session.agentState}
                         contextSize={reduced.latestUsage?.contextSize}
+                        latestUsage={reduced.latestUsage}
                         usage={props.session.usage}
                         accountStatus={props.session.accountStatus}
                         controlledByUser={controlledByUser}

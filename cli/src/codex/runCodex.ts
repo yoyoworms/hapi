@@ -12,6 +12,7 @@ import { isPermissionModeAllowedForFlavor } from '@hapi/protocol';
 import { CodexCollaborationModeSchema, PermissionModeSchema } from '@hapi/protocol/schemas';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
 import { getInvokedCwd } from '@/utils/invokedCwd';
+import { resolveCodexResumeTitle } from '@/utils/resumeTitle';
 import type { ReasoningEffort } from './appServerTypes';
 
 export { emitReadyIfIdle } from './utils/emitReadyIfIdle';
@@ -32,12 +33,14 @@ export async function runCodex(opts: {
     let state: AgentState = {
         controlledByUser: false
     };
+    const resumeTitle = resolveCodexResumeTitle(opts.resumeSessionId);
     const { api, session } = await bootstrapSession({
         flavor: 'codex',
         startedBy,
         workingDirectory,
         agentState: state,
-        model: opts.model
+        model: opts.model,
+        metadataOverrides: resumeTitle ? { name: resumeTitle } : undefined
     });
 
     const startingMode: 'local' | 'remote' = startedBy === 'runner' ? 'remote' : 'local';

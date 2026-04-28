@@ -29,8 +29,8 @@ export async function claudeLocalLauncher(session: Session): Promise<'switch' | 
         }
     });
 
-    const handleSessionFound = (sessionId: string) => {
-        scanner.onNewSession(sessionId);
+    const handleSessionFound = (sessionId: string, sessionFilePath?: string) => {
+        scanner.onNewSession(sessionId, sessionFilePath);
     };
     session.addSessionFoundCallback(handleSessionFound);
 

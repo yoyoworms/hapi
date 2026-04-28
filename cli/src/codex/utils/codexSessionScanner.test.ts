@@ -408,6 +408,49 @@ describe('codexSessionScanner', () => {
         expect(imported.has(sessionId)).toBe(true);
     });
 
+    it('imports explicit resume history from an old date path', async () => {
+        const sessionId = 'session-explicit-old-date';
+        const targetCwd = '/data/github/happy/hapi';
+        const oldSessionsDir = join(testDir, 'sessions', '2025', '01', '02');
+        sessionFile = join(oldSessionsDir, `codex-${sessionId}.jsonl`);
+        await mkdir(oldSessionsDir, { recursive: true });
+
+        await writeFile(
+            sessionFile,
+            [
+                JSON.stringify({
+                    type: 'session_meta',
+                    payload: {
+                        id: sessionId,
+                        cwd: targetCwd,
+                        timestamp: '2025-01-02T00:00:00.000Z'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: { type: 'agent_message', message: 'old explicit resume history' }
+                })
+            ].join('\n') + '\n'
+        );
+
+        let importedSessionId: string | null = null;
+        scanner = await createCodexSessionScanner({
+            sessionId,
+            cwd: targetCwd,
+            startupTimestampMs: Date.parse('2025-12-22T00:00:00.000Z'),
+            shouldImportHistory: () => true,
+            onHistoryImported: (candidate) => {
+                importedSessionId = candidate;
+            },
+            onEvent: (event) => events.push(event)
+        });
+
+        await wait(150);
+
+        expect(importedSessionId).toBe(sessionId);
+        expect(events.map((event) => event.type)).toEqual(['session_meta', 'event_msg']);
+    });
+
     it('does not synchronously adopt an old matching session without fresh activity', async () => {
         const oldSessionId = 'session-old-no-activity';
         const targetCwd = '/data/github/happy/hapi';
