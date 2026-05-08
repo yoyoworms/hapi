@@ -221,6 +221,23 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 }
             }
 
+            // Background tools (e.g. Monitor) echo their injected user input back as
+            // assistant text starting with "Human: <task-notification>..." or
+            // "Human: <system-reminder>...". Don't surface these in the chat —
+            // they're noise, not real assistant responses.
+            if (msg.type === 'assistant') {
+                const content = (msg as any)?.message?.content;
+                if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text') {
+                    const text: string = content[0].text ?? '';
+                    if (
+                        text.includes('<task-notification>')
+                        || text.includes('<system-reminder>')
+                    ) {
+                        return;
+                    }
+                }
+            }
+
             const logMessage = sdkToLogConverter.convert(msg);
             if (logMessage) {
                 // Skip user text messages echoed back by SDK — these are already stored
@@ -413,14 +430,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                                 totalOutputTokens: usage.totalOutputTokens
                             });
                         },
-                        onReady: async () => {
+                        onReady: async (autonomous) => {
                             // Flush the outgoing message queue before sending ready event
                             // to prevent delayed messages from arriving after the user's next message
                             await messageQueue.flush();
                             logger.debug(
                                 `[claudeRemoteLauncher][async-debug] onReady callback ` +
-                                `(hasPending=${Boolean(pending)}, queueSize=${session.queue.size()})`
+                                `(hasPending=${Boolean(pending)}, queueSize=${session.queue.size()}, autonomous=${autonomous})`
                             );
+                            if (autonomous) {
+                                logger.debug('[claudeRemoteLauncher][async-debug] ready event suppressed (autonomous turn)');
+                                return;
+                            }
                             if (!pending && session.queue.size() === 0) {
                                 session.client.sendSessionEvent({ type: 'ready' });
                                 logger.debug('[claudeRemoteLauncher][async-debug] ready event sent to hub');

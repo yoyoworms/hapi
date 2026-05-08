@@ -284,4 +284,109 @@ describe('claudeRemote async message handling', () => {
             process.off('unhandledRejection', onUnhandled);
         }
     });
+
+    it('flags autonomous turns when the result echoes a Monitor task-notification', async () => {
+        const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
+        const { claudeRemote } = await import('./claudeRemote');
+        const pendingNext = deferred<{ message: string; mode: { permissionMode: 'default' } } | null>();
+        const onReadyCalls: boolean[] = [];
+
+        const sdkMessages: SDKMessage[] = [
+            {
+                type: 'assistant',
+                message: {
+                    role: 'assistant',
+                    content: [{ type: 'text', text: 'Human: <task-notification>\n<task-id>x</task-id>' }]
+                }
+            } as unknown as SDKMessage,
+            {
+                type: 'result',
+                subtype: 'success',
+                num_turns: 1,
+                total_cost_usd: 0,
+                duration_ms: 1,
+                duration_api_ms: 1,
+                is_error: false,
+                session_id: 's-1',
+                result: 'Human: <task-notification>\n<task-id>x</task-id>'
+            } as unknown as SDKMessage,
+            {
+                type: 'assistant',
+                message: {
+                    role: 'assistant',
+                    content: [{ type: 'text', text: 'real reply' }]
+                }
+            } as unknown as SDKMessage,
+            {
+                type: 'result',
+                subtype: 'success',
+                num_turns: 1,
+                total_cost_usd: 0,
+                duration_ms: 1,
+                duration_api_ms: 1,
+                is_error: false,
+                session_id: 's-1',
+                result: 'real reply'
+            } as unknown as SDKMessage
+        ];
+
+        queryMock.mockReturnValueOnce(createAsyncStream(sdkMessages));
+
+        let nextCallCount = 0;
+        const runPromise = claudeRemote({
+            sessionId: 'session-1',
+            path: process.cwd(),
+            mcpServers: {},
+            claudeEnvVars: {},
+            claudeArgs: [],
+            allowedTools: [],
+            hookSettingsPath: '/tmp/hook.json',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            nextMessage: async () => {
+                nextCallCount += 1;
+                if (nextCallCount === 1) {
+                    return { message: 'A', mode: { permissionMode: 'default' } };
+                }
+                return await pendingNext.promise;
+            },
+            onReady: (autonomous) => {
+                onReadyCalls.push(autonomous);
+            },
+            isAborted: () => false,
+            onSessionFound: () => {},
+            onMessage: () => {},
+            onCompletionEvent: () => {},
+            onSessionReset: () => {}
+        });
+
+        try {
+            await waitFor(() => onReadyCalls.length >= 2);
+            expect(onReadyCalls).toEqual([true, false]);
+        } finally {
+            pendingNext.resolve(null);
+            await runPromise;
+            queryMock.mockReset();
+            querySpy.mockRestore();
+        }
+    });
+});
+
+describe('isAutonomousTurnResult', () => {
+    it('detects task-notification echoes', async () => {
+        const { isAutonomousTurnResult } = await import('./claudeRemote');
+        expect(
+            isAutonomousTurnResult({ result: 'Human: <task-notification>\n<task-id>x</task-id>' } as any)
+        ).toBe(true);
+    });
+
+    it('detects system-reminder echoes', async () => {
+        const { isAutonomousTurnResult } = await import('./claudeRemote');
+        expect(isAutonomousTurnResult({ result: 'Human: <system-reminder>...' } as any)).toBe(true);
+    });
+
+    it('returns false for ordinary results', async () => {
+        const { isAutonomousTurnResult } = await import('./claudeRemote');
+        expect(isAutonomousTurnResult({ result: 'hello world' } as any)).toBe(false);
+        expect(isAutonomousTurnResult({} as any)).toBe(false);
+    });
 });

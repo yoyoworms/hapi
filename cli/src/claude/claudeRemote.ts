@@ -12,6 +12,14 @@ import { PermissionResult } from "./sdk/types";
 import { getHapiBlobsDir } from "@/constants/uploadPaths";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
 
+const AUTONOMOUS_RESULT_MARKERS = ['<task-notification>', '<system-reminder>'];
+
+export function isAutonomousTurnResult(message: SDKResultMessage): boolean {
+    const result = (message as { result?: unknown }).result;
+    if (typeof result !== 'string' || !result) return false;
+    return AUTONOMOUS_RESULT_MARKERS.some((marker) => result.includes(marker));
+}
+
 export async function claudeRemote(opts: {
 
     // Fixed parameters
@@ -27,7 +35,7 @@ export async function claudeRemote(opts: {
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
-    onReady: () => void | Promise<void>,
+    onReady: (autonomous: boolean) => void | Promise<void>,
     isAborted: (toolCallId: string) => boolean,
 
     // Callbacks
@@ -287,9 +295,13 @@ export async function claudeRemote(opts: {
                 // a race where the frontend sees thinking=false (via keepAlive) before
                 // all response messages have been stored in the hub, allowing the user
                 // to send a new message that gets a lower seq than the remaining response.
-                await opts.onReady();
+                // Background tools (e.g. Monitor) inject task-notification turns that are
+                // echoed back into the result text. Surfacing those as "ready for input"
+                // pushes the user every time, so flag the turn as autonomous to suppress.
+                const autonomous = isAutonomousTurnResult(resultMsg);
+                await opts.onReady(autonomous);
                 updateThinking(false);
-                logger.debug(`${debugPrefix} onReady emitted for result #${resultSeq}`);
+                logger.debug(`${debugPrefix} onReady emitted for result #${resultSeq} autonomous=${autonomous}`);
 
                 // Pull next user message without blocking response stream processing.
                 // Claude may emit autonomous async messages (e.g. scheduled tasks) after a result,
