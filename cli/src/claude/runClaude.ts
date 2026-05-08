@@ -268,7 +268,11 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
                 }
             }
 
-            applyHookModel(data);
+            // Don't apply data.model from SessionStart: the hook fires on every
+            // resume / mode switch, and Claude Code reports the settings.json
+            // default rather than the active runtime model — so applying it
+            // clobbers whatever the user (or CLI flag) set. statusLine carries
+            // the live runtime model and remains the authoritative signal.
         },
         onStatusLine: (data) => {
             const currentSession = currentSessionRef.current;
