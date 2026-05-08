@@ -60,7 +60,7 @@ function readClaudeSettingsModel(): string | null {
     }
 }
 
-function modelFromStatusLine(data: Record<string, unknown>): string | null {
+function modelFromHookData(data: Record<string, unknown>): string | null {
     const model = data.model;
     const direct = asString(model);
     if (direct) return direct;
@@ -234,6 +234,25 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         return `${message.slice(0, maxLength)}...`;
     };
 
+    const applyHookModel = (data: Record<string, unknown>) => {
+        const currentSession = currentSessionRef.current;
+        if (!currentSession) return;
+
+        const hookModel = modelFromHookData(data);
+        if (hookModel === null) return;
+
+        const normalizedModel = normalizeClaudeSessionModel(hookModel);
+        if (normalizedModel === currentModel) return;
+
+        currentModel = normalizedModel;
+        currentSession.setModel(currentModel);
+        currentSession.client.keepAlive(currentSession.thinking, currentSession.mode, {
+            permissionMode: currentSession.getPermissionMode(),
+            model: currentModel,
+            effort: currentSession.getEffort()
+        });
+    };
+
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
         onSessionHook: (sessionId, data) => {
@@ -248,21 +267,14 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
                     currentSession.onSessionFound(sessionId, sessionFilePath);
                 }
             }
+
+            applyHookModel(data);
         },
         onStatusLine: (data) => {
             const currentSession = currentSessionRef.current;
             if (!currentSession) return;
 
-            const statusLineModel = normalizeClaudeSessionModel(modelFromStatusLine(data));
-            if (statusLineModel !== undefined && statusLineModel !== currentModel) {
-                currentModel = statusLineModel;
-                currentSession.setModel(currentModel);
-                currentSession.client.keepAlive(currentSession.thinking, currentSession.mode, {
-                    permissionMode: currentSession.getPermissionMode(),
-                    model: currentModel,
-                    effort: currentSession.getEffort()
-                });
-            }
+            applyHookModel(data);
 
             const accountStatus = accountStatusFromStatusLine(data);
             if (!accountStatus) return;
