@@ -260,4 +260,35 @@ describe('AppServerEventConverter', () => {
 
         expect(events).toEqual([{ type: 'task_failed', error: 'fatal' }]);
     });
+
+    it('maps wrapped stream errors to task_failed', () => {
+        const converter = new AppServerEventConverter();
+
+        const events = converter.handleNotification('codex/event/stream_error', {
+            msg: {
+                type: 'stream_error',
+                message: 'Selected model is at capacity. Please try a different model.'
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'task_failed',
+            error: 'Selected model is at capacity. Please try a different model.'
+        }]);
+    });
+
+    it('maps direct turn errors to task_failed', () => {
+        const converter = new AppServerEventConverter();
+
+        const events = converter.handleNotification('turn/error', {
+            error: {
+                message: 'Selected model is at capacity. Please try a different model.'
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'task_failed',
+            error: 'Selected model is at capacity. Please try a different model.'
+        }]);
+    });
 });

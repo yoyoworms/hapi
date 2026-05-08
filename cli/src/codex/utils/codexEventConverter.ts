@@ -42,6 +42,10 @@ export type CodexConversionResult = {
     sessionId?: string;
     message?: CodexMessage;
     userMessage?: string;
+    sessionEvent?: {
+        type: 'message';
+        message: string;
+    };
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -53,6 +57,23 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | null {
     return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+    return typeof value === 'boolean' ? value : null;
+}
+
+function extractErrorMessage(payload: Record<string, unknown>): string | null {
+    const errorRecord = asRecord(payload.error);
+    return asString(payload.message)
+        ?? asString(payload.error)
+        ?? (errorRecord ? asString(errorRecord.message) : null)
+        ?? asString(payload.reason);
+}
+
+function formatVisibleErrorMessage(message: string): string {
+    const trimmed = message.trim();
+    return trimmed.startsWith('⚠') ? trimmed : `⚠ ${trimmed}`;
 }
 
 function parseArguments(value: unknown): unknown {
@@ -181,6 +202,26 @@ export function convertCodexEvent(rawEvent: unknown): CodexConversionResult | nu
                     type: 'token_count',
                     info,
                     id: randomUUID()
+                }
+            };
+        }
+
+        if (eventType === 'error' || eventType === 'task_failed' || eventType === 'stream_error') {
+            const errorRecord = asRecord(payloadRecord.error);
+            const willRetry = asBoolean(payloadRecord.will_retry ?? payloadRecord.willRetry ?? errorRecord?.will_retry ?? errorRecord?.willRetry) ?? false;
+            if (willRetry) {
+                return null;
+            }
+
+            const message = extractErrorMessage(payloadRecord);
+            if (!message) {
+                return null;
+            }
+
+            return {
+                sessionEvent: {
+                    type: 'message',
+                    message: formatVisibleErrorMessage(message)
                 }
             };
         }

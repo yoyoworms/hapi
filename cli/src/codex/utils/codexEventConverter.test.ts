@@ -91,4 +91,33 @@ describe('convertCodexEvent', () => {
             output: { ok: true }
         });
     });
+
+    it('converts Codex error event_msg into a visible session event', () => {
+        const result = convertCodexEvent({
+            type: 'event_msg',
+            payload: {
+                type: 'error',
+                message: 'Selected model is at capacity. Please try a different model.',
+                codex_error_info: 'server_overloaded'
+            }
+        });
+
+        expect(result?.sessionEvent).toEqual({
+            type: 'message',
+            message: '⚠ Selected model is at capacity. Please try a different model.'
+        });
+    });
+
+    it('ignores retryable Codex error event_msg', () => {
+        const result = convertCodexEvent({
+            type: 'event_msg',
+            payload: {
+                type: 'error',
+                message: 'temporary',
+                will_retry: true
+            }
+        });
+
+        expect(result).toBeNull();
+    });
 });

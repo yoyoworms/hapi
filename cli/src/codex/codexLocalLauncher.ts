@@ -95,6 +95,9 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                 emptyCompletionNoticeTracker.onConvertedMessage(converted.message);
                 session.sendAgentMessage(converted.message);
             }
+            if (converted?.sessionEvent) {
+                session.sendSessionEvent(converted.sessionEvent);
+            }
             const eventPayload = event.payload && typeof event.payload === 'object'
                 ? event.payload as Record<string, unknown>
                 : null;

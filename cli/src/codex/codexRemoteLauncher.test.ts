@@ -8,7 +8,8 @@ const harness = vi.hoisted(() => ({
     initializeCalls: [] as unknown[],
     startTurnCalls: [] as unknown[],
     manualTurns: false,
-    turnResolvers: [] as Array<() => void>
+    turnResolvers: [] as Array<() => void>,
+    latestNotificationHandler: null as ((method: string, params: unknown) => void) | null
 }));
 
 vi.mock('./codexAppServerClient', () => {
@@ -24,6 +25,7 @@ vi.mock('./codexAppServerClient', () => {
 
         setNotificationHandler(handler: ((method: string, params: unknown) => void) | null): void {
             this.notificationHandler = handler;
+            harness.latestNotificationHandler = handler;
         }
 
         registerRequestHandler(method: string): void {
@@ -189,6 +191,7 @@ describe('codexRemoteLauncher', () => {
         harness.startTurnCalls = [];
         harness.manualTurns = false;
         harness.turnResolvers = [];
+        harness.latestNotificationHandler = null;
     });
 
     it('finishes a turn and emits ready when task lifecycle events omit turn_id', async () => {
@@ -237,5 +240,27 @@ describe('codexRemoteLauncher', () => {
         session.queue.close();
 
         await expect(launchPromise).resolves.toBe('exit');
+    });
+
+    it('forwards app-server task failures as visible session messages', async () => {
+        harness.manualTurns = true;
+        const { session, sessionEvents } = createSessionStub({ closeQueue: false });
+
+        const launchPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnCalls.length).toBe(1));
+
+        harness.latestNotificationHandler?.('turn/error', {
+            error: {
+                message: 'Selected model is at capacity. Please try a different model.'
+            }
+        });
+        harness.turnResolvers.shift()?.();
+        session.queue.close();
+
+        await expect(launchPromise).resolves.toBe('exit');
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: '⚠ Selected model is at capacity. Please try a different model.'
+        });
     });
 });

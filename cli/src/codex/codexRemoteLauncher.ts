@@ -275,11 +275,22 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             completion?.resolve();
         };
 
+        const formatVisibleErrorMessage = (message: string): string => {
+            const trimmed = message.trim();
+            return trimmed.startsWith('⚠') ? trimmed : `⚠ ${trimmed}`;
+        };
+
         const handleCodexEvent = (msg: Record<string, unknown>) => {
             const msgType = asString(msg.type);
             if (!msgType) return;
-            const eventTurnId = asString(msg.turn_id ?? msg.turnId);
+            let eventTurnId = asString(msg.turn_id ?? msg.turnId);
             const isTerminalEvent = msgType === 'task_complete' || msgType === 'turn_aborted' || msgType === 'task_failed';
+            if (msgType === 'task_failed' && !eventTurnId && this.currentTurnId) {
+                // Codex capacity/overload errors can arrive without turn_id even
+                // though they belong to the active turn. Do not drop those:
+                // otherwise web keeps showing "thinking/ready" with no visible error.
+                eventTurnId = this.currentTurnId;
+            }
 
             if (msgType === 'thread_started') {
                 const threadId = asString(msg.thread_id ?? msg.threadId);
@@ -460,6 +471,15 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const notice = emptyCompletionNoticeTracker.maybeCreateNotice(msg);
                 if (notice) {
                     session.sendAgentMessage(notice);
+                }
+            }
+            if (msgType === 'task_failed') {
+                const error = asString(msg.error);
+                if (error) {
+                    session.sendSessionEvent({
+                        type: 'message',
+                        message: formatVisibleErrorMessage(error)
+                    });
                 }
             }
             if (msgType === 'token_count') {

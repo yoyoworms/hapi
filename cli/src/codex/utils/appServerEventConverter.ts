@@ -141,6 +141,14 @@ function extractAccountStatus(params: Record<string, unknown>): Record<string, u
     };
 }
 
+function extractErrorMessage(params: Record<string, unknown>): string | null {
+    const errorRecord = asRecord(params.error);
+    return asString(params.message)
+        ?? asString(params.error)
+        ?? (errorRecord ? asString(errorRecord.message) : null)
+        ?? asString(params.reason);
+}
+
 function extractItemId(params: Record<string, unknown>): string | null {
     const direct = asString(params.itemId ?? params.item_id ?? params.id);
     if (direct) return direct;
@@ -341,7 +349,7 @@ export class AppServerEventConverter {
             if (willRetry) {
                 return [];
             }
-            const error = asString(msg.message ?? msg.reason ?? errorRecord?.message);
+            const error = extractErrorMessage(msg);
             return error ? [{ type: 'task_failed', error }] : [];
         }
 
@@ -350,13 +358,17 @@ export class AppServerEventConverter {
             msgType === 'mcp_startup_complete' ||
             msgType === 'plan_update' ||
             msgType === 'skills_update_available' ||
-            msgType === 'stream_error' ||
             msgType === 'warning' ||
             msgType === 'context_compacted' ||
             msgType === 'terminal_interaction' ||
             msgType === 'user_message'
         ) {
             return [];
+        }
+
+        if (msgType === 'stream_error') {
+            const error = extractErrorMessage(msg);
+            return error ? [{ type: 'task_failed', error }] : [];
         }
 
         return [msg as ConvertedEvent];
@@ -433,7 +445,17 @@ export class AppServerEventConverter {
         if (method === 'error') {
             const willRetry = asBoolean(paramsRecord.will_retry ?? paramsRecord.willRetry) ?? false;
             if (willRetry) return events;
-            const message = asString(paramsRecord.message) ?? asString(asRecord(paramsRecord.error)?.message);
+            const message = extractErrorMessage(paramsRecord);
+            if (message) {
+                events.push({ type: 'task_failed', error: message });
+            }
+            return events;
+        }
+
+        if (method === 'stream/error' || method === 'turn/error') {
+            const willRetry = asBoolean(paramsRecord.will_retry ?? paramsRecord.willRetry) ?? false;
+            if (willRetry) return events;
+            const message = extractErrorMessage(paramsRecord);
             if (message) {
                 events.push({ type: 'task_failed', error: message });
             }
