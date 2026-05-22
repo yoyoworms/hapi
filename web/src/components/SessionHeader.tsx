@@ -82,6 +82,7 @@ export function SessionHeader(props: {
     const menuId = useId()
     const menuAnchorRef = useRef<HTMLButtonElement | null>(null)
     const [renameOpen, setRenameOpen] = useState(false)
+    const [restartOpen, setRestartOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
@@ -216,6 +217,7 @@ export function SessionHeader(props: {
                 sessionActive={session.active}
                 onRename={() => setRenameOpen(true)}
                 onResume={handleResume}
+                onRestart={() => setRestartOpen(true)}
                 onArchive={() => setArchiveOpen(true)}
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}
@@ -227,6 +229,17 @@ export function SessionHeader(props: {
                 onClose={() => setRenameOpen(false)}
                 currentName={title}
                 onRename={renameSession}
+                isPending={isPending}
+            />
+
+            <ConfirmDialog
+                isOpen={restartOpen}
+                onClose={() => setRestartOpen(false)}
+                title={t('dialog.restart.title')}
+                description={t('dialog.restart.description', { name: title })}
+                confirmLabel={t('dialog.restart.confirm')}
+                confirmingLabel={t('dialog.restart.confirming')}
+                onConfirm={handleResume}
                 isPending={isPending}
             />
 

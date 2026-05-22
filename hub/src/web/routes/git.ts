@@ -130,6 +130,69 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         return c.json(result)
     })
 
+    const MAX_RAW_FILE_BYTES = 20 * 1024 * 1024
+    const MIME_TYPES: Record<string, string> = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.svg': 'image/svg+xml',
+        '.bmp': 'image/bmp',
+        '.ico': 'image/x-icon',
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.mov': 'video/quicktime',
+        '.pdf': 'application/pdf',
+        '.json': 'application/json',
+        '.txt': 'text/plain',
+        '.csv': 'text/csv',
+        '.html': 'text/html',
+        '.xml': 'application/xml',
+        '.md': 'text/markdown',
+    }
+
+    function getMimeType(filePath: string): string {
+        const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase()
+        return MIME_TYPES[ext] ?? 'application/octet-stream'
+    }
+
+    app.get('/sessions/:id/file/raw', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const parsed = filePathSchema.safeParse(c.req.query())
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid file path' }, 400)
+        }
+
+        const result = await runRpc(() => engine.readSessionFile(sessionResult.sessionId, parsed.data.path))
+        if (!result.success || !result.content) {
+            return c.json({ error: result.error ?? 'File not found' }, 404)
+        }
+
+        const buffer = Buffer.from(result.content, 'base64')
+        if (buffer.length > MAX_RAW_FILE_BYTES) {
+            return c.json({ error: `File too large (${Math.round(buffer.length / 1024 / 1024)}MB, max ${MAX_RAW_FILE_BYTES / 1024 / 1024}MB)` }, 413)
+        }
+
+        const mimeType = getMimeType(parsed.data.path)
+        return new Response(buffer, {
+            headers: {
+                'content-type': mimeType,
+                'content-length': String(buffer.length),
+                'cache-control': 'private, max-age=60',
+            }
+        })
+    })
+
     app.get('/sessions/:id/files', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {

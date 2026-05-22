@@ -359,6 +359,8 @@ export async function startRunner(): Promise<void> {
             } else {
                 args.push('--resume', options.resumeSessionId);
             }
+        } else if (options.continueLatest && agent !== 'codex') {
+            args.push('--continue');
         }
         args.push('--hapi-starting-mode', 'remote', '--started-by', 'runner');
         if (options.model && agent !== 'opencode') {

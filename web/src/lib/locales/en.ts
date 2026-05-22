@@ -61,6 +61,7 @@ export default {
   // Session actions
   'session.action.rename': 'Rename',
   'session.action.resume': 'Resume',
+  'session.action.restart': 'Restart',
   'session.action.archive': 'Archive',
   'session.action.delete': 'Delete',
   'session.action.copy': 'Copy',
@@ -71,6 +72,10 @@ export default {
   'dialog.rename.save': 'Save',
   'dialog.rename.saving': 'Saving…',
   'dialog.rename.error': 'Failed to rename. Please try again.',
+  'dialog.restart.title': 'Restart Session',
+  'dialog.restart.description': 'Restart "{name}"? The session will be killed and relaunched, resuming the current conversation.',
+  'dialog.restart.confirm': 'Restart',
+  'dialog.restart.confirming': 'Restarting…',
   'dialog.archive.title': 'Archive Session',
   'dialog.archive.description': 'Are you sure you want to archive "{name}"? This will disconnect active session.',
   'dialog.archive.confirm': 'Archive',

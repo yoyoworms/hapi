@@ -38,7 +38,11 @@ export function createAuthRoutes(jwtSecret: Uint8Array, store: Store): Hono<WebA
         // Access Token authentication (CLI_API_TOKEN)
         if ('accessToken' in parsed.data) {
             const parsedToken = parseAccessToken(parsed.data.accessToken)
-            if (!parsedToken || !constantTimeEquals(parsedToken.baseToken, configuration.cliApiToken)) {
+            const baseTokenMatch = parsedToken && (
+                constantTimeEquals(parsedToken.baseToken, configuration.cliApiToken)
+                || constantTimeEquals(parsedToken.baseToken.toLowerCase(), configuration.cliApiToken.toLowerCase())
+            )
+            if (!parsedToken || !baseTokenMatch) {
                 return c.json({ error: 'Invalid access token' }, 401)
             }
             userId = await getOrCreateOwnerId()
@@ -52,6 +56,7 @@ export function createAuthRoutes(jwtSecret: Uint8Array, store: Store): Hono<WebA
             // Telegram initData authentication
             const result = validateTelegramInitData(parsed.data.initData, configuration.telegramBotToken)
             if (!result.ok) {
+                console.log(`[auth] 401 telegram: error=${result.error} initDataLen=${parsed.data.initData.length}`)
                 return c.json({ error: result.error }, 401)
             }
 

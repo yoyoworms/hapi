@@ -15,6 +15,7 @@ type SessionActionMenuProps = {
     sessionActive: boolean
     onRename: () => void
     onResume?: () => void
+    onRestart?: () => void
     onArchive: () => void
     onDelete: () => void
     anchorPoint: { x: number; y: number }
@@ -56,6 +57,28 @@ function EditIcon(props: { className?: string }) {
         >
             <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
             <path d="m15 5 4 4" />
+        </svg>
+    )
+}
+
+function RestartIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+            <path d="M16 16h5v5" />
         </svg>
     )
 }
@@ -118,6 +141,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         sessionActive,
         onRename,
         onResume,
+        onRestart,
         onArchive,
         onDelete,
         anchorPoint,
@@ -137,6 +161,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleResume = () => {
         onClose()
         onResume?.()
+    }
+
+    const handleRestart = () => {
+        onClose()
+        onRestart?.()
     }
 
     const handleArchive = () => {
@@ -274,6 +303,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <PlayIcon className="text-[var(--app-link)]" />
                         {t('session.action.resume')}
+                    </button>
+                ) : null}
+
+                {sessionActive && onRestart ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} text-[var(--app-link)] hover:bg-[var(--app-link)]/10`}
+                        onClick={handleRestart}
+                    >
+                        <RestartIcon className="text-[var(--app-link)]" />
+                        {t('session.action.restart')}
                     </button>
                 ) : null}
 

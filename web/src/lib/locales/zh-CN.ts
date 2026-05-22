@@ -61,6 +61,7 @@ export default {
   // Session actions
   'session.action.rename': '重命名',
   'session.action.resume': '恢复',
+  'session.action.restart': '重启',
   'session.action.archive': '归档',
   'session.action.delete': '删除',
   'session.action.copy': '复制',
@@ -72,6 +73,10 @@ export default {
   'dialog.rename.saving': '保存中…',
   'dialog.rename.error': '重命名失败，请重试。',
 
+  'dialog.restart.title': '重启会话',
+  'dialog.restart.description': '确定要重启 "{name}" 吗？会话将被关闭并重新启动，恢复当前对话。',
+  'dialog.restart.confirm': '重启',
+  'dialog.restart.confirming': '重启中…',
   'dialog.archive.title': '归档会话',
   'dialog.archive.description': '确定要归档 "{name}" 吗？这将断开活动会话。',
   'dialog.archive.confirm': '归档',

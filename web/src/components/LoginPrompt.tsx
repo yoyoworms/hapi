@@ -132,11 +132,14 @@ export function LoginPrompt(props: LoginPromptProps) {
                 <form onSubmit={handleSubmit} className="space-y-4">
                     <div>
                         <input
-                            type="password"
+                            type="text"
                             value={accessToken}
                             onChange={(e) => setAccessToken(e.target.value)}
                             placeholder={t('login.placeholder')}
-                            autoComplete="current-password"
+                            autoComplete="off"
+                            autoCapitalize="off"
+                            autoCorrect="off"
+                            spellCheck={false}
                             disabled={isLoading}
                             className="w-full px-3 py-2.5 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none focus:ring-2 focus:ring-[var(--app-button)] focus:border-transparent disabled:opacity-50"
                         />

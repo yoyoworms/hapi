@@ -426,7 +426,8 @@ export class SyncEngine {
         worktreeName?: string,
         resumeSessionId?: string,
         effort?: string,
-        sandbox?: boolean
+        sandbox?: boolean,
+        continueLatest?: boolean
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         return await this.rpcGateway.spawnSession(
             machineId,
@@ -439,7 +440,8 @@ export class SyncEngine {
             worktreeName,
             resumeSessionId,
             effort,
-            sandbox
+            sandbox,
+            continueLatest
         )
     }
 
@@ -507,8 +509,11 @@ export class SyncEngine {
             return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
         }
 
-        // Auto-discovery fallback: if no resume token, scan for available sessions
-        if (!resumeToken) {
+        // For Claude/Cursor/Gemini without explicit resume token, use --continue
+        const useContinue = !resumeToken && flavor !== 'codex' && flavor !== 'opencode'
+
+        // Auto-discovery fallback for agents that don't support --continue
+        if (!resumeToken && !useContinue) {
             try {
                 const scanResult = await this.rpcGateway.listAgentSessions(
                     targetMachine.id,
@@ -525,7 +530,6 @@ export class SyncEngine {
             } catch {
                 // Scan failed, continue without resume token
             }
-
         }
 
         let spawnResult = await this.rpcGateway.spawnSession(
@@ -538,7 +542,9 @@ export class SyncEngine {
             undefined,
             undefined,
             resumeToken,
-            session.effort ?? undefined
+            session.effort ?? undefined,
+            undefined,
+            useContinue || undefined
         )
 
         // Fallback: if resume spawn fails, retry without resume token (start fresh session)

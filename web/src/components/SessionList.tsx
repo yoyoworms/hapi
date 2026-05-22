@@ -178,6 +178,7 @@ function SessionItem(props: {
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
     const [renameOpen, setRenameOpen] = useState(false)
+    const [restartOpen, setRestartOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
@@ -312,6 +313,7 @@ function SessionItem(props: {
                 sessionActive={s.active}
                 onRename={() => setRenameOpen(true)}
                 onResume={handleResume}
+                onRestart={() => setRestartOpen(true)}
                 onArchive={() => setArchiveOpen(true)}
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}
@@ -322,6 +324,17 @@ function SessionItem(props: {
                 onClose={() => setRenameOpen(false)}
                 currentName={sessionName}
                 onRename={renameSession}
+                isPending={isPending}
+            />
+
+            <ConfirmDialog
+                isOpen={restartOpen}
+                onClose={() => setRestartOpen(false)}
+                title={t('dialog.restart.title')}
+                description={t('dialog.restart.description', { name: sessionName })}
+                confirmLabel={t('dialog.restart.confirm')}
+                confirmingLabel={t('dialog.restart.confirming')}
+                onConfirm={handleResume}
                 isPending={isPending}
             />
 
