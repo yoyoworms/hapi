@@ -536,7 +536,7 @@ export function HappyComposer(props: {
 
             const canNavigateUp = key === 'ArrowUp'
                 && el.selectionStart === el.selectionEnd
-                && isCaretOnFirstLine(el)
+                && (historyIndexRef.current !== null || isCaretOnFirstLine(el))
             const canNavigateDown = key === 'ArrowDown'
                 && el.selectionStart === el.selectionEnd
                 && (historyIndexRef.current !== null || isCaretOnLastLine(el))
