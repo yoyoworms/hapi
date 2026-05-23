@@ -50,11 +50,23 @@ bun run test             # all packages
 
 ## Deploy
 
-Use the `/deploy-hapi` skill to deploy. Manual steps:
+This fork (`yoyoworms/hapi`) deploys to `liuxinhapi.1to10.cn`, **not** to `hapi.1to10.cn` (that's upstream `tiann/hapi`).
 
-- **Hub:** Build, then scp `hub/dist/index.js` to `ubuntu@hapi.1to10.cn:~/hapi-custom/index.js`. Restart via PM2.
-- **Web:** Build, then rsync `web/dist/` to `ubuntu@hapi.1to10.cn:~/hapi-custom/web/dist/`.
-- **CLI:** Build binary, replace at `/opt/homebrew/lib/node_modules/@twsxtd/hapi/node_modules/@twsxtd/hapi-darwin-arm64/bin/hapi`, then **codesign** (required on macOS).
+```bash
+bun run deploy:liuxin          # full deploy: tests + typecheck + rsync + remote build + pm2 restart
+bun run deploy:liuxin:fast     # same but --skip-tests
+scripts/deploy-liuxinhapi.sh --dry-run   # preview without changing remote
+```
+
+What the script does:
+1. Runs focused local tests + `bun typecheck`
+2. Creates a timestamped tar backup on remote at `/home/ubuntu/hapi-liuxin-src-backup-<ts>.tar.gz`
+3. rsyncs working tree to `ubuntu@liuxinhapi.1to10.cn:/home/ubuntu/hapi-liuxin-src/` (excludes `node_modules`, `*/dist/`, `.git`)
+4. Remote: `bun install` + `build:web` + `generate:embedded-web-assets` + `build:hub`
+5. `pm2 restart hapi-hub-liuxin --update-env && pm2 save`
+6. Smoke checks `https://liuxinhapi.1to10.cn` and `/sw.js`
+
+**CLI binary is not deployed by this script** — it's a local-dev artifact. To install/refresh the local CLI binary, build with `cd cli && bun run build:exe` and copy to `/opt/homebrew/lib/node_modules/@twsxtd/hapi/node_modules/@twsxtd/hapi-darwin-arm64/bin/hapi`, then codesign (see Common Pitfalls).
 
 ## Key File Locations
 
@@ -108,9 +120,10 @@ codesign --force --sign - /opt/homebrew/lib/node_modules/@twsxtd/hapi/node_modul
 Without this, macOS will refuse to execute the binary.
 
 ### Deployment Paths
-- Hub entry: `~/hapi-custom/index.js` (not a standard node_modules path)
-- Web dist: `~/hapi-custom/web/dist/`
-- These are on `ubuntu@hapi.1to10.cn`
+- Remote host: `ubuntu@liuxinhapi.1to10.cn`
+- Remote source: `/home/ubuntu/hapi-liuxin-src/` (full repo synced; remote builds in-place)
+- PM2 app name: `hapi-hub-liuxin`
+- Public URL: `https://liuxinhapi.1to10.cn`
 
 ### Namespace Isolation
 Multiple namespaces are supported via token format: `baseToken:namespace`. Each namespace has isolated sessions. The Hub routes messages based on the namespace extracted from the auth token.
@@ -121,7 +134,7 @@ Internal/system messages should be filtered on the Hub side, not in the frontend
 ### Version Management
 - CLI version: `cli/package.json` `version` field (currently uses semver)
 - Web build number: `web/build-number.json`
-- Both should be incremented on deploy (the `/deploy-hapi` skill handles this)
+- `scripts/deploy-liuxinhapi.sh` does **not** auto-increment — bump manually before deploy if you want the version stamp to change.
 
 ## Code Conventions
 

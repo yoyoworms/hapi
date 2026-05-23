@@ -98,8 +98,6 @@ if [[ "$SKIP_TESTS" != "1" ]]; then
     run bun test \
         hub/src/sync/sessionModel.test.ts \
         hub/src/socket/handlers/cli/sessionHandlers.test.ts \
-        cli/src/codex/codexLocal.test.ts \
-        cli/src/codex/utils/codexSessionScanner.test.ts \
         hub/src/sse/sseManager.test.ts \
         hub/src/notifications/notificationHub.test.ts
 
