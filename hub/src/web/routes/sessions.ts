@@ -1,5 +1,19 @@
-import { getPermissionModesForFlavor, isPermissionModeAllowedForFlavor, toSessionSummary } from '@hapi/protocol'
-import { CodexCollaborationModeSchema, PermissionModeSchema } from '@hapi/protocol/schemas'
+import {
+    DeleteUploadRequestSchema,
+    getPermissionModesForFlavor,
+    isPermissionModeAllowedForFlavor,
+    RenameSessionRequestSchema,
+    ResumeSessionRequestSchema,
+    SessionCollaborationModeRequestSchema,
+    SessionEffortRequestSchema,
+    SessionModelReasoningEffortRequestSchema,
+    SessionModelRequestSchema,
+    SessionPermissionModeRequestSchema,
+    supportsModelChange,
+    toSessionSummary,
+    UploadFileRequestSchema
+} from '@hapi/protocol'
+import type { SlashCommand } from '@hapi/protocol/apiTypes'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { mkdir, writeFile } from 'fs/promises'
@@ -10,39 +24,33 @@ import type { SyncEngine, Session } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
 import { uploadDownloadTokens } from '../server'
-import { configuration } from '../../configuration'
-
-const permissionModeSchema = z.object({
-    mode: PermissionModeSchema
-})
-
-const collaborationModeSchema = z.object({
-    mode: CodexCollaborationModeSchema
-})
-
-const modelSchema = z.object({
-    model: z.string().trim().min(1).nullable()
-})
-
-const effortSchema = z.object({
-    effort: z.string().trim().min(1).nullable()
-})
-
-const renameSessionSchema = z.object({
-    name: z.string().min(1).max(255)
-})
-
-const uploadSchema = z.object({
-    filename: z.string().min(1).max(255),
-    content: z.string().min(1),
-    mimeType: z.string().min(1).max(255)
-})
-
-const uploadDeleteSchema = z.object({
-    path: z.string().min(1)
-})
+import { getConfiguration } from '../../configuration'
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+function commandsFromMetadataSlashCommands(names: readonly string[] | undefined): SlashCommand[] {
+    if (!names?.length) {
+        return []
+    }
+
+    return names
+        .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+        .map((name) => ({
+            name,
+            source: 'builtin'
+        }))
+}
+
+function mergeSlashCommands(
+    primary: readonly SlashCommand[],
+    fallback: readonly SlashCommand[]
+): SlashCommand[] {
+    const commandMap = new Map<string, SlashCommand>()
+    for (const command of [...fallback, ...primary]) {
+        commandMap.set(command.name, command)
+    }
+    return Array.from(commandMap.values())
+}
 
 function estimateBase64Bytes(base64: string): number {
     const len = base64.length
@@ -108,13 +116,33 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return sessionResult
         }
 
-        const namespace = c.get('namespace')
         const body = await c.req.json().catch(() => null)
-        const resumeWithSessionId = body && typeof body === 'object' && typeof body.resumeWithSessionId === 'string'
-            ? body.resumeWithSessionId
+        const parsed = body ? ResumeSessionRequestSchema.safeParse(body) : { success: true as const, data: {} }
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body' }, 400)
+        }
+
+        const { permissionMode } = parsed.data
+        if (permissionMode !== undefined) {
+            const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
+            if (!isPermissionModeAllowedForFlavor(permissionMode, flavor)) {
+                return c.json({ error: 'Invalid permission mode for session flavor' }, 400)
+            }
+        }
+
+        const namespace = c.get('namespace')
+        const resumeWithSessionId = body && typeof body === 'object' && typeof (body as Record<string, unknown>).resumeWithSessionId === 'string'
+            ? (body as Record<string, unknown>).resumeWithSessionId as string
             : undefined
 
-        const result = await engine.resumeSession(sessionResult.sessionId, namespace, resumeWithSessionId)
+        const result = await engine.resumeSession(
+            sessionResult.sessionId,
+            namespace,
+            {
+                permissionMode,
+                resumeWithSessionId
+            }
+        )
         if (result.type === 'error') {
             const status = result.code === 'no_machine_online' ? 503
                 : result.code === 'access_denied' ? 403
@@ -167,7 +195,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = uploadSchema.safeParse(body)
+        const parsed = UploadFileRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
@@ -203,7 +231,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 const downloadToken = randomUUID()
                 uploadDownloadTokens.add(downloadToken)
                 setTimeout(() => uploadDownloadTokens.delete(downloadToken), 120_000)
-                const downloadUrl = `${configuration.publicUrl}/api/sessions/${encodeURIComponent(sessionResult.sessionId)}/upload/download/${encodeURIComponent(uniqueFilename)}?token=${downloadToken}`
+                const downloadUrl = `${getConfiguration().publicUrl}/api/sessions/${encodeURIComponent(sessionResult.sessionId)}/upload/download/${encodeURIComponent(uniqueFilename)}?token=${downloadToken}`
                 const result = await engine.uploadFileFromHub(
                     sessionResult.sessionId,
                     parsed.data.filename,
@@ -242,7 +270,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = uploadDeleteSchema.safeParse(body)
+        const parsed = DeleteUploadRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
@@ -309,13 +337,13 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return engine
         }
 
-        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        const sessionResult = requireSessionFromParam(c, engine)
         if (sessionResult instanceof Response) {
             return sessionResult
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = permissionModeSchema.safeParse(body)
+        const parsed = SessionPermissionModeRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
@@ -361,7 +389,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = collaborationModeSchema.safeParse(body)
+        const parsed = SessionCollaborationModeRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
@@ -387,14 +415,17 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = modelSchema.safeParse(body)
+        const parsed = SessionModelRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
 
         const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
-        if (flavor !== 'claude' && flavor !== 'gemini') {
-            return c.json({ error: 'Model selection is only supported for Claude and Gemini sessions' }, 400)
+        if (!supportsModelChange(flavor)) {
+            return c.json({ error: 'Model selection is not supported for this session' }, 400)
+        }
+        if (flavor === 'codex' && sessionResult.session.agentState?.controlledByUser === true) {
+            return c.json({ error: 'Model selection can only be changed for remote Codex sessions' }, 409)
         }
 
         try {
@@ -402,6 +433,42 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ ok: true })
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to apply model'
+            return c.json({ error: message }, 409)
+        }
+    })
+
+    app.post('/sessions/:id/model-reasoning-effort', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
+        if (flavor !== 'codex') {
+            return c.json({ error: 'Model reasoning effort is only supported for Codex sessions' }, 400)
+        }
+        if (sessionResult.session.agentState?.controlledByUser === true) {
+            return c.json({ error: 'Model reasoning effort can only be changed for remote Codex sessions' }, 409)
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = SessionModelReasoningEffortRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body' }, 400)
+        }
+
+        try {
+            await engine.applySessionConfig(sessionResult.sessionId, {
+                modelReasoningEffort: parsed.data.modelReasoningEffort
+            })
+            return c.json({ ok: true })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to apply model reasoning effort'
             return c.json({ error: message }, 409)
         }
     })
@@ -418,7 +485,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = effortSchema.safeParse(body)
+        const parsed = SessionEffortRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body' }, 400)
         }
@@ -449,7 +516,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const body = await c.req.json().catch(() => null)
-        const parsed = renameSessionSchema.safeParse(body)
+        const parsed = RenameSessionRequestSchema.safeParse(body)
         if (!parsed.success) {
             return c.json({ error: 'Invalid body: name is required' }, 400)
         }
@@ -510,10 +577,29 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         // Get agent type from session metadata, default to 'claude'
         const agent = sessionResult.session.metadata?.flavor ?? 'claude'
 
+        const metadataCommands = commandsFromMetadataSlashCommands(
+            sessionResult.session.metadata?.slashCommands
+        )
+
         try {
             const result = await engine.listSlashCommands(sessionResult.sessionId, agent)
+            if (result.success && result.commands) {
+                return c.json({
+                    ...result,
+                    commands: mergeSlashCommands(result.commands, metadataCommands)
+                })
+            }
+
+            if (metadataCommands.length > 0) {
+                return c.json({ success: true, commands: metadataCommands })
+            }
+
             return c.json(result)
         } catch (error) {
+            if (metadataCommands.length > 0) {
+                return c.json({ success: true, commands: metadataCommands })
+            }
+
             return c.json({
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to list slash commands'
@@ -541,6 +627,66 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to list skills'
             })
+        }
+    })
+
+    app.get('/sessions/:id/codex-models', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
+        if (flavor !== 'codex') {
+            return c.json({
+                success: false,
+                error: 'Codex models are only available for Codex sessions'
+            }, 400)
+        }
+
+        try {
+            const result = await engine.listCodexModelsForSession(sessionResult.sessionId)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list Codex models'
+            }, 500)
+        }
+    })
+
+    app.get('/sessions/:id/opencode-models', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
+        if (flavor !== 'opencode') {
+            return c.json({
+                success: false,
+                error: 'OpenCode models are only available for OpenCode sessions'
+            }, 400)
+        }
+
+        try {
+            const result = await engine.listOpencodeModelsForSession(sessionResult.sessionId)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list OpenCode models'
+            }, 500)
         }
     })
 

@@ -1,5 +1,5 @@
 import type { Session } from '../sync/syncEngine'
-import type { NotificationChannel } from '../notifications/notificationTypes'
+import type { NotificationChannel, TaskNotification } from '../notifications/notificationTypes'
 import { getAgentName, getSessionName } from '../notifications/sessionInfo'
 import type { SSEManager } from '../sse/sseManager'
 import type { PushPayload, PushService } from './pushService'
@@ -76,6 +76,32 @@ export class PushNotificationChannel implements NotificationChannel {
                 url
             }
         })
+
+        await this.pushService.sendToNamespace(session.namespace, payload)
+    }
+
+    async sendTaskNotification(session: Session, notification: TaskNotification): Promise<void> {
+        if (!session.active) {
+            return
+        }
+
+        const agentName = getAgentName(session)
+        const name = getSessionName(session)
+        const normalizedStatus = notification.status?.trim().toLowerCase()
+        const isFailure = normalizedStatus === 'failed'
+            || normalizedStatus === 'error'
+            || normalizedStatus === 'killed'
+            || normalizedStatus === 'aborted'
+
+        const payload: PushPayload = {
+            title: isFailure ? 'Task failed' : 'Task completed',
+            body: `${agentName} · ${name} · ${notification.summary}`,
+            data: {
+                type: 'task-notification',
+                sessionId: session.id,
+                url: this.buildSessionPath(session.id)
+            }
+        }
 
         await this.pushService.sendToNamespace(session.namespace, payload)
     }

@@ -1,17 +1,36 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type WheelEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useParams, useSearch } from '@tanstack/react-router'
 import type { GitCommandResponse } from '@/types/api'
 import { FileIcon } from '@/components/FileIcon'
-import { CopyIcon, CheckIcon } from '@/components/icons'
+import { CopyIcon, CheckIcon, CloseIcon } from '@/components/icons'
 import { useAppContext } from '@/lib/app-context'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
+import { formatDiffError, formatReadFileError } from '@/lib/files-i18n'
 import { queryKeys } from '@/lib/query-keys'
 import { langAlias, useShikiHighlighter } from '@/lib/shiki'
+import { useTranslation } from '@/lib/use-translation'
 import { decodeBase64 } from '@/lib/utils'
 
 const MAX_COPYABLE_FILE_BYTES = 1_000_000
+const MIN_IMAGE_SCALE = 0.25
+const MAX_IMAGE_SCALE = 8
+const IMAGE_SCALE_STEP = 0.25
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+    apng: 'image/apng',
+    avif: 'image/avif',
+    bmp: 'image/bmp',
+    gif: 'image/gif',
+    ico: 'image/x-icon',
+    jpeg: 'image/jpeg',
+    jpg: 'image/jpeg',
+    png: 'image/png',
+    svg: 'image/svg+xml',
+    tif: 'image/tiff',
+    tiff: 'image/tiff',
+    webp: 'image/webp'
+}
 
 function decodePath(value: string): string {
     if (!value) return ''
@@ -73,12 +92,12 @@ function DiffDisplay(props: { diffContent: string }) {
     )
 }
 
-function FileContentSkeleton() {
+function FileContentSkeleton(props: { label: string }) {
     const widths = ['w-full', 'w-11/12', 'w-5/6', 'w-3/4', 'w-2/3', 'w-4/5']
 
     return (
         <div role="status" aria-live="polite">
-            <span className="sr-only">Loading file…</span>
+            <span className="sr-only">{props.label}</span>
             <div className="animate-pulse space-y-2 rounded-md border border-[var(--app-border)] bg-[var(--app-code-bg)] p-3">
                 {Array.from({ length: 12 }).map((_, index) => (
                     <div key={`file-skeleton-${index}`} className={`h-3 ${widths[index % widths.length]} rounded bg-[var(--app-subtle-bg)]`} />
@@ -94,6 +113,14 @@ function resolveLanguage(path: string): string | undefined {
     const ext = parts[parts.length - 1]?.toLowerCase()
     if (!ext) return undefined
     return langAlias[ext] ?? ext
+}
+
+function resolveImageMimeType(path: string): string | null {
+    const parts = path.split('.')
+    if (parts.length <= 1) return null
+    const ext = parts[parts.length - 1]?.toLowerCase()
+    if (!ext) return null
+    return IMAGE_MIME_BY_EXTENSION[ext] ?? null
 }
 
 function getUtf8ByteLength(value: string): number {
@@ -116,8 +143,263 @@ function extractCommandError(result: GitCommandResponse | undefined): string | n
     return result.error ?? result.stderr ?? 'Failed to load diff'
 }
 
+function clampImageScale(value: number): number {
+    return Math.min(MAX_IMAGE_SCALE, Math.max(MIN_IMAGE_SCALE, value))
+}
+
+type ImagePoint = { x: number; y: number }
+
+function getPointDistance(a: ImagePoint, b: ImagePoint): number {
+    return Math.hypot(a.x - b.x, a.y - b.y)
+}
+
+function getPointCenter(a: ImagePoint, b: ImagePoint): ImagePoint {
+    return {
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2
+    }
+}
+
+function ImagePreview(props: { dataUrl: string; fileName: string; label: string }) {
+    const [viewerOpen, setViewerOpen] = useState(false)
+    const [scale, setScale] = useState(1)
+    const [offset, setOffset] = useState({ x: 0, y: 0 })
+    const scaleRef = useRef(scale)
+    const offsetRef = useRef(offset)
+    const activePointersRef = useRef(new Map<number, ImagePoint>())
+    const dragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number } | null>(null)
+    const pinchRef = useRef<{ startDistance: number; startScale: number; startCenter: ImagePoint; origin: ImagePoint } | null>(null)
+
+    const updateScale = useCallback((next: number | ((current: number) => number)) => {
+        setScale((current) => {
+            const value = typeof next === 'function' ? next(current) : next
+            scaleRef.current = value
+            return value
+        })
+    }, [])
+
+    const updateOffset = useCallback((next: ImagePoint) => {
+        offsetRef.current = next
+        setOffset(next)
+    }, [])
+
+    const resetView = useCallback(() => {
+        updateScale(1)
+        updateOffset({ x: 0, y: 0 })
+    }, [updateOffset, updateScale])
+
+    const closeViewer = useCallback(() => {
+        setViewerOpen(false)
+        activePointersRef.current.clear()
+        dragRef.current = null
+        pinchRef.current = null
+        resetView()
+    }, [resetView])
+
+    const zoomBy = useCallback((delta: number) => {
+        updateScale((current) => clampImageScale(current + delta))
+    }, [updateScale])
+
+    const handleWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+        event.preventDefault()
+        const delta = event.deltaY < 0 ? IMAGE_SCALE_STEP : -IMAGE_SCALE_STEP
+        zoomBy(delta)
+    }, [zoomBy])
+
+    const beginPinch = useCallback(() => {
+        const pointers = Array.from(activePointersRef.current.values())
+        if (pointers.length < 2) return
+
+        const [first, second] = pointers
+        pinchRef.current = {
+            startDistance: getPointDistance(first, second),
+            startScale: scaleRef.current,
+            startCenter: getPointCenter(first, second),
+            origin: offsetRef.current
+        }
+        dragRef.current = null
+    }, [])
+
+    const handlePointerDown = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        if (event.button !== 0) return
+        event.currentTarget.setPointerCapture(event.pointerId)
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+
+        if (activePointersRef.current.size >= 2) {
+            beginPinch()
+            return
+        }
+
+        dragRef.current = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            originX: offsetRef.current.x,
+            originY: offsetRef.current.y
+        }
+    }, [beginPinch])
+
+    const handlePointerMove = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        if (!activePointersRef.current.has(event.pointerId)) return
+        activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+
+        if (activePointersRef.current.size >= 2 && pinchRef.current) {
+            const pointers = Array.from(activePointersRef.current.values())
+            const [first, second] = pointers
+            const distance = getPointDistance(first, second)
+            const center = getPointCenter(first, second)
+            const pinch = pinchRef.current
+            const nextScale = pinch.startDistance > 0
+                ? clampImageScale(pinch.startScale * (distance / pinch.startDistance))
+                : pinch.startScale
+
+            updateScale(nextScale)
+            updateOffset({
+                x: pinch.origin.x + center.x - pinch.startCenter.x,
+                y: pinch.origin.y + center.y - pinch.startCenter.y
+            })
+            return
+        }
+
+        const drag = dragRef.current
+        if (!drag || drag.pointerId !== event.pointerId) return
+        updateOffset({
+            x: drag.originX + event.clientX - drag.startX,
+            y: drag.originY + event.clientY - drag.startY
+        })
+    }, [updateOffset, updateScale])
+
+    const handlePointerUp = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        activePointersRef.current.delete(event.pointerId)
+        if (dragRef.current?.pointerId === event.pointerId) {
+            dragRef.current = null
+        }
+        pinchRef.current = null
+
+        const remainingPointer = activePointersRef.current.entries().next().value as [number, ImagePoint] | undefined
+        if (remainingPointer) {
+            dragRef.current = {
+                pointerId: remainingPointer[0],
+                startX: remainingPointer[1].x,
+                startY: remainingPointer[1].y,
+                originX: offsetRef.current.x,
+                originY: offsetRef.current.y
+            }
+        }
+    }, [])
+
+    useEffect(() => {
+        if (!viewerOpen) return
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                closeViewer()
+            }
+            if (event.key === '0') {
+                resetView()
+            }
+            if (event.key === '+' || event.key === '=') {
+                zoomBy(IMAGE_SCALE_STEP)
+            }
+            if (event.key === '-') {
+                zoomBy(-IMAGE_SCALE_STEP)
+            }
+        }
+
+        window.addEventListener('keydown', handleKeyDown)
+        return () => window.removeEventListener('keydown', handleKeyDown)
+    }, [closeViewer, resetView, viewerOpen, zoomBy])
+
+    return (
+        <>
+            <button
+                type="button"
+                onClick={() => setViewerOpen(true)}
+                className="group flex min-h-[18rem] w-full items-center justify-center overflow-auto rounded-md border border-[var(--app-border)] bg-[var(--app-code-bg)] p-3 text-left"
+                title="Click to zoom"
+            >
+                <img
+                    src={props.dataUrl}
+                    alt={props.label}
+                    className="max-h-[calc(100vh-14rem)] max-w-full object-contain transition-transform group-hover:scale-[1.01]"
+                    draggable={false}
+                />
+                <span className="sr-only">{props.fileName}</span>
+            </button>
+
+            {viewerOpen ? (
+                <div
+                    className="fixed inset-0 z-50 flex flex-col bg-black/90 text-white"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label={props.label}
+                >
+                    <div className="flex items-center gap-2 border-b border-white/10 bg-black/50 px-3 py-2">
+                        <div className="min-w-0 flex-1 truncate text-sm font-medium">{props.fileName}</div>
+                        <button
+                            type="button"
+                            onClick={() => zoomBy(-IMAGE_SCALE_STEP)}
+                            className="rounded bg-white/10 px-3 py-1 text-sm hover:bg-white/20 disabled:opacity-40"
+                            disabled={scale <= MIN_IMAGE_SCALE}
+                            title="Zoom out"
+                        >
+                            −
+                        </button>
+                        <button
+                            type="button"
+                            onClick={resetView}
+                            className="rounded bg-white/10 px-3 py-1 text-sm hover:bg-white/20"
+                            title="Reset zoom"
+                        >
+                            {Math.round(scale * 100)}%
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => zoomBy(IMAGE_SCALE_STEP)}
+                            className="rounded bg-white/10 px-3 py-1 text-sm hover:bg-white/20 disabled:opacity-40"
+                            disabled={scale >= MAX_IMAGE_SCALE}
+                            title="Zoom in"
+                        >
+                            +
+                        </button>
+                        <button
+                            type="button"
+                            onClick={closeViewer}
+                            className="flex h-8 w-8 items-center justify-center rounded bg-white/10 hover:bg-white/20"
+                            title="Close"
+                        >
+                            <CloseIcon className="h-4 w-4" />
+                        </button>
+                    </div>
+                    <div
+                        className="relative min-h-0 flex-1 cursor-grab touch-none overflow-hidden active:cursor-grabbing"
+                        onWheel={handleWheel}
+                        onPointerDown={handlePointerDown}
+                        onPointerMove={handlePointerMove}
+                        onPointerUp={handlePointerUp}
+                        onPointerCancel={handlePointerUp}
+                        onDoubleClick={resetView}
+                    >
+                        <img
+                            src={props.dataUrl}
+                            alt={props.label}
+                            draggable={false}
+                            className="absolute left-1/2 top-1/2 max-h-[90vh] max-w-[90vw] select-none object-contain"
+                            style={{
+                                transform: `translate(calc(-50% + ${offset.x}px), calc(-50% + ${offset.y}px)) scale(${scale})`,
+                                transformOrigin: 'center center'
+                            }}
+                        />
+                    </div>
+                </div>
+            ) : null}
+        </>
+    )
+}
+
 export default function FilePage() {
     const { api } = useAppContext()
+    const { t } = useTranslation()
     const { copied: pathCopied, copy: copyPath } = useCopyToClipboard()
     const { copied: contentCopied, copy: copyContent } = useCopyToClipboard()
     const goBack = useAppGoBack()
@@ -127,7 +409,8 @@ export default function FilePage() {
     const staged = search.staged
 
     const filePath = useMemo(() => decodePath(encodedPath), [encodedPath])
-    const fileName = filePath.split('/').pop() || filePath || 'File'
+    const fileName = filePath.split('/').pop() || filePath || t('file.page.fallbackName')
+    const imageMimeType = useMemo(() => resolveImageMimeType(filePath), [filePath])
 
     const diffQuery = useQuery({
         queryKey: queryKeys.gitFileDiff(sessionId, filePath, staged),
@@ -164,9 +447,12 @@ export default function FilePage() {
     const binaryFile = fileContentResult?.success
         ? !decodedContentResult.ok || isBinaryContent(decodedContent)
         : false
+    const imagePreviewUrl = fileContentResult?.success && fileContentResult.content && imageMimeType
+        ? `data:${imageMimeType};base64,${fileContentResult.content}`
+        : null
 
-    const language = useMemo(() => resolveLanguage(filePath), [filePath])
-    const highlighted = useShikiHighlighter(decodedContent, language)
+    const language = useMemo(() => imageMimeType ? undefined : resolveLanguage(filePath), [filePath, imageMimeType])
+    const highlighted = useShikiHighlighter(imageMimeType ? '' : decodedContent, language)
     const contentSizeBytes = useMemo(
         () => (decodedContent ? getUtf8ByteLength(decodedContent) : 0),
         [decodedContent]
@@ -179,6 +465,10 @@ export default function FilePage() {
     const [displayMode, setDisplayMode] = useState<'diff' | 'file'>('diff')
 
     useEffect(() => {
+        if (imageMimeType) {
+            setDisplayMode('file')
+            return
+        }
         if (diffSuccess && !diffContent) {
             setDisplayMode('file')
             return
@@ -186,14 +476,15 @@ export default function FilePage() {
         if (diffFailed) {
             setDisplayMode('file')
         }
-    }, [diffSuccess, diffFailed, diffContent])
+    }, [diffSuccess, diffFailed, diffContent, imageMimeType])
 
     const loading = diffQuery.isLoading || fileQuery.isLoading
     const fileError = fileContentResult && !fileContentResult.success
         ? (fileContentResult.error ?? 'Failed to read file')
         : null
     const missingPath = !filePath
-    const diffErrorMessage = diffError ? `Diff unavailable: ${diffError}` : null
+    const diffErrorMessage = diffError ? formatDiffError(diffError, t) : null
+    const fileErrorMessage = fileError ? formatReadFileError(fileError, t) : null
 
     return (
         <div className="flex h-full min-h-0 flex-col">
@@ -208,7 +499,7 @@ export default function FilePage() {
                     </button>
                     <div className="min-w-0 flex-1">
                         <div className="truncate font-semibold">{fileName}</div>
-                        <div className="truncate text-xs text-[var(--app-hint)]">{filePath || 'Unknown path'}</div>
+                        <div className="truncate text-xs text-[var(--app-hint)]">{filePath || t('file.page.unknownPath')}</div>
                     </div>
                 </div>
             </div>
@@ -216,12 +507,12 @@ export default function FilePage() {
             <div className="bg-[var(--app-bg)]">
                 <div className="mx-auto w-full max-w-content px-3 py-2 flex items-center gap-2 border-b border-[var(--app-divider)]">
                     <FileIcon fileName={fileName} size={20} />
-                    <span className="min-w-0 flex-1 truncate text-xs text-[var(--app-hint)]">{filePath}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs text-[var(--app-hint)]">{filePath || t('file.page.unknownPath')}</span>
                     <button
                         type="button"
                         onClick={() => copyPath(filePath)}
                         className="shrink-0 rounded p-1 text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] transition-colors"
-                        title="Copy path"
+                        title={t('file.page.copyPath')}
                     >
                         {pathCopied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
                     </button>
@@ -236,14 +527,14 @@ export default function FilePage() {
                             onClick={() => setDisplayMode('diff')}
                             className={`rounded px-3 py-1 text-xs font-semibold ${displayMode === 'diff' ? 'bg-[var(--app-button)] text-[var(--app-button-text)] opacity-80' : 'bg-[var(--app-subtle-bg)] text-[var(--app-hint)]'}`}
                         >
-                            Diff
+                            {t('file.page.tab.diff')}
                         </button>
                         <button
                             type="button"
                             onClick={() => setDisplayMode('file')}
                             className={`rounded px-3 py-1 text-xs font-semibold ${displayMode === 'file' ? 'bg-[var(--app-button)] text-[var(--app-button-text)] opacity-80' : 'bg-[var(--app-subtle-bg)] text-[var(--app-hint)]'}`}
                         >
-                            File
+                            {t('file.page.tab.file')}
                         </button>
                     </div>
                 </div>
@@ -257,41 +548,49 @@ export default function FilePage() {
                         </div>
                     ) : null}
                     {missingPath ? (
-                        <div className="text-sm text-[var(--app-hint)]">No file path provided.</div>
+                        <div className="text-sm text-[var(--app-hint)]">{t('file.page.missingPath')}</div>
                     ) : loading ? (
-                        <FileContentSkeleton />
-                    ) : fileError ? (
-                        <div className="text-sm text-[var(--app-hint)]">{fileError}</div>
-                    ) : binaryFile ? (
-                        <div className="text-sm text-[var(--app-hint)]">
-                            This looks like a binary file. It cannot be displayed.
-                        </div>
+                        <FileContentSkeleton label={t('loading.file')} />
+                    ) : fileErrorMessage ? (
+                        <div className="text-sm text-[var(--app-hint)]">{fileErrorMessage}</div>
                     ) : displayMode === 'diff' && diffContent ? (
                         <DiffDisplay diffContent={diffContent} />
                     ) : displayMode === 'diff' && diffError ? (
-                        <div className="text-sm text-[var(--app-hint)]">{diffError}</div>
+                        <div className="text-sm text-[var(--app-hint)]">{diffErrorMessage}</div>
                     ) : displayMode === 'file' ? (
-                        decodedContent ? (
-                            <div className="relative">
-                                {canCopyContent ? (
-                                    <button
-                                        type="button"
-                                        onClick={() => copyContent(decodedContent)}
-                                        className="absolute right-2 top-2 z-10 rounded p-1 text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] transition-colors"
-                                        title="Copy file content"
-                                    >
-                                        {contentCopied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
-                                    </button>
-                                ) : null}
-                                <pre className="shiki overflow-auto rounded-md bg-[var(--app-code-bg)] p-3 pr-8 text-xs font-mono">
-                                    <code>{highlighted ?? decodedContent}</code>
-                                </pre>
+                        imagePreviewUrl ? (
+                            <ImagePreview
+                                dataUrl={imagePreviewUrl}
+                                fileName={fileName}
+                                label={t('file.page.imagePreviewAlt', { name: fileName })}
+                            />
+                        ) : binaryFile ? (
+                            <div className="text-sm text-[var(--app-hint)]">
+                                {t('file.page.binary')}
                             </div>
                         ) : (
-                            <div className="text-sm text-[var(--app-hint)]">File is empty.</div>
+                            decodedContent ? (
+                                <div className="relative">
+                                    {canCopyContent ? (
+                                        <button
+                                            type="button"
+                                            onClick={() => copyContent(decodedContent)}
+                                            className="absolute right-2 top-2 z-10 rounded p-1 text-[var(--app-hint)] hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] transition-colors"
+                                            title={t('file.page.copyContent')}
+                                        >
+                                            {contentCopied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
+                                        </button>
+                                    ) : null}
+                                    <pre className="shiki overflow-auto rounded-md bg-[var(--app-code-bg)] p-3 pr-8 text-xs font-mono">
+                                        <code>{highlighted ?? decodedContent}</code>
+                                    </pre>
+                                </div>
+                            ) : (
+                                <div className="text-sm text-[var(--app-hint)]">{t('file.page.empty')}</div>
+                            )
                         )
                     ) : (
-                        <div className="text-sm text-[var(--app-hint)]">No changes to display.</div>
+                        <div className="text-sm text-[var(--app-hint)]">{t('file.page.noChanges')}</div>
                     )}
                 </div>
             </div>

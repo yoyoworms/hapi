@@ -17,6 +17,7 @@ type SessionAlivePayload = {
     mode?: 'local' | 'remote'
     permissionMode?: PermissionMode
     model?: string | null
+    modelReasoningEffort?: string | null
     effort?: string | null
     collaborationMode?: CodexCollaborationMode
 }
@@ -43,10 +44,13 @@ export type CliHandlersDeps = {
     onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onMachineAlive?: (payload: MachineAlivePayload) => void
     onWebappEvent?: (event: SyncEvent) => void
+    onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
+    onSessionActivity?: (sessionId: string, updatedAt: number) => void
+    onSweepImmediateQueued?: (sessionId: string, now: number) => void
 }
 
 export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlersDeps): void {
-    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onMachineAlive, onWebappEvent } = deps
+    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onMachineAlive, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued } = deps
     const terminalNamespace = io.of('/terminal')
     const namespace = typeof socket.data.namespace === 'string' ? socket.data.namespace : null
 
@@ -108,7 +112,10 @@ export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlers
         onSessionUsage,
         onSessionAccountStatus,
         onSessionMetadataUpdated,
-        onWebappEvent
+        onWebappEvent,
+        onBackgroundTaskDelta,
+        onSessionActivity,
+        onSweepImmediateQueued
     })
     registerMachineHandlers(socket, {
         store,

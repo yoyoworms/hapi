@@ -27,6 +27,18 @@ export class EmptyCompletionNoticeTracker {
         }
     }
 
+    onRawEvent(eventPayloadType: string | null | undefined): void {
+        if (!eventPayloadType) return;
+        if (
+            eventPayloadType === 'exec_command_begin'
+            || eventPayloadType === 'exec_command_end'
+            || eventPayloadType === 'patch_apply_begin'
+            || eventPayloadType === 'patch_apply_end'
+        ) {
+            this.toolActivitySinceAssistantMessage = true;
+        }
+    }
+
     maybeCreateNotice(event: TerminalEvent): CodexMessage | null {
         if (event.type !== 'task_complete') {
             return null;

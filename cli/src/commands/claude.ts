@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { z } from 'zod'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import type { StartOptions } from '@/claude/runClaude'
+import { CLAUDE_PERMISSION_MODES } from '@hapi/protocol/modes'
 import { configuration } from '@/configuration'
 import { isRunnerRunningCurrentlyInstalledHappyVersion } from '@/runner/controlClient'
 import { authAndSetupMachineIfNeeded } from '@/ui/auth'
@@ -37,6 +38,7 @@ export const claudeCommand: CommandDefinition = {
         const options: StartOptions = {}
         let showHelp = false
         const unknownArgs: string[] = []
+        let hasExplicitPermissionMode = false
 
         for (let i = 0; i < args.length; i++) {
             const arg = args[i]
@@ -46,10 +48,17 @@ export const claudeCommand: CommandDefinition = {
                 unknownArgs.push(arg)
             } else if (arg === '--hapi-starting-mode') {
                 options.startingMode = z.enum(['local', 'remote']).parse(args[++i])
-            } else if (arg === '--yolo') {
+            } else if (arg === '--permission-mode') {
+                const mode = args[++i]
+                if (!mode || !(CLAUDE_PERMISSION_MODES as readonly string[]).includes(mode)) {
+                    throw new Error(`Invalid --permission-mode value: ${mode ?? '(missing)'}`)
+                }
+                options.permissionMode = mode as StartOptions['permissionMode']
+                hasExplicitPermissionMode = true
+            } else if (arg === '--yolo' && !hasExplicitPermissionMode) {
                 options.permissionMode = 'bypassPermissions'
                 unknownArgs.push('--dangerously-skip-permissions')
-            } else if (arg === '--dangerously-skip-permissions') {
+            } else if (arg === '--dangerously-skip-permissions' && !hasExplicitPermissionMode) {
                 options.permissionMode = 'bypassPermissions'
                 unknownArgs.push(arg)
             } else if (arg === '--model') {
@@ -91,6 +100,7 @@ ${chalk.bold('Usage:')}
   hapi cursor            Start Cursor Agent mode
   hapi gemini            Start Gemini ACP mode
   hapi opencode          Start OpenCode ACP mode
+  hapi resume [id]       Resume an existing HAPI session locally
   hapi mcp               Start MCP stdio bridge
   hapi connect           (not available in direct-connect mode)
   hapi notify            (not available in direct-connect mode)

@@ -1,4 +1,4 @@
-import type { AgentEvent, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
+import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
 import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
 
@@ -36,12 +36,191 @@ function normalizeAgentEvent(value: unknown): AgentEvent | null {
     return value as AgentEvent
 }
 
+function normalizeThreadGoal(value: unknown) {
+    if (!isObject(value)) return null
+    const threadId = asString(value.threadId ?? value.thread_id)
+    const objective = asString(value.objective)
+    const status = asString(value.status)
+    if (!threadId || !objective || !status) return null
+    if (status !== 'active' && status !== 'paused' && status !== 'budgetLimited' && status !== 'complete') return null
+    return {
+        threadId,
+        objective,
+        status,
+        tokenBudget: asNumber(value.tokenBudget ?? value.token_budget),
+        tokensUsed: asNumber(value.tokensUsed ?? value.tokens_used) ?? 0,
+        timeUsedSeconds: asNumber(value.timeUsedSeconds ?? value.time_used_seconds) ?? 0,
+        createdAt: asNumber(value.createdAt ?? value.created_at) ?? 0,
+        updatedAt: asNumber(value.updatedAt ?? value.updated_at) ?? 0
+    }
+}
+
+function normalizeCodexTokenUsage(value: unknown, data?: Record<string, unknown>) {
+    const info = isObject(value) ? value : null
+    if (!info) return null
+    const scope = data && isObject(data.scope) ? data.scope : null
+    // Codex reports both:
+    // - `total`: cumulative usage for the whole session (can be millions).
+    // - `last`: current turn/request usage, which matches the live context bar.
+    // Prefer `last`; falling back to `total` keeps older payloads working.
+    const usageSource = isObject(info.last)
+        ? info.last
+        : isObject(info.lastTokenUsage)
+            ? info.lastTokenUsage
+            : isObject(info.last_token_usage)
+                ? info.last_token_usage
+                : isObject(info.total)
+                    ? info.total
+                    : isObject(info.totalTokenUsage)
+                        ? info.totalTokenUsage
+                        : isObject(info.total_token_usage)
+                            ? info.total_token_usage
+                            : info
+    const inputTokens = asNumber(usageSource.inputTokens ?? usageSource.input_tokens)
+    const outputTokens = asNumber(usageSource.outputTokens ?? usageSource.output_tokens)
+    if (inputTokens === null || outputTokens === null) return null
+
+    return {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        // Codex `inputTokens` already includes cached input tokens; expose cache
+        // hits for display, but use `context_tokens` to avoid double-counting.
+        cache_creation_input_tokens: undefined,
+        cache_read_input_tokens: asNumber(
+            usageSource.cachedInputTokens
+            ?? usageSource.cached_input_tokens
+            ?? usageSource.cacheReadInputTokens
+            ?? usageSource.cache_read_input_tokens
+        ) ?? undefined,
+        context_tokens: inputTokens,
+        context_window: asNumber(info.modelContextWindow ?? info.model_context_window) ?? undefined,
+        thread_id: asString(
+            data?.thread_id
+            ?? data?.threadId
+            ?? scope?.thread_id
+            ?? scope?.threadId
+            ?? info.thread_id
+            ?? info.threadId
+        ) ?? undefined,
+        scope_role: asString(data?.scope_role ?? data?.scopeRole ?? scope?.role) ?? undefined
+    }
+}
+
+function normalizePlanStatus(value: unknown): 'pending' | 'in_progress' | 'completed' {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]/g, '_') : ''
+    if (raw === 'completed' || raw === 'complete' || raw === 'done') return 'completed'
+    if (raw === 'in_progress' || raw === 'inprogress' || raw === 'active' || raw === 'running') return 'in_progress'
+    return 'pending'
+}
+
+function normalizePlanEntries(value: unknown): Array<{ step: string; status: 'pending' | 'in_progress' | 'completed' }> {
+    const record = isObject(value) ? value : null
+    const entries = Array.isArray(value)
+        ? value
+        : Array.isArray(record?.plan)
+            ? record.plan
+            : Array.isArray(record?.items)
+                ? record.items
+                : Array.isArray(record?.steps)
+                    ? record.steps
+                    : []
+
+    const plan: Array<{ step: string; status: 'pending' | 'in_progress' | 'completed' }> = []
+    for (const entry of entries) {
+        if (typeof entry === 'string') {
+            plan.push({ step: entry, status: 'pending' })
+            continue
+        }
+        if (!isObject(entry)) continue
+        const step = asString(entry.step)
+            ?? asString(entry.content)
+            ?? asString(entry.text)
+            ?? asString(entry.title)
+            ?? asString(entry.description)
+        if (!step) continue
+        plan.push({
+            step,
+            status: normalizePlanStatus(entry.status ?? entry.state)
+        })
+    }
+    return plan
+}
+
+function normalizeCodexReviewFinding(value: unknown): CodexReviewFinding | null {
+    if (!isObject(value)) return null
+    const title = asString(value.title)
+    const body = asString(value.body)
+    if (!title || !body) return null
+
+    const codeLocation = isObject(value.code_location)
+        ? value.code_location
+        : isObject(value.codeLocation)
+            ? value.codeLocation
+            : null
+    const lineRange = codeLocation && isObject(codeLocation.line_range)
+        ? codeLocation.line_range
+        : codeLocation && isObject(codeLocation.lineRange)
+            ? codeLocation.lineRange
+            : null
+
+    return {
+        title,
+        body,
+        priority: asNumber(value.priority),
+        confidenceScore: asNumber(value.confidence_score ?? value.confidenceScore),
+        filePath: codeLocation ? asString(codeLocation.absolute_file_path ?? codeLocation.absoluteFilePath ?? codeLocation.path) : null,
+        lineStart: lineRange ? asNumber(lineRange.start) : null,
+        lineEnd: lineRange ? asNumber(lineRange.end) : null
+    }
+}
+
+function normalizeCodexReviewJson(value: unknown): CodexReview | null {
+    if (!isObject(value)) return null
+    const hasReviewMarker = Array.isArray(value.findings)
+        || 'overall_correctness' in value
+        || 'overallCorrectness' in value
+        || 'overall_explanation' in value
+        || 'overallExplanation' in value
+    if (!hasReviewMarker) return null
+
+    const findings = Array.isArray(value.findings)
+        ? value.findings
+            .map(normalizeCodexReviewFinding)
+            .filter((finding): finding is CodexReviewFinding => finding !== null)
+        : []
+
+    const overallCorrectness = asString(value.overall_correctness ?? value.overallCorrectness)
+    const overallExplanation = asString(value.overall_explanation ?? value.overallExplanation)
+    const overallConfidenceScore = asNumber(value.overall_confidence_score ?? value.overallConfidenceScore)
+
+    if (findings.length === 0 && !overallCorrectness && !overallExplanation && overallConfidenceScore === null) {
+        return null
+    }
+
+    return {
+        findings,
+        overallCorrectness,
+        overallExplanation,
+        overallConfidenceScore
+    }
+}
+
+function parseCodexReviewMessage(message: string): CodexReview | null {
+    const trimmed = message.trim()
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null
+    try {
+        return normalizeCodexReviewJson(JSON.parse(trimmed) as unknown)
+    } catch {
+        return null
+    }
+}
+
 function normalizeAssistantOutput(
     messageId: string,
     localId: string | null,
     createdAt: number,
     data: Record<string, unknown>,
-    meta?: unknown
+    meta?: unknown,
 ): NormalizedMessage | null {
     const uuid = asString(data.uuid) ?? messageId
     const parentUUID = asString(data.parentUuid) ?? null
@@ -78,11 +257,13 @@ function normalizeAssistantOutput(
     const usage = isObject(message.usage) ? (message.usage as Record<string, unknown>) : null
     const inputTokens = usage ? asNumber(usage.input_tokens) : null
     const outputTokens = usage ? asNumber(usage.output_tokens) : null
+    const model = asString(message.model) ?? null
 
     return {
         id: messageId,
         localId,
         createdAt,
+        model,
         role: 'agent',
         isSidechain,
         content: blocks,
@@ -102,7 +283,7 @@ function normalizeUserOutput(
     localId: string | null,
     createdAt: number,
     data: Record<string, unknown>,
-    meta?: unknown
+    meta?: unknown,
 ): NormalizedMessage | null {
     const uuid = asString(data.uuid) ?? messageId
     const parentUUID = asString(data.parentUuid) ?? null
@@ -249,7 +430,7 @@ export function normalizeAgentRecord(
     localId: string | null,
     createdAt: number,
     content: unknown,
-    meta?: unknown
+    meta?: unknown,
 ): NormalizedMessage | null {
     if (!isObject(content) || typeof content.type !== 'string') return null
 
@@ -303,7 +484,8 @@ export function normalizeAgentRecord(
                 role: 'event',
                 content: {
                     type: 'turn-duration',
-                    durationMs: asNumber(data.durationMs) ?? 0
+                    durationMs: asNumber(data.durationMs) ?? 0,
+                    targetMessageId: asString(data.messageId) ?? undefined
                 },
                 isSidechain: false,
                 meta
@@ -363,7 +545,57 @@ export function normalizeAgentRecord(
         const data = isObject(content.data) ? content.data : null
         if (!data || typeof data.type !== 'string') return null
 
+        if (
+            data.type === 'agent-run-start'
+            || data.type === 'agent-run-update'
+            || data.type === 'agent-run-trace'
+        ) {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: data as AgentEvent,
+                isSidechain: false,
+                meta
+            }
+        }
+
+        if (data.type === 'generated-image') {
+            const imageId = asString(data.imageId ?? data.image_id)
+            if (!imageId) return null
+            const uuid = asString(data.id) ?? messageId
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'agent',
+                isSidechain: false,
+                content: [{
+                    type: 'generated-image',
+                    imageId,
+                    fileName: asString(data.fileName ?? data.file_name) ?? 'generated-image',
+                    mimeType: asString(data.mimeType ?? data.mime_type),
+                    uuid,
+                    parentUUID: null
+                }],
+                meta
+            }
+        }
+
         if (data.type === 'message' && typeof data.message === 'string') {
+            const review = parseCodexReviewMessage(data.message)
+            if (review) {
+                return {
+                    id: messageId,
+                    localId,
+                    createdAt,
+                    role: 'agent',
+                    isSidechain: false,
+                    content: [{ type: 'codex-review', review, uuid: messageId, parentUUID: null }],
+                    meta
+                }
+            }
             return {
                 id: messageId,
                 localId,
@@ -376,13 +608,81 @@ export function normalizeAgentRecord(
         }
 
         if (data.type === 'reasoning' && typeof data.message === 'string') {
+            const streamId = asString(data.id) ?? messageId
             return {
                 id: messageId,
                 localId,
                 createdAt,
                 role: 'agent',
                 isSidechain: false,
-                content: [{ type: 'reasoning', text: data.message, uuid: messageId, parentUUID: null }],
+                content: [{ type: 'reasoning', text: data.message, uuid: messageId, streamId, parentUUID: null }],
+                meta
+            }
+        }
+
+        if (data.type === 'context_compacted') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'compact',
+                    trigger: asString(data.trigger) ?? 'auto',
+                    preTokens: asNumber(data.preTokens ?? data.pre_tokens) ?? 0
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
+        if (data.type === 'token_count') {
+            const usage = normalizeCodexTokenUsage(data.info, data)
+            return usage ? {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'token-count',
+                    info: data.info
+                },
+                isSidechain: false,
+                meta,
+                usage
+            } : null
+        }
+
+        if (data.type === 'thread_goal_updated') {
+            const goal = normalizeThreadGoal(data.goal)
+            if (!goal) return null
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-updated',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? goal.threadId,
+                    turnId: asString(data.turnId ?? data.turn_id) ?? undefined,
+                    goal
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
+        if (data.type === 'thread_goal_cleared') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-cleared',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? undefined
+                },
+                isSidechain: false,
                 meta
             }
         }
@@ -420,10 +720,50 @@ export function normalizeAgentRecord(
                     type: 'tool-result',
                     tool_use_id: data.callId,
                     content: data.output,
-                    is_error: false,
+                    is_error: Boolean(data.is_error),
                     uuid,
                     parentUUID: null
                 }],
+                meta
+            }
+        }
+
+        if (data.type === 'plan_update') {
+            const plan = normalizePlanEntries(data.plan ?? data.update ?? data.items ?? data.steps ?? data)
+            if (plan.length === 0) return null
+            const uuid = asString(data.id) ?? messageId
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'agent',
+                isSidechain: false,
+                content: [
+                    {
+                        type: 'tool-call',
+                        id: 'codex-plan-state',
+                        name: 'update_plan',
+                        input: {
+                            plan,
+                            source: 'codex'
+                        },
+                        description: null,
+                        uuid,
+                        parentUUID: null
+                    },
+                    {
+                        type: 'tool-result',
+                        tool_use_id: 'codex-plan-state',
+                        content: {
+                            plan,
+                            source: 'codex',
+                            status: 'updated'
+                        },
+                        is_error: false,
+                        uuid: `${uuid}:result`,
+                        parentUUID: null
+                    }
+                ],
                 meta
             }
         }

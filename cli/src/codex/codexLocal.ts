@@ -1,7 +1,13 @@
 import { logger } from '@/ui/logger';
 import { spawnWithTerminalGuard } from '@/utils/spawnWithTerminalGuard';
-import { buildMcpServerConfigArgs, buildDeveloperInstructionsArg } from './utils/codexMcpConfig';
+import {
+    buildMcpServerConfigArgs,
+    buildDeveloperInstructionsArg,
+    buildSessionStartHookConfigArgs,
+    buildModelReasoningEffortConfigArgs
+} from './utils/codexMcpConfig';
 import { codexSystemPrompt } from './utils/systemPrompt';
+import type { ReasoningEffort } from './appServerTypes';
 
 export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
     if (!sessionMatchToken) {
@@ -37,11 +43,16 @@ export async function codexLocal(opts: {
     sessionId: string | null;
     path: string;
     model?: string;
+    modelReasoningEffort?: ReasoningEffort;
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
     onSessionFound: (id: string) => void;
     codexArgs?: string[];
     sessionMatchToken?: string;
     mcpServers?: Record<string, { command: string; args: string[] }>;
+    sessionHook?: {
+        port: number;
+        token: string;
+    };
 }): Promise<void> {
     const args: string[] = [];
 
@@ -54,6 +65,10 @@ export async function codexLocal(opts: {
         args.push('--model', opts.model);
     }
 
+    if (opts.modelReasoningEffort) {
+        args.push(...buildModelReasoningEffortConfigArgs(opts.modelReasoningEffort));
+    }
+
     if (opts.sandbox) {
         args.push('--sandbox', opts.sandbox);
     }
@@ -63,6 +78,11 @@ export async function codexLocal(opts: {
         args.push(...buildMcpServerConfigArgs(opts.mcpServers));
     }
 
+    if (opts.sessionHook) {
+        args.push(...buildSessionStartHookConfigArgs(opts.sessionHook.port, opts.sessionHook.token));
+    }
+
+    // Add developer instructions (system prompt)
     args.push(...buildDeveloperInstructionsArg(appendSessionMatchToken(codexSystemPrompt, opts.sessionMatchToken)));
 
     if (opts.codexArgs) {
@@ -87,7 +107,6 @@ export async function codexLocal(opts: {
         spawnName: 'codex',
         installHint: 'Codex CLI',
         includeCause: true,
-        logExit: true,
-        shell: process.platform === 'win32'
+        logExit: true
     });
 }

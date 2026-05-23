@@ -4,7 +4,7 @@ import type { ApiClient } from '@/api/client'
 import type { CodexCollaborationMode, PermissionMode } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
 import { clearMessageWindow } from '@/lib/message-window-store'
-import { isKnownFlavor } from '@/lib/agentFlavorUtils'
+import { isKnownFlavor } from '@hapi/protocol'
 
 export function useSessionActions(
     api: ApiClient | null,
@@ -19,6 +19,7 @@ export function useSessionActions(
     setPermissionMode: (mode: PermissionMode) => Promise<void>
     setCollaborationMode: (mode: CodexCollaborationMode) => Promise<void>
     setModel: (model: string | null) => Promise<void>
+    setModelReasoningEffort: (modelReasoningEffort: string | null) => Promise<void>
     setEffort: (effort: string | null) => Promise<void>
     renameSession: (name: string) => Promise<void>
     deleteSession: () => Promise<void>
@@ -67,7 +68,7 @@ export function useSessionActions(
             if (!api || !sessionId) {
                 throw new Error('Session unavailable')
             }
-            return api.resumeSession(sessionId, resumeWithSessionId)
+            return api.resumeSession(sessionId, resumeWithSessionId ? { resumeWithSessionId } : undefined)
         },
         onSuccess: () => void invalidateSession(),
     })
@@ -107,6 +108,22 @@ export function useSessionActions(
                 throw new Error('Session unavailable')
             }
             await api.setModel(sessionId, model)
+        },
+        onSuccess: () => void invalidateSession(),
+    })
+
+    const modelReasoningEffortMutation = useMutation({
+        mutationFn: async (modelReasoningEffort: string | null) => {
+            if (!api || !sessionId) {
+                throw new Error('Session unavailable')
+            }
+            if (agentFlavor !== 'codex') {
+                throw new Error('Model reasoning effort is only supported for Codex sessions')
+            }
+            if (!codexCollaborationModeSupported) {
+                throw new Error('Model reasoning effort is only supported for remote Codex sessions')
+            }
+            await api.setModelReasoningEffort(sessionId, modelReasoningEffort)
         },
         onSuccess: () => void invalidateSession(),
     })
@@ -154,6 +171,7 @@ export function useSessionActions(
         setPermissionMode: permissionMutation.mutateAsync,
         setCollaborationMode: collaborationMutation.mutateAsync,
         setModel: modelMutation.mutateAsync,
+        setModelReasoningEffort: modelReasoningEffortMutation.mutateAsync,
         setEffort: effortMutation.mutateAsync,
         renameSession: renameMutation.mutateAsync,
         deleteSession: deleteMutation.mutateAsync,
@@ -164,6 +182,7 @@ export function useSessionActions(
             || permissionMutation.isPending
             || collaborationMutation.isPending
             || modelMutation.isPending
+            || modelReasoningEffortMutation.isPending
             || effortMutation.isPending
             || renameMutation.isPending
             || deleteMutation.isPending,

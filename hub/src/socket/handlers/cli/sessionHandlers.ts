@@ -2,11 +2,15 @@ import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
+import { isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
 import type { Store, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
 import { extractTodoWriteTodosFromMessageContent } from '../../../sync/todos'
 import { extractTeamStateFromMessageContent, applyTeamStateDelta } from '../../../sync/teams'
+import { extractBackgroundTaskDelta } from '../../../sync/backgroundTasks'
+import { shouldRecordSessionActivity } from '../../../sync/sessionActivity'
 import type { CliSocketWithData } from '../../socketTypes'
+import type { SessionEndReason } from '@hapi/protocol'
 import type { AccessErrorReason, AccessResult } from './types'
 
 type SessionAlivePayload = {
@@ -16,6 +20,7 @@ type SessionAlivePayload = {
     mode?: 'local' | 'remote'
     permissionMode?: PermissionMode
     model?: string | null
+    modelReasoningEffort?: string | null
     effort?: string | null
     collaborationMode?: CodexCollaborationMode
 }
@@ -23,6 +28,7 @@ type SessionAlivePayload = {
 type SessionEndPayload = {
     sid: string
     time: number
+    reason?: SessionEndReason
 }
 
 type ResolveSessionAccess = (sessionId: string) => AccessResult<StoredSession>
@@ -95,10 +101,14 @@ export type SessionHandlersDeps = {
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
     onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onWebappEvent?: (event: SyncEvent) => void
+    onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
+    onSessionActivity?: (sessionId: string, updatedAt: number) => void
+    /** Delegates session-end immediate-queue sweep to the MessageService layer. */
+    onSweepImmediateQueued?: (sessionId: string, now: number) => void
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onWebappEvent } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued } = deps
 
     // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
     const recentContentUuids = new Set<string>()
@@ -151,10 +161,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             ack?.()
             return
         }
-        // Skip other internal event messages (ready, rate_limit_event, etc.)
-        // These are not user-visible and should not be stored or forwarded
+        // Internal event messages are not user-visible — but 'ready' marks a
+        // completed turn and must be reported as session activity (upstream #524).
+        // We emit the webapp event + record activity, then short-circuit so the
+        // event is NOT persisted to the store (fork optimization).
         const agentEventType = getAgentEventType(_c)
         if (agentEventType === 'ready') {
+            const now = Date.now()
             onWebappEvent?.({
                 type: 'message-received',
                 sessionId: sid,
@@ -163,9 +176,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     seq: null,
                     localId: null,
                     content,
-                    createdAt: Date.now()
+                    createdAt: now
                 }
             })
+            if (shouldRecordSessionActivity(content)) {
+                onSessionActivity?.(sid, now)
+            }
             ack?.()
             return
         }
@@ -179,6 +195,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         if (_c?.role === 'agent' && typeof _c?.content?.type === 'string' && INTERNAL_TYPES.includes(_c.content.type)) {
+            ack?.()
+            return
+        }
+
+        // Upstream addition: drop redundant goal-status events.
+        if (isRedundantGoalStatusEventContent(content)) {
             ack?.()
             return
         }
@@ -198,13 +220,16 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 if (first) recentContentUuids.delete(first)
             }
         }
-        const msg = store.messages.addMessage(sid, content, localId, socket.data.clockOffset)
+        const msg = store.messages.addMessage(sid, content, localId)
+        if (shouldRecordSessionActivity(content)) {
+            onSessionActivity?.(sid, msg.createdAt)
+        }
 
         const todos = extractTodoWriteTodosFromMessageContent(content)
         if (todos) {
             const updated = store.sessions.setSessionTodos(sid, todos, msg.createdAt, session.namespace)
             if (updated) {
-                onWebappEvent?.({ type: 'session-updated', sessionId: sid, data: { sid } })
+                onWebappEvent?.({ type: 'session-updated', sessionId: sid })
             }
         }
 
@@ -215,8 +240,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             const newTeamState = applyTeamStateDelta(existingTeamState ?? null, teamDelta)
             const updated = store.sessions.setSessionTeamState(sid, newTeamState, msg.createdAt, session.namespace)
             if (updated) {
-                onWebappEvent?.({ type: 'session-updated', sessionId: sid, data: { sid } })
+                onWebappEvent?.({ type: 'session-updated', sessionId: sid })
             }
+        }
+
+        const bgDelta = extractBackgroundTaskDelta(content)
+        if (bgDelta) {
+            onBackgroundTaskDelta?.(sid, bgDelta)
         }
 
         const update = {
@@ -245,7 +275,8 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 seq: msg.seq,
                 localId: msg.localId,
                 content: msg.content,
-                createdAt: msg.createdAt
+                createdAt: msg.createdAt,
+                invokedAt: msg.invokedAt
             }
         })
 
@@ -294,7 +325,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
             }
             socket.to(`session:${sid}`).emit('update', update)
-            onWebappEvent?.({ type: 'session-updated', sessionId: sid, data: { sid } })
+            onWebappEvent?.({ type: 'session-updated', sessionId: sid })
         }
     }
 
@@ -341,7 +372,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
             }
             socket.to(`session:${sid}`).emit('update', update)
-            onWebappEvent?.({ type: 'session-updated', sessionId: sid, data: { sid } })
+            onWebappEvent?.({ type: 'session-updated', sessionId: sid })
         }
     }
 
@@ -359,6 +390,33 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         onSessionAlive?.(data)
     })
 
+    socket.on('messages-consumed', (data: { sid: string; localIds: string[] }) => {
+        if (!data || typeof data.sid !== 'string' || !Array.isArray(data.localIds)) {
+            return
+        }
+        const localIds = data.localIds.filter((id): id is string => typeof id === 'string')
+        if (localIds.length === 0) {
+            return
+        }
+        const sessionAccess = resolveSessionAccess(data.sid)
+        if (!sessionAccess.ok) {
+            emitAccessError('session', data.sid, sessionAccess.reason)
+            return
+        }
+        const invokedAt = Date.now()
+        try {
+            store.messages.markMessagesInvoked(data.sid, localIds, invokedAt)
+            onSessionActivity?.(data.sid, invokedAt)
+            // Emit only after the DB write succeeds. Otherwise a transient SQLite
+            // failure would broadcast an `invokedAt` that was never persisted —
+            // live clients would hide the queued rows while a refresh / secondary
+            // client would see them as queued again, diverging the state.
+            onWebappEvent?.({ type: 'messages-consumed', sessionId: data.sid, localIds, invokedAt })
+        } catch (err) {
+            console.error('markMessagesInvoked failed', err)
+        }
+    })
+
     socket.on('session-end', (data: SessionEndPayload) => {
         if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number') {
             return
@@ -368,6 +426,25 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             emitAccessError('session', data.sid, sessionAccess.reason)
             return
         }
+
+        // Force-invoke only immediate-queued messages (scheduled_at IS NULL) at
+        // session end.  *All* scheduled rows — mature or future — are deliberately
+        // preserved in DB so the mature-scan path (releaseMatureScheduledMessages)
+        // remains the sole emit channel and the CLI ack remains the sole writer of
+        // invoked_at.  See HAPI Bot R4: stamping a mature scheduled row here would
+        // make the next mature-scan tick skip it (filter on invoked_at IS NULL) and
+        // silently drop the user's prompt.
+        //
+        // Without this sweep for immediate rows, the floating bar would pin queued
+        // rows after the CLI exits — there is no longer an ack path, so they would
+        // stay queued forever.  The 5-second tick in syncEngine.expireInactive
+        // emits scheduled rows when they mature, regardless of session end.
+        try {
+            onSweepImmediateQueued?.(data.sid, Date.now())
+        } catch (err) {
+            console.error('session-end sweep failed', err)
+        }
+
         onSessionEnd?.(data)
     })
 }

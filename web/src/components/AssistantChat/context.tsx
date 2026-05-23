@@ -1,16 +1,21 @@
 import type { ReactNode } from 'react'
 import { createContext, useContext } from 'react'
 import type { ApiClient } from '@/api/client'
+import type { TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
 import type { SessionMetadataSummary } from '@/types/api'
 
 export type HappyChatContextValue = {
     api: ApiClient
     sessionId: string
     metadata: SessionMetadataSummary | null
+    terminalToolDisplayMode: TerminalToolDisplayMode
     disabled: boolean
     onRefresh: () => void
     onRetryMessage?: (localId: string) => void
     onCancelQueued?: (localId: string) => void
+    hasMoreMessages: boolean
+    isLoadingMoreMessages: boolean
+    loadOlderMessagesPreservingScroll: () => Promise<boolean>
 }
 
 const HappyChatContext = createContext<HappyChatContextValue | null>(null)
@@ -23,8 +28,12 @@ export function HappyChatProvider(props: { value: HappyChatContextValue; childre
     )
 }
 
+export function useOptionalHappyChatContext(): HappyChatContextValue | null {
+    return useContext(HappyChatContext)
+}
+
 export function useHappyChatContext(): HappyChatContextValue {
-    const ctx = useContext(HappyChatContext)
+    const ctx = useOptionalHappyChatContext()
     if (!ctx) {
         throw new Error('HappyChatContext is missing')
     }

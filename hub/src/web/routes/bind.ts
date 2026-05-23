@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { SignJWT } from 'jose'
 import { z } from 'zod'
-import { configuration } from '../../configuration'
+import { getConfiguration } from '../../configuration'
 import { constantTimeEquals } from '../../utils/crypto'
 import { parseAccessToken } from '../../utils/accessToken'
 import { validateTelegramInitData } from '../telegramInitData'
@@ -24,6 +24,7 @@ export function createBindRoutes(jwtSecret: Uint8Array, store: Store): Hono<WebA
             return c.json({ error: 'Invalid body' }, 400)
         }
 
+        const configuration = getConfiguration()
         const parsedToken = parseAccessToken(parsed.data.accessToken)
         if (!parsedToken || !constantTimeEquals(parsedToken.baseToken, configuration.cliApiToken)) {
             return c.json({ error: 'Invalid access token' }, 401)
@@ -51,7 +52,7 @@ export function createBindRoutes(jwtSecret: Uint8Array, store: Store): Hono<WebA
         const token = await new SignJWT({ uid: userId, ns: namespace })
             .setProtectedHeader({ alg: 'HS256' })
             .setIssuedAt()
-            .setExpirationTime('15m')
+            .setExpirationTime('4h')
             .sign(jwtSecret)
 
         return c.json({

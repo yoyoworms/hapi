@@ -6,7 +6,6 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { parseAccessToken } from '../utils/accessToken'
 import { getOrCreateSettingsValue } from './generators'
 import { getSettingsFile, readSettings, writeSettings } from './settings'
 
@@ -41,55 +40,49 @@ function isWeakToken(token: string): boolean {
     return weakPatterns.some(p => p.test(token))
 }
 
-type CliApiTokenSource = 'env' | 'file'
-
-function normalizeCliApiToken(rawToken: string, source: CliApiTokenSource): { token: string; didStrip: boolean } {
-    const parsed = parseAccessToken(rawToken)
-    if (!parsed) {
-        if (rawToken.includes(':')) {
-            console.warn(`[WARN] CLI_API_TOKEN from ${source} contains ":" but is not a valid token. Server expects a base token without namespace.`)
+function validateCliApiToken(rawToken: string, source: 'env' | 'file'): string {
+    if (rawToken.includes(':')) {
+        if (source === 'env') {
+            throw new Error(
+                `CLI_API_TOKEN env var must be the base token only; namespace suffixes are not accepted.`
+            )
         }
-        return { token: rawToken, didStrip: false }
+        const baseToken = rawToken.split(':', 1)[0]
+        console.warn(
+            `[WARN] cliApiToken in settings.json contains a namespace suffix; using base token only. Re-save settings to clean up.`
+        )
+        return baseToken
     }
-
-    if (!rawToken.includes(':')) {
-        return { token: rawToken, didStrip: false }
-    }
-
-    console.warn(
-        `[WARN] CLI_API_TOKEN from ${source} includes namespace suffix "${parsed.namespace}". ` +
-        'Server expects the base token only; stripping the suffix.'
-    )
-    return { token: parsed.baseToken, didStrip: true }
+    return rawToken
 }
 
 /**
  * Get or create CLI API token
  *
  * Priority:
- * 1. CLI_API_TOKEN environment variable (highest - backward compatible)
+ * 1. CLI_API_TOKEN environment variable (highest)
  * 2. settings.json cliApiToken field
  * 3. Auto-generate and save to settings.json
  */
 export async function getOrCreateCliApiToken(dataDir: string): Promise<CliApiTokenResult> {
     const settingsFile = getSettingsFile(dataDir)
 
-    // 1. Environment variable has highest priority (backward compatible)
+    // 1. Environment variable has highest priority
     const envToken = process.env.CLI_API_TOKEN
     if (envToken) {
-        const normalized = normalizeCliApiToken(envToken, 'env')
-        if (isWeakToken(normalized.token)) {
+        const token = validateCliApiToken(envToken, 'env')
+        if (isWeakToken(token)) {
             console.warn('[WARN] CLI_API_TOKEN appears to be weak. Consider using a stronger secret.')
         }
 
         // Persist env token to file if not already saved (prevents token loss on env var issues)
         const settings = await readSettings(settingsFile)
         if (settings !== null && !settings.cliApiToken) {
-            settings.cliApiToken = normalized.token
+            settings.cliApiToken = token
             await writeSettings(settingsFile, settings)
         }
 
-        return { token: normalized.token, source: 'env', isNew: false, filePath: settingsFile }
+        return { token, source: 'env', isNew: false, filePath: settingsFile }
     }
 
     const result = await getOrCreateSettingsValue({
@@ -98,12 +91,7 @@ export async function getOrCreateCliApiToken(dataDir: string): Promise<CliApiTok
             if (!settings.cliApiToken) {
                 return null
             }
-            const normalized = normalizeCliApiToken(settings.cliApiToken, 'file')
-            if (normalized.didStrip) {
-                settings.cliApiToken = normalized.token
-                return { value: normalized.token, writeBack: true }
-            }
-            return { value: normalized.token }
+            return { value: validateCliApiToken(settings.cliApiToken, 'file') }
         },
         writeValue: (settings, value) => {
             settings.cliApiToken = value

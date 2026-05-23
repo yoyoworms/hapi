@@ -1,19 +1,24 @@
 import { logger } from '@/ui/logger';
+import { startHookServer } from '@/claude/utils/startHookServer';
 import { codexLocal } from './codexLocal';
+import type { ReasoningEffort } from './appServerTypes';
 import { CodexSession } from './session';
-import { createCodexSessionScanner } from './utils/codexSessionScanner';
+import { createCodexSessionScanner, type CodexSessionScanner } from './utils/codexSessionScanner';
 import { convertCodexEvent } from './utils/codexEventConverter';
 import { buildHapiMcpBridge } from './utils/buildHapiMcpBridge';
 import { stripCodexCliOverrides } from './utils/codexCliOverrides';
 import { buildCodexPermissionModeCliArgs } from './utils/permissionModeConfig';
 import { BaseLocalLauncher } from '@/modules/common/launcher/BaseLocalLauncher';
-import { randomUUID } from 'node:crypto';
 import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
 
 export async function codexLocalLauncher(session: CodexSession): Promise<'switch' | 'exit'> {
     const resumeSessionId = session.sessionId;
-    const sessionMatchToken = resumeSessionId ? undefined : randomUUID();
-    let scanner: Awaited<ReturnType<typeof createCodexSessionScanner>> | null = null;
+    let primarySessionId = resumeSessionId;
+    let primaryTranscriptPath: string | null = null;
+    let scanner: CodexSessionScanner | null = null;
+    let hookReady = false;
+    let shuttingDown = false;
+    let pendingScannerSetup: Promise<void> | null = null;
     const permissionMode = session.getPermissionMode();
     const managedPermissionMode = permissionMode === 'read-only' || permissionMode === 'safe-yolo' || permissionMode === 'yolo'
         ? permissionMode
@@ -30,10 +35,149 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
     const { server: happyServer, mcpServers } = await buildHapiMcpBridge(session.client);
     logger.debug(`[codex-local]: Started hapi MCP bridge server at ${happyServer.url}`);
 
-    const handleSessionFound = (sessionId: string) => {
-        session.onSessionFound(sessionId);
-        scanner?.onNewSession(sessionId);
+    const reportTranscriptSyncFailure = (transcriptPath: string, error: unknown): void => {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `Codex transcript sync failed for ${transcriptPath}: ${detail}`;
+        logger.warn(`[codex-local]: ${message}`);
+        session.sendSessionEvent({
+            type: 'message',
+            message: `${message} Keeping local Codex running; remote transcript sync is unavailable for this launch.`
+        });
     };
+
+    const handleSessionFound = (sessionId: string, allowSwitch = false): void => {
+        if (primarySessionId && primarySessionId !== sessionId && !allowSwitch) {
+            logger.debug(`[codex-local]: Ignoring non-primary Codex session id ${sessionId}; primary is ${primarySessionId}`);
+            return;
+        }
+        primarySessionId = sessionId;
+        session.onSessionFound(sessionId);
+    };
+
+    const isPrimarySessionId = (sessionId: string): boolean => {
+        return primarySessionId === null || primarySessionId === sessionId;
+    };
+
+    const bindPrimarySession = (sessionId: string, transcriptPath: string, allowSwitch = false): void => {
+        if (primarySessionId && primarySessionId !== sessionId && !allowSwitch) {
+            logger.debug(`[codex-local]: Ignoring non-primary SessionStart hook ${sessionId}; primary is ${primarySessionId}`);
+            return;
+        }
+        primarySessionId = sessionId;
+        primaryTranscriptPath = transcriptPath;
+        session.onSessionFound(sessionId);
+        hookReady = true;
+        session.onTranscriptPathFound(transcriptPath);
+    };
+
+    const processTranscriptPath = async (transcriptPath: string): Promise<void> => {
+        hookReady = true;
+        if (shuttingDown) {
+            return;
+        }
+        if (primaryTranscriptPath && transcriptPath !== primaryTranscriptPath) {
+            logger.debug(`[codex-local]: Ignoring non-primary transcript path ${transcriptPath}; primary is ${primaryTranscriptPath}`);
+            return;
+        }
+        if (scanner) {
+            await scanner.setTranscriptPath(transcriptPath);
+            return;
+        }
+        const createdScanner = await createCodexSessionScanner({
+            transcriptPath,
+            onSessionId: (sessionId) => {
+                if (!isPrimarySessionId(sessionId)) {
+                    logger.debug(`[codex-local]: Ignoring transcript session id ${sessionId}; primary is ${primarySessionId}`);
+                    return;
+                }
+                session.onSessionFound(sessionId);
+            },
+            onEvent: (event) => {
+                const converted = convertCodexEvent(event);
+                if (converted?.sessionId) {
+                    if (!isPrimarySessionId(converted.sessionId)) {
+                        logger.debug(`[codex-local]: Ignoring converted session id ${converted.sessionId}; primary is ${primarySessionId}`);
+                        return;
+                    }
+                    session.onSessionFound(converted.sessionId);
+                }
+                if (converted?.userMessage) {
+                    session.sendUserMessage(converted.userMessage);
+                }
+                if (converted?.message) {
+                    emptyCompletionNoticeTracker.onConvertedMessage(converted.message);
+                    session.sendAgentMessage(converted.message);
+                }
+                if (converted?.sessionEvent) {
+                    session.sendSessionEvent(converted.sessionEvent);
+                }
+                const eventPayload = event.payload && typeof event.payload === 'object'
+                    ? event.payload as Record<string, unknown>
+                    : null;
+                if (event.type === 'event_msg' && typeof eventPayload?.type === 'string') {
+                    if (eventPayload.type === 'task_started') {
+                        emptyCompletionNoticeTracker.onTaskStarted();
+                    } else if (eventPayload.type === 'task_complete') {
+                        const notice = emptyCompletionNoticeTracker.maybeCreateNotice(eventPayload);
+                        if (notice) {
+                            session.sendAgentMessage(notice);
+                        }
+                    } else {
+                        emptyCompletionNoticeTracker.onRawEvent(eventPayload.type);
+                    }
+                }
+            }
+        });
+        if (shuttingDown) {
+            await createdScanner.cleanup();
+            return;
+        }
+        scanner = createdScanner;
+    };
+
+    const handleTranscriptPath = (transcriptPath: string): Promise<void> => {
+        const setupTask = (pendingScannerSetup ?? Promise.resolve()).then(() => processTranscriptPath(transcriptPath));
+        const observedTask = setupTask.catch((error) => {
+            if (!shuttingDown) {
+                reportTranscriptSyncFailure(transcriptPath, error);
+            }
+        });
+        pendingScannerSetup = observedTask.finally(() => {
+            if (pendingScannerSetup === observedTask) {
+                pendingScannerSetup = null;
+            }
+        });
+        return pendingScannerSetup;
+    };
+
+    const handleSessionHook = (sessionId: string, data: Record<string, unknown>): void => {
+        if (shuttingDown) {
+            return;
+        }
+
+        const transcriptPath = typeof data.transcript_path === 'string' && data.transcript_path.length > 0
+            ? data.transcript_path
+            : null;
+        const hookSource = typeof data.source === 'string' ? data.source : null;
+        const shouldAllowSessionSwitch = hookSource === 'clear';
+
+        if (!transcriptPath) {
+            handleSessionFound(sessionId, shouldAllowSessionSwitch);
+            return;
+        }
+
+        bindPrimarySession(sessionId, transcriptPath, shouldAllowSessionSwitch);
+    };
+
+    const hookServer = await startHookServer({
+        onSessionHook: (sessionId, data) => {
+            if (shuttingDown) {
+                return;
+            }
+            handleSessionHook(sessionId, data);
+        }
+    });
+    logger.debug(`[codex-local]: Started Codex SessionStart hook server on port ${hookServer.port}`);
 
     const launcher = new BaseLocalLauncher({
         label: 'codex-local',
@@ -46,11 +190,15 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
             await codexLocal({
                 path: session.path,
                 sessionId: resumeSessionId,
+                modelReasoningEffort: (session.getModelReasoningEffort() ?? undefined) as ReasoningEffort | undefined,
                 onSessionFound: handleSessionFound,
                 abort: abortSignal,
                 codexArgs,
-                sessionMatchToken,
-                mcpServers
+                mcpServers,
+                sessionHook: {
+                    port: hookServer.port,
+                    token: hookServer.token
+                }
             });
         },
         sendFailureMessage: (message) => {
@@ -63,65 +211,29 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
         switchLogMessage: 'doSwitch'
     });
 
-    const handleSessionMatchFailed = (message: string) => {
-        logger.warn(`[codex-local]: ${message}`);
-        session.sendSessionEvent({
-            type: 'message',
-            message: `${message} Keeping local Codex running; remote transcript sync may be unavailable for this launch.`
-        });
+    session.resetTranscriptPath();
+    const handleTranscriptPathCallback = (transcriptPath: string) => {
+        void handleTranscriptPath(transcriptPath);
     };
-
-    scanner = await createCodexSessionScanner({
-        sessionId: resumeSessionId,
-        cwd: session.path,
-        sessionMatchToken,
-        startupTimestampMs: Date.now(),
-        shouldImportHistory: session.shouldImportHistory,
-        onHistoryImported: session.markHistoryImported,
-        onSessionMatchFailed: handleSessionMatchFailed,
-        onSessionFound: (sessionId) => {
-            session.onSessionFound(sessionId);
-        },
-        onEvent: (event) => {
-            const converted = convertCodexEvent(event);
-            if (converted?.sessionId) {
-                session.onSessionFound(converted.sessionId);
-                scanner?.onNewSession(converted.sessionId);
-            }
-            if (converted?.userMessage) {
-                session.sendUserMessage(converted.userMessage);
-            }
-            if (converted?.message) {
-                emptyCompletionNoticeTracker.onConvertedMessage(converted.message);
-                session.sendAgentMessage(converted.message);
-            }
-            if (converted?.sessionEvent) {
-                session.sendSessionEvent(converted.sessionEvent);
-            }
-            const eventPayload = event.payload && typeof event.payload === 'object'
-                ? event.payload as Record<string, unknown>
-                : null;
-            if (event.type === 'event_msg' && eventPayload?.type === 'task_started') {
-                emptyCompletionNoticeTracker.onTaskStarted();
-            }
-            if (event.type === 'event_msg' && eventPayload?.type === 'task_complete') {
-                const notice = emptyCompletionNoticeTracker.maybeCreateNotice(eventPayload);
-                if (notice) {
-                    session.sendAgentMessage(notice);
-                }
-            }
-        }
-    });
+    session.addTranscriptPathCallback(handleTranscriptPathCallback);
 
     try {
-        const exitReason = await launcher.run();
-        if (exitReason === 'switch' && !session.sessionId) {
-            await scanner?.resolveActiveSession();
-        }
-        return exitReason;
+        return await launcher.run();
     } finally {
-        await scanner?.cleanup();
+        shuttingDown = true;
+        session.removeTranscriptPathCallback(handleTranscriptPathCallback);
+        hookServer.stop();
+        if (pendingScannerSetup) {
+            await pendingScannerSetup;
+        }
+        const activeScanner = scanner as CodexSessionScanner | null;
+        if (activeScanner) {
+            await activeScanner.cleanup();
+        }
         happyServer.stop();
+        if (!hookReady) {
+            logger.debug('[codex-local]: SessionStart hook did not provide transcript path before shutdown');
+        }
         logger.debug('[codex-local]: Stopped hapi MCP bridge server');
     }
 }

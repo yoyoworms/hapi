@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
 import { join, resolve, sep } from 'path'
 import { rmSync } from 'node:fs'
 import { execSync } from 'node:child_process'
+import type { DeleteUploadResponse, UploadFileResponse } from '@hapi/protocol/apiTypes'
+import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager'
 import { getErrorMessage, rpcError } from '../rpcResponses'
 import { getHapiBlobsDir } from '@/constants/uploadPaths'
@@ -14,20 +16,9 @@ interface UploadFileRequest {
     mimeType: string
 }
 
-interface UploadFileResponse {
-    success: boolean
-    path?: string
-    error?: string
-}
-
 interface DeleteUploadRequest {
     sessionId?: string
     path: string
-}
-
-interface DeleteUploadResponse {
-    success: boolean
-    error?: string
 }
 
 const uploadDirs = new Map<string, string>()
@@ -193,7 +184,7 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
         process.once('exit', cleanupUploadDirsSync)
     }
 
-    rpcHandlerManager.registerHandler<UploadFileRequest, UploadFileResponse>('uploadFile', async (data) => {
+    rpcHandlerManager.registerHandler<UploadFileRequest, UploadFileResponse>(RPC_METHODS.UploadFile, async (data) => {
         logger.debug('Upload file request:', data.filename, 'mimeType:', data.mimeType)
 
         if (!data.filename) {
@@ -278,7 +269,7 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
         }
     })
 
-    rpcHandlerManager.registerHandler<DeleteUploadRequest, DeleteUploadResponse>('deleteUpload', async (data) => {
+    rpcHandlerManager.registerHandler<DeleteUploadRequest, DeleteUploadResponse>(RPC_METHODS.DeleteUpload, async (data) => {
         const path = data?.path?.trim()
         if (!path) {
             return rpcError('Path is required')

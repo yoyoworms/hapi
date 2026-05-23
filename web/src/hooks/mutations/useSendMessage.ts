@@ -19,15 +19,45 @@ type SendMessageInput = {
     localId: string
     createdAt: number
     attachments?: AttachmentMetadata[]
+    scheduledAt?: number | null
 }
 
-type BlockedReason = 'no-api' | 'no-session'
+type BlockedReason = 'no-api' | 'no-session' | 'pending'
 
 type UseSendMessageOptions = {
     resolveSessionId?: (sessionId: string) => Promise<string>
     onSessionResolved?: (sessionId: string) => void
     onBlocked?: (reason: BlockedReason) => void
+    onSuccess?: (sessionId: string) => void
+    // Fork uses `thinking`; upstream renamed to `isSessionThinking`. Accept both.
     thinking?: boolean
+    isSessionThinking?: boolean
+}
+
+/** Create an optimistic message for display. Extracted as an extension point
+ *  so a future floating-UI PR can route queued messages to a separate area. */
+function createOptimisticMessage(input: SendMessageInput, status: 'queued' | 'sending'): DecryptedMessage {
+    return {
+        id: input.localId,
+        seq: null,
+        localId: input.localId,
+        content: {
+            role: 'user',
+            content: {
+                type: 'text',
+                text: input.text,
+                attachments: input.attachments
+            }
+        },
+        createdAt: input.createdAt,
+        // Explicit null so the strict-null queued check matches. A pre-V8 hub
+        // response that omits the field entirely (`undefined`) is treated as
+        // already-invoked and stays in the thread, not the floating bar.
+        invokedAt: null,
+        scheduledAt: input.scheduledAt ?? null,
+        status,
+        originalText: input.text,
+    }
 }
 
 function findMessageByLocalId(
@@ -49,7 +79,13 @@ export function useSendMessage(
     sessionId: string | null,
     options?: UseSendMessageOptions
 ): {
-    sendMessage: (text: string, attachments?: AttachmentMetadata[]) => void
+    // Resolves true when a mutation was actually started, false when the call was
+    // rejected pre-mutation (no-api / no-session / pending) OR the async
+    // resolveSessionId step threw. Async is required because inactive-session
+    // resume happens before mutation.mutate(), and a sync `true` would let the
+    // caller clear UI state (e.g. pendingSchedule) before knowing whether
+    // resume succeeded — see SessionChat.handleSend.
+    sendMessage: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
     retryMessage: (localId: string) => void
     isSending: boolean
     queuedCount: number
@@ -63,7 +99,9 @@ export function useSendMessage(
     const resolveGuardRef = useRef(false)
     const drainingRef = useRef(false)
     const releaseTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-    const thinkingRef = useRef(Boolean(options?.thinking))
+    // `thinking` is the fork's name; upstream renamed to `isSessionThinking`. Honor either.
+    const thinkingFlag = Boolean(options?.thinking ?? options?.isSessionThinking)
+    const thinkingRef = useRef(thinkingFlag)
     const mutationPendingRef = useRef(false)
 
     // Subscribe to queue changes — getState returns a stable reference when empty
@@ -100,8 +138,8 @@ export function useSendMessage(
     }, [clearTurnLock, clearTurnReleaseTimer])
 
     useEffect(() => {
-        thinkingRef.current = Boolean(options?.thinking)
-    }, [options?.thinking])
+        thinkingRef.current = thinkingFlag
+    }, [thinkingFlag])
 
     useEffect(() => () => {
         clearTurnReleaseTimer()
@@ -112,7 +150,7 @@ export function useSendMessage(
             if (!api) {
                 throw new Error('API unavailable')
             }
-            await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments)
+            await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments, input.scheduledAt)
         },
         onSuccess: (_, input) => {
             updateMessageStatus(input.sessionId, input.localId, 'sent')
@@ -120,6 +158,7 @@ export function useSendMessage(
                 scheduleTurnLockRelease(input.sessionId, input.localId)
             }
             haptic.notification('success')
+            options?.onSuccess?.(input.sessionId)
             if (api) {
                 const doFetch = () => fetchLatestMessages(api, input.sessionId, { incremental: true }).catch(() => {})
                 doFetch()
@@ -139,15 +178,18 @@ export function useSendMessage(
         mutationPendingRef.current = mutation.isPending
     }, [mutation.isPending])
 
-    // Dispatch a single message through the resolve → fetch → send pipeline
+    // Dispatch a single message through the resolve → fetch → send pipeline.
+    // Returns true once the mutation has been started, false if resolveSessionId
+    // threw (caller can clear pendingSchedule, etc.).
     const dispatchMessage = useCallback(async (
         targetApi: ApiClient,
         sid: string,
         text: string,
         localId: string,
         createdAt: number,
-        attachments?: AttachmentMetadata[]
-    ) => {
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null
+    ): Promise<boolean> => {
         let targetSessionId = sid
         if (options?.resolveSessionId) {
             resolveGuardRef.current = true
@@ -164,7 +206,7 @@ export function useSendMessage(
                 console.error('Failed to resolve session before send:', error)
                 clearTurnLock(sid)
                 queue.pauseQueue(sid)
-                return
+                return false
             } finally {
                 resolveGuardRef.current = false
                 setIsResolving(false)
@@ -181,14 +223,16 @@ export function useSendMessage(
             localId,
             createdAt,
             attachments,
+            scheduledAt: scheduledAt ?? null,
         })
+        return true
     }, [clearTurnLock, mutation, options, haptic])
 
     // Try to drain the queue — called when Claude finishes or dispatch completes
     const drainQueue = useCallback(() => {
         if (!api || !sessionId) return
         if (mutation.isPending || resolveGuardRef.current || drainingRef.current || queueState.inFlightLocalId) return
-        if (options?.thinking) return
+        if (thinkingFlag) return
 
         const next = queue.peek(sessionId)
         if (!next || next.phase === 'paused') return
@@ -199,25 +243,25 @@ export function useSendMessage(
 
         void dispatchMessage(api, sessionId, item.text, item.localId, item.createdAt, item.attachments)
             .finally(() => { drainingRef.current = false })
-    }, [api, sessionId, mutation.isPending, options?.thinking, queueState.inFlightLocalId, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, thinkingFlag, queueState.inFlightLocalId, dispatchMessage])
 
     // Release the current turn lock and try the next queued item when Claude
     // actually finishes thinking.
-    const prevThinkingRef = useRef(options?.thinking)
+    const prevThinkingRef = useRef(thinkingFlag)
     useEffect(() => {
         const wasThinking = prevThinkingRef.current
-        prevThinkingRef.current = options?.thinking
-        if (options?.thinking) {
+        prevThinkingRef.current = thinkingFlag
+        if (thinkingFlag) {
             clearTurnReleaseTimer()
             return
         }
-        if (wasThinking && !options?.thinking) {
+        if (wasThinking && !thinkingFlag) {
             if (sessionId && queueState.inFlightLocalId) {
                 clearTurnLock(sessionId)
             }
             drainQueue()
         }
-    }, [options?.thinking, sessionId, queueState.inFlightLocalId, clearTurnLock, clearTurnReleaseTimer, drainQueue])
+    }, [thinkingFlag, sessionId, queueState.inFlightLocalId, clearTurnLock, clearTurnReleaseTimer, drainQueue])
 
     // On mount, restore optimistic bubbles for any persisted queued messages
     useEffect(() => {
@@ -244,18 +288,18 @@ export function useSendMessage(
         if (queuedCount > 0) {
             drainQueue()
         }
-    }, [queuedCount, queueState.inFlightLocalId, mutation.isPending, options?.thinking, drainQueue])
+    }, [queuedCount, queueState.inFlightLocalId, mutation.isPending, thinkingFlag, drainQueue])
 
-    const sendMessage = useCallback((text: string, attachments?: AttachmentMetadata[]) => {
+    const sendMessage = useCallback(async (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<boolean> => {
         if (!api) {
             options?.onBlocked?.('no-api')
             haptic.notification('error')
-            return
+            return false
         }
         if (!sessionId) {
             options?.onBlocked?.('no-session')
             haptic.notification('error')
-            return
+            return false
         }
 
         const localId = makeClientSideId('local')
@@ -266,39 +310,33 @@ export function useSendMessage(
         if (busy) {
             // Enqueue and show optimistic bubble with 'queued' status
             queue.enqueue(sessionId, { localId, text, attachments, createdAt })
-            const optimisticMessage: DecryptedMessage = {
-                id: localId,
-                seq: null,
+            appendOptimisticMessage(sessionId, createOptimisticMessage({
+                sessionId,
+                text,
                 localId,
-                content: {
-                    role: 'user',
-                    content: { type: 'text', text, attachments }
-                },
                 createdAt,
-                status: 'queued',
-                originalText: text,
-            }
-            appendOptimisticMessage(sessionId, optimisticMessage)
+                attachments,
+                scheduledAt,
+            }, 'queued'))
             haptic.impact('light')
         } else {
             // Dispatch immediately
-            const optimisticMessage: DecryptedMessage = {
-                id: localId,
-                seq: null,
+            appendOptimisticMessage(sessionId, createOptimisticMessage({
+                sessionId,
+                text,
                 localId,
-                content: {
-                    role: 'user',
-                    content: { type: 'text', text, attachments }
-                },
                 createdAt,
-                status: 'sending',
-                originalText: text,
-            }
-            appendOptimisticMessage(sessionId, optimisticMessage)
+                attachments,
+                scheduledAt,
+            }, 'sending'))
             queue.setInFlight(sessionId, localId)
-            void dispatchMessage(api, sessionId, text, localId, createdAt, attachments)
+            // Await dispatchMessage so the caller learns whether the async
+            // resolveSessionId step succeeded — needed to clear pendingSchedule
+            // only on actual send. dispatchMessage returns false when resolve threw.
+            return await dispatchMessage(api, sessionId, text, localId, createdAt, attachments, scheduledAt)
         }
-    }, [api, sessionId, mutation.isPending, options?.thinking, options?.onBlocked, queueState.inFlightLocalId, haptic, dispatchMessage])
+        return true
+    }, [api, sessionId, mutation.isPending, thinkingFlag, options, queueState.inFlightLocalId, haptic, dispatchMessage])
 
     const retryMessage = useCallback((localId: string) => {
         if (!api || !sessionId) return
@@ -310,7 +348,15 @@ export function useSendMessage(
         updateMessageStatus(sessionId, localId, 'sending')
         queue.setInFlight(sessionId, localId)
 
-        void dispatchMessage(api, sessionId, message.originalText, localId, message.createdAt)
+        void dispatchMessage(
+            api,
+            sessionId,
+            message.originalText,
+            localId,
+            message.createdAt,
+            undefined,
+            message.scheduledAt ?? null,
+        )
     }, [api, sessionId, mutation.isPending, queueState.inFlightLocalId, dispatchMessage])
 
     const cancelQueued = useCallback((localId: string) => {

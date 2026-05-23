@@ -1,3 +1,5 @@
+import type { AgentFlavor } from '@hapi/protocol'
+
 export interface SpawnSessionOptions {
     machineId?: string
     directory: string
@@ -5,11 +7,12 @@ export interface SpawnSessionOptions {
     resumeSessionId?: string
     continueLatest?: boolean
     approvedNewDirectoryCreation?: boolean
-    agent?: 'claude' | 'codex' | 'cursor' | 'gemini' | 'opencode'
+    agent?: AgentFlavor
     model?: string
     effort?: string
     modelReasoningEffort?: string
     yolo?: boolean
+    permissionMode?: string
     token?: string
     sessionType?: 'simple' | 'worktree'
     worktreeName?: string

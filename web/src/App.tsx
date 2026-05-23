@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Outlet, useLocation, useMatchRoute, useRouter } from '@tanstack/react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { getTelegramWebApp, isTelegramApp } from '@/hooks/useTelegram'
+import { initializeChatSurfaceColors } from '@/hooks/useChatSurfaceColors'
 import { initializeTheme } from '@/hooks/useTheme'
 import { useAuth } from '@/hooks/useAuth'
 import { useAuthSource } from '@/hooks/useAuthSource'
@@ -13,7 +14,7 @@ import { useViewportHeight } from '@/hooks/useViewportHeight'
 import { useVisibilityReporter } from '@/hooks/useVisibilityReporter'
 import { queryKeys } from '@/lib/query-keys'
 import { AppContextProvider } from '@/lib/app-context'
-import { fetchLatestMessages } from '@/lib/message-window-store'
+import { clearMessageWindow, fetchLatestMessages } from '@/lib/message-window-store'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useTranslation } from '@/lib/use-translation'
 // import { VoiceProvider } from '@/lib/voice-context' // voice disabled
@@ -99,6 +100,7 @@ function AppInner() {
         tg?.ready()
         tg?.expand()
         initializeTheme()
+        initializeChatSurfaceColors()
     }, [])
 
     // Track visual viewport height for mobile keyboard avoidance (see useViewportHeight.ts)
@@ -297,16 +299,70 @@ function AppInner() {
         }
     }, [])
 
-    const handleSseEvent = useCallback(() => {}, [])
+    const handleSseEvent = useCallback((event: SyncEvent) => {
+        if (event.type !== 'messages-invalidated') {
+            return
+        }
+        if (!api || event.sessionId !== selectedSessionId) {
+            return
+        }
+        clearMessageWindow(event.sessionId)
+        void fetchLatestMessages(api, event.sessionId)
+    }, [api, selectedSessionId])
+    const translateIncomingToast = useCallback((title: string, body: string): { title: string; body: string } => {
+        const normalizedTitle = title.trim()
+        const normalizedBody = body.trim()
+
+        if (normalizedTitle === 'Ready for input') {
+            const waitingMatch = normalizedBody.match(/^(.+)\s+is waiting in\s+(.+)$/i)
+            if (waitingMatch) {
+                const agent = waitingMatch[1]?.trim() ?? ''
+                const sessionName = waitingMatch[2]?.trim() ?? ''
+                return {
+                    title: t('toast.ready.title'),
+                    body: t('toast.ready.body', { agent, session: sessionName })
+                }
+            }
+            return {
+                title: t('toast.ready.title'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Permission Request') {
+            return {
+                title: t('toast.permission.title'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Task completed') {
+            return {
+                title: t('toast.task.completed'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Task failed') {
+            return {
+                title: t('toast.task.failed'),
+                body: normalizedBody
+            }
+        }
+
+        return { title, body }
+    }, [t])
+
     const handleToast = useCallback((event: ToastEvent) => {
+        const localized = translateIncomingToast(event.data.title, event.data.body)
         addToast({
-            title: event.data.title,
-            body: event.data.body,
+            title: localized.title,
+            body: localized.body,
             sessionId: event.data.sessionId,
             url: event.data.url
         })
         void showSystemNotificationForToast(event)
-    }, [addToast])
+    }, [addToast, translateIncomingToast])
 
     const eventSubscription = useMemo(() => {
         if (selectedSessionId) {

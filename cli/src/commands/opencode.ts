@@ -3,41 +3,15 @@ import { authAndSetupMachineIfNeeded } from '@/ui/auth'
 import { initializeToken } from '@/ui/tokenInit'
 import { maybeAutoStartServer } from '@/utils/autoStartServer'
 import type { CommandDefinition } from './types'
-import type { OpencodePermissionMode } from '@hapi/protocol/types'
+import { OPENCODE_PERMISSION_MODES } from '@hapi/protocol/modes'
+import { parseRemoteAgentCommandOptions } from './agentCommandOptions'
 
 export const opencodeCommand: CommandDefinition = {
     name: 'opencode',
     requiresRuntimeAssets: true,
     run: async ({ commandArgs }) => {
         try {
-            const options: {
-                startedBy?: 'runner' | 'terminal'
-                startingMode?: 'local' | 'remote'
-                permissionMode?: OpencodePermissionMode
-                resumeSessionId?: string
-            } = {}
-
-            for (let i = 0; i < commandArgs.length; i++) {
-                const arg = commandArgs[i]
-                if (arg === '--started-by') {
-                    options.startedBy = commandArgs[++i] as 'runner' | 'terminal'
-                } else if (arg === '--hapi-starting-mode') {
-                    const value = commandArgs[++i]
-                    if (value === 'local' || value === 'remote') {
-                        options.startingMode = value
-                    } else {
-                        throw new Error('Invalid --hapi-starting-mode (expected local or remote)')
-                    }
-                } else if (arg === '--yolo') {
-                    options.permissionMode = 'yolo'
-                } else if (arg === '--resume') {
-                    const sessionId = commandArgs[++i]
-                    if (!sessionId) {
-                        throw new Error('Missing --resume value')
-                    }
-                    options.resumeSessionId = sessionId
-                }
-            }
+            const options = parseRemoteAgentCommandOptions(commandArgs, OPENCODE_PERMISSION_MODES)
 
             await initializeToken()
             await maybeAutoStartServer()

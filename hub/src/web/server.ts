@@ -4,7 +4,7 @@ import { logger } from 'hono/logger'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { serveStatic } from 'hono/bun'
-import { configuration } from '../configuration'
+import { getConfiguration } from '../configuration'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import type { SyncEngine } from '../sync/syncEngine'
 import { createAuthMiddleware, type WebAppEnv } from './middleware/auth'
@@ -79,6 +79,7 @@ function createWebApp(options: {
     // Health check endpoint (no auth required)
     app.get('/health', (c) => c.json({ status: 'ok', protocolVersion: PROTOCOL_VERSION }))
 
+    const configuration = getConfiguration()
     const corsOrigins = options.corsOrigins ?? configuration.corsOrigins
     const corsOriginOption = corsOrigins.includes('*') ? '*' : corsOrigins
     const corsMiddleware = cors({
@@ -293,6 +294,7 @@ export async function startWebServer(options: {
         officialWebUrl: options.officialWebUrl
     })
 
+    const configuration = getConfiguration()
     const socketHandler = options.socketEngine.handler()
 
     const server = Bun.serve({

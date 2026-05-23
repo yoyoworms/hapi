@@ -1,39 +1,8 @@
-import { z } from 'zod'
+import type { Machine, MachinePatch } from '@hapi/protocol/types'
+import { MachineMetadataSchema, RunnerStateSchema } from '@hapi/protocol/schemas'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
 import { EventPublisher } from './eventPublisher'
-
-const machineMetadataSchema = z.object({
-    host: z.string().optional(),
-    platform: z.string().optional(),
-    happyCliVersion: z.string().optional(),
-    displayName: z.string().optional(),
-    homeDir: z.string().optional(),
-    happyHomeDir: z.string().optional(),
-    happyLibDir: z.string().optional()
-})
-
-export interface Machine {
-    id: string
-    namespace: string
-    seq: number
-    createdAt: number
-    updatedAt: number
-    active: boolean
-    activeAt: number
-    metadata: {
-        host: string
-        platform: string
-        happyCliVersion: string
-        displayName?: string
-        homeDir?: string
-        happyHomeDir?: string
-        happyLibDir?: string
-    } | null
-    metadataVersion: number
-    runnerState: unknown | null
-    runnerStateVersion: number
-}
 
 export class MachineCache {
     private readonly machines: Map<string, Machine> = new Map()
@@ -91,17 +60,22 @@ export class MachineCache {
         const existing = this.machines.get(machineId)
 
         const metadata = (() => {
-            const parsed = machineMetadataSchema.safeParse(stored.metadata)
+            const parsed = MachineMetadataSchema.safeParse(stored.metadata)
             if (!parsed.success) return null
             const data = parsed.data
-            const host = typeof data.host === 'string' ? data.host : 'unknown'
-            const platform = typeof data.platform === 'string' ? data.platform : 'unknown'
-            const happyCliVersion = typeof data.happyCliVersion === 'string' ? data.happyCliVersion : 'unknown'
-            const displayName = typeof data.displayName === 'string' ? data.displayName : undefined
-            const homeDir = typeof data.homeDir === 'string' ? data.homeDir : undefined
-            const happyHomeDir = typeof data.happyHomeDir === 'string' ? data.happyHomeDir : undefined
-            const happyLibDir = typeof data.happyLibDir === 'string' ? data.happyLibDir : undefined
-            return { host, platform, happyCliVersion, displayName, homeDir, happyHomeDir, happyLibDir }
+            const workspaceRoots = Array.from(new Set(
+                (data.workspaceRoots ?? []).filter((path) => path.trim().length > 0)
+            ))
+            return {
+                ...data,
+                workspaceRoots: workspaceRoots.length > 0 ? workspaceRoots : undefined
+            }
+        })()
+
+        const runnerState = (() => {
+            if (stored.runnerState == null) return null
+            const parsed = RunnerStateSchema.safeParse(stored.runnerState)
+            return parsed.success ? parsed.data : null
         })()
 
         const storedActiveAt = stored.activeAt ?? stored.createdAt
@@ -118,7 +92,7 @@ export class MachineCache {
             activeAt: useStoredActivity ? storedActiveAt : (existingActiveAt || storedActiveAt),
             metadata,
             metadataVersion: stored.metadataVersion,
-            runnerState: stored.runnerState,
+            runnerState,
             runnerStateVersion: stored.runnerStateVersion
         }
 
@@ -161,7 +135,13 @@ export class MachineCache {
             if (!machine.active) continue
             if (now - machine.activeAt <= machineTimeoutMs) continue
             machine.active = false
-            this.publisher.emit({ type: 'machine-updated', machineId: machine.id, data: { active: false } })
+            this.publisher.emit({
+                type: 'machine-updated',
+                machineId: machine.id,
+                data: { active: false } satisfies MachinePatch
+            })
         }
     }
 }
+
+export type { Machine }

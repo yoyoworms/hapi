@@ -1,6 +1,13 @@
 import { ApiClient, ApiSessionClient } from '@/lib';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
-import type { Metadata, SessionCollaborationMode, SessionEffort, SessionModel, SessionPermissionMode } from '@/api/types';
+import type {
+    Metadata,
+    SessionCollaborationMode,
+    SessionEffort,
+    SessionModel,
+    SessionModelReasoningEffort,
+    SessionPermissionMode
+} from '@/api/types';
 import { logger } from '@/ui/logger';
 
 export type SessionFoundCallback = (sessionId: string, sessionFilePath?: string) => void;
@@ -19,6 +26,7 @@ export type AgentSessionBaseOptions<Mode> = {
     applySessionIdToMetadata: (metadata: Metadata, sessionId: string) => Metadata;
     permissionMode?: SessionPermissionMode;
     model?: SessionModel;
+    modelReasoningEffort?: SessionModelReasoningEffort;
     effort?: SessionEffort;
     collaborationMode?: SessionCollaborationMode;
 };
@@ -42,6 +50,7 @@ export class AgentSessionBase<Mode> {
     private keepAliveInterval: NodeJS.Timeout | null = null;
     protected permissionMode?: SessionPermissionMode;
     protected model?: SessionModel;
+    protected modelReasoningEffort?: SessionModelReasoningEffort;
     protected effort?: SessionEffort;
     protected collaborationMode?: SessionCollaborationMode;
 
@@ -59,8 +68,11 @@ export class AgentSessionBase<Mode> {
         this.mode = opts.mode ?? 'local';
         this.permissionMode = opts.permissionMode;
         this.model = opts.model;
+        this.modelReasoningEffort = opts.modelReasoningEffort;
         this.effort = opts.effort;
         this.collaborationMode = opts.collaborationMode;
+
+        this.queue.onBatchConsumed = (localIds) => this.client.emitMessagesConsumed(localIds);
 
         this.client.keepAlive(this.thinking, this.mode, this.getKeepAliveRuntime());
         this.keepAliveInterval = setInterval(() => {
@@ -74,16 +86,21 @@ export class AgentSessionBase<Mode> {
         this.client.keepAlive(thinking, this.mode, this.getKeepAliveRuntime());
     };
 
+    pushKeepAlive = () => {
+        this.client.keepAlive(this.thinking, this.mode, this.getKeepAliveRuntime());
+    };
+
     onModeChange = (mode: 'local' | 'remote') => {
         this.mode = mode;
         this.client.keepAlive(this.thinking, mode, this.getKeepAliveRuntime());
         const permissionLabel = this.permissionMode ?? 'unset';
         const modelLabel = this.model === undefined ? 'unset' : (this.model ?? 'auto');
+        const modelReasoningEffortLabel = this.modelReasoningEffort === undefined ? 'unset' : (this.modelReasoningEffort ?? 'default');
         const effortLabel = this.effort === undefined ? 'unset' : (this.effort ?? 'auto');
         const collaborationLabel = this.collaborationMode ?? 'unset';
         logger.debug(
             `[${this.sessionLabel}] Mode switched to ${mode} ` +
-            `(permissionMode=${permissionLabel}, model=${modelLabel}, effort=${effortLabel}, collaborationMode=${collaborationLabel})`
+            `(permissionMode=${permissionLabel}, model=${modelLabel}, modelReasoningEffort=${modelReasoningEffortLabel}, effort=${effortLabel}, collaborationMode=${collaborationLabel})`
         );
         this._onModeChange(mode);
     };
@@ -120,15 +137,23 @@ export class AgentSessionBase<Mode> {
         {
             permissionMode?: SessionPermissionMode
             model?: SessionModel
+            modelReasoningEffort?: SessionModelReasoningEffort
             effort?: SessionEffort
             collaborationMode?: SessionCollaborationMode
         } | undefined {
-        if (this.permissionMode === undefined && this.model === undefined && this.effort === undefined && this.collaborationMode === undefined) {
+        if (
+            this.permissionMode === undefined
+            && this.model === undefined
+            && this.modelReasoningEffort === undefined
+            && this.effort === undefined
+            && this.collaborationMode === undefined
+        ) {
             return undefined;
         }
         return {
             permissionMode: this.permissionMode,
             model: this.model,
+            modelReasoningEffort: this.modelReasoningEffort,
             effort: this.effort,
             collaborationMode: this.collaborationMode
         };
@@ -140,6 +165,10 @@ export class AgentSessionBase<Mode> {
 
     getModel(): SessionModel | undefined {
         return this.model;
+    }
+
+    getModelReasoningEffort(): SessionModelReasoningEffort | undefined {
+        return this.modelReasoningEffort;
     }
 
     getEffort(): SessionEffort | undefined {

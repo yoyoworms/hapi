@@ -10,6 +10,7 @@ export type StoredSession = {
     agentState: unknown | null
     agentStateVersion: number
     model: string | null
+    modelReasoningEffort: string | null
     effort: string | null
     todos: unknown | null
     todosUpdatedAt: number | null
@@ -41,6 +42,8 @@ export type StoredMessage = {
     createdAt: number
     seq: number
     localId: string | null
+    invokedAt: number | null
+    scheduledAt: number | null
 }
 
 export type StoredUser = {

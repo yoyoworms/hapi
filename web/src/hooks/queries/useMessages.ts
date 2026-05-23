@@ -2,7 +2,6 @@ import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import type { ApiClient } from '@/api/client'
 import type { DecryptedMessage } from '@/types/api'
 import {
-    clearMessageWindow,
     fetchLatestMessages,
     fetchOlderMessages,
     flushPendingMessages,
@@ -12,7 +11,7 @@ import {
     type MessageWindowState,
 } from '@/lib/message-window-store'
 
-const EMPTY_STATE: MessageWindowState = {
+export const EMPTY_STATE: MessageWindowState = {
     sessionId: 'unknown',
     messages: [],
     pending: [],
@@ -29,6 +28,7 @@ const EMPTY_STATE: MessageWindowState = {
 
 export function useMessages(api: ApiClient | null, sessionId: string | null): {
     messages: DecryptedMessage[]
+    pendingMessages: DecryptedMessage[]
     warning: string | null
     isLoading: boolean
     isLoadingMore: boolean
@@ -63,15 +63,6 @@ export function useMessages(api: ApiClient | null, sessionId: string | null): {
         void fetchLatestMessages(api, sessionId)
     }, [api, sessionId])
 
-    useEffect(() => {
-        if (!sessionId) {
-            return
-        }
-        return () => {
-            clearMessageWindow(sessionId)
-        }
-    }, [sessionId])
-
     const loadMore = useCallback(async () => {
         if (!api || !sessionId) return
         if (!state.hasMore || state.isLoadingMore) return
@@ -98,6 +89,7 @@ export function useMessages(api: ApiClient | null, sessionId: string | null): {
 
     return {
         messages: state.messages,
+        pendingMessages: state.pending,
         warning: state.warning,
         isLoading: state.isLoading,
         isLoadingMore: state.isLoadingMore,

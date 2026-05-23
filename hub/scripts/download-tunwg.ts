@@ -2,7 +2,7 @@
  * Download tunwg binaries for all platforms
  *
  * Downloads pre-built tunwg binaries from GitHub releases.
- * Output directory: hub/tools/tunwg/
+ * Output directory: shared/tools/tunwg/
  */
 
 import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
     } else {
         scriptDir = dirname(new URL(import.meta.url).pathname);
     }
-    const toolsDir = join(scriptDir, '..', 'tools', 'tunwg');
+    const toolsDir = join(scriptDir, '..', '..', 'shared', 'tools', 'tunwg');
 
     console.log('Downloading tunwg binaries...\n');
 

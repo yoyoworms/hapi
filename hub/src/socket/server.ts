@@ -3,7 +3,7 @@ import { Server, type DefaultEventsMap } from 'socket.io'
 import { jwtVerify } from 'jose'
 import { z } from 'zod'
 import type { Store } from '../store'
-import { configuration } from '../configuration'
+import { getConfiguration } from '../configuration'
 import { constantTimeEquals } from '../utils/crypto'
 import { parseAccessToken } from '../utils/accessToken'
 import { registerCliHandlers } from './handlers/cli'
@@ -43,6 +43,9 @@ export type SocketServerDeps = {
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
     onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
     onMachineAlive?: (payload: { machineId: string; time: number }) => void
+    onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
+    onSessionActivity?: (sessionId: string, updatedAt: number) => void
+    onSweepImmediateQueued?: (sessionId: string, now: number) => void
 }
 
 export function createSocketServer(deps: SocketServerDeps): {
@@ -50,6 +53,7 @@ export function createSocketServer(deps: SocketServerDeps): {
     engine: Engine
     rpcRegistry: RpcRegistry
 } {
+    const configuration = getConfiguration()
     const corsOrigins = deps.corsOrigins ?? configuration.corsOrigins
     const allowAllOrigins = corsOrigins.includes('*')
     const corsOriginOption = allowAllOrigins ? '*' : corsOrigins
@@ -129,7 +133,10 @@ export function createSocketServer(deps: SocketServerDeps): {
         onSessionAccountStatus: deps.onSessionAccountStatus,
         onSessionMetadataUpdated: deps.onSessionMetadataUpdated,
         onMachineAlive: deps.onMachineAlive,
-        onWebappEvent: deps.onWebappEvent
+        onWebappEvent: deps.onWebappEvent,
+        onBackgroundTaskDelta: deps.onBackgroundTaskDelta,
+        onSessionActivity: deps.onSessionActivity,
+        onSweepImmediateQueued: deps.onSweepImmediateQueued
     }))
 
     terminalNs.use(async (socket, next) => {

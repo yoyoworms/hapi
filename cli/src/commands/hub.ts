@@ -28,12 +28,28 @@ export const hubCommand: CommandDefinition = {
             const { host, port } = parseHubArgs(context.commandArgs)
 
             if (host) {
-                process.env.WEBAPP_HOST = host
+                process.env.HAPI_LISTEN_HOST = host
             }
             if (port) {
-                process.env.WEBAPP_PORT = port
+                process.env.HAPI_LISTEN_PORT = port
             }
-            await import('../../../hub/src/index')
+            const { startHub } = await import('hapi-hub/startHub')
+            const hub = await startHub({ args: context.commandArgs })
+            let shuttingDown = false
+            const shutdown = async () => {
+                if (shuttingDown) {
+                    return
+                }
+                shuttingDown = true
+                process.off('SIGINT', shutdown)
+                process.off('SIGTERM', shutdown)
+                console.log('\nShutting down...')
+                await hub.stop()
+                process.exit(0)
+            }
+            process.on('SIGINT', shutdown)
+            process.on('SIGTERM', shutdown)
+            await new Promise(() => {})
         } catch (error) {
             console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
             if (process.env.DEBUG) {

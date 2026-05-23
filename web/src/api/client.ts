@@ -2,12 +2,7 @@ import type {
     AttachmentMetadata,
     AuthResponse,
     CodexCollaborationMode,
-    DeleteUploadResponse,
-    ListDirectoryResponse,
-    FileReadResponse,
     FileSearchResponse,
-    GitCommandResponse,
-    MachinePathsExistsResponse,
     MachinesResponse,
     MessagesResponse,
     PermissionMode,
@@ -17,12 +12,24 @@ import type {
     SlashCommandsResponse,
     SkillsResponse,
     SpawnResponse,
-    UploadFileResponse,
     VisibilityPayload,
     SessionResponse,
     SessionsResponse,
     UsageResponse
 } from '@/types/api'
+import type {
+    CodexModelsResponse,
+    DeleteUploadResponse,
+    FileReadResponse,
+    GitCommandResponse,
+    ListDirectoryResponse,
+    MachineListDirectoryResponse,
+    MachinePathsExistsResponse,
+    OpencodeModelsResponse,
+    UploadFileResponse
+} from '@hapi/protocol/apiTypes'
+import type { AgentFlavor } from '@hapi/protocol'
+import type { CancelMessageResponse } from '@hapi/protocol/schemas'
 
 type ApiClientOptions = {
     baseUrl?: string
@@ -190,11 +197,23 @@ export class ApiClient {
         return await this.request<SessionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}`)
     }
 
-    async getMessages(sessionId: string, options: { beforeSeq?: number | null; afterSeq?: number | null; limit?: number }): Promise<MessagesResponse> {
+    async getMessages(
+        sessionId: string,
+        options: {
+            beforeSeq?: number | null
+            afterSeq?: number | null
+            beforeAt?: number | null
+            limit?: number
+        }
+    ): Promise<MessagesResponse> {
         const params = new URLSearchParams()
         if (options.afterSeq !== undefined && options.afterSeq !== null) {
             params.set('afterSeq', `${options.afterSeq}`)
-        } else if (options.beforeSeq !== undefined && options.beforeSeq !== null) {
+        }
+        if (options.beforeAt !== undefined && options.beforeAt !== null) {
+            params.set('beforeAt', `${options.beforeAt}`)
+        }
+        if (options.beforeSeq !== undefined && options.beforeSeq !== null) {
             params.set('beforeSeq', `${options.beforeSeq}`)
         }
         if (options.limit !== undefined && options.limit !== null) {
@@ -237,6 +256,31 @@ export class ApiClient {
         return await this.request<FileSearchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/files${qs ? `?${qs}` : ''}`)
     }
 
+    async getGeneratedImageBlob(sessionId: string, imageId: string, attempt: number = 0, overrideToken?: string | null): Promise<Blob> {
+        const headers = new Headers()
+        const liveToken = this.getToken ? this.getToken() : null
+        const authToken = overrideToken !== undefined
+            ? (overrideToken ?? (liveToken ?? this.token))
+            : (liveToken ?? this.token)
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+        const res = await fetch(this.buildUrl(`/api/sessions/${encodeURIComponent(sessionId)}/generated-images/${encodeURIComponent(imageId)}`), {
+            headers
+        })
+        if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
+            const refreshed = await this.onUnauthorized()
+            if (refreshed) {
+                this.token = refreshed
+                return await this.getGeneratedImageBlob(sessionId, imageId, attempt + 1, refreshed)
+            }
+        }
+        if (!res.ok) {
+            throw new ApiError(`HTTP ${res.status}`, res.status, undefined, await res.text().catch(() => undefined))
+        }
+        return await res.blob()
+    }
+
     async readSessionFile(sessionId: string, path: string): Promise<FileReadResponse> {
         const params = new URLSearchParams()
         params.set('path', path)
@@ -269,12 +313,19 @@ export class ApiClient {
         })
     }
 
-    async resumeSession(sessionId: string, resumeWithSessionId?: string): Promise<string> {
+    async resumeSession(
+        sessionId: string,
+        opts?: { permissionMode?: string; resumeWithSessionId?: string }
+    ): Promise<string> {
+        const body: Record<string, unknown> = {}
+        if (opts?.permissionMode !== undefined) body.permissionMode = opts.permissionMode
+        if (opts?.resumeWithSessionId !== undefined) body.resumeWithSessionId = opts.resumeWithSessionId
+        const hasBody = Object.keys(body).length > 0
         const response = await this.request<{ sessionId: string }>(
             `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
             {
                 method: 'POST',
-                ...(resumeWithSessionId ? { body: JSON.stringify({ resumeWithSessionId }) } : {})
+                ...(hasBody ? { body: JSON.stringify(body) } : {})
             }
         )
         return response.sessionId
@@ -287,15 +338,24 @@ export class ApiClient {
         return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/resume-options`)
     }
 
-    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[]): Promise<void> {
+    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
             body: JSON.stringify({
                 text,
                 localId: localId ?? undefined,
-                attachments: attachments ?? undefined
+                attachments: attachments ?? undefined,
+                scheduledAt: scheduledAt ?? undefined
             })
         })
+    }
+
+    async cancelMessage(sessionId: string, messageId: string): Promise<CancelMessageResponse> {
+        const response = await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+            { method: 'DELETE' }
+        )
+        return response as CancelMessageResponse
     }
 
     async abortSession(sessionId: string): Promise<void> {
@@ -337,6 +397,13 @@ export class ApiClient {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
             method: 'POST',
             body: JSON.stringify({ model })
+        })
+    }
+
+    async setModelReasoningEffort(sessionId: string, modelReasoningEffort: string | null): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/model-reasoning-effort`, {
+            method: 'POST',
+            body: JSON.stringify({ modelReasoningEffort })
         })
     }
 
@@ -387,6 +454,19 @@ export class ApiClient {
         return await this.request<MachinesResponse>('/api/machines')
     }
 
+    async listMachineDirectory(
+        machineId: string,
+        path: string
+    ): Promise<MachineListDirectoryResponse> {
+        return await this.request<MachineListDirectoryResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/list-directory`,
+            {
+                method: 'POST',
+                body: JSON.stringify({ path })
+            }
+        )
+    }
+
     async checkMachinePathsExists(
         machineId: string,
         paths: string[]
@@ -403,7 +483,7 @@ export class ApiClient {
     async spawnSession(
         machineId: string,
         directory: string,
-        agent?: 'claude' | 'codex' | 'cursor' | 'gemini' | 'opencode',
+        agent?: AgentFlavor,
         model?: string,
         modelReasoningEffort?: string,
         yolo?: boolean,
@@ -416,6 +496,30 @@ export class ApiClient {
             method: 'POST',
             body: JSON.stringify({ directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, effort, sandbox })
         })
+    }
+
+    async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
+        return await this.request<CodexModelsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-models`
+        )
+    }
+
+    async getSessionCodexModels(sessionId: string): Promise<CodexModelsResponse> {
+        return await this.request<CodexModelsResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/codex-models`
+        )
+    }
+
+    async getSessionOpencodeModels(sessionId: string): Promise<OpencodeModelsResponse> {
+        return await this.request<OpencodeModelsResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/opencode-models`
+        )
+    }
+
+    async getMachineOpencodeModelsForCwd(machineId: string, cwd: string): Promise<OpencodeModelsResponse> {
+        return await this.request<OpencodeModelsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/opencode-models?cwd=${encodeURIComponent(cwd)}`
+        )
     }
 
     async getSlashCommands(sessionId: string): Promise<SlashCommandsResponse> {

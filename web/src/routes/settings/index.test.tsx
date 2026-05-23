@@ -1,9 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { I18nContext, I18nProvider } from '@/lib/i18n-context'
+import { AppContextProvider } from '@/lib/app-context'
 import { en } from '@/lib/locales'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import SettingsPage from './index'
+
+const mockAppContextValue = {
+    api: {
+        getUsage: vi.fn(async () => null),
+        getCodexCapacityStatus: vi.fn(async () => null),
+    } as never,
+    token: 'test-token',
+    baseUrl: 'http://localhost:3000',
+    signOut: vi.fn(),
+}
 
 vi.mock('@hapi/protocol', () => ({
     PROTOCOL_VERSION: 1,
@@ -35,6 +46,47 @@ vi.mock('@/hooks/useTerminalFontSize', () => ({
     ],
 }))
 
+vi.mock('@/hooks/useComposerEnterBehavior', () => ({
+    useComposerEnterBehavior: () => ({ composerEnterBehavior: 'send', setComposerEnterBehavior: vi.fn() }),
+    getComposerEnterBehaviorOptions: () => [
+        { value: 'send', labelKey: 'settings.chat.enterBehavior.send' },
+        { value: 'newline', labelKey: 'settings.chat.enterBehavior.newline' },
+    ],
+}))
+
+vi.mock('@/hooks/useTerminalToolDisplayMode', () => ({
+    useTerminalToolDisplayMode: () => ({ terminalToolDisplayMode: 'compact', setTerminalToolDisplayMode: vi.fn() }),
+    getTerminalToolDisplayModeOptions: () => [
+        { value: 'compact', labelKey: 'settings.chat.terminalToolDisplay.compact' },
+        { value: 'detailed', labelKey: 'settings.chat.terminalToolDisplay.detailed' },
+    ],
+}))
+
+vi.mock('@/hooks/useSessionPreviewLimit', () => ({
+    MIN_SESSION_PREVIEW_LIMIT: 1,
+    MAX_SESSION_PREVIEW_LIMIT: 99,
+    normalizeSessionPreviewLimit: (value: number) => Number.isInteger(value) ? Math.min(99, Math.max(1, value)) : 8,
+    useSessionPreviewLimit: () => ({ sessionPreviewLimit: 8, setSessionPreviewLimit: vi.fn() }),
+}))
+
+vi.mock('@/hooks/useChatSurfaceColors', () => ({
+    useChatSurfaceColors: () => ({
+        toolGroupBackground: 'default',
+        userMessageBackground: 'preset:soft-blue',
+        setToolGroupBackground: vi.fn(),
+        setUserMessageBackground: vi.fn(),
+    }),
+    getChatSurfaceColorPresetOptions: () => [
+        { value: 'default', labelKey: 'settings.chat.surfaceColor.default' },
+        { value: 'soft-blue', labelKey: 'settings.chat.surfaceColor.softBlue' },
+        { value: 'soft-green', labelKey: 'settings.chat.surfaceColor.softGreen' },
+        { value: 'soft-yellow', labelKey: 'settings.chat.surfaceColor.softYellow' },
+    ],
+    getChatSurfaceColorPickerValue: () => '#7db7ff',
+    toPresetChatSurfaceColorPreference: (value: string) => value === 'default' ? 'default' : `preset:${value}`,
+    toCustomChatSurfaceColorPreference: (value: string) => `custom:${value}`,
+}))
+
 // Mock useTheme hook
 vi.mock('@/hooks/useTheme', () => ({
     useAppearance: () => ({ appearance: 'system', setAppearance: vi.fn() }),
@@ -56,9 +108,11 @@ vi.mock('@/lib/languages', () => ({
 
 function renderWithProviders(ui: React.ReactElement) {
     return render(
-        <I18nProvider>
-            {ui}
-        </I18nProvider>
+        <AppContextProvider value={mockAppContextValue}>
+            <I18nProvider>
+                {ui}
+            </I18nProvider>
+        </AppContextProvider>
     )
 }
 
@@ -66,9 +120,11 @@ function renderWithSpyT(ui: React.ReactElement) {
     const translations = en as Record<string, string>
     const spyT = vi.fn((key: string) => translations[key] ?? key)
     render(
-        <I18nContext.Provider value={{ t: spyT, locale: 'en', setLocale: vi.fn() }}>
-            {ui}
-        </I18nContext.Provider>
+        <AppContextProvider value={mockAppContextValue}>
+            <I18nContext.Provider value={{ t: spyT, locale: 'en', setLocale: vi.fn() }}>
+                {ui}
+            </I18nContext.Provider>
+        </AppContextProvider>
     )
     return spyT
 }
@@ -81,8 +137,11 @@ describe('SettingsPage', () => {
             getItem: vi.fn(() => 'en'),
             setItem: vi.fn(),
             removeItem: vi.fn(),
+            clear: vi.fn(),
+            key: vi.fn(() => null),
+            length: 0,
         }
-        Object.defineProperty(window, 'localStorage', { value: localStorageMock })
+        Object.defineProperty(window, 'localStorage', { value: localStorageMock, configurable: true })
     })
 
     it('renders the About section', () => {
@@ -133,11 +192,58 @@ describe('SettingsPage', () => {
         const calledKeys = spyT.mock.calls.map((call) => call[0])
         expect(calledKeys).toContain('settings.display.appearance')
         expect(calledKeys).toContain('settings.display.appearance.system')
+        expect(calledKeys).toContain('settings.display.sessionPreviewLimit')
+        expect(calledKeys).toContain('settings.display.sessionPreviewLimit.decrease')
+        expect(calledKeys).toContain('settings.display.sessionPreviewLimit.increase')
     })
 
     it('renders the Terminal Font Size setting', () => {
         renderWithProviders(<SettingsPage />)
         expect(screen.getAllByText('Terminal Font Size').length).toBeGreaterThanOrEqual(1)
         expect(screen.getAllByText('13px').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('renders the Session Preview Limit setting', () => {
+        renderWithProviders(<SettingsPage />)
+        expect(screen.getAllByText('Sessions Before Folding').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getByLabelText('Sessions Before Folding')).toHaveValue(8)
+        expect(screen.getAllByLabelText('Show fewer sessions before folding').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByLabelText('Show more sessions before folding').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('renders the Enter Key setting', () => {
+        renderWithProviders(<SettingsPage />)
+        expect(screen.getAllByText('Enter Key').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Send message').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('renders the Terminal Tool Display setting', () => {
+        renderWithProviders(<SettingsPage />)
+        expect(screen.getAllByText('Terminal Tool Cards').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Compact (command only)').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('renders grouped tool and user message background settings', () => {
+        renderWithProviders(<SettingsPage />)
+        expect(screen.getAllByText('Grouped Tool Use Background').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('User Message Background').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Default color').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Soft blue').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Soft green').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByText('Soft yellow').length).toBeGreaterThanOrEqual(1)
+        expect(screen.getAllByLabelText('Custom color').length).toBeGreaterThanOrEqual(2)
+    })
+
+    it('uses correct i18n keys for the Enter Key setting', () => {
+        const spyT = renderWithSpyT(<SettingsPage />)
+        const calledKeys = spyT.mock.calls.map((call) => call[0])
+        expect(calledKeys).toContain('settings.chat.title')
+        expect(calledKeys).toContain('settings.chat.enterBehavior')
+        expect(calledKeys).toContain('settings.chat.enterBehavior.send')
+        expect(calledKeys).toContain('settings.chat.terminalToolDisplay')
+        expect(calledKeys).toContain('settings.chat.terminalToolDisplay.compact')
+        expect(calledKeys).toContain('settings.chat.groupedToolBackground')
+        expect(calledKeys).toContain('settings.chat.userMessageBackground')
+        expect(calledKeys).toContain('settings.chat.surfaceColor.default')
     })
 })

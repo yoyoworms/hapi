@@ -1,17 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { isObject, toSessionSummary } from '@hapi/protocol'
+import { MachinePatchSchema, MachineSchema, SessionPatchSchema, SessionSchema } from '@hapi/protocol/schemas'
 import type {
     Machine,
     MachinesResponse,
     Session,
+    SessionPatch,
     SessionResponse,
     SessionsResponse,
     SessionSummary,
     SyncEvent
 } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
-import { clearMessageWindow, ingestIncomingMessages } from '@/lib/message-window-store'
+import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
 
 type SSESubscription = {
     all?: boolean
@@ -30,8 +32,6 @@ const RECONNECT_MAX_DELAY_MS = 30_000
 const RECONNECT_JITTER_MS = 500
 const INVALIDATION_BATCH_MS = 16
 
-type SessionPatch = Partial<Pick<Session, 'active' | 'thinking' | 'activeAt' | 'updatedAt' | 'model' | 'effort' | 'permissionMode' | 'collaborationMode' | 'usage'>>
-
 function sortSessionSummaries(left: SessionSummary, right: SessionSummary): number {
     if (left.active !== right.active) {
         return left.active ? -1 : 1
@@ -42,100 +42,33 @@ function sortSessionSummaries(left: SessionSummary, right: SessionSummary): numb
     return right.updatedAt - left.updatedAt
 }
 
-function hasRecordShape(value: unknown): value is Record<string, unknown> {
-    return isObject(value)
-}
-
 function isSessionRecord(value: unknown): value is Session {
-    if (!hasRecordShape(value)) {
-        return false
-    }
-    return typeof value.id === 'string'
-        && typeof value.active === 'boolean'
-        && typeof value.activeAt === 'number'
-        && typeof value.updatedAt === 'number'
-        && typeof value.thinking === 'boolean'
+    return SessionSchema.safeParse(value).success
 }
 
 function getSessionPatch(value: unknown): SessionPatch | null {
-    if (!hasRecordShape(value)) {
+    const parsed = SessionPatchSchema.safeParse(value)
+    if (!parsed.success) {
         return null
     }
-
-    const patch: SessionPatch = {}
-    let hasKnownPatch = false
-
-    if (typeof value.active === 'boolean') {
-        patch.active = value.active
-        hasKnownPatch = true
+    const patch = { ...parsed.data } as SessionPatch & { usage?: Session['usage'] }
+    // Fork extension: preserve `usage` field on patch even though the shared schema strips it.
+    if (isObject(value) && 'usage' in value && (value as Record<string, unknown>).usage !== undefined) {
+        patch.usage = (value as Record<string, unknown>).usage as Session['usage']
     }
-    if (typeof value.thinking === 'boolean') {
-        patch.thinking = value.thinking
-        hasKnownPatch = true
-    }
-    if (typeof value.activeAt === 'number') {
-        patch.activeAt = value.activeAt
-        hasKnownPatch = true
-    }
-    if (typeof value.updatedAt === 'number') {
-        patch.updatedAt = value.updatedAt
-        hasKnownPatch = true
-    }
-    if (value.model === null || typeof value.model === 'string') {
-        patch.model = value.model
-        hasKnownPatch = true
-    }
-    if (value.effort === null || typeof value.effort === 'string') {
-        patch.effort = value.effort
-        hasKnownPatch = true
-    }
-    if (typeof value.permissionMode === 'string') {
-        patch.permissionMode = value.permissionMode as Session['permissionMode']
-        hasKnownPatch = true
-    }
-    if (typeof value.collaborationMode === 'string') {
-        patch.collaborationMode = value.collaborationMode as Session['collaborationMode']
-        hasKnownPatch = true
-    }
-    if (value.usage !== undefined) {
-        patch.usage = value.usage as Session['usage']
-        hasKnownPatch = true
-    }
-
-    return hasKnownPatch ? patch : null
-}
-
-function hasUnknownSessionPatchKeys(value: unknown): boolean {
-    if (!hasRecordShape(value)) {
-        return false
-    }
-    const knownKeys = new Set(['active', 'thinking', 'activeAt', 'updatedAt', 'model', 'effort', 'permissionMode', 'collaborationMode', 'usage'])
-    return Object.keys(value).some((key) => !knownKeys.has(key))
-}
-
-function isMachineMetadata(value: unknown): value is Machine['metadata'] {
-    if (value === null) {
-        return true
-    }
-    if (!hasRecordShape(value)) {
-        return false
-    }
-    return typeof value.host === 'string'
-        && typeof value.platform === 'string'
-        && typeof value.happyCliVersion === 'string'
+    return Object.keys(patch).length > 0 ? patch : null
 }
 
 function isMachineRecord(value: unknown): value is Machine {
-    if (!hasRecordShape(value)) {
-        return false
-    }
-    return typeof value.id === 'string'
-        && typeof value.active === 'boolean'
-        && isMachineMetadata(value.metadata)
+    return MachineSchema.safeParse(value).success
 }
 
-function isInactiveMachinePatch(value: unknown): boolean {
-    return hasRecordShape(value) && value.active === false
+function getMachinePatch(value: unknown): { active?: boolean; activeAt?: number; updatedAt?: number } | null {
+    const parsed = MachinePatchSchema.safeParse(value)
+    if (!parsed.success) {
+        return null
+    }
+    return Object.keys(parsed.data).length > 0 ? parsed.data : null
 }
 
 function getVisibilityState(): VisibilityState {
@@ -497,6 +430,16 @@ export function useSSE(options: {
                 return
             }
 
+            if (event.type === 'messages-consumed') {
+                markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt)
+            }
+
+            if (event.type === 'message-cancelled') {
+                // Remove the cancelled message from the store. If the local
+                // optimistic removal already cleared it, this is a no-op.
+                removeOptimisticMessage(event.sessionId, event.messageId)
+            }
+
             if (event.type === 'message-received') {
                 ingestIncomingMessages(event.sessionId, [event.message])
             }
@@ -521,10 +464,6 @@ export function useSSE(options: {
                         if (!summaryPatched) {
                             queueSessionListInvalidation()
                         }
-                        if (hasUnknownSessionPatchKeys(event.data)) {
-                            queueSessionDetailInvalidation(event.sessionId)
-                            queueSessionListInvalidation()
-                        }
                     } else {
                         queueSessionDetailInvalidation(event.sessionId)
                         queueSessionListInvalidation()
@@ -535,9 +474,17 @@ export function useSSE(options: {
             if (event.type === 'machine-updated') {
                 if (isMachineRecord(event.data)) {
                     upsertMachine(event.data)
-                } else if (event.data === null || isInactiveMachinePatch(event.data)) {
+                } else if (event.data === null) {
                     removeMachine(event.machineId)
-                } else if (!hasRecordShape(event.data) || typeof event.data.activeAt !== 'number') {
+                } else {
+                    const patch = getMachinePatch(event.data)
+                    if (patch?.active === false) {
+                        removeMachine(event.machineId)
+                    } else {
+                        queueMachinesInvalidation()
+                    }
+                }
+                if (event.data === undefined) {
                     queueMachinesInvalidation()
                 }
             }

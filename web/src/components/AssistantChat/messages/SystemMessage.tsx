@@ -1,9 +1,12 @@
-import { useAssistantState } from '@assistant-ui/react'
+import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
 import { getEventPresentation } from '@/chat/presentation'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
+import { getConversationMessageAnchorId } from '@/chat/outline'
+import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
 
 export function HappySystemMessage() {
     const role = useAssistantState(({ message }) => message.role)
+    const messageId = useAssistantState(({ message }) => message.id)
     const text = useAssistantState(({ message }) => {
         if (message.role !== 'system') return ''
         return message.content[0]?.type === 'text' ? message.content[0].text : ''
@@ -18,13 +21,14 @@ export function HappySystemMessage() {
     if (role !== 'system') return null
 
     return (
-        <div className="py-1">
+        <MessagePrimitive.Root id={getConversationMessageAnchorId(messageId)} className="scroll-mt-4 py-1">
             <div className="mx-auto w-fit max-w-[92%] px-2 text-center text-xs text-[var(--app-hint)] opacity-80">
                 <span className="inline-flex items-center gap-1">
                     {icon ? <span aria-hidden="true">{icon}</span> : null}
                     <span>{text}</span>
+                    <MessageTimestamp className="text-[10px]" />
                 </span>
             </div>
-        </div>
+        </MessagePrimitive.Root>
     )
 }

@@ -5,6 +5,23 @@ import { useAppContext } from '@/lib/app-context'
 import { getElevenLabsSupportedLanguages, getLanguageDisplayName, type Language } from '@/lib/languages'
 import { getFontScaleOptions, useFontScale, type FontScale } from '@/hooks/useFontScale'
 import { getTerminalFontSizeOptions, useTerminalFontSize, type TerminalFontSize } from '@/hooks/useTerminalFontSize'
+import { getComposerEnterBehaviorOptions, useComposerEnterBehavior, type ComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
+import { getTerminalToolDisplayModeOptions, useTerminalToolDisplayMode, type TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+import {
+    MAX_SESSION_PREVIEW_LIMIT,
+    MIN_SESSION_PREVIEW_LIMIT,
+    normalizeSessionPreviewLimit,
+    useSessionPreviewLimit,
+} from '@/hooks/useSessionPreviewLimit'
+import {
+    getChatSurfaceColorPickerValue,
+    getChatSurfaceColorPresetOptions,
+    toCustomChatSurfaceColorPreference,
+    toPresetChatSurfaceColorPreference,
+    useChatSurfaceColors,
+    type ChatSurfaceColorPreference,
+    type ChatSurfaceColorPreset,
+} from '@/hooks/useChatSurfaceColors'
 import { useAppearance, getAppearanceOptions, type AppearancePreference } from '@/hooks/useTheme'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import type { UsageResponse } from '@/types/api'
@@ -112,6 +129,182 @@ function UsageBar({ label, utilization, resetsAt, t }: {
     )
 }
 
+function MinusIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+    )
+}
+
+function PlusIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+    )
+}
+
+function SessionPreviewLimitControl(props: {
+    label: string
+    value: number
+    onChange: (value: number) => void
+    decreaseLabel: string
+    increaseLabel: string
+}) {
+    const [draft, setDraft] = useState(String(props.value))
+
+    useEffect(() => {
+        setDraft(String(props.value))
+    }, [props.value])
+
+    const commitDraft = () => {
+        const parsed = draft.trim() === '' ? props.value : Number(draft)
+        const next = normalizeSessionPreviewLimit(parsed)
+        props.onChange(next)
+        setDraft(String(next))
+    }
+
+    const step = (delta: number) => {
+        const next = normalizeSessionPreviewLimit(props.value + delta)
+        props.onChange(next)
+        setDraft(String(next))
+    }
+
+    return (
+        <div className="flex w-full items-center justify-between gap-3 px-3 py-3">
+            <label htmlFor="session-preview-limit" className="text-[var(--app-fg)]">
+                {props.label}
+            </label>
+            <div className="flex h-9 shrink-0 items-center rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm">
+                <button
+                    type="button"
+                    onClick={() => step(-1)}
+                    disabled={props.value <= MIN_SESSION_PREVIEW_LIMIT}
+                    aria-label={props.decreaseLabel}
+                    title={props.decreaseLabel}
+                    className="flex h-8 w-8 items-center justify-center rounded-l-lg text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                    <MinusIcon className="h-3.5 w-3.5" />
+                </button>
+                <input
+                    id="session-preview-limit"
+                    type="number"
+                    inputMode="numeric"
+                    min={MIN_SESSION_PREVIEW_LIMIT}
+                    max={MAX_SESSION_PREVIEW_LIMIT}
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onBlur={commitDraft}
+                    onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                            event.preventDefault()
+                            commitDraft()
+                            event.currentTarget.blur()
+                        }
+                        if (event.key === 'Escape') {
+                            event.preventDefault()
+                            setDraft(String(props.value))
+                            event.currentTarget.blur()
+                        }
+                    }}
+                    className="h-8 w-14 border-x border-[var(--app-border)] bg-transparent text-center text-sm font-medium tabular-nums text-[var(--app-fg)] outline-none focus:bg-[var(--app-subtle-bg)]"
+                />
+                <button
+                    type="button"
+                    onClick={() => step(1)}
+                    disabled={props.value >= MAX_SESSION_PREVIEW_LIMIT}
+                    aria-label={props.increaseLabel}
+                    title={props.increaseLabel}
+                    className="flex h-8 w-8 items-center justify-center rounded-r-lg text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                </button>
+            </div>
+        </div>
+    )
+}
+
+function ChatSurfaceColorControl(props: {
+    label: string
+    preference: ChatSurfaceColorPreference
+    onPresetChange: (preset: ChatSurfaceColorPreset) => void
+    onCustomChange: (value: string) => void
+    t: (key: string) => string
+}) {
+    const presetOptions = getChatSurfaceColorPresetOptions()
+    const pickerValue = getChatSurfaceColorPickerValue(props.preference)
+    const isCustomSelected = props.preference.startsWith('custom:')
+
+    return (
+        <div className="border-t border-[var(--app-divider)] px-3 py-3">
+            <div className="mb-2 text-[var(--app-fg)]">{props.label}</div>
+            <div className="flex flex-wrap gap-2">
+                {presetOptions.map((option) => {
+                    const selected = props.preference === toPresetChatSurfaceColorPreference(option.value)
+                    const swatchColor = getChatSurfaceColorPickerValue(toPresetChatSurfaceColorPreference(option.value))
+                    return (
+                        <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => props.onPresetChange(option.value)}
+                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition-colors ${
+                                selected
+                                    ? 'border-[var(--app-link)] bg-[var(--app-subtle-bg)] text-[var(--app-link)]'
+                                    : 'border-[var(--app-border)] bg-[var(--app-bg)] text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
+                            }`}
+                        >
+                            <span className="h-2.5 w-2.5 rounded-full opacity-80" style={{ backgroundColor: swatchColor }} />
+                            <span>{props.t(option.labelKey)}</span>
+                        </button>
+                    )
+                })}
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+                <span className="text-sm text-[var(--app-hint)]">{props.t('settings.chat.surfaceColor.custom')}</span>
+                <label
+                    className={`inline-flex items-center rounded-xl border px-2 py-1 transition-colors ${
+                        isCustomSelected
+                            ? 'border-[var(--app-link)] bg-[var(--app-subtle-bg)]'
+                            : 'border-[var(--app-border)] bg-[var(--app-bg)]'
+                    }`}
+                >
+                    <input
+                        aria-label={props.t('settings.chat.surfaceColor.custom')}
+                        type="color"
+                        value={pickerValue}
+                        onChange={(event) => props.onCustomChange(event.target.value)}
+                        className="h-8 w-11 cursor-pointer appearance-none border-0 bg-transparent p-0"
+                    />
+                </label>
+            </div>
+        </div>
+    )
+}
+
 export default function SettingsPage() {
     const { t, locale, setLocale } = useTranslation()
     const goBack = useAppGoBack()
@@ -120,14 +313,27 @@ export default function SettingsPage() {
     const [isAppearanceOpen, setIsAppearanceOpen] = useState(false)
     const [isFontOpen, setIsFontOpen] = useState(false)
     const [isTerminalFontOpen, setIsTerminalFontOpen] = useState(false)
+    const [isChatOpen, setIsChatOpen] = useState(false)
+    const [isTerminalToolDisplayOpen, setIsTerminalToolDisplayOpen] = useState(false)
     const [isVoiceOpen, setIsVoiceOpen] = useState(false)
     const containerRef = useRef<HTMLDivElement>(null)
     const appearanceContainerRef = useRef<HTMLDivElement>(null)
     const fontContainerRef = useRef<HTMLDivElement>(null)
     const terminalFontContainerRef = useRef<HTMLDivElement>(null)
+    const chatContainerRef = useRef<HTMLDivElement>(null)
+    const terminalToolDisplayContainerRef = useRef<HTMLDivElement>(null)
     const voiceContainerRef = useRef<HTMLDivElement>(null)
     const { fontScale, setFontScale } = useFontScale()
     const { terminalFontSize, setTerminalFontSize } = useTerminalFontSize()
+    const { sessionPreviewLimit, setSessionPreviewLimit } = useSessionPreviewLimit()
+    const { composerEnterBehavior, setComposerEnterBehavior } = useComposerEnterBehavior()
+    const { terminalToolDisplayMode, setTerminalToolDisplayMode } = useTerminalToolDisplayMode()
+    const {
+        toolGroupBackground,
+        userMessageBackground,
+        setToolGroupBackground,
+        setUserMessageBackground,
+    } = useChatSurfaceColors()
     const { appearance, setAppearance } = useAppearance()
     const { api } = useAppContext()
     const [usage, setUsage] = useState<UsageResponse | null>(null)
@@ -148,11 +354,15 @@ export default function SettingsPage() {
 
     const fontScaleOptions = getFontScaleOptions()
     const terminalFontSizeOptions = getTerminalFontSizeOptions()
+    const composerEnterBehaviorOptions = getComposerEnterBehaviorOptions()
+    const terminalToolDisplayModeOptions = getTerminalToolDisplayModeOptions()
     const appearanceOptions = getAppearanceOptions()
     const currentLocale = locales.find((loc) => loc.value === locale)
     const currentAppearanceLabel = appearanceOptions.find((opt) => opt.value === appearance)?.labelKey ?? 'settings.display.appearance.system'
     const currentFontScaleLabel = fontScaleOptions.find((opt) => opt.value === fontScale)?.label ?? '100%'
     const currentTerminalFontSizeLabel = terminalFontSizeOptions.find((opt) => opt.value === terminalFontSize)?.label ?? '13px'
+    const currentComposerEnterBehaviorLabel = composerEnterBehaviorOptions.find((opt) => opt.value === composerEnterBehavior)?.labelKey ?? 'settings.chat.enterBehavior.send'
+    const currentTerminalToolDisplayModeLabel = terminalToolDisplayModeOptions.find((opt) => opt.value === terminalToolDisplayMode)?.labelKey ?? 'settings.chat.terminalToolDisplay.compact'
     const currentVoiceLanguage = voiceLanguages.find((lang) => lang.code === voiceLanguage)
 
     const handleLocaleChange = (newLocale: Locale) => {
@@ -175,6 +385,16 @@ export default function SettingsPage() {
         setIsTerminalFontOpen(false)
     }
 
+    const handleComposerEnterBehaviorChange = (newBehavior: ComposerEnterBehavior) => {
+        setComposerEnterBehavior(newBehavior)
+        setIsChatOpen(false)
+    }
+
+    const handleTerminalToolDisplayModeChange = (newMode: TerminalToolDisplayMode) => {
+        setTerminalToolDisplayMode(newMode)
+        setIsTerminalToolDisplayOpen(false)
+    }
+
     const handleVoiceLanguageChange = (language: Language) => {
         setVoiceLanguage(language.code)
         if (language.code === null) {
@@ -187,7 +407,7 @@ export default function SettingsPage() {
 
     // Close dropdown when clicking outside
     useEffect(() => {
-        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isVoiceOpen) return
+        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isChatOpen && !isTerminalToolDisplayOpen && !isVoiceOpen) return
 
         const handleClickOutside = (event: MouseEvent) => {
             if (isOpen && containerRef.current && !containerRef.current.contains(event.target as Node)) {
@@ -202,6 +422,12 @@ export default function SettingsPage() {
             if (isTerminalFontOpen && terminalFontContainerRef.current && !terminalFontContainerRef.current.contains(event.target as Node)) {
                 setIsTerminalFontOpen(false)
             }
+            if (isChatOpen && chatContainerRef.current && !chatContainerRef.current.contains(event.target as Node)) {
+                setIsChatOpen(false)
+            }
+            if (isTerminalToolDisplayOpen && terminalToolDisplayContainerRef.current && !terminalToolDisplayContainerRef.current.contains(event.target as Node)) {
+                setIsTerminalToolDisplayOpen(false)
+            }
             if (isVoiceOpen && voiceContainerRef.current && !voiceContainerRef.current.contains(event.target as Node)) {
                 setIsVoiceOpen(false)
             }
@@ -209,11 +435,11 @@ export default function SettingsPage() {
 
         document.addEventListener('mousedown', handleClickOutside)
         return () => document.removeEventListener('mousedown', handleClickOutside)
-    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isVoiceOpen])
+    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isChatOpen, isTerminalToolDisplayOpen, isVoiceOpen])
 
     // Close on escape key
     useEffect(() => {
-        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isVoiceOpen) return
+        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isChatOpen && !isTerminalToolDisplayOpen && !isVoiceOpen) return
 
         const handleEscape = (event: KeyboardEvent) => {
             if (event.key === 'Escape') {
@@ -221,13 +447,15 @@ export default function SettingsPage() {
                 setIsAppearanceOpen(false)
                 setIsFontOpen(false)
                 setIsTerminalFontOpen(false)
+                setIsChatOpen(false)
+                setIsTerminalToolDisplayOpen(false)
                 setIsVoiceOpen(false)
             }
         }
 
         document.addEventListener('keydown', handleEscape)
         return () => document.removeEventListener('keydown', handleEscape)
-    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isVoiceOpen])
+    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isChatOpen, isTerminalToolDisplayOpen, isVoiceOpen])
 
     return (
         <div className="flex h-full min-h-0 flex-col">
@@ -450,6 +678,130 @@ export default function SettingsPage() {
                                 </div>
                             )}
                         </div>
+                        <SessionPreviewLimitControl
+                            label={t('settings.display.sessionPreviewLimit')}
+                            value={sessionPreviewLimit}
+                            onChange={setSessionPreviewLimit}
+                            decreaseLabel={t('settings.display.sessionPreviewLimit.decrease')}
+                            increaseLabel={t('settings.display.sessionPreviewLimit.increase')}
+                        />
+                    </div>
+
+                    {/* Chat section */}
+                    <div className="border-b border-[var(--app-divider)]">
+                        <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
+                            {t('settings.chat.title')}
+                        </div>
+                        <div ref={chatContainerRef} className="relative">
+                            <button
+                                type="button"
+                                onClick={() => setIsChatOpen(!isChatOpen)}
+                                className="flex w-full items-center justify-between px-3 py-3 text-left transition-colors hover:bg-[var(--app-subtle-bg)]"
+                                aria-expanded={isChatOpen}
+                                aria-haspopup="listbox"
+                            >
+                                <span className="text-[var(--app-fg)]">{t('settings.chat.enterBehavior')}</span>
+                                <span className="flex items-center gap-1 text-[var(--app-hint)]">
+                                    <span>{t(currentComposerEnterBehaviorLabel)}</span>
+                                    <ChevronDownIcon className={`transition-transform ${isChatOpen ? 'rotate-180' : ''}`} />
+                                </span>
+                            </button>
+
+                            {isChatOpen && (
+                                <div
+                                    className="absolute right-3 top-full mt-1 min-w-[170px] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-lg overflow-hidden z-50"
+                                    role="listbox"
+                                    aria-label={t('settings.chat.enterBehavior')}
+                                >
+                                    {composerEnterBehaviorOptions.map((opt) => {
+                                        const isSelected = composerEnterBehavior === opt.value
+                                        return (
+                                            <button
+                                                key={opt.value}
+                                                type="button"
+                                                role="option"
+                                                aria-selected={isSelected}
+                                                onClick={() => handleComposerEnterBehaviorChange(opt.value)}
+                                                className={`flex items-center justify-between w-full px-3 py-2 text-base text-left transition-colors ${
+                                                    isSelected
+                                                        ? 'text-[var(--app-link)] bg-[var(--app-subtle-bg)]'
+                                                        : 'text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
+                                                }`}
+                                            >
+                                                <span>{t(opt.labelKey)}</span>
+                                                {isSelected && (
+                                                    <span className="ml-2 text-[var(--app-link)]">
+                                                        <CheckIcon />
+                                                    </span>
+                                                )}
+                                            </button>
+                                        )
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                        <div ref={terminalToolDisplayContainerRef} className="relative">
+                            <button
+                                type="button"
+                                onClick={() => setIsTerminalToolDisplayOpen(!isTerminalToolDisplayOpen)}
+                                className="flex w-full items-center justify-between px-3 py-3 text-left transition-colors hover:bg-[var(--app-subtle-bg)]"
+                                aria-expanded={isTerminalToolDisplayOpen}
+                                aria-haspopup="listbox"
+                            >
+                                <span className="text-[var(--app-fg)]">{t('settings.chat.terminalToolDisplay')}</span>
+                                <span className="flex items-center gap-1 text-[var(--app-hint)]">
+                                    <span>{t(currentTerminalToolDisplayModeLabel)}</span>
+                                    <ChevronDownIcon className={`transition-transform ${isTerminalToolDisplayOpen ? 'rotate-180' : ''}`} />
+                                </span>
+                            </button>
+
+                            {isTerminalToolDisplayOpen && (
+                                <div
+                                    className="absolute right-3 top-full mt-1 min-w-[230px] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-lg overflow-hidden z-50"
+                                    role="listbox"
+                                    aria-label={t('settings.chat.terminalToolDisplay')}
+                                >
+                                    {terminalToolDisplayModeOptions.map((opt) => {
+                                        const isSelected = terminalToolDisplayMode === opt.value
+                                        return (
+                                            <button
+                                                key={opt.value}
+                                                type="button"
+                                                role="option"
+                                                aria-selected={isSelected}
+                                                onClick={() => handleTerminalToolDisplayModeChange(opt.value)}
+                                                className={`flex items-center justify-between w-full px-3 py-2 text-base text-left transition-colors ${
+                                                    isSelected
+                                                        ? 'text-[var(--app-link)] bg-[var(--app-subtle-bg)]'
+                                                        : 'text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
+                                                }`}
+                                            >
+                                                <span>{t(opt.labelKey)}</span>
+                                                {isSelected && (
+                                                    <span className="ml-2 text-[var(--app-link)]">
+                                                        <CheckIcon />
+                                                    </span>
+                                                )}
+                                            </button>
+                                        )
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                        <ChatSurfaceColorControl
+                            label={t('settings.chat.groupedToolBackground')}
+                            preference={toolGroupBackground}
+                            onPresetChange={(preset) => setToolGroupBackground(toPresetChatSurfaceColorPreference(preset))}
+                            onCustomChange={(value) => setToolGroupBackground(toCustomChatSurfaceColorPreference(value))}
+                            t={t}
+                        />
+                        <ChatSurfaceColorControl
+                            label={t('settings.chat.userMessageBackground')}
+                            preference={userMessageBackground}
+                            onPresetChange={(preset) => setUserMessageBackground(toPresetChatSurfaceColorPreference(preset))}
+                            onCustomChange={(value) => setUserMessageBackground(toCustomChatSurfaceColorPreference(value))}
+                            t={t}
+                        />
                     </div>
 
                     {/* Voice Assistant section */}
