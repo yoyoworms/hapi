@@ -173,7 +173,8 @@ describe('NotificationHub', () => {
         const channel = new StubChannel()
         const hub = new NotificationHub(engine as unknown as SyncEngine, [channel], {
             permissionDebounceMs: 1,
-            readyCooldownMs: 20
+            readyCooldownMs: 20,
+            taskDebounceMs: 5
         })
 
         const session = createSession()
@@ -203,12 +204,69 @@ describe('NotificationHub', () => {
         }
 
         engine.emit(taskEvent)
-        await sleep(5)
+        await sleep(20)
 
         expect(channel.taskNotifications).toHaveLength(1)
         expect(channel.taskNotifications[0]?.notification).toEqual({
             status: 'completed',
             summary: 'Commit T4 finished'
+        })
+
+        hub.stop()
+    })
+
+    it('debounces a burst of task notifications into a single push with the latest summary', async () => {
+        const engine = new FakeSyncEngine()
+        const channel = new StubChannel()
+        const hub = new NotificationHub(engine as unknown as SyncEngine, [channel], {
+            permissionDebounceMs: 1,
+            readyCooldownMs: 20,
+            taskDebounceMs: 20
+        })
+
+        const session = createSession()
+        engine.setSession(session)
+
+        const makeTaskEvent = (summary: string, status: string): SyncEvent => ({
+            type: 'message-received',
+            sessionId: session.id,
+            message: {
+                id: `message-task-${summary}`,
+                seq: 0,
+                localId: null,
+                createdAt: 0,
+                content: {
+                    role: 'agent',
+                    content: {
+                        type: 'output',
+                        data: {
+                            type: 'system',
+                            subtype: 'task_notification',
+                            status,
+                            summary
+                        }
+                    }
+                }
+            }
+        })
+
+        engine.emit(makeTaskEvent('Step 1/5', 'in_progress'))
+        await sleep(2)
+        engine.emit(makeTaskEvent('Step 2/5', 'in_progress'))
+        await sleep(2)
+        engine.emit(makeTaskEvent('Step 3/5', 'in_progress'))
+        await sleep(2)
+        engine.emit(makeTaskEvent('Done', 'completed'))
+
+        // Within the debounce window we should not have pushed yet.
+        expect(channel.taskNotifications).toHaveLength(0)
+
+        await sleep(40)
+
+        expect(channel.taskNotifications).toHaveLength(1)
+        expect(channel.taskNotifications[0]?.notification).toEqual({
+            status: 'completed',
+            summary: 'Done'
         })
 
         hub.stop()
