@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import type { ChatBlock } from '@/chat/types'
 import type { GeneratedImageBlock, ToolCallBlock } from '@/chat/types'
@@ -242,7 +242,7 @@ function HappyNestedBlockList(props: {
     )
 }
 
-export function HappyToolMessage(props: ToolCallMessagePartProps) {
+function HappyToolMessageImpl(props: ToolCallMessagePartProps) {
     const ctx = useHappyChatContext()
     const artifact = props.artifact
 
@@ -346,3 +346,5 @@ export function HappyToolMessage(props: ToolCallMessagePartProps) {
         </div>
     )
 }
+
+export const HappyToolMessage = memo(HappyToolMessageImpl)

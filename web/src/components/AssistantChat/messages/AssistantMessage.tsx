@@ -1,4 +1,4 @@
-import { useCallback, useState, type KeyboardEvent, type MouseEvent } from 'react'
+import { memo, useCallback, useState, type KeyboardEvent, type MouseEvent } from 'react'
 import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
 import { MarkdownText } from '@/components/assistant-ui/markdown-text'
 import { Reasoning, ReasoningGroup } from '@/components/assistant-ui/reasoning'
@@ -25,7 +25,7 @@ const MESSAGE_PART_COMPONENTS = {
     tools: TOOL_COMPONENTS
 } as const
 
-export function HappyAssistantMessage() {
+function HappyAssistantMessageImpl() {
     const { copied, copy } = useCopyToClipboard()
     const [showMetadata, setShowMetadata] = useState(false)
     const toggleMetadata = useCallback((event: MouseEvent<HTMLElement>) => {
@@ -241,3 +241,5 @@ export function HappyAssistantMessage() {
         </MessagePrimitive.Root>
     )
 }
+
+export const HappyAssistantMessage = memo(HappyAssistantMessageImpl)

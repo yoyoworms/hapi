@@ -18,9 +18,9 @@ export type MessageWindowState = {
     messagesVersion: number
 }
 
-export const VISIBLE_WINDOW_SIZE = 400
+export const VISIBLE_WINDOW_SIZE = 150
 export const PENDING_WINDOW_SIZE = 200
-const AGENT_RUN_WINDOW_SIZE = 800
+const AGENT_RUN_WINDOW_SIZE = 300
 const OLDER_LOAD_WINDOW_SIZE = VISIBLE_WINDOW_SIZE * 2
 const PAGE_SIZE = 50
 const MIN_INITIAL_VISIBLE_MESSAGES = 8

@@ -1,10 +1,11 @@
+import { memo } from 'react'
 import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
 import { getEventPresentation } from '@/chat/presentation'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
 import { getConversationMessageAnchorId } from '@/chat/outline'
 import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
 
-export function HappySystemMessage() {
+function HappySystemMessageImpl() {
     const role = useAssistantState(({ message }) => message.role)
     const messageId = useAssistantState(({ message }) => message.id)
     const text = useAssistantState(({ message }) => {
@@ -32,3 +33,5 @@ export function HappySystemMessage() {
         </MessagePrimitive.Root>
     )
 }
+
+export const HappySystemMessage = memo(HappySystemMessageImpl)

@@ -1,4 +1,4 @@
-import { useCallback, useState, type KeyboardEvent, type MouseEvent } from 'react'
+import { memo, useCallback, useState, type KeyboardEvent, type MouseEvent } from 'react'
 import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
 import { useHappyChatContext } from '@/components/AssistantChat/context'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
@@ -19,7 +19,7 @@ function formatTimestamp(date: Date): string {
     return `${h}:${m}`
 }
 
-export function HappyUserMessage() {
+function HappyUserMessageImpl() {
     const ctx = useHappyChatContext()
     const { copied, copy } = useCopyToClipboard()
     const [showMetadata, setShowMetadata] = useState(false)
@@ -188,3 +188,5 @@ export function HappyUserMessage() {
         </>
     )
 }
+
+export const HappyUserMessage = memo(HappyUserMessageImpl)
