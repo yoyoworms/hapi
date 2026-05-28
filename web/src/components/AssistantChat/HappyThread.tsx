@@ -407,50 +407,8 @@ export function HappyThread(props: {
             setAtBottomMode(false)
         }
 
-        // Capture upward scroll intent synchronously from input events. The
-        // scroll event is async and races with useLayoutEffect/ResizeObserver
-        // re-snapping to bottom during streaming, which locked the viewport
-        // when users tried to two-finger scroll up.
-        const releaseAutoFollow = () => {
-            setAutoScrollMode(false)
-            setAtBottomMode(false)
-        }
-
-        const handleWheel = (event: WheelEvent) => {
-            if (event.deltaY < 0) {
-                releaseAutoFollow()
-            }
-        }
-
-        let touchStartY: number | null = null
-        const handleTouchStart = (event: TouchEvent) => {
-            touchStartY = event.touches[0]?.clientY ?? null
-        }
-        const handleTouchMove = (event: TouchEvent) => {
-            if (touchStartY === null) return
-            const currentY = event.touches[0]?.clientY ?? touchStartY
-            if (currentY - touchStartY > MANUAL_SCROLL_EPSILON_PX) {
-                releaseAutoFollow()
-            }
-        }
-        const handleTouchEnd = () => {
-            touchStartY = null
-        }
-
         viewport.addEventListener('scroll', handleScroll, { passive: true })
-        viewport.addEventListener('wheel', handleWheel, { passive: true })
-        viewport.addEventListener('touchstart', handleTouchStart, { passive: true })
-        viewport.addEventListener('touchmove', handleTouchMove, { passive: true })
-        viewport.addEventListener('touchend', handleTouchEnd, { passive: true })
-        viewport.addEventListener('touchcancel', handleTouchEnd, { passive: true })
-        return () => {
-            viewport.removeEventListener('scroll', handleScroll)
-            viewport.removeEventListener('wheel', handleWheel)
-            viewport.removeEventListener('touchstart', handleTouchStart)
-            viewport.removeEventListener('touchmove', handleTouchMove)
-            viewport.removeEventListener('touchend', handleTouchEnd)
-            viewport.removeEventListener('touchcancel', handleTouchEnd)
-        }
+        return () => viewport.removeEventListener('scroll', handleScroll)
     }, []) // Stable: no dependencies, reads from refs
 
     const scrollToBottomInstant = useCallback(() => {

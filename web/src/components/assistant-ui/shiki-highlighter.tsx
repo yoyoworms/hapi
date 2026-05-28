@@ -21,7 +21,7 @@ export function SyntaxHighlighter(props: SyntaxHighlighterProps) {
     } satisfies CSSProperties
 
     return (
-        <div className="aui-md-codeblock min-w-0 w-full max-w-full overflow-x-auto overflow-y-hidden rounded-b-xl bg-[var(--app-code-bg)]">
+        <div className="aui-md-codeblock min-w-0 w-full max-w-full overflow-x-auto overflow-y-clip rounded-b-xl bg-[var(--app-code-bg)]">
             <div className="grid w-max min-w-full text-sm font-mono" style={codeGridStyle}>
                 <pre
                     aria-hidden="true"

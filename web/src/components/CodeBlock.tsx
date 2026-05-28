@@ -64,13 +64,13 @@ export function CodeBlock(props: {
         gridTemplateColumns: `${lineNumberWidth}ch max-content`
     } satisfies CSSProperties
     const bodyStyle = isCollapsed
-        ? { maxHeight: collapsedHeight, overflowY: 'hidden' as const }
+        ? { maxHeight: collapsedHeight, overflowY: 'clip' as const }
         : props.scrollY
             ? { maxHeight: scrollHeight, overflowY: 'auto' as const }
-            : { overflowY: 'hidden' as const }
+            : { overflowY: 'clip' as const }
 
     return (
-        <div className="aui-code-surface relative min-w-0 max-w-full overflow-hidden rounded-xl bg-[var(--app-code-bg)] shadow-none">
+        <div className="aui-code-surface relative min-w-0 max-w-full overflow-clip rounded-xl bg-[var(--app-code-bg)] shadow-none">
             <div className="aui-code-surface-header flex items-center justify-between gap-3 bg-[var(--app-code-header-bg)] px-3 py-2">
                 <div className="min-w-0 flex-1 truncate font-mono text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">
                     {label}

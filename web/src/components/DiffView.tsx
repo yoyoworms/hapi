@@ -99,7 +99,7 @@ export function DiffView(props: {
                     onKeyDown={onTriggerKeyDown}
                     onBlur={onTriggerBlur}
                 >
-                    <div className="overflow-hidden rounded-2xl bg-[var(--app-code-bg)] transition-colors">
+                    <div className="overflow-clip rounded-2xl bg-[var(--app-code-bg)] transition-colors">
                         <div className="flex items-center justify-between gap-3 bg-[var(--app-code-header-bg)] px-3 py-2">
                             <div className="min-w-0">
                                 <div className="truncate font-mono text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">
@@ -115,7 +115,7 @@ export function DiffView(props: {
                                 <span className="text-xs font-medium text-[var(--app-link)]">{t('diff.view')}</span>
                             </div>
                         </div>
-                        <div className="max-h-40 overflow-hidden">
+                        <div className="max-h-40 overflow-clip">
                             <DiffInlineView
                                 oldString={props.oldString}
                                 newString={props.newString}
@@ -169,7 +169,7 @@ function DiffInlineView(props: {
     let newLineNumber = 1
 
     return (
-        <div className={cn('overflow-hidden bg-[var(--app-code-bg)]', props.showHeader ? 'rounded-2xl' : 'rounded-none')}>
+        <div className={cn('overflow-clip bg-[var(--app-code-bg)]', props.showHeader ? 'rounded-2xl' : 'rounded-none')}>
             {props.showHeader ? (
                 <div className="flex items-center justify-between gap-3 bg-[var(--app-code-header-bg)] px-3 py-2">
                     <div className="min-w-0 truncate font-mono text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">
@@ -185,7 +185,7 @@ function DiffInlineView(props: {
             <div
                 className={cn(
                     'overflow-x-auto',
-                    props.scrollY ? 'overflow-y-auto' : 'overflow-y-hidden'
+                    props.scrollY ? 'overflow-y-auto' : 'overflow-y-clip'
                 )}
                 style={props.scrollY ? { maxHeight: props.maxHeight ?? 420 } : undefined}
             >

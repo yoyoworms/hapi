@@ -673,7 +673,7 @@ function CosFilePreview({ url }: { url: string }) {
         return (
             <div className="mt-2">
                 <a href={url} target="_blank" rel="noopener noreferrer" className="block">
-                    <div className="relative rounded-lg overflow-hidden border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
+                    <div className="relative rounded-lg overflow-clip border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
                         <img
                             src={url}
                             alt={filename}
@@ -696,7 +696,7 @@ function CosFilePreview({ url }: { url: string }) {
     if (type === 'video') {
         return (
             <div className="mt-2">
-                <div className="rounded-lg overflow-hidden border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
+                <div className="rounded-lg overflow-clip border border-[var(--app-border)] bg-[var(--app-bg-secondary)] inline-block max-w-full">
                     <video
                         src={url}
                         controls

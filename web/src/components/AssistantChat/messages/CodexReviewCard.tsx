@@ -74,7 +74,7 @@ export function CodexReviewCard(props: { review: CodexReview }) {
     const findingCount = props.review.findings.length
 
     return (
-        <section className="my-1 max-w-full overflow-hidden rounded-lg border border-[var(--app-border)] bg-[var(--app-subtle-bg)]">
+        <section className="my-1 max-w-full overflow-clip rounded-lg border border-[var(--app-border)] bg-[var(--app-subtle-bg)]">
             <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-[var(--app-divider)] px-3 py-2">
                 <div className="min-w-0 flex-1 text-sm font-semibold text-[var(--app-fg)]">
                     {t('codexReview.title')}

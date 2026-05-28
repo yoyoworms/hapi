@@ -11,7 +11,7 @@ function formatFileSize(bytes: number): string {
 function ImageAttachment(props: { attachment: AttachmentMetadata }) {
     const { attachment } = props
     return (
-        <div className="relative overflow-hidden rounded-lg">
+        <div className="relative overflow-clip rounded-lg">
             <img
                 src={attachment.previewUrl}
                 alt={attachment.filename}

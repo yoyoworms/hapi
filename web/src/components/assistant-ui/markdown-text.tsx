@@ -361,7 +361,7 @@ function Pre(props: ComponentPropsWithoutRef<'pre'>) {
     const { className, ...rest } = props
 
     return (
-        <div className="aui-md-pre-wrapper min-w-0 w-full max-w-full overflow-x-auto overflow-y-hidden">
+        <div className="aui-md-pre-wrapper min-w-0 w-full max-w-full overflow-x-auto overflow-y-clip">
             <pre
                 {...rest}
                 className={cn(

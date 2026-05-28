@@ -71,7 +71,7 @@ export const ReasoningGroup: FC<PropsWithChildren> = ({ children }) => {
     }, [isStreaming])
 
     return (
-        <div className="aui-reasoning-group my-3 overflow-hidden rounded-2xl bg-[var(--app-reasoning-bg)]">
+        <div className="aui-reasoning-group my-3 overflow-clip rounded-2xl bg-[var(--app-reasoning-bg)]">
             <button
                 type="button"
                 onClick={() => setIsOpen(!isOpen)}
@@ -92,7 +92,7 @@ export const ReasoningGroup: FC<PropsWithChildren> = ({ children }) => {
 
             <div
                 className={cn(
-                    'overflow-hidden transition-all duration-200 ease-in-out',
+                    'overflow-clip transition-all duration-200 ease-in-out',
                     isOpen ? 'max-h-[5000px] opacity-100' : 'max-h-0 opacity-0'
                 )}
             >
