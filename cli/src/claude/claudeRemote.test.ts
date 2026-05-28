@@ -2,10 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import * as claudeSdk from '@/claude/sdk';
 import type { SDKMessage } from '@/claude/sdk/types';
 
-vi.mock('@/claude/utils/claudeCheckSession', () => ({
-    claudeCheckSession: () => true
-}));
-
 vi.mock('@/modules/watcher/awaitFileExist', () => ({
     awaitFileExist: async () => true
 }));

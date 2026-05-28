@@ -1,6 +1,5 @@
 import { mkdirSync } from "node:fs";
 import { logger } from "@/ui/logger";
-import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { getProjectPath } from "./utils/path";
 import { appendMcpConfigArg } from "./utils/mcpConfig";
 import { systemPrompt } from "./utils/systemPrompt";
@@ -33,10 +32,12 @@ export async function claudeLocal(opts: {
     // Determine session strategy:
     // - If resuming an existing session: use --resume (unless user already supplied session control)
     // - If starting fresh: let Claude create a new session ID (reported via SessionStart hook)
-    let startFrom = opts.sessionId;
-    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
-        startFrom = null;
-    }
+    //
+    // We don't pre-validate the session file path. Path resolution depends on
+    // CLAUDE_CONFIG_DIR / custom installs like ~/.ccs/instances/<name>/, and a
+    // silent fallback to null here drops context across launcher iterations.
+    // Claude CLI will fall back to a new session if the id can't be resumed.
+    const startFrom = opts.sessionId;
 
     if (opts.abort.aborted) {
         logger.debug('[ClaudeLocal] Abort already signaled before spawn; skipping launch');

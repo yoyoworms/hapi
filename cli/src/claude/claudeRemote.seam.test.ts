@@ -16,10 +16,6 @@ vi.mock('node:child_process', () => ({
     spawn: spawnMock
 }))
 
-vi.mock('@/claude/utils/claudeCheckSession', () => ({
-    claudeCheckSession: () => true
-}))
-
 vi.mock('@/modules/watcher/awaitFileExist', () => ({
     awaitFileExist: async () => true
 }))

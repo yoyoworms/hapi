@@ -1,6 +1,5 @@
 import { EnhancedMode, PermissionMode } from "./loop";
 import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, type SDKResultMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
-import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
@@ -48,12 +47,14 @@ export async function claudeRemote(opts: {
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
-    // Check if session is valid
+    // Pass the persisted session id straight through to the SDK. If the file
+    // is missing or invalid, the SDK will start a new session and report the
+    // new id via the init message — we don't pre-validate the path here
+    // because path resolution depends on CLAUDE_CONFIG_DIR (and other
+    // custom-install layouts like ~/.ccs/instances/<name>/), and a silent
+    // null-out here drops context across launcher iterations.
     let startFrom = opts.sessionId;
-    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
-        startFrom = null;
-    }
-    
+
     // Extract --resume from claudeArgs if present (for first spawn)
     if (!startFrom && opts.claudeArgs) {
         for (let i = 0; i < opts.claudeArgs.length; i++) {
