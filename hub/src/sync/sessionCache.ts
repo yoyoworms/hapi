@@ -145,7 +145,7 @@ export class SessionCache {
             model: stored.model,
             modelReasoningEffort: stored.modelReasoningEffort,
             effort: stored.effort,
-            permissionMode: existing?.permissionMode,
+            permissionMode: existing?.permissionMode ?? metadata?.preferredPermissionMode,
             collaborationMode: existing?.collaborationMode,
             usage: existing?.usage ?? null,
             accountStatus: existing?.accountStatus ?? null
@@ -201,6 +201,7 @@ export class SessionCache {
         }
         if (payload.permissionMode !== undefined) {
             session.permissionMode = payload.permissionMode
+            this.persistPreferredPermissionMode(session, payload.permissionMode)
         }
         if (payload.model !== undefined) {
             if (payload.model !== session.model) {
@@ -437,6 +438,7 @@ export class SessionCache {
 
         if (config.permissionMode !== undefined) {
             session.permissionMode = config.permissionMode
+            this.persistPreferredPermissionMode(session, config.permissionMode)
         }
         if (config.model !== undefined) {
             if (config.model !== session.model) {
@@ -535,73 +537,6 @@ export class SessionCache {
         }
 
         this.refreshSession(sessionId)
-    }
-
-    // Mark a session as having "unread" activity that the user should look at.
-    // Triggered by the same events that fire a push notification (ready,
-    // permission request, task notification, session completion). Best-effort:
-    // we retry once on a version-mismatch and otherwise swallow errors so the
-    // notification path doesn't fail because of metadata churn.
-    async markSessionUnread(sessionId: string): Promise<void> {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            const session = this.sessions.get(sessionId)
-            if (!session) return
-
-            const currentMetadata = session.metadata ?? { path: '', host: '' }
-            if ((currentMetadata as { unreadAt?: number | null }).unreadAt) {
-                return
-            }
-
-            const newMetadata = { ...currentMetadata, unreadAt: Date.now() }
-
-            const result = this.store.sessions.updateSessionMetadata(
-                sessionId,
-                newMetadata,
-                session.metadataVersion,
-                session.namespace,
-                { touchUpdatedAt: false }
-            )
-
-            if (result.result === 'success') {
-                this.refreshSession(sessionId)
-                return
-            }
-            if (result.result === 'error') {
-                return
-            }
-            this.refreshSession(sessionId)
-            // version-mismatch: loop and try again with the refreshed version
-        }
-    }
-
-    async markSessionRead(sessionId: string): Promise<void> {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            const session = this.sessions.get(sessionId)
-            if (!session) return
-
-            const currentMetadata = session.metadata ?? { path: '', host: '' }
-            const { unreadAt: existing, ...rest } = currentMetadata as { unreadAt?: number | null } & Record<string, unknown>
-            if (existing == null) {
-                return
-            }
-
-            const result = this.store.sessions.updateSessionMetadata(
-                sessionId,
-                rest as typeof currentMetadata,
-                session.metadataVersion,
-                session.namespace,
-                { touchUpdatedAt: false }
-            )
-
-            if (result.result === 'success') {
-                this.refreshSession(sessionId)
-                return
-            }
-            if (result.result === 'error') {
-                return
-            }
-            this.refreshSession(sessionId)
-        }
     }
 
     async deleteSession(sessionId: string): Promise<void> {
@@ -814,8 +749,40 @@ export class SessionCache {
             merged.host = oldObj.host
             changed = true
         }
+        if (typeof oldObj.preferredPermissionMode === 'string' && typeof newObj.preferredPermissionMode !== 'string') {
+            merged.preferredPermissionMode = oldObj.preferredPermissionMode
+            changed = true
+        }
 
         return changed ? merged : newMetadata
+    }
+
+    private persistPreferredPermissionMode(session: Session, permissionMode: PermissionMode): void {
+        const currentMetadata = session.metadata
+        if (!currentMetadata || currentMetadata.preferredPermissionMode === permissionMode) {
+            return
+        }
+
+        const nextMetadata = { ...currentMetadata, preferredPermissionMode: permissionMode }
+        const result = this.store.sessions.updateSessionMetadata(
+            session.id,
+            nextMetadata,
+            session.metadataVersion,
+            session.namespace,
+            { touchUpdatedAt: false }
+        )
+
+        if (result.result === 'error') {
+            return
+        }
+
+        const parsed = MetadataSchema.safeParse(result.value)
+        if (!parsed.success) {
+            return
+        }
+
+        session.metadata = parsed.data
+        session.metadataVersion = result.version
     }
 
     private mergeAgentState(oldState: unknown | null, newState: unknown | null): unknown | null {

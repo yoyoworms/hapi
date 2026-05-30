@@ -400,7 +400,7 @@ export function StatusBar(props: {
         ].filter(Boolean).join('\n')
         : undefined
     const usageText = formatUsageText(props.usage, props.latestUsage)
-    const codexReasoningLabel = props.agentFlavor === 'codex'
+    const codexReasoningLabel = (props.agentFlavor === 'codex' || props.agentFlavor === 'opencode')
         ? formatCodexReasoningLabel(props.modelReasoningEffort)
         : null
     const codexFastMode = props.agentFlavor === 'codex'

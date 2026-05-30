@@ -10,12 +10,17 @@ import { seedMessageWindowFromSession, fetchLatestMessages } from '@/lib/message
 import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
-import { CopyIcon, CheckIcon } from '@/components/icons'
+import { CopyIcon, CheckIcon, ScheduleIcon } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
 import { AgentIcon, agentIconColor, getAgentDisplayName } from '@/components/AgentIcon'
 import { DEFAULT_SESSION_PREVIEW_LIMIT, useSessionPreviewLimit } from '@/hooks/useSessionPreviewLimit'
 import { getSessionModelLabel } from '@/lib/sessionModelLabel'
+import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
+import { useSessionListStatusMode } from '@/hooks/useSessionListStatusMode'
+import { classifySessionAttention } from '@/lib/sessionAttention'
+import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
+import { getAttentionLabel, SessionAttentionIndicator } from '@/components/SessionAttentionIndicator'
 
 type SessionGroup = {
     key: string
@@ -217,13 +222,6 @@ export function expandSelectedSessionCollapseOverrides(
     // Expand project group if collapsed. Project and machine keys use true = collapsed.
     if (overrides.has(group.key) && overrides.get(group.key)) {
         next.delete(group.key)
-        changed = true
-    }
-
-    // Session preview keys use inverted semantics: false = expanded, true/missing = collapsed.
-    const sessionPreviewKey = `sessions::${group.key}`
-    if (overrides.get(sessionPreviewKey) !== false) {
-        next.set(sessionPreviewKey, false)
         changed = true
     }
 
@@ -472,7 +470,7 @@ export function getVisibleSessionPreview(
 
     const requiredIds = new Set<string>()
     for (const session of sessions) {
-        if (session.active) requiredIds.add(session.id)
+        if (session.pendingRequestsCount > 0) requiredIds.add(session.id)
     }
     if (options.selectedSessionId && sessions.some(session => session.id === options.selectedSessionId)) {
         requiredIds.add(options.selectedSessionId)
@@ -522,45 +520,6 @@ function SessionListSearch(props: {
     )
 }
 
-const FLAVOR_BADGES: Record<string, { label: string; colors: string }> = {
-    claude: {
-        label: 'Cl',
-        colors: 'bg-[#d97706] text-white',
-    },
-    codex: {
-        label: 'Cx',
-        colors: 'bg-[#111827] text-white',
-    },
-    cursor: {
-        label: 'Cu',
-        colors: 'bg-[#0f766e] text-white',
-    },
-    gemini: {
-        label: 'Gm',
-        colors: 'bg-[#2563eb] text-white',
-    },
-    kimi: {
-        label: 'Km',
-        colors: 'bg-[#7c3aed] text-white',
-    },
-    opencode: {
-        label: 'Op',
-        colors: 'bg-[#15803d] text-white',
-    },
-}
-
-function FlavorIcon({ flavor, className }: { flavor?: string | null; className?: string }) {
-    const badge = FLAVOR_BADGES[(flavor ?? 'claude').trim().toLowerCase()] ?? FLAVOR_BADGES.claude
-    return (
-        <span
-            aria-hidden="true"
-            className={`inline-flex items-center justify-center rounded-sm text-[8px] font-semibold leading-none ${badge.colors} ${className ?? 'h-4 w-4'}`}
-        >
-            {badge.label}
-        </span>
-    )
-}
-
 function MachineIcon(props: { className?: string }) {
     return (
         <svg
@@ -605,9 +564,19 @@ function SessionItem(props: {
     isPinned?: boolean
     onTogglePin?: () => void
     machineLabelsById?: Record<string, string>
+    showDetailedStatus?: boolean
 }) {
     const { t } = useTranslation()
-    const { session: s, onSelect, showPath = true, api, selected = false, isPinned = false, onTogglePin } = props
+    const {
+        session: s,
+        onSelect,
+        showPath = true,
+        api,
+        selected = false,
+        isPinned = false,
+        onTogglePin,
+        showDetailedStatus = false
+    } = props
     const { haptic } = usePlatform()
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
@@ -666,6 +635,19 @@ function SessionItem(props: {
         ? (s.thinking ? 'bg-[#007AFF]' : 'bg-[var(--app-badge-success-text)]')
         : 'bg-[var(--app-hint)]'
     const todoProgress = getTodoProgress(s)
+    const attention = useMemo(
+        () => showDetailedStatus
+            ? classifySessionAttention(s, {
+                selected,
+                lastSeenAt: getSessionLastSeenAt(s.id)
+            })
+            : null,
+        [s, selected, showDetailedStatus]
+    )
+    const attentionLabel = attention ? getAttentionLabel(attention, t) : null
+    const scheduledLabel = s.futureScheduledMessageCount > 1
+        ? t('session.item.scheduledMessages', { count: s.futureScheduledMessageCount })
+        : t('session.item.scheduledMessage')
     return (
         <>
             <button
@@ -677,14 +659,7 @@ function SessionItem(props: {
             >
                 <div className={`flex items-center justify-between gap-3 ${!s.active ? 'opacity-50' : ''}`}>
                     <div className="flex items-center gap-2 min-w-0">
-                        <FlavorIcon flavor={s.metadata?.flavor} className="h-4 w-4 shrink-0" />
-                        {s.metadata?.unreadAt ? (
-                            <span
-                                className="h-2 w-2 shrink-0 rounded-full bg-[#007AFF]"
-                                aria-label={t('session.unread')}
-                                title={t('session.unread')}
-                            />
-                        ) : null}
+                        <AgentFlavorIcon flavor={s.metadata?.flavor} className="h-4 w-4 shrink-0" />
                         <div className={`truncate text-sm font-medium ${s.active ? 'text-[var(--app-fg)]' : 'text-[var(--app-hint)]'}`}>
                             {sessionName}
                         </div>
@@ -703,6 +678,16 @@ function SessionItem(props: {
                         ) : null}
                         {s.active && s.thinking ? (
                             <LoaderIcon className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)] animate-spin-slow" />
+                        ) : attention ? (
+                            <SessionAttentionIndicator
+                                attention={attention}
+                                label={attentionLabel ?? ''}
+                            />
+                        ) : null}
+                        {showDetailedStatus && s.futureScheduledMessageCount > 0 ? (
+                            <span title={scheduledLabel} aria-label={scheduledLabel} className="inline-flex shrink-0">
+                                <ScheduleIcon className="h-3.5 w-3.5 text-[var(--app-hint)]" />
+                            </span>
                         ) : null}
                     </div>
                     <div className="flex items-center gap-2 shrink-0 text-xs">
@@ -717,7 +702,7 @@ function SessionItem(props: {
                                 {todoProgress.completed}/{todoProgress.total}
                             </span>
                         ) : null}
-                        {s.pendingRequestsCount > 0 ? (
+                        {!attention && s.pendingRequestsCount > 0 ? (
                             <span className="text-[var(--app-badge-warning-text)]">
                                 {t('session.item.pending')} {s.pendingRequestsCount}
                             </span>
@@ -833,6 +818,8 @@ export function SessionList(props: {
     const { t } = useTranslation()
     const { renderHeader = true, api, selectedSessionId, machineLabelsById = {}, onNewSessionInDirectory } = props
     const { sessionPreviewLimit } = useSessionPreviewLimit()
+    const { sessionListStatusMode } = useSessionListStatusMode()
+    const showDetailedStatus = sessionListStatusMode === 'detailed'
     const [searchQuery, setSearchQuery] = useState('')
     const normalizedQuery = normalizeSearch(searchQuery)
     const isSearching = normalizedQuery.length > 0
@@ -1052,6 +1039,7 @@ export function SessionList(props: {
                                     isPinned={isPinned(s.id)}
                                     onTogglePin={() => togglePin(s.id)}
                                     machineLabelsById={machineLabelsById}
+                                    showDetailedStatus={showDetailedStatus}
                                 />
                             ))}
                         </div>
@@ -1145,6 +1133,7 @@ export function SessionList(props: {
                                                                 isPinned={isPinned(s.id)}
                                                                 onTogglePin={() => togglePin(s.id)}
                                                                 machineLabelsById={props.machineLabelsById}
+                                                                showDetailedStatus={showDetailedStatus}
                                                             />
                                                         ))}
                                                         {!isSearching && group.sessions.length > sessionPreviewLimit && (sessionGroupExpanded || hiddenSessionCount > 0) ? (

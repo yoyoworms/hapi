@@ -10,7 +10,6 @@ import { CopyIcon, CheckIcon } from '@/components/icons'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 import { getConversationMessageAnchorId } from '@/chat/outline'
 import { MessageMetadata } from '@/components/AssistantChat/messages/MessageMetadata'
-import { isNestedInteractiveEvent } from '@/components/AssistantChat/messages/metadataToggle'
 import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
 
 function formatTimestamp(date: Date): string {
@@ -23,10 +22,6 @@ function HappyUserMessageImpl() {
     const ctx = useHappyChatContext()
     const { copied, copy } = useCopyToClipboard()
     const [showMetadata, setShowMetadata] = useState(false)
-    const toggleMetadata = useCallback((event: MouseEvent<HTMLElement>) => {
-        if (isNestedInteractiveEvent(event)) return
-        setShowMetadata((open) => !open)
-    }, [])
     const role = useAssistantState(({ message }) => message.role)
     const messageId = useAssistantState(({ message }) => message.id)
     const text = useAssistantState(({ message }) => {
@@ -67,12 +62,17 @@ function HappyUserMessageImpl() {
 
     const hasMetadata = invokedAt != null
 
-    const onMetadataKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
-        if (isNestedInteractiveEvent(event)) return
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault()
-            setShowMetadata((open) => !open)
-        }
+    const toggleMetadata = useCallback((event: MouseEvent<HTMLDivElement>) => {
+        const target = event.target as HTMLElement
+        if (target.closest('button, a, input, textarea, select')) return
+        setShowMetadata((open) => !open)
+    }, [])
+    const onMetadataKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return
+        const target = event.target as HTMLElement
+        if (target.closest('button, a, input, textarea, select')) return
+        event.preventDefault()
+        setShowMetadata((open) => !open)
     }, [])
 
     if (role !== 'user') return null
@@ -99,12 +99,12 @@ function HappyUserMessageImpl() {
                                 aria-expanded={showMetadata}
                                 className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
                             >
-                                {showMetadata ? 'Hide metadata' : 'Show metadata'}
+                                {showMetadata ? 'Hide info' : 'Show info'}
                             </button>
                         )}
                     </div>
                     {showMetadata && invokedAt != null && (
-                        <MessageMetadata invokedAt={invokedAt} className="mt-1 justify-end" />
+                        <MessageMetadata invokedAt={invokedAt} />
                     )}
                 </div>
             </MessagePrimitive.Root>

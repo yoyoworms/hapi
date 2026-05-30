@@ -1,10 +1,6 @@
-/**
- * Key TanStack Router uses for its scroll restoration cache in sessionStorage.
- * Defined in `@tanstack/router-core/src/scroll-restoration.ts` (not part of
- * the package's public API — update this constant if the library bumps the
- * suffix on `tsr-scroll-restoration-v1_*`).
- */
-const STORAGE_KEY = 'tsr-scroll-restoration-v1_3'
+import { storageKey } from '@tanstack/router-core'
+
+const STORAGE_KEY = storageKey
 
 const TARGET_ENTRIES_AFTER_PRUNE = 50
 
@@ -14,18 +10,22 @@ interface GuardedStorage extends Storage {
     [GUARD_MARKER]?: true
 }
 
+function hardResetScrollRestorationPersistedState(storage: Storage): void {
+    try {
+        storage.removeItem(STORAGE_KEY)
+    } catch {
+        // ignore
+    }
+}
+
 /**
  * Wrap `sessionStorage.setItem` so writes to the scroll restoration cache
- * survive quota exhaustion. The default behavior throws synchronously during
- * a React commit, blocking the UI (see tiann/hapi#611). We prune the oldest
- * entries (by JSON property insertion order — i.e. visited-first dropped,
- * recently-visited kept) and retry once; if the value is not valid JSON or
- * the retry still fails, we drop the key entirely so navigation can continue.
+ * survive quota exhaustion. The default throws synchronously during a React
+ * commit, blocking the UI (see tiann/hapi#611). We prune oldest entries and
+ * retry once; if still failing, we drop the key so navigation can continue.
  *
- * Idempotent — calling more than once on the same storage is a no-op.
- *
- * Returns an `uninstall` thunk that restores the original `setItem`. Intended
- * for tests; production code calls this once at boot and never uninstalls.
+ * Upstream >=1.145.6 also wraps setItem with try-catch, so this guard is an
+ * additional safety net that proactively keeps the cache small.
  */
 export function installScrollRestorationGuard(
     storage: Storage = typeof window !== 'undefined' ? window.sessionStorage : undefined as unknown as Storage,
@@ -38,15 +38,17 @@ export function installScrollRestorationGuard(
         return () => {}
     }
     const originalSetItem = storage.setItem
+
     const wrappedSetItem = (key: string, value: string): void => {
         try {
             originalSetItem.call(storage, key, value)
             return
         } catch (err) {
-            if (key !== STORAGE_KEY || !isQuotaError(err)) {
+            if (key !== STORAGE_KEY) {
                 throw err
             }
         }
+
         let trimmed: string
         try {
             const parsed = JSON.parse(value) as Record<string, unknown>
@@ -60,13 +62,13 @@ export function installScrollRestorationGuard(
             }
             trimmed = JSON.stringify(next)
         } catch {
-            storage.removeItem(STORAGE_KEY)
+            hardResetScrollRestorationPersistedState(storage)
             return
         }
         try {
             originalSetItem.call(storage, key, trimmed)
         } catch {
-            storage.removeItem(STORAGE_KEY)
+            hardResetScrollRestorationPersistedState(storage)
         }
     }
     storage.setItem = wrappedSetItem
@@ -77,11 +79,4 @@ export function installScrollRestorationGuard(
             delete guarded[GUARD_MARKER]
         }
     }
-}
-
-function isQuotaError(err: unknown): boolean {
-    return (
-        err instanceof Error &&
-        (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED')
-    )
 }

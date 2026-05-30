@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useRef } from 'react'
 import type React from 'react'
 import type { AppendMessage, AttachmentAdapter, ThreadMessageLike } from '@assistant-ui/react'
 import { useExternalMessageConverter, useExternalStoreRuntime } from '@assistant-ui/react'
@@ -279,7 +279,49 @@ export function aggregateResponseGroups(
     return aggregates
 }
 
-function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
+export type BlockWithThreadMessageId = {
+    block: VisibleChatBlock
+    threadMessageId: string
+}
+
+/**
+ * Stable, unique IDs for assistant-ui's linear MessageRepository.
+ * Uses `${kind}:${block.id}`; suffixes `~1`, `~2`, … when the same kind+id
+ * appears more than once (should be rare — indicates duplicate hub rows or
+ * a reducer bug, but must not crash the thread).
+ *
+ * Reuses `{ block, threadMessageId }` objects from `wrapperCache` when the
+ * reconciled `block` reference and computed id match, so
+ * `useExternalMessageConverter`'s WeakMap caches stay warm across streaming
+ * appends (see PR review).
+ */
+export function assignThreadMessageIdsWithStableWrappers(
+    blocks: readonly VisibleChatBlock[],
+    wrapperCache: WeakMap<VisibleChatBlock, BlockWithThreadMessageId>
+): BlockWithThreadMessageId[] {
+    const seen = new Map<string, number>()
+    return blocks.map((block) => {
+        const base = `${block.kind}:${block.id}`
+        const occurrence = seen.get(base) ?? 0
+        seen.set(base, occurrence + 1)
+        const threadMessageId = occurrence === 0 ? base : `${base}~${occurrence}`
+        const cached = wrapperCache.get(block)
+        if (cached?.threadMessageId === threadMessageId) {
+            return cached
+        }
+        const next: BlockWithThreadMessageId = { block, threadMessageId }
+        wrapperCache.set(block, next)
+        return next
+    })
+}
+
+export function assignThreadMessageIds(
+    blocks: readonly VisibleChatBlock[]
+): BlockWithThreadMessageId[] {
+    return assignThreadMessageIdsWithStableWrappers(blocks, new WeakMap())
+}
+
+function toThreadMessageLike(block: VisibleChatBlock, threadMessageId: string): ThreadMessageLike {
     if (block.kind === 'user-text') {
         const messageId = `user:${block.id}`
         // Show timestamp above user message when there's a gap > 60s from previous block
@@ -291,7 +333,7 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
             : undefined
         return {
             role: 'user',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'text', text: block.text }],
             metadata: {
@@ -309,10 +351,9 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     if (block.kind === 'agent-text') {
-        const messageId = `assistant:${block.id}`
         return {
             role: 'assistant',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'text', text: block.text }],
             metadata: {
@@ -330,7 +371,7 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     if (block.kind === 'generated-image') {
         return {
             role: 'assistant',
-            id: `generated-image:${block.id}`,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{
                 type: 'tool-call',
@@ -350,10 +391,9 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     if (block.kind === 'agent-reasoning') {
-        const messageId = `assistant:${block.id}`
         return {
             role: 'assistant',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'reasoning', text: block.text }],
             metadata: {
@@ -369,10 +409,9 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     if (block.kind === 'codex-review') {
-        const messageId = `review:${block.id}`
         return {
             role: 'assistant',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'text', text: formatCodexReviewText(block.review) }],
             metadata: {
@@ -389,10 +428,9 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     if (block.kind === 'agent-event') {
-        const messageId = `event:${block.id}`
         return {
             role: 'system',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'text', text: renderEventLabel(block.event) }],
             metadata: {
@@ -407,10 +445,9 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     if (block.kind === 'cli-output') {
-        const messageId = `cli:${block.id}`
         return {
             role: block.source === 'user' ? 'user' : 'assistant',
-            id: messageId,
+            id: threadMessageId,
             createdAt: new Date(block.createdAt),
             content: [{ type: 'text', text: block.text }],
             metadata: {
@@ -430,7 +467,7 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
         const groupBlock: ToolGroupBlock = block
         return {
             role: 'assistant',
-            id: `tool:${groupBlock.id}`,
+            id: threadMessageId,
             createdAt: new Date(groupBlock.createdAt),
             content: [{
                 type: 'tool-call',
@@ -450,12 +487,11 @@ function toThreadMessageLike(block: VisibleChatBlock): ThreadMessageLike {
     }
 
     const toolBlock: ToolCallBlock = block
-    const messageId = `tool:${toolBlock.id}`
     const inputText = safeStringify(toolBlock.tool.input)
 
     return {
         role: 'assistant',
-        id: messageId,
+        id: threadMessageId,
         createdAt: new Date(toolBlock.createdAt),
         content: [{
             type: 'tool-call',
@@ -552,14 +588,25 @@ export function useHappyRuntime(props: {
     // The library's `joinExternalMessages` only preserves
     // `metadata.custom` from the first block of a joined chunk, so this
     // is the surface that survives the join.
+    const threadIdWrapperCacheRef = useRef(
+        new WeakMap<VisibleChatBlock, BlockWithThreadMessageId>()
+    )
+    const blocksWithThreadIds = useMemo(
+        () => assignThreadMessageIdsWithStableWrappers(
+            props.blocks,
+            threadIdWrapperCacheRef.current
+        ),
+        [props.blocks]
+    )
+
     const aggregates = useMemo(
         () => aggregateResponseGroups(props.blocks),
         [props.blocks]
     )
 
     const convertBlock = useCallback(
-        (block: VisibleChatBlock): ThreadMessageLike => {
-            const message = toThreadMessageLike(block)
+        ({ block, threadMessageId }: BlockWithThreadMessageId): ThreadMessageLike => {
+            const message = toThreadMessageLike(block, threadMessageId)
             const aggregate = aggregates.get(block.id)
             if (!aggregate) return message
             const existing = message.metadata?.custom as HappyChatMessageMetadata | undefined
@@ -583,9 +630,9 @@ export function useHappyRuntime(props: {
 
     // Use cached message converter for performance optimization
     // This prevents re-converting all messages on every render
-    const convertedMessages = useExternalMessageConverter<VisibleChatBlock>({
+    const convertedMessages = useExternalMessageConverter<BlockWithThreadMessageId>({
         callback: convertBlock,
-        messages: props.blocks as VisibleChatBlock[],
+        messages: blocksWithThreadIds,
         isRunning,
     })
 

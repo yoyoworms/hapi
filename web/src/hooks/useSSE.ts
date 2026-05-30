@@ -21,6 +21,19 @@ type SSESubscription = {
     machineId?: string
 }
 
+export type SSEScope = 'global' | 'full'
+
+const MESSAGE_STREAM_EVENT_TYPES = new Set<SyncEvent['type']>([
+    'message-received',
+    'messages-consumed',
+    'message-cancelled',
+    'scheduled-matured'
+])
+
+export function isGlobalScopedMessageStreamEvent(scope: SSEScope, eventType: SyncEvent['type']): boolean {
+    return scope === 'global' && MESSAGE_STREAM_EVENT_TYPES.has(eventType)
+}
+
 type VisibilityState = 'visible' | 'hidden'
 
 type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
@@ -110,6 +123,7 @@ export function useSSE(options: {
     token: string
     baseUrl: string
     subscription?: SSESubscription
+    scope?: SSEScope
     onEvent: (event: SyncEvent) => void
     onConnect?: () => void
     onDisconnect?: (reason: string) => void
@@ -156,10 +170,11 @@ export function useSSE(options: {
     }, [options.onToast])
 
     const subscription = options.subscription ?? {}
+    const scope = options.scope ?? 'full'
 
     const subscriptionKey = useMemo(() => {
-        return `${subscription.all ? '1' : '0'}|${subscription.sessionId ?? ''}|${subscription.machineId ?? ''}`
-    }, [subscription.all, subscription.sessionId, subscription.machineId])
+        return `${scope}|${subscription.all ? '1' : '0'}|${subscription.sessionId ?? ''}|${subscription.machineId ?? ''}`
+    }, [scope, subscription.all, subscription.sessionId, subscription.machineId])
 
     useEffect(() => {
         if (!options.enabled) {
@@ -290,9 +305,13 @@ export function useSSE(options: {
                     return previous
                 }
 
-                const summary = toSessionSummary(session)
+                const existingIndex = previous.sessions.findIndex((item) => item.id === session.id)
+                const existing = existingIndex >= 0 ? previous.sessions[existingIndex] : undefined
+                const summary = {
+                    ...toSessionSummary(session),
+                    futureScheduledMessageCount: existing?.futureScheduledMessageCount ?? 0
+                }
                 const nextSessions = previous.sessions.slice()
-                const existingIndex = nextSessions.findIndex((item) => item.id === session.id)
                 if (existingIndex >= 0) {
                     nextSessions[existingIndex] = summary
                 } else {
@@ -327,6 +346,9 @@ export function useSSE(options: {
                     thinking: patch.thinking ?? current.thinking,
                     activeAt: patch.activeAt ?? current.activeAt,
                     updatedAt: patch.updatedAt ?? current.updatedAt,
+                    backgroundTaskCount: Object.prototype.hasOwnProperty.call(patch, 'backgroundTaskCount')
+                        ? patch.backgroundTaskCount ?? 0
+                        : current.backgroundTaskCount,
                     model: Object.prototype.hasOwnProperty.call(patch, 'model') ? patch.model ?? null : current.model,
                     effort: Object.prototype.hasOwnProperty.call(patch, 'effort') ? patch.effort ?? null : current.effort
                 }
@@ -427,6 +449,21 @@ export function useSSE(options: {
 
             if (event.type === 'toast') {
                 onToastRef.current?.(event)
+                return
+            }
+
+            if (scope === 'global' && MESSAGE_STREAM_EVENT_TYPES.has(event.type)) {
+                if (event.type === 'message-received' && event.message.scheduledAt != null) {
+                    queueSessionListInvalidation()
+                }
+                if (
+                    event.type === 'message-cancelled'
+                    || event.type === 'messages-consumed'
+                    || event.type === 'scheduled-matured'
+                ) {
+                    queueSessionListInvalidation()
+                }
+                onEventRef.current(event)
                 return
             }
 
@@ -579,7 +616,7 @@ export function useSSE(options: {
             }
             setSubscriptionId(null)
         }
-    }, [options.baseUrl, options.enabled, options.token, subscriptionKey, queryClient, reconnectNonce])
+    }, [options.baseUrl, options.enabled, options.scope, options.token, scope, subscriptionKey, queryClient, reconnectNonce])
 
     return { subscriptionId }
 }

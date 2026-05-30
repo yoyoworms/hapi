@@ -27,7 +27,9 @@ import {
     type RpcGeneratedImageResponse,
     type RpcListDirectoryResponse,
     type RpcListCodexModelsResponse,
+    type RpcListCursorModelsResponse,
     type RpcListOpencodeModelsResponse,
+    type RpcCursorModel,
     type RpcOpencodeModel,
     type RpcPathExistsResponse,
     type RpcReadFileResponse,
@@ -45,7 +47,9 @@ export type {
     RpcGeneratedImageResponse,
     RpcListDirectoryResponse,
     RpcListCodexModelsResponse,
+    RpcListCursorModelsResponse,
     RpcListOpencodeModelsResponse,
+    RpcCursorModel,
     RpcOpencodeModel,
     RpcPathExistsResponse,
     RpcReadFileResponse,
@@ -186,6 +190,10 @@ export class SyncEngine {
 
     getSessionsByNamespace(namespace: string): Session[] {
         return this.sessionCache.getSessionsByNamespace(namespace)
+    }
+
+    getFutureScheduledMessageCounts(sessionIds: string[], now: number = Date.now()): Map<string, number> {
+        return this.store.messages.countFutureScheduledBySessionIds(sessionIds, now)
     }
 
     getSession(sessionId: string): Session | undefined {
@@ -471,6 +479,7 @@ export class SyncEngine {
         await this.rpcGateway.flushMessages(sessionId)
         await this.messageService.sendMessage(sessionId, payload)
         this.sessionCache.markMessageQueued(sessionId)
+        this.sessionCache.recordSessionActivity(sessionId, Date.now())
     }
 
     async cancelQueuedMessage(
@@ -524,14 +533,6 @@ export class SyncEngine {
         await this.sessionCache.pinSession(sessionId, pinned)
     }
 
-    async markSessionUnread(sessionId: string): Promise<void> {
-        await this.sessionCache.markSessionUnread(sessionId)
-    }
-
-    async markSessionRead(sessionId: string): Promise<void> {
-        await this.sessionCache.markSessionRead(sessionId)
-    }
-
     async deleteSession(sessionId: string): Promise<void> {
         await this.sessionCache.deleteSession(sessionId)
     }
@@ -573,10 +574,16 @@ export class SyncEngine {
             throw new Error('Missing applied session config')
         }
 
-        // If CLI returned legacy "modelMode" instead of "model", use the requested
-        // config.model value directly since legacy CLI normalizes away the [1m] suffix
+        // Legacy CLI returns `modelMode` instead of `model` and strips the [1m]
+        // suffix; backfill from the request before the strict key check below.
         if (applied.model === undefined && config.model !== undefined) {
             applied.model = config.model
+        }
+        const requestedKeys = Object.keys(config) as Array<keyof typeof config>
+        for (const key of requestedKeys) {
+            if (!(key in applied)) {
+                throw new Error(`Session did not apply ${key}`)
+            }
         }
 
         this.sessionCache.applySessionConfig(sessionId, applied)
@@ -799,7 +806,9 @@ export class SyncEngine {
             }
         }
 
-        const effectivePermissionMode = opts?.permissionMode ?? session.permissionMode ?? undefined
+        const preferredPermissionMode = opts?.permissionMode
+            ?? session.permissionMode
+            ?? session.metadata?.preferredPermissionMode
         let spawnResult = await this.rpcGateway.spawnSession(
             targetMachine.id,
             target.directory,
@@ -813,7 +822,7 @@ export class SyncEngine {
             session.effort ?? undefined,
             undefined,
             useContinue || undefined,
-            effectivePermissionMode
+            preferredPermissionMode
         )
 
         // Fallback: if resume spawn fails, retry without resume token (start fresh session)
@@ -832,6 +841,15 @@ export class SyncEngine {
         const becameActive = await this.waitForSessionActive(spawnResult.sessionId)
         if (!becameActive) {
             return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
+        }
+
+        if (preferredPermissionMode !== undefined) {
+            try {
+                await this.applySessionConfig(spawnResult.sessionId, { permissionMode: preferredPermissionMode })
+            } catch (error) {
+                const message = error instanceof Error ? error.message : 'Failed to restore permission mode'
+                return { type: 'error', message, code: 'resume_failed' }
+            }
         }
 
         if (spawnResult.sessionId !== access.sessionId) {
@@ -1128,12 +1146,12 @@ export class SyncEngine {
         return await this.rpcGateway.listSlashCommands(sessionId, agent)
     }
 
-    async listSkills(sessionId: string): Promise<{
+    async listSkills(sessionId: string, flavor?: string): Promise<{
         success: boolean
         skills?: Array<{ name: string; description?: string }>
         error?: string
     }> {
-        return await this.rpcGateway.listSkills(sessionId)
+        return await this.rpcGateway.listSkills(sessionId, flavor)
     }
 
     async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
@@ -1142,6 +1160,14 @@ export class SyncEngine {
 
     async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {
         return await this.rpcGateway.listCodexModelsForMachine(machineId)
+    }
+
+    async listCursorModelsForSession(sessionId: string): Promise<RpcListCursorModelsResponse> {
+        return await this.rpcGateway.listCursorModelsForSession(sessionId)
+    }
+
+    async listCursorModelsForMachine(machineId: string): Promise<RpcListCursorModelsResponse> {
+        return await this.rpcGateway.listCursorModelsForMachine(machineId)
     }
 
     async listOpencodeModelsForSession(sessionId: string): Promise<RpcListOpencodeModelsResponse> {

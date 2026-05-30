@@ -308,6 +308,12 @@ export type OpencodeModelsResponse = {
 
 export type ListOpencodeModelsResponse = OpencodeModelsResponse
 
+export type CursorModelSummary = OpencodeModelSummary
+
+export type CursorModelsResponse = OpencodeModelsResponse
+
+export type ListCursorModelsResponse = CursorModelsResponse
+
 export type SlashCommand = {
     name: string
     description?: string

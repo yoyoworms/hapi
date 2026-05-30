@@ -16,6 +16,39 @@ describe('getModelOptionsForFlavor', () => {
         expect(options.some((o) => o.value === 'opus')).toBe(true)
     })
 
+    it('keeps Claude presets when explicit options only include Sonnet models', () => {
+        const options = getModelOptionsForFlavor('claude', null, [
+            { value: null, label: 'Default' },
+            { value: 'sonnet', label: 'Sonnet' },
+            { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+        ])
+        expect(options).toEqual([
+            { value: null, label: 'Default' },
+            { value: 'sonnet', label: 'Sonnet' },
+            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
+            { value: 'opus', label: 'Opus' },
+            { value: 'opus[1m]', label: 'Opus 1M' },
+            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
+        ])
+    })
+
+    it('adds non-preset Claude options without hiding Opus presets', () => {
+        const options = getModelOptionsForFlavor('claude', null, [
+            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' }
+        ])
+        expect(options).toEqual([
+            { value: null, label: 'Default' },
+            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' },
+            { value: 'sonnet', label: 'Sonnet' },
+            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
+            { value: 'opus', label: 'Opus' },
+            { value: 'opus[1m]', label: 'Opus 1M' },
+            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
+        ])
+    })
+
     it('includes custom Gemini model from env/config in options', () => {
         const options = getModelOptionsForFlavor('gemini', 'gemini-custom-experiment')
         expect(options.some((o) => o.value === 'gemini-custom-experiment')).toBe(true)
@@ -53,6 +86,25 @@ describe('getModelOptionsForFlavor', () => {
         expect(options).toEqual([])
     })
 
+    it('returns only default/current for cursor before models are discovered (no claude fallback)', () => {
+        const options = getModelOptionsForFlavor('cursor', 'composer-2.5')
+        expect(options).toEqual([
+            { value: null, label: 'Default' },
+            { value: 'composer-2.5', label: 'composer-2.5' }
+        ])
+    })
+
+    it('returns dynamic cursor options when supplied', () => {
+        const options = getModelOptionsForFlavor('cursor', null, [
+            { value: 'composer-2.5', label: 'Composer 2.5' },
+            { value: 'gpt-5.5-high-fast', label: 'GPT-5.5 High Fast' }
+        ])
+        expect(options).toEqual([
+            { value: 'composer-2.5', label: 'Composer 2.5' },
+            { value: 'gpt-5.5-high-fast', label: 'GPT-5.5 High Fast' }
+        ])
+    })
+
     it('includes the current opencode model when it is missing from explicit options', () => {
         const options = getModelOptionsForFlavor('opencode', 'ollama/legacy', [
             { value: 'ollama/exaone:4.5-33b-q8', label: 'Ollama EXAONE' }
@@ -73,6 +125,14 @@ describe('getNextModelForFlavor', () => {
     it('cycles Claude models', () => {
         const next = getNextModelForFlavor('claude', null)
         expect(next).not.toBeNull()
+    })
+
+    it('cycles through Claude presets when explicit options only include Sonnet models', () => {
+        const next = getNextModelForFlavor('claude', 'sonnet[1m]', [
+            { value: 'sonnet', label: 'Sonnet' },
+            { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+        ])
+        expect(next).toBe('opus')
     })
 
     it('cycles explicit model options', () => {
@@ -104,5 +164,10 @@ describe('getNextModelForFlavor', () => {
     it('returns null for opencode without a current model and without dynamic options (no Claude fallback)', () => {
         const next = getNextModelForFlavor('opencode', null, [])
         expect(next).toBeNull()
+    })
+
+    it('keeps the current cursor model when the dynamic list has not loaded', () => {
+        const next = getNextModelForFlavor('cursor', 'composer-2.5')
+        expect(next).toBe('composer-2.5')
     })
 })

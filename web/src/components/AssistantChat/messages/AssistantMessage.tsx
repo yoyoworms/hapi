@@ -10,7 +10,6 @@ import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
 import { getAssistantCopyText } from '@/components/AssistantChat/messages/assistantCopyText'
 import { getConversationMessageAnchorId } from '@/chat/outline'
 import { MessageMetadata } from '@/components/AssistantChat/messages/MessageMetadata'
-import { isNestedInteractiveEvent } from '@/components/AssistantChat/messages/metadataToggle'
 import { CodexReviewCard } from '@/components/AssistantChat/messages/CodexReviewCard'
 import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
 
@@ -28,10 +27,6 @@ const MESSAGE_PART_COMPONENTS = {
 function HappyAssistantMessageImpl() {
     const { copied, copy } = useCopyToClipboard()
     const [showMetadata, setShowMetadata] = useState(false)
-    const toggleMetadata = useCallback((event: MouseEvent<HTMLElement>) => {
-        if (isNestedInteractiveEvent(event)) return
-        setShowMetadata((open) => !open)
-    }, [])
     const messageId = useAssistantState(({ message }) => message.id)
     const isCliOutput = useAssistantState(({ message }) => {
         const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
@@ -66,14 +61,7 @@ function HappyAssistantMessageImpl() {
         || (typeof durationMs === 'number' && durationMs >= 0)
         || usage != null
         || (messageModel != null && messageModel !== '')
-
-    const onMetadataKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
-        if (isNestedInteractiveEvent(event)) return
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault()
-            setShowMetadata((open) => !open)
-        }
-    }, [])
+        || (typeof turnCount === 'number' && turnCount >= 2)
 
     const rootClass = toolOnly
         ? 'py-1 min-w-0 max-w-full overflow-x-clip'
@@ -95,7 +83,7 @@ function HappyAssistantMessageImpl() {
                             aria-expanded={showMetadata}
                             className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
                         >
-                            {showMetadata ? 'Hide metadata' : 'Show metadata'}
+                            {showMetadata ? 'Hide info' : 'Show info'}
                         </button>
                     )}
                 </div>
@@ -106,7 +94,6 @@ function HappyAssistantMessageImpl() {
                         usage={usage}
                         model={messageModel ?? null}
                         turnCount={turnCount}
-                        className="mt-1"
                     />
                 )}
             </MessagePrimitive.Root>
@@ -120,17 +107,20 @@ function HappyAssistantMessageImpl() {
                 className={`${rootClass} ${copyText ? 'group/msg' : ''} scroll-mt-4`}
             >
                 <div className="flex items-start gap-2">
-                    <div
-                        className={hasMetadata ? 'min-w-0 flex-1 cursor-pointer' : 'min-w-0 flex-1'}
-                        onClick={hasMetadata ? toggleMetadata : undefined}
-                        onKeyDown={hasMetadata ? onMetadataKeyDown : undefined}
-                        role={hasMetadata ? 'button' : undefined}
-                        tabIndex={hasMetadata ? 0 : undefined}
-                        aria-expanded={hasMetadata ? showMetadata : undefined}
-                    >
+                    <div className="min-w-0 flex-1">
                         <CodexReviewCard review={codexReview} />
-                        <div className="mt-1 flex justify-start">
+                        <div className="mt-1 flex items-center gap-2">
                             <MessageTimestamp className="text-[10px] leading-none text-[var(--app-hint)]" />
+                            {hasMetadata && (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowMetadata((open) => !open)}
+                                    aria-expanded={showMetadata}
+                                    className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
+                                >
+                                    {showMetadata ? 'Hide info' : 'Show info'}
+                                </button>
+                            )}
                         </div>
                         {showMetadata && (
                             <MessageMetadata
@@ -138,7 +128,7 @@ function HappyAssistantMessageImpl() {
                                 durationMs={durationMs}
                                 usage={usage}
                                 model={messageModel ?? null}
-                                className="mt-1"
+                                turnCount={turnCount}
                             />
                         )}
                     </div>
@@ -167,17 +157,20 @@ function HappyAssistantMessageImpl() {
                 id={getConversationMessageAnchorId(messageId)}
                 className={`${rootClass} ${copyText ? 'group/msg' : ''} scroll-mt-4`}
             >
-                <div
-                    className={hasMetadata ? 'min-w-0 cursor-pointer' : 'min-w-0'}
-                    onClick={hasMetadata ? toggleMetadata : undefined}
-                    onKeyDown={hasMetadata ? onMetadataKeyDown : undefined}
-                    role={hasMetadata ? 'button' : undefined}
-                    tabIndex={hasMetadata ? 0 : undefined}
-                    aria-expanded={hasMetadata ? showMetadata : undefined}
-                >
+                <div className="min-w-0">
                     <MessagePrimitive.Content components={MESSAGE_PART_COMPONENTS} />
-                    <div className="mt-1 flex justify-start">
+                    <div className="mt-1 flex items-center gap-2">
                         <MessageTimestamp className="text-[10px] leading-none text-[var(--app-hint)]" />
+                        {hasMetadata && (
+                            <button
+                                type="button"
+                                onClick={() => setShowMetadata((open) => !open)}
+                                aria-expanded={showMetadata}
+                                className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
+                            >
+                                {showMetadata ? 'Hide info' : 'Show info'}
+                            </button>
+                        )}
                     </div>
                     {showMetadata && (
                         <MessageMetadata
@@ -186,7 +179,6 @@ function HappyAssistantMessageImpl() {
                             usage={usage}
                             model={messageModel ?? null}
                             turnCount={turnCount}
-                            className="mt-1"
                         />
                     )}
                 </div>
@@ -200,17 +192,20 @@ function HappyAssistantMessageImpl() {
             className={`${rootClass} ${copyText ? 'group/msg' : ''} scroll-mt-4`}
         >
             <div className="flex items-start gap-2">
-                <div
-                    className={hasMetadata ? 'min-w-0 flex-1 cursor-pointer' : 'min-w-0 flex-1'}
-                    onClick={hasMetadata ? toggleMetadata : undefined}
-                    onKeyDown={hasMetadata ? onMetadataKeyDown : undefined}
-                    role={hasMetadata ? 'button' : undefined}
-                    tabIndex={hasMetadata ? 0 : undefined}
-                    aria-expanded={hasMetadata ? showMetadata : undefined}
-                >
+                <div className="min-w-0 flex-1">
                     <MessagePrimitive.Content components={MESSAGE_PART_COMPONENTS} />
-                    <div className="mt-1 flex justify-start">
+                    <div className="mt-1 flex items-center gap-2">
                         <MessageTimestamp className="text-[10px] leading-none text-[var(--app-hint)]" />
+                        {hasMetadata && (
+                            <button
+                                type="button"
+                                onClick={() => setShowMetadata((open) => !open)}
+                                aria-expanded={showMetadata}
+                                className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
+                            >
+                                {showMetadata ? 'Hide info' : 'Show info'}
+                            </button>
+                        )}
                     </div>
                     {showMetadata && (
                         <MessageMetadata
@@ -219,7 +214,6 @@ function HappyAssistantMessageImpl() {
                             usage={usage}
                             model={messageModel ?? null}
                             turnCount={turnCount}
-                            className="mt-1"
                         />
                     )}
                 </div>

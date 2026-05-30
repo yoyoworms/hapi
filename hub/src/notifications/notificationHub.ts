@@ -220,16 +220,7 @@ export class NotificationHub {
         await this.notifySessionCompletion(session, reason)
     }
 
-    // Mark the session as unread on the same triggers that fire a push.
-    // Fire-and-forget so a metadata write failure doesn't disrupt the push path.
-    private markSessionUnreadAsync(sessionId: string): void {
-        this.syncEngine.markSessionUnread(sessionId).catch((error) => {
-            console.error('[NotificationHub] Failed to mark session unread:', error)
-        })
-    }
-
     private async notifyReady(session: Session): Promise<void> {
-        this.markSessionUnreadAsync(session.id)
         for (const channel of this.channels) {
             try {
                 await channel.sendReady(session)
@@ -240,7 +231,6 @@ export class NotificationHub {
     }
 
     private async notifyPermission(session: Session): Promise<void> {
-        this.markSessionUnreadAsync(session.id)
         for (const channel of this.channels) {
             try {
                 await channel.sendPermissionRequest(session)
@@ -251,7 +241,6 @@ export class NotificationHub {
     }
 
     private async notifyTask(session: Session, notification: TaskNotification): Promise<void> {
-        this.markSessionUnreadAsync(session.id)
         for (const channel of this.channels) {
             try {
                 await channel.sendTaskNotification(session, notification)
@@ -262,7 +251,6 @@ export class NotificationHub {
     }
 
     private async notifySessionCompletion(session: Session, reason: SessionEndReason): Promise<void> {
-        this.markSessionUnreadAsync(session.id)
         for (const channel of this.channels) {
             if (typeof channel.sendSessionCompletion !== 'function') {
                 continue

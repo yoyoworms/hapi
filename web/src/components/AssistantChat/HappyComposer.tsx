@@ -453,7 +453,9 @@ export function HappyComposer(props: {
         [agentFlavor, model, availableModelOptions]
     )
     const codexReasoningEffortOptions = useMemo(
-        () => agentFlavor === 'codex' ? getCodexComposerReasoningEffortOptions(modelReasoningEffort) : [],
+        () => agentFlavor === 'codex' || agentFlavor === 'opencode'
+            ? getCodexComposerReasoningEffortOptions(modelReasoningEffort, agentFlavor)
+            : [],
         [agentFlavor, modelReasoningEffort]
     )
     const claudeEffortOptions = useMemo(
@@ -674,8 +676,8 @@ export function HappyComposer(props: {
     }, [haptic])
 
     const handleSubmit = useCallback((event?: ReactFormEvent<HTMLFormElement>) => {
-        if (event && !attachmentsReady) {
-            event.preventDefault()
+        event?.preventDefault()
+        if (!attachmentsReady) {
             return
         }
         setShowContinueHint(false)

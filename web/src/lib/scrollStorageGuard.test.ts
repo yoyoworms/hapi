@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { storageKey as STORAGE_KEY } from '@tanstack/router-core'
+
 import { installScrollRestorationGuard } from './scrollStorageGuard'
 
-const STORAGE_KEY = 'tsr-scroll-restoration-v1_3'
 const RETAIN_COUNT = 50
 
 class QuotaExceededError extends Error {
@@ -38,12 +39,66 @@ describe('installScrollRestorationGuard', () => {
 
     afterEach(() => {
         uninstall()
-        vi.restoreAllMocks()
     })
 
     it('passes through writes to keys other than the scroll restoration key unchanged on quota error', () => {
         storage._setItem.mockImplementationOnce(() => { throw new QuotaExceededError() })
         expect(() => storage.setItem('other-key', 'value')).toThrow(QuotaExceededError)
+    })
+
+    it('recovers from any write failure on the scroll key, not only quota errors', () => {
+        class GenericStorageError extends Error {
+            constructor() {
+                super('storage write failed')
+                this.name = 'SecurityError'
+            }
+        }
+        const fullState: Record<string, unknown> = {}
+        for (let i = 0; i < 100; i++) {
+            fullState[`/route/${i}`] = { window: { scrollX: 0, scrollY: i } }
+        }
+        const fullValue = JSON.stringify(fullState)
+
+        let call = 0
+        storage._setItem.mockImplementation((key: string, value: string) => {
+            call += 1
+            if (call === 1) {
+                throw new GenericStorageError()
+            }
+            storage._store[key] = value
+        })
+
+        storage.setItem(STORAGE_KEY, fullValue)
+
+        expect(storage._setItem).toHaveBeenCalledTimes(2)
+        expect(Object.keys(JSON.parse(storage._store[STORAGE_KEY]) as object).length).toBe(RETAIN_COUNT)
+    })
+
+    it('handles quota errors that are not instanceof Error (DOMException-shaped)', () => {
+        const domExceptionLike = {
+            name: 'QuotaExceededError',
+            message: "Failed to execute 'setItem' on 'Storage': Setting the value of 'tsr-scroll-restoration-v1_3' exceeded the quota."
+        }
+        const fullState: Record<string, unknown> = {}
+        for (let i = 0; i < 100; i++) {
+            fullState[`/route/${i}`] = { window: { scrollX: 0, scrollY: i } }
+        }
+        const fullValue = JSON.stringify(fullState)
+
+        let call = 0
+        storage._setItem.mockImplementation((key: string, value: string) => {
+            call += 1
+            if (call === 1) {
+                throw domExceptionLike
+            }
+            storage._store[key] = value
+        })
+
+        expect(domExceptionLike instanceof Error).toBe(false)
+        storage.setItem(STORAGE_KEY, fullValue)
+
+        expect(storage._setItem).toHaveBeenCalledTimes(2)
+        expect(Object.keys(JSON.parse(storage._store[STORAGE_KEY]) as object).length).toBe(RETAIN_COUNT)
     })
 
     it('passes through scroll restoration writes that succeed', () => {

@@ -32,6 +32,7 @@ import { TeamPanel } from '@/components/TeamPanel'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useCodexModels } from '@/hooks/queries/useCodexModels'
+import { useCursorModels } from '@/hooks/queries/useCursorModels'
 import { useOpencodeModels } from '@/hooks/queries/useOpencodeModels'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { RealtimeVoiceSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
@@ -132,19 +133,6 @@ export function SessionChat(props: {
     const { t } = useTranslation()
     const navigate = useNavigate()
     const sessionInactive = !props.session.active
-
-    // Clear the server-side unread flag whenever this session is being viewed
-    // and has unread activity. Re-runs if a new event marks it unread again
-    // while the user is still on the page, so the badge clears on the next tick.
-    const sessionId = props.session.id
-    const unreadAt = props.session.metadata?.unreadAt ?? null
-    const api = props.api
-    useEffect(() => {
-        if (unreadAt == null) return
-        api.markSessionRead(sessionId).catch((error) => {
-            console.error('Failed to mark session read:', error)
-        })
-    }, [sessionId, unreadAt, api])
     const terminalSupported = isRemoteTerminalSupported(props.session.metadata)
     const { terminalToolDisplayMode } = useTerminalToolDisplayMode()
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
@@ -189,6 +177,26 @@ export function SessionChat(props: {
             label: opencodeModel.name ?? opencodeModel.modelId
         }))
     }, [agentFlavor, opencodeModelsState.availableModels])
+    const cursorModelsState = useCursorModels({
+        api: props.api,
+        sessionId: props.session.id,
+        enabled: agentFlavor === 'cursor' && props.session.active
+    })
+    const cursorModelOptions = useMemo(() => {
+        if (agentFlavor !== 'cursor') {
+            return undefined
+        }
+
+        return [
+            { value: null, label: 'Default' },
+            ...cursorModelsState.availableModels
+                .filter((cursorModel) => cursorModel.modelId !== 'auto')
+                .map((cursorModel) => ({
+                    value: cursorModel.modelId,
+                    label: cursorModel.name ?? cursorModel.modelId
+                }))
+        ]
+    }, [agentFlavor, cursorModelsState.availableModels])
     const {
         abortSession,
         switchSession,
@@ -237,6 +245,9 @@ export function SessionChat(props: {
         const normalized: NormalizedMessage[] = []
         const seen = new Set<string>()
         for (const message of visibleMessages) {
+            if (seen.has(message.id)) {
+                continue
+            }
             seen.add(message.id)
             const cached = cache.get(message.id)
             if (cached && cached.source === message) {
@@ -542,15 +553,17 @@ export function SessionChat(props: {
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
                         threadGoal={reduced.latestGoal}
                         model={props.session.model}
-                        modelReasoningEffort={agentFlavor === 'codex' ? props.session.modelReasoningEffort : undefined}
+                        modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
                         effort={props.session.effort}
                         agentFlavor={agentFlavor}
                         availableModelOptions={
                             agentFlavor === 'codex'
                                 ? codexModelOptions
-                                : agentFlavor === 'opencode'
-                                    ? opencodeModelOptions
-                                    : undefined
+                                : agentFlavor === 'cursor'
+                                    ? cursorModelOptions
+                                    : agentFlavor === 'opencode'
+                                        ? opencodeModelOptions
+                                        : undefined
                         }
                         active={props.session.active}
                         allowSendWhenInactive
@@ -573,10 +586,12 @@ export function SessionChat(props: {
                         onModelChange={
                             agentFlavor === 'codex'
                                 ? (props.session.active && !controlledByUser && !codexModelsState.error ? handleModelChange : undefined)
-                                : handleModelChange
+                                : agentFlavor === 'cursor'
+                                    ? (props.session.active && !cursorModelsState.error ? handleModelChange : undefined)
+                                    : handleModelChange
                         }
                         onModelReasoningEffortChange={
-                            agentFlavor === 'codex' && props.session.active && !controlledByUser
+                            (agentFlavor === 'codex' || agentFlavor === 'opencode') && props.session.active && !controlledByUser
                                 ? handleModelReasoningEffortChange
                                 : undefined
                         }

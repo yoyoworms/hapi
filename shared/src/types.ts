@@ -26,7 +26,7 @@ export type {
     WorktreeMetadata
 } from './schemas'
 
-export type { SessionSummary, SessionSummaryMetadata } from './sessionSummary'
+export type { SessionSummary, SessionSummaryMetadata, PendingRequestKind } from './sessionSummary'
 export { AGENT_MESSAGE_PAYLOAD_TYPE } from './modes'
 
 export type {
