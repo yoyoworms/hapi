@@ -131,6 +131,12 @@ export const RenameSessionRequestSchema = z.object({
 
 export type RenameSessionRequest = z.infer<typeof RenameSessionRequestSchema>
 
+export const PinSessionRequestSchema = z.object({
+    pinned: z.boolean()
+})
+
+export type PinSessionRequest = z.infer<typeof PinSessionRequestSchema>
+
 export const UploadFileRequestSchema = z.object({
     filename: z.string().min(1).max(255),
     content: z.string().min(1),

@@ -520,6 +520,18 @@ export class SyncEngine {
         await this.sessionCache.renameSession(sessionId, name)
     }
 
+    async pinSession(sessionId: string, pinned: boolean): Promise<void> {
+        await this.sessionCache.pinSession(sessionId, pinned)
+    }
+
+    async markSessionUnread(sessionId: string): Promise<void> {
+        await this.sessionCache.markSessionUnread(sessionId)
+    }
+
+    async markSessionRead(sessionId: string): Promise<void> {
+        await this.sessionCache.markSessionRead(sessionId)
+    }
+
     async deleteSession(sessionId: string): Promise<void> {
         await this.sessionCache.deleteSession(sessionId)
     }

@@ -13,6 +13,8 @@ type SessionActionMenuProps = {
     isOpen: boolean
     onClose: () => void
     sessionActive: boolean
+    isPinned?: boolean
+    onTogglePin?: () => void
     onRename: () => void
     onResume?: () => void
     onRestart?: () => void
@@ -37,6 +39,26 @@ function PlayIcon(props: { className?: string }) {
             className={props.className}
         >
             <polygon points="5 3 19 12 5 21 5 3" />
+        </svg>
+    )
+}
+
+function PinIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <path d="M12 17v5" />
+            <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V5a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
         </svg>
     )
 }
@@ -139,6 +161,8 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         isOpen,
         onClose,
         sessionActive,
+        isPinned = false,
+        onTogglePin,
         onRename,
         onResume,
         onRestart,
@@ -152,6 +176,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const internalId = useId()
     const resolvedMenuId = menuId ?? `session-action-menu-${internalId}`
     const headingId = `${resolvedMenuId}-heading`
+
+    const handleTogglePin = () => {
+        onClose()
+        onTogglePin?.()
+    }
 
     const handleRename = () => {
         onClose()
@@ -284,6 +313,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                 aria-labelledby={headingId}
                 className="flex flex-col gap-1"
             >
+                {onTogglePin ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                        onClick={handleTogglePin}
+                    >
+                        <PinIcon className="text-[var(--app-hint)]" />
+                        {isPinned ? t('session.action.unpin') : t('session.action.pin')}
+                    </button>
+                ) : null}
+
                 <button
                     type="button"
                     role="menuitem"

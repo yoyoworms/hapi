@@ -132,6 +132,19 @@ export function SessionChat(props: {
     const { t } = useTranslation()
     const navigate = useNavigate()
     const sessionInactive = !props.session.active
+
+    // Clear the server-side unread flag whenever this session is being viewed
+    // and has unread activity. Re-runs if a new event marks it unread again
+    // while the user is still on the page, so the badge clears on the next tick.
+    const sessionId = props.session.id
+    const unreadAt = props.session.metadata?.unreadAt ?? null
+    const api = props.api
+    useEffect(() => {
+        if (unreadAt == null) return
+        api.markSessionRead(sessionId).catch((error) => {
+            console.error('Failed to mark session read:', error)
+        })
+    }, [sessionId, unreadAt, api])
     const terminalSupported = isRemoteTerminalSupported(props.session.metadata)
     const { terminalToolDisplayMode } = useTerminalToolDisplayMode()
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())

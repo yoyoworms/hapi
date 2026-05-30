@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionSummary } from '@/types/api'
-import { deduplicateSessionsByAgentId, expandSelectedSessionCollapseOverrides, getVisibleSessionPreview, normalizeSearch, sessionMatchesQuery } from './SessionList'
+import { deduplicateSessionsByAgentId, expandSelectedSessionCollapseOverrides, getRecentSessions, getVisibleSessionPreview, normalizeSearch, RECENT_SESSIONS_WINDOW_MS, sessionMatchesQuery } from './SessionList'
 
 function makeSession(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
     return {
@@ -78,6 +78,63 @@ describe('deduplicateSessionsByAgentId', () => {
         const result = deduplicateSessionsByAgentId(sessions)
         expect(result).toHaveLength(2)
         expect(result.map(s => s.id).sort()).toEqual(['b', 'd'])
+    })
+})
+
+describe('getRecentSessions', () => {
+    const now = 1_000_000_000_000
+    const oneHour = 60 * 60 * 1000
+
+    it('keeps sessions updated within the 12h window', () => {
+        const sessions = [
+            makeSession({ id: 'within', updatedAt: now - 6 * oneHour }),
+            makeSession({ id: 'outside', updatedAt: now - 13 * oneHour })
+        ]
+        const result = getRecentSessions(sessions, now)
+        expect(result.map(s => s.id)).toEqual(['within'])
+    })
+
+    it('orders active sessions ahead of inactive within window, by recency', () => {
+        const sessions = [
+            makeSession({ id: 'idle-fresh', updatedAt: now - 1 * oneHour }),
+            makeSession({ id: 'active-old', active: true, updatedAt: now - 5 * oneHour }),
+            makeSession({ id: 'pending', active: true, pendingRequestsCount: 1, updatedAt: now - 8 * oneHour })
+        ]
+        const result = getRecentSessions(sessions, now)
+        expect(result.map(s => s.id)).toEqual(['pending', 'active-old', 'idle-fresh'])
+    })
+
+    it('exposes RECENT_SESSIONS_WINDOW_MS as 12 hours', () => {
+        expect(RECENT_SESSIONS_WINDOW_MS).toBe(12 * 60 * 60 * 1000)
+    })
+
+    it('dedupes by agentSessionId before sorting', () => {
+        const sessions = [
+            makeSession({ id: 'a', metadata: { path: '/p', agentSessionId: 'thread-1' }, updatedAt: now - 1 * oneHour }),
+            makeSession({ id: 'b', metadata: { path: '/p', agentSessionId: 'thread-1' }, updatedAt: now - 2 * oneHour })
+        ]
+        const result = getRecentSessions(sessions, now)
+        expect(result).toHaveLength(1)
+        expect(result[0].id).toBe('a')
+    })
+
+    it('keeps pinned sessions even outside the 12h window', () => {
+        const sessions = [
+            makeSession({ id: 'pinned-old', updatedAt: now - 48 * oneHour }),
+            makeSession({ id: 'fresh', updatedAt: now - 1 * oneHour }),
+            makeSession({ id: 'stale', updatedAt: now - 36 * oneHour })
+        ]
+        const result = getRecentSessions(sessions, now, new Set(['pinned-old']))
+        expect(result.map(s => s.id)).toEqual(['pinned-old', 'fresh'])
+    })
+
+    it('orders pinned sessions ahead of unpinned regardless of activity', () => {
+        const sessions = [
+            makeSession({ id: 'unpinned-active', active: true, pendingRequestsCount: 1, updatedAt: now - 1 * oneHour }),
+            makeSession({ id: 'pinned-idle', updatedAt: now - 3 * oneHour })
+        ]
+        const result = getRecentSessions(sessions, now, new Set(['pinned-idle']))
+        expect(result.map(s => s.id)).toEqual(['pinned-idle', 'unpinned-active'])
     })
 })
 

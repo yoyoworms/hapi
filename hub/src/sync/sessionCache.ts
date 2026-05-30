@@ -506,6 +506,104 @@ export class SessionCache {
         this.refreshSession(sessionId)
     }
 
+    async pinSession(sessionId: string, pinned: boolean): Promise<void> {
+        const session = this.sessions.get(sessionId)
+        if (!session) {
+            throw new Error('Session not found')
+        }
+
+        const currentMetadata = session.metadata ?? { path: '', host: '' }
+        const { pinnedAt: _existing, ...rest } = currentMetadata as { pinnedAt?: number | null } & Record<string, unknown>
+        const newMetadata = pinned
+            ? { ...rest, pinnedAt: Date.now() }
+            : rest
+
+        const result = this.store.sessions.updateSessionMetadata(
+            sessionId,
+            newMetadata as typeof currentMetadata,
+            session.metadataVersion,
+            session.namespace,
+            { touchUpdatedAt: false }
+        )
+
+        if (result.result === 'error') {
+            throw new Error('Failed to update session metadata')
+        }
+
+        if (result.result === 'version-mismatch') {
+            throw new Error('Session was modified concurrently. Please try again.')
+        }
+
+        this.refreshSession(sessionId)
+    }
+
+    // Mark a session as having "unread" activity that the user should look at.
+    // Triggered by the same events that fire a push notification (ready,
+    // permission request, task notification, session completion). Best-effort:
+    // we retry once on a version-mismatch and otherwise swallow errors so the
+    // notification path doesn't fail because of metadata churn.
+    async markSessionUnread(sessionId: string): Promise<void> {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const session = this.sessions.get(sessionId)
+            if (!session) return
+
+            const currentMetadata = session.metadata ?? { path: '', host: '' }
+            if ((currentMetadata as { unreadAt?: number | null }).unreadAt) {
+                return
+            }
+
+            const newMetadata = { ...currentMetadata, unreadAt: Date.now() }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                newMetadata,
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+            if (result.result === 'error') {
+                return
+            }
+            this.refreshSession(sessionId)
+            // version-mismatch: loop and try again with the refreshed version
+        }
+    }
+
+    async markSessionRead(sessionId: string): Promise<void> {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const session = this.sessions.get(sessionId)
+            if (!session) return
+
+            const currentMetadata = session.metadata ?? { path: '', host: '' }
+            const { unreadAt: existing, ...rest } = currentMetadata as { unreadAt?: number | null } & Record<string, unknown>
+            if (existing == null) {
+                return
+            }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                rest as typeof currentMetadata,
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+            if (result.result === 'error') {
+                return
+            }
+            this.refreshSession(sessionId)
+        }
+    }
+
     async deleteSession(sessionId: string): Promise<void> {
         const session = this.sessions.get(sessionId)
         if (!session) {

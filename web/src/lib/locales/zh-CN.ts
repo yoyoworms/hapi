@@ -53,6 +53,7 @@ export default {
   'sessions.group.showMore': '再显示 {n} 个',
   'sessions.group.showLess': '收起',
   'sessions.group.new': '在此目录新建会话',
+  'sessions.recent.title': '最近（12 小时内）',
 
   // Session list
   'session.item.path': '路径',
@@ -83,6 +84,10 @@ export default {
   'session.action.archive': '归档',
   'session.action.delete': '删除',
   'session.action.copy': '复制',
+  'session.action.pin': '置顶',
+  'session.action.unpin': '取消置顶',
+  'session.pinned': '已置顶',
+  'session.unread': '未读',
 
   // Dialogs
   'dialog.uri.title': '打开此链接？',

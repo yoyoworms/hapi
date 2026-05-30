@@ -53,6 +53,7 @@ export default {
   'sessions.group.showMore': 'Show {n} more',
   'sessions.group.showLess': 'Show less',
   'sessions.group.new': 'New session in this directory',
+  'sessions.recent.title': 'Recent (last 12h)',
 
   // Session list
   'session.item.path': 'path',
@@ -83,6 +84,10 @@ export default {
   'session.action.archive': 'Archive',
   'session.action.delete': 'Delete',
   'session.action.copy': 'Copy',
+  'session.action.pin': 'Pin to top',
+  'session.action.unpin': 'Unpin',
+  'session.pinned': 'Pinned',
+  'session.unread': 'Unread activity',
 
   // Dialogs
   'dialog.uri.title': 'Open this link?',

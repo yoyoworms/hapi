@@ -3,6 +3,7 @@ import { useNavigate } from '@tanstack/react-router'
 import type { SessionSummary } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { useLongPress } from '@/hooks/useLongPress'
+import { usePinnedSessions } from '@/hooks/usePinnedSessions'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { seedMessageWindowFromSession, fetchLatestMessages } from '@/lib/message-window-store'
@@ -131,6 +132,29 @@ export function deduplicateSessionsByAgentId(sessions: SessionSummary[], selecte
     return result
 }
 
+
+export const RECENT_SESSIONS_WINDOW_MS = 12 * 60 * 60 * 1000
+
+export function getRecentSessions(
+    sessions: SessionSummary[],
+    nowMs: number,
+    pinned: ReadonlySet<string> = new Set(),
+    selectedSessionId?: string | null
+): SessionSummary[] {
+    const cutoff = nowMs - RECENT_SESSIONS_WINDOW_MS
+    // Pinned sessions always show, even if outside the 12h window.
+    const eligible = sessions.filter(s => pinned.has(s.id) || s.updatedAt > cutoff)
+    const deduped = deduplicateSessionsByAgentId(eligible, selectedSessionId)
+    return deduped.sort((a, b) => {
+        const pinA = pinned.has(a.id)
+        const pinB = pinned.has(b.id)
+        if (pinA !== pinB) return pinA ? -1 : 1
+        const rankA = a.active ? (a.pendingRequestsCount > 0 ? 0 : 1) : 2
+        const rankB = b.active ? (b.pendingRequestsCount > 0 ? 0 : 1) : 2
+        if (rankA !== rankB) return rankA - rankB
+        return b.updatedAt - a.updatedAt
+    })
+}
 
 function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
     const groups = new Map<string, { directory: string; machineId: string | null; sessions: SessionSummary[] }>()
@@ -578,10 +602,12 @@ function SessionItem(props: {
     showPath?: boolean
     api: ApiClient | null
     selected?: boolean
+    isPinned?: boolean
+    onTogglePin?: () => void
     machineLabelsById?: Record<string, string>
 }) {
     const { t } = useTranslation()
-    const { session: s, onSelect, showPath = true, api, selected = false } = props
+    const { session: s, onSelect, showPath = true, api, selected = false, isPinned = false, onTogglePin } = props
     const { haptic } = usePlatform()
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
@@ -652,9 +678,29 @@ function SessionItem(props: {
                 <div className={`flex items-center justify-between gap-3 ${!s.active ? 'opacity-50' : ''}`}>
                     <div className="flex items-center gap-2 min-w-0">
                         <FlavorIcon flavor={s.metadata?.flavor} className="h-4 w-4 shrink-0" />
+                        {s.metadata?.unreadAt ? (
+                            <span
+                                className="h-2 w-2 shrink-0 rounded-full bg-[#007AFF]"
+                                aria-label={t('session.unread')}
+                                title={t('session.unread')}
+                            />
+                        ) : null}
                         <div className={`truncate text-sm font-medium ${s.active ? 'text-[var(--app-fg)]' : 'text-[var(--app-hint)]'}`}>
                             {sessionName}
                         </div>
+                        {isPinned ? (
+                            <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="12"
+                                height="12"
+                                viewBox="0 0 24 24"
+                                fill="currentColor"
+                                className="shrink-0 text-[var(--app-hint)]"
+                                aria-label={t('session.pinned')}
+                            >
+                                <path d="M16 12V4h1a1 1 0 0 0 0-2H7a1 1 0 0 0 0 2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2z" />
+                            </svg>
+                        ) : null}
                         {s.active && s.thinking ? (
                             <LoaderIcon className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)] animate-spin-slow" />
                         ) : null}
@@ -715,6 +761,8 @@ function SessionItem(props: {
                 isOpen={menuOpen}
                 onClose={() => setMenuOpen(false)}
                 sessionActive={s.active}
+                isPinned={isPinned}
+                onTogglePin={onTogglePin}
                 onRename={() => setRenameOpen(true)}
                 onResume={handleResume}
                 onRestart={() => setRestartOpen(true)}
@@ -877,6 +925,12 @@ export function SessionList(props: {
         [groups, machineLabelsById] // eslint-disable-line react-hooks/exhaustive-deps
     )
 
+    const { pinned, isPinned, togglePin } = usePinnedSessions(allSessions, api)
+    const recentSessions = useMemo(
+        () => isSearching ? [] : getRecentSessions(allSessions, Date.now(), pinned, selectedSessionId),
+        [allSessions, isSearching, pinned, selectedSessionId]
+    )
+
     const isMachineCollapsed = (mg: MachineGroup): boolean => {
         if (isSearching) return false
         const key = `machine::${mg.machineId ?? UNKNOWN_MACHINE_ID}`
@@ -980,6 +1034,30 @@ export function SessionList(props: {
             ) : null}
 
             <div className="flex flex-col gap-3 px-2 pt-1 pb-2">
+                {recentSessions.length > 0 && (
+                    <div>
+                        <div className="flex items-center gap-2 px-1 py-1.5 text-sm font-semibold text-[var(--app-fg)] select-none">
+                            <span className="flex-1">{t('sessions.recent.title')}</span>
+                            <span className="text-[11px] tabular-nums text-[var(--app-hint)] shrink-0">({recentSessions.length})</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5">
+                            {recentSessions.map((s) => (
+                                <SessionItem
+                                    key={`recent::${s.id}`}
+                                    session={s}
+                                    onSelect={props.onSelect}
+                                    showPath={true}
+                                    api={api}
+                                    selected={selectedSessionId === s.id}
+                                    isPinned={isPinned(s.id)}
+                                    onTogglePin={() => togglePin(s.id)}
+                                    machineLabelsById={machineLabelsById}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                )}
+
                 {machineGroups.map((mg) => {
                     const machineCollapsed = isMachineCollapsed(mg)
                     return (
@@ -1064,6 +1142,8 @@ export function SessionList(props: {
                                                                 showPath={false}
                                                                 api={api}
                                                                 selected={s.id === selectedSessionId}
+                                                                isPinned={isPinned(s.id)}
+                                                                onTogglePin={() => togglePin(s.id)}
                                                                 machineLabelsById={props.machineLabelsById}
                                                             />
                                                         ))}

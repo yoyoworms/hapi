@@ -541,6 +541,20 @@ export class ApiClient {
         })
     }
 
+    async pinSession(sessionId: string, pinned: boolean): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/pin`, {
+            method: 'POST',
+            body: JSON.stringify({ pinned })
+        })
+    }
+
+    async markSessionRead(sessionId: string): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/mark-read`, {
+            method: 'POST',
+            body: JSON.stringify({})
+        })
+    }
+
     async deleteSession(sessionId: string): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
             method: 'DELETE'

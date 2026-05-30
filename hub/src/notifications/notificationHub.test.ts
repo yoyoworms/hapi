@@ -9,6 +9,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 class FakeSyncEngine {
     private readonly listeners: Set<SyncEventListener> = new Set()
     private readonly sessions: Map<string, Session> = new Map()
+    readonly unreadMarks: string[] = []
+    readonly readMarks: string[] = []
 
     subscribe(listener: SyncEventListener): () => void {
         this.listeners.add(listener)
@@ -21,6 +23,14 @@ class FakeSyncEngine {
 
     setSession(session: Session): void {
         this.sessions.set(session.id, session)
+    }
+
+    async markSessionUnread(sessionId: string): Promise<void> {
+        this.unreadMarks.push(sessionId)
+    }
+
+    async markSessionRead(sessionId: string): Promise<void> {
+        this.readMarks.push(sessionId)
     }
 
     emit(event: SyncEvent): void {
@@ -118,6 +128,45 @@ describe('NotificationHub', () => {
         await sleep(25)
 
         expect(channel.permissionSessions).toHaveLength(2)
+
+        hub.stop()
+    })
+
+    it('marks session unread when a ready notification fires', async () => {
+        const engine = new FakeSyncEngine()
+        const channel = new StubChannel()
+        const hub = new NotificationHub(engine as unknown as SyncEngine, [channel], {
+            permissionDebounceMs: 1,
+            readyCooldownMs: 1
+        })
+
+        const session = createSession()
+        engine.setSession(session)
+
+        const readyEvent: SyncEvent = {
+            type: 'message-received',
+            sessionId: session.id,
+            message: {
+                id: 'message-1',
+                seq: 1,
+                localId: null,
+                createdAt: 0,
+                content: {
+                    role: 'agent',
+                    content: {
+                        id: 'event-1',
+                        type: 'event',
+                        data: { type: 'ready' }
+                    }
+                }
+            }
+        }
+
+        engine.emit(readyEvent)
+        await sleep(5)
+
+        expect(channel.readySessions).toHaveLength(1)
+        expect(engine.unreadMarks).toEqual([session.id])
 
         hub.stop()
     })

@@ -2,6 +2,7 @@ import {
     DeleteUploadRequestSchema,
     getPermissionModesForFlavor,
     isPermissionModeAllowedForFlavor,
+    PinSessionRequestSchema,
     RenameSessionRequestSchema,
     ResumeSessionRequestSchema,
     SessionCollaborationModeRequestSchema,
@@ -313,6 +314,50 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         await engine.archiveSession(sessionResult.sessionId)
+        return c.json({ ok: true })
+    })
+
+    app.post('/sessions/:id/pin', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = PinSessionRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body: pinned (boolean) is required' }, 400)
+        }
+
+        try {
+            await engine.pinSession(sessionResult.sessionId, parsed.data.pinned)
+            return c.json({ ok: true })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to update pin state'
+            if (message.includes('concurrently') || message.includes('version')) {
+                return c.json({ error: message }, 409)
+            }
+            return c.json({ error: message }, 500)
+        }
+    })
+
+    app.post('/sessions/:id/mark-read', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        await engine.markSessionRead(sessionResult.sessionId)
         return c.json({ ok: true })
     })
 
