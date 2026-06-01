@@ -367,6 +367,62 @@ describe('claudeRemote async message handling', () => {
     });
 });
 
+describe('claudeRemote stale-resume handling', () => {
+    it('clears the session id when SDK reports "No conversation found"', async () => {
+        const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
+        const { claudeRemote } = await import('./claudeRemote');
+
+        const sdkMessages: SDKMessage[] = [
+            {
+                type: 'result',
+                subtype: 'error_during_execution',
+                num_turns: 0,
+                total_cost_usd: 0,
+                duration_ms: 0,
+                duration_api_ms: 0,
+                is_error: true,
+                session_id: 'replacement-session',
+                errors: ['No conversation found with session ID: stale-session-id']
+            } as unknown as SDKMessage
+        ];
+
+        queryMock.mockReturnValueOnce(createAsyncStream(sdkMessages));
+
+        let onSessionResetCalled = 0;
+        const onReadyCalls: boolean[] = [];
+
+        await claudeRemote({
+            sessionId: 'stale-session-id',
+            path: process.cwd(),
+            mcpServers: {},
+            claudeEnvVars: {},
+            claudeArgs: [],
+            allowedTools: [],
+            hookSettingsPath: '/tmp/hook.json',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            nextMessage: async () => ({ message: 'hi', mode: { permissionMode: 'default' } }),
+            onReady: (autonomous) => {
+                onReadyCalls.push(autonomous);
+            },
+            isAborted: () => false,
+            onSessionFound: () => {},
+            onMessage: () => {},
+            onCompletionEvent: () => {},
+            onSessionReset: () => {
+                onSessionResetCalled += 1;
+            }
+        });
+
+        expect(onSessionResetCalled).toBe(1);
+        // We must NOT signal "ready" on a stale-resume error — that would let
+        // the launcher think the turn completed normally.
+        expect(onReadyCalls).toHaveLength(0);
+
+        queryMock.mockReset();
+        querySpy.mockRestore();
+    });
+});
+
 describe('isAutonomousTurnResult', () => {
     it('detects task-notification echoes', async () => {
         const { isAutonomousTurnResult } = await import('./claudeRemote');

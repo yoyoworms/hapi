@@ -282,6 +282,23 @@ export async function claudeRemote(opts: {
                     });
                 }
 
+                // If the SDK rejected our resume id (Claude Code persisted the
+                // session somewhere we couldn't find), clear it so the next
+                // launcher iteration starts a fresh session instead of
+                // looping forever on the same bad id.
+                if (resultMsg.is_error && startFrom) {
+                    const errors = (resultMsg as { errors?: unknown }).errors
+                    const errorText = Array.isArray(errors) ? errors.join(' ') : ''
+                    if (errorText.includes('No conversation found with session ID')) {
+                        logger.debug(`[claudeRemote] SDK rejected resume id ${startFrom}; clearing session id and exiting stream`)
+                        opts.onSessionReset?.()
+                        startFrom = null
+                        inputEnded = true
+                        messages.end()
+                        return
+                    }
+                }
+
                 // Send completion messages
                 if (isCompactCommand) {
                     logger.debug('[claudeRemote] Compaction completed');
