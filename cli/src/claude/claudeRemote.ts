@@ -43,6 +43,11 @@ export async function claudeRemote(opts: {
     onMessage: (message: SDKMessage) => void | Promise<void>,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
+    // Invoked when the SDK rejects our resume id and we're about to bail
+    // out. The launcher should re-queue the in-flight user message so the
+    // next iteration (with a fresh session) actually processes it instead
+    // of stranding the user with no reply.
+    onStaleResume?: (pending: { message: string; mode: EnhancedMode }) => void,
     onUsage?: (usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
@@ -285,12 +290,17 @@ export async function claudeRemote(opts: {
                 // If the SDK rejected our resume id (Claude Code persisted the
                 // session somewhere we couldn't find), clear it so the next
                 // launcher iteration starts a fresh session instead of
-                // looping forever on the same bad id.
+                // looping forever on the same bad id. Also hand the in-flight
+                // user message back to the launcher so it gets processed by
+                // the fresh session rather than stranded with no reply.
                 if (resultMsg.is_error && startFrom) {
                     const errors = (resultMsg as { errors?: unknown }).errors
                     const errorText = Array.isArray(errors) ? errors.join(' ') : ''
                     if (errorText.includes('No conversation found with session ID')) {
                         logger.debug(`[claudeRemote] SDK rejected resume id ${startFrom}; clearing session id and exiting stream`)
+                        if (resultSeq === 1 && opts.onStaleResume) {
+                            opts.onStaleResume({ message: initial.message, mode: initial.mode })
+                        }
                         opts.onSessionReset?.()
                         startFrom = null
                         inputEnded = true

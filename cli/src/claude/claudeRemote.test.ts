@@ -390,6 +390,7 @@ describe('claudeRemote stale-resume handling', () => {
 
         let onSessionResetCalled = 0;
         const onReadyCalls: boolean[] = [];
+        const staleResumeRecovered: Array<{ message: string }> = [];
 
         await claudeRemote({
             sessionId: 'stale-session-id',
@@ -410,6 +411,9 @@ describe('claudeRemote stale-resume handling', () => {
             onCompletionEvent: () => {},
             onSessionReset: () => {
                 onSessionResetCalled += 1;
+            },
+            onStaleResume: (recovered) => {
+                staleResumeRecovered.push({ message: recovered.message });
             }
         });
 
@@ -417,6 +421,9 @@ describe('claudeRemote stale-resume handling', () => {
         // We must NOT signal "ready" on a stale-resume error — that would let
         // the launcher think the turn completed normally.
         expect(onReadyCalls).toHaveLength(0);
+        // The in-flight user message must be handed back so the launcher can
+        // re-process it on the fresh-session iteration.
+        expect(staleResumeRecovered).toEqual([{ message: 'hi' }]);
 
         queryMock.mockReset();
         querySpy.mockRestore();

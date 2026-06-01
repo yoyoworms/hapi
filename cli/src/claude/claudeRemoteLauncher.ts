@@ -422,6 +422,16 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                             logger.debug('[remote]: Session reset');
                             session.clearSessionId();
                         },
+                        onStaleResume: (recovered) => {
+                            // The SDK rejected our resume id and the user's
+                            // in-flight message was consumed before any reply
+                            // came back. Stash it into `pending` so the next
+                            // launcher iteration (with a fresh session) picks
+                            // it up via nextMessage and the user actually
+                            // gets a response.
+                            logger.debug('[remote]: Restaging user message after stale-resume reset');
+                            pending = recovered;
+                        },
                         onUsage: (usage) => {
                             session.client.sendSessionEvent({
                                 type: 'usage',
