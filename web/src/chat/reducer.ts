@@ -166,6 +166,7 @@ export function reduceChatBlocks(
 
     // Calculate latest usage from messages (find the most recent message with usage data)
     let latestUsage: LatestUsage | null = null
+    let latestUsageIndex = -1
     for (let i = normalized.length - 1; i >= 0; i--) {
         const msg = normalized[i]
         if (msg.usage && isUsageVisibleInParentContext(msg.usage)) {
@@ -177,6 +178,41 @@ export function reduceChatBlocks(
                 contextSize: calculateContextSize(msg.usage),
                 contextWindow: msg.usage.context_window ?? null,
                 timestamp: msg.createdAt
+            }
+            latestUsageIndex = i
+            break
+        }
+    }
+
+    // If a compact_boundary event happened AFTER the latest message with
+    // usage, the conversation has been shrunk since that turn. Override the
+    // context-size figures with the compact's `postTokens` so the status bar
+    // shows the actual post-compact state instead of stale pre-compact tokens.
+    for (let i = normalized.length - 1; i > latestUsageIndex; i--) {
+        const msg = normalized[i]
+        if (
+            msg.role === 'event'
+            && msg.content.type === 'compact'
+            && typeof (msg.content as { postTokens?: unknown }).postTokens === 'number'
+        ) {
+            const postTokens = (msg.content as { postTokens: number }).postTokens
+            if (latestUsage) {
+                latestUsage.contextSize = postTokens
+                latestUsage.inputTokens = 0
+                latestUsage.outputTokens = 0
+                latestUsage.cacheCreation = 0
+                latestUsage.cacheRead = postTokens
+                latestUsage.timestamp = msg.createdAt
+            } else {
+                latestUsage = {
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheCreation: 0,
+                    cacheRead: postTokens,
+                    contextSize: postTokens,
+                    contextWindow: null,
+                    timestamp: msg.createdAt
+                }
             }
             break
         }

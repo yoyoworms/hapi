@@ -516,6 +516,7 @@ export function normalizeAgentRecord(
         }
         if (data.type === 'system' && data.subtype === 'compact_boundary') {
             const metadata = isObject(data.compactMetadata) ? data.compactMetadata : null
+            const postTokens = asNumber(metadata?.postTokens)
             return {
                 id: messageId,
                 localId,
@@ -524,7 +525,8 @@ export function normalizeAgentRecord(
                 content: {
                     type: 'compact',
                     trigger: asString(metadata?.trigger) ?? 'auto',
-                    preTokens: asNumber(metadata?.preTokens) ?? 0
+                    preTokens: asNumber(metadata?.preTokens) ?? 0,
+                    ...(typeof postTokens === 'number' ? { postTokens } : {})
                 },
                 isSidechain: false,
                 meta

@@ -121,6 +121,96 @@ describe('reduceChatBlocks', () => {
         })
     })
 
+    it('uses compact postTokens for contextSize when compact happens after the last usage message', () => {
+        const messages: NormalizedMessage[] = [
+            {
+                id: 'pre-compact-usage',
+                localId: null,
+                createdAt: 1_700_000_000_000,
+                role: 'event',
+                content: { type: 'token-count', info: {} },
+                isSidechain: false,
+                usage: {
+                    input_tokens: 12000,
+                    output_tokens: 5000,
+                    cache_read_input_tokens: 950000,
+                    cache_creation_input_tokens: 1000,
+                    context_tokens: 963000,
+                    scope_role: 'parent'
+                }
+            },
+            {
+                id: 'compact-event',
+                localId: null,
+                createdAt: 1_700_000_001_000,
+                role: 'event',
+                content: { type: 'compact', trigger: 'manual', preTokens: 963000, postTokens: 5697 },
+                isSidechain: false
+            }
+        ] as NormalizedMessage[]
+
+        const reduced = reduceChatBlocks(messages, null)
+
+        expect(reduced.latestUsage).toMatchObject({
+            contextSize: 5697,
+            cacheRead: 5697,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheCreation: 0
+        })
+    })
+
+    it('keeps the regular latest usage when a fresh assistant turn happens after compact', () => {
+        const messages: NormalizedMessage[] = [
+            {
+                id: 'pre-compact-usage',
+                localId: null,
+                createdAt: 1_700_000_000_000,
+                role: 'event',
+                content: { type: 'token-count', info: {} },
+                isSidechain: false,
+                usage: {
+                    input_tokens: 12000,
+                    output_tokens: 5000,
+                    cache_read_input_tokens: 950000,
+                    context_tokens: 963000,
+                    scope_role: 'parent'
+                }
+            },
+            {
+                id: 'compact-event',
+                localId: null,
+                createdAt: 1_700_000_001_000,
+                role: 'event',
+                content: { type: 'compact', trigger: 'manual', preTokens: 963000, postTokens: 5697 },
+                isSidechain: false
+            },
+            {
+                id: 'post-compact-usage',
+                localId: null,
+                createdAt: 1_700_000_002_000,
+                role: 'event',
+                content: { type: 'token-count', info: {} },
+                isSidechain: false,
+                usage: {
+                    input_tokens: 80,
+                    output_tokens: 40,
+                    cache_read_input_tokens: 6000,
+                    context_tokens: 6080,
+                    scope_role: 'parent'
+                }
+            }
+        ] as NormalizedMessage[]
+
+        const reduced = reduceChatBlocks(messages, null)
+
+        expect(reduced.latestUsage).toMatchObject({
+            contextSize: 6080,
+            inputTokens: 80,
+            outputTokens: 40
+        })
+    })
+
     it('keeps active goals visible across later normal user messages', () => {
         const reduced = reduceChatBlocks([
             goalMessage('goal-active', 'active', 1),

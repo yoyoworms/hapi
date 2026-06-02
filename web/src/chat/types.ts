@@ -23,7 +23,7 @@ export type AgentEvent =
     | { type: 'api-error'; retryAttempt: number; maxRetries: number; error: unknown }
     | { type: 'turn-duration'; durationMs: number; targetMessageId?: string }
     | { type: 'microcompact'; trigger: string; preTokens: number; tokensSaved: number }
-    | { type: 'compact'; trigger: string; preTokens: number }
+    | { type: 'compact'; trigger: string; preTokens: number; postTokens?: number }
     | { type: 'usage'; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }
     | { type: 'thread-goal-updated'; goal: ThreadGoal; threadId?: string; turnId?: string }
     | { type: 'thread-goal-cleared'; threadId?: string }
