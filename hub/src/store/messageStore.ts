@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite'
 
 import type { StoredMessage } from './types'
-import { addMessage, cancelQueuedMessage, deleteQueuedMessageById, lookupQueuedMessage, getMessages, getFirstMessages, getDeliverableMessagesAfter, getMessagesByPosition, getUninvokedLocalMessages, getMatureScheduledMessages, getImmediateQueuedLocalMessages, countFutureScheduledBySessionIds, countFutureScheduledLocalMessages, markMessagesInvoked, mergeSessionMessages, type CancelQueuedMessageResult, type LookupQueuedMessageResult } from './messages'
+import { addMessage, cancelQueuedMessage, deleteQueuedMessageById, lookupQueuedMessage, getMessages, getFirstMessages, getDeliverableMessagesAfter, getMessagesByPosition, getUninvokedLocalMessages, getMatureScheduledMessages, getImmediateQueuedLocalMessages, countFutureScheduledBySessionIds, countFutureScheduledLocalMessages, markMessagesInvoked, mergeSessionMessages, pruneOldMessages, type CancelQueuedMessageResult, type LookupQueuedMessageResult } from './messages'
 
 export class MessageStore {
     private readonly db: Database
@@ -68,5 +68,9 @@ export class MessageStore {
 
     mergeSessionMessages(fromSessionId: string, toSessionId: string): { moved: number; oldMaxSeq: number; newMaxSeq: number } {
         return mergeSessionMessages(this.db, fromSessionId, toSessionId)
+    }
+
+    pruneOldMessages(keepPerSession: number): number {
+        return pruneOldMessages(this.db, keepPerSession)
     }
 }

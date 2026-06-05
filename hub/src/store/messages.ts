@@ -13,6 +13,7 @@ type DbMessageRow = {
     local_id: string | null
     invoked_at: number | null
     scheduled_at: number | null
+    content_uuid?: string | null
 }
 
 function toStoredMessage(row: DbMessageRow): StoredMessage {
@@ -177,14 +178,33 @@ export function addMessage(
         }
     }
 
+    // Agent output messages carry a content uuid that is unique per generation.
+    // Dedup on it persistently so a CLI reconnect — which replays the Socket.IO
+    // buffer through a fresh socket whose in-memory dedup set has been reset —
+    // cannot re-insert the same message. (This was the cause of ~1GB of exact
+    // duplicate rows: agent messages have no localId, so the unique local_id
+    // index never applied, and the consecutive-only fallback below missed
+    // multi-message replays.)
+    const contentUuid = extractContentUuid(content)
     if (!localId) {
-        const dedupeKey = getMessageMergeDedupeKey(content)
-        if (dedupeKey) {
-            const latest = db.prepare(
-                'SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1'
-            ).get(sessionId) as DbMessageRow | undefined
-            if (latest && getMessageMergeDedupeKey(safeJsonParse(latest.content)) === dedupeKey) {
-                return toStoredMessage(latest)
+        if (contentUuid) {
+            const existing = db.prepare(
+                'SELECT * FROM messages WHERE session_id = ? AND content_uuid = ? LIMIT 1'
+            ).get(sessionId, contentUuid) as DbMessageRow | undefined
+            if (existing) {
+                return toStoredMessage(existing)
+            }
+        } else {
+            // No stable uuid: fall back to collapsing a consecutive duplicate of
+            // the immediately-preceding message (e.g. repeated user text).
+            const dedupeKey = getMessageMergeDedupeKey(content)
+            if (dedupeKey) {
+                const latest = db.prepare(
+                    'SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1'
+                ).get(sessionId) as DbMessageRow | undefined
+                if (latest && getMessageMergeDedupeKey(safeJsonParse(latest.content)) === dedupeKey) {
+                    return toStoredMessage(latest)
+                }
             }
         }
     }
@@ -206,9 +226,9 @@ export function addMessage(
 
     db.prepare(`
         INSERT INTO messages (
-            id, session_id, content, created_at, seq, local_id, invoked_at, scheduled_at
+            id, session_id, content, created_at, seq, local_id, invoked_at, scheduled_at, content_uuid
         ) VALUES (
-            @id, @session_id, @content, @created_at, @seq, @local_id, @invoked_at, @scheduled_at
+            @id, @session_id, @content, @created_at, @seq, @local_id, @invoked_at, @scheduled_at, @content_uuid
         )
     `).run({
         id,
@@ -218,7 +238,8 @@ export function addMessage(
         seq: msgSeq,
         local_id: localId ?? null,
         invoked_at: invokedAt,
-        scheduled_at: scheduledAt ?? null
+        scheduled_at: scheduledAt ?? null,
+        content_uuid: contentUuid ?? null
     })
 
     const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as DbMessageRow | undefined
@@ -423,6 +444,29 @@ export function getMaxSeq(db: Database, sessionId: string): number {
     return row?.maxSeq ?? 0
 }
 
+/**
+ * Retention: in any session that exceeds `keepPerSession`, delete the oldest
+ * already-delivered messages, keeping the most recent `keepPerSession` by seq.
+ * Messages still pending delivery (invoked_at IS NULL — queued or scheduled)
+ * are never pruned. Returns the number of rows deleted.
+ */
+export function pruneOldMessages(db: Database, keepPerSession: number): number {
+    if (!Number.isFinite(keepPerSession) || keepPerSession <= 0) return 0
+    const result = db.prepare(`
+        DELETE FROM messages
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY seq DESC) AS rn
+                FROM messages
+                WHERE invoked_at IS NOT NULL
+            )
+            WHERE rn > @keep
+        )
+    `).run({ keep: Math.floor(keepPerSession) })
+    return result.changes ?? 0
+}
+
 export type CancelQueuedMessageResult =
     | { status: 'cancelled'; localId: string | null }
     | { status: 'invoked'; message: StoredMessage }
@@ -601,9 +645,9 @@ export function mergeSessionMessages(
 
         const insert = db.prepare(`
             INSERT INTO messages (
-                id, session_id, content, created_at, seq, local_id, invoked_at, scheduled_at
+                id, session_id, content, created_at, seq, local_id, invoked_at, scheduled_at, content_uuid
             ) VALUES (
-                @id, @session_id, @content, @created_at, @seq, @local_id, @invoked_at, @scheduled_at
+                @id, @session_id, @content, @created_at, @seq, @local_id, @invoked_at, @scheduled_at, @content_uuid
             )
         `)
         const seenLocalIds = new Set<string>()
@@ -625,7 +669,8 @@ export function mergeSessionMessages(
                 seq: index + 1,
                 local_id: localId,
                 invoked_at: invokedAt,
-                scheduled_at: row.scheduled_at ?? null
+                scheduled_at: row.scheduled_at ?? null,
+                content_uuid: row.content_uuid ?? extractContentUuid(safeJsonParse(row.content))
             })
         }
 

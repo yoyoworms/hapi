@@ -6,6 +6,14 @@ import { randomId } from '@/lib/randomId'
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 const MAX_PREVIEW_BYTES = 5 * 1024 * 1024
+// Previews are persisted inline (base64) in the message content, so they must
+// stay small. We downscale images to a thumbnail before embedding; a full-res
+// data URL of a multi-MB photo previously bloated message rows to several MB
+// each. If the thumbnail step fails we only inline the original when it is
+// already under this cap, otherwise we skip the preview (renders as a file).
+const PREVIEW_MAX_DIM = 1280
+const PREVIEW_QUALITY = 0.72
+const MAX_INLINE_PREVIEW_BYTES = 256 * 1024
 
 type PendingUploadAttachment = PendingAttachment & {
     path?: string
@@ -97,10 +105,17 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     return
                 }
 
-                // Generate preview URL for images under 5MB
+                // Generate a downscaled thumbnail preview for images under 5MB.
+                // Kept small because it is persisted inline in the message content.
                 let previewUrl: string | undefined
                 if (isImageMimeType(contentType) && file.size <= MAX_PREVIEW_BYTES) {
-                    previewUrl = await fileToDataUrl(file)
+                    try {
+                        previewUrl = await fileToThumbnailDataUrl(file)
+                    } catch {
+                        previewUrl = file.size <= MAX_INLINE_PREVIEW_BYTES
+                            ? await fileToDataUrl(file)
+                            : undefined
+                    }
                 }
 
                 // Save path for directSend access
@@ -189,4 +204,37 @@ async function fileToDataUrl(file: File): Promise<string> {
         reader.onerror = reject
         reader.readAsDataURL(file)
     })
+}
+
+function loadImageElement(src: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => resolve(img)
+        img.onerror = () => reject(new Error('image decode failed'))
+        img.src = src
+    })
+}
+
+/**
+ * Downscale an image to a thumbnail data URL (JPEG) bounded by PREVIEW_MAX_DIM.
+ * Keeps the inline preview to tens of KB instead of the multi-MB full-res image.
+ */
+async function fileToThumbnailDataUrl(file: File): Promise<string> {
+    const objectUrl = URL.createObjectURL(file)
+    try {
+        const img = await loadImageElement(objectUrl)
+        const largestSide = Math.max(img.width, img.height)
+        const scale = largestSide > PREVIEW_MAX_DIM ? PREVIEW_MAX_DIM / largestSide : 1
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) throw new Error('no 2d canvas context')
+        ctx.drawImage(img, 0, 0, w, h)
+        return canvas.toDataURL('image/jpeg', PREVIEW_QUALITY)
+    } finally {
+        URL.revokeObjectURL(objectUrl)
+    }
 }

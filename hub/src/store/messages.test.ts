@@ -344,3 +344,70 @@ describe('countFutureScheduledLocalMessages', () => {
         expect(counts.get(sessionB.id)).toBeUndefined()
     })
 })
+
+function agentOutput(uuid: string, text: string) {
+    return { role: 'agent', content: { type: 'output', data: { uuid, text } } }
+}
+
+describe('content-uuid dedup (reconnect replay)', () => {
+    it('agent message with same content uuid is not re-inserted, even with other messages in between', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'uuid-dedup')
+
+        const first = store.messages.addMessage(session.id, agentOutput('uuid-a', 'hello'))
+        // A different message lands in between (so the consecutive-only fallback would miss it).
+        store.messages.addMessage(session.id, agentOutput('uuid-b', 'world'))
+        // Reconnect replays 'uuid-a' through a fresh socket — must be deduped to the original row.
+        const replay = store.messages.addMessage(session.id, agentOutput('uuid-a', 'hello'))
+
+        expect(replay.id).toBe(first.id)
+        expect(store.messages.getMessages(session.id)).toHaveLength(2)
+    })
+
+    it('distinct content uuids are all kept', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'uuid-distinct')
+        store.messages.addMessage(session.id, agentOutput('u1', 'a'))
+        store.messages.addMessage(session.id, agentOutput('u2', 'a'))
+        store.messages.addMessage(session.id, agentOutput('u3', 'a'))
+        expect(store.messages.getMessages(session.id)).toHaveLength(3)
+    })
+})
+
+describe('pruneOldMessages retention', () => {
+    it('keeps the most recent N delivered messages per session, deletes older ones', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'prune')
+        for (let i = 0; i < 10; i++) {
+            store.messages.addMessage(session.id, agentOutput(`p${i}`, `m${i}`))
+        }
+        const deleted = store.messages.pruneOldMessages(4)
+        expect(deleted).toBe(6)
+
+        const remaining = store.messages.getMessages(session.id)
+        expect(remaining).toHaveLength(4)
+        // The kept rows are the most recent by seq.
+        expect(remaining.map(m => (m.content as any).content.data.uuid)).toEqual(['p6', 'p7', 'p8', 'p9'])
+    })
+
+    it('never prunes pending (uninvoked) messages', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'prune-pending')
+        // Queued user messages keep invoked_at NULL until acked.
+        for (let i = 0; i < 5; i++) {
+            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: `q${i}` } }, `lid-${i}`)
+        }
+        const deleted = store.messages.pruneOldMessages(1)
+        expect(deleted).toBe(0)
+        expect(store.messages.getMessages(session.id)).toHaveLength(5)
+    })
+
+    it('cap of 0 or negative is a no-op', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'prune-noop')
+        store.messages.addMessage(session.id, agentOutput('x', 'x'))
+        expect(store.messages.pruneOldMessages(0)).toBe(0)
+        expect(store.messages.pruneOldMessages(-5)).toBe(0)
+        expect(store.messages.getMessages(session.id)).toHaveLength(1)
+    })
+})

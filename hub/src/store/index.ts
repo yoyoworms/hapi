@@ -23,7 +23,7 @@ export { PushStore } from './pushStore'
 export { SessionStore } from './sessionStore'
 export { UserStore } from './userStore'
 
-const SCHEMA_VERSION: number = 9
+const SCHEMA_VERSION: number = 10
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -36,6 +36,7 @@ export class Store {
     private db: Database
     private readonly dbPath: string
     private closed: boolean = false
+    private maintenanceTimer: ReturnType<typeof setInterval> | null = null
 
     readonly sessions: SessionStore
     readonly machines: MachineStore
@@ -67,6 +68,11 @@ export class Store {
         this.db.exec('PRAGMA synchronous = NORMAL')
         this.db.exec('PRAGMA foreign_keys = ON')
         this.db.exec('PRAGMA busy_timeout = 5000')
+        // Cap the WAL file so it is truncated back down after each checkpoint.
+        // Without this (SQLite default is -1 = unbounded) the WAL only ever grows
+        // to its high-water mark and never shrinks — one busy instance reached a
+        // 1.2GB WAL on disk.  64MB is well above the 4MB autocheckpoint threshold.
+        this.db.exec('PRAGMA journal_size_limit = 67108864')
         this.initSchema()
 
         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
@@ -83,10 +89,45 @@ export class Store {
         this.messages = new MessageStore(this.db)
         this.users = new UserStore(this.db)
         this.push = new PushStore(this.db)
+
+        if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
+            this.startMaintenance()
+        }
+    }
+
+    // Periodically enforce the per-session message retention cap so the DB does
+    // not grow without bound (one session had reached 47k messages). Opt-out by
+    // setting HAPI_MAX_MESSAGES_PER_SESSION=0.
+    private startMaintenance(): void {
+        const raw = process.env.HAPI_MAX_MESSAGES_PER_SESSION
+        const cap = raw === undefined || raw === '' ? 5000 : Number(raw)
+        if (!Number.isFinite(cap) || cap <= 0) return
+
+        const run = () => {
+            if (this.closed) return
+            try {
+                const pruned = this.messages.pruneOldMessages(cap)
+                if (pruned > 0) {
+                    console.log(`[store] retention: pruned ${pruned} old messages (cap ${cap}/session)`)
+                    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+                }
+            } catch (error) {
+                console.error('[store] retention prune failed:', error)
+            }
+        }
+
+        this.maintenanceTimer = setInterval(run, 6 * 60 * 60 * 1000)
+        this.maintenanceTimer.unref?.()
+        // First sweep shortly after startup (do not block construction).
+        setTimeout(run, 60_000).unref?.()
     }
 
     close(): void {
         if (this.closed) return
+        if (this.maintenanceTimer) {
+            clearInterval(this.maintenanceTimer)
+            this.maintenanceTimer = null
+        }
         this.db.close()
         this.closed = true
 
@@ -114,6 +155,7 @@ export class Store {
             6: () => this.migrateFromV6ToV7(),
             7: () => this.migrateFromV7ToV8(),
             8: () => this.migrateFromV8ToV9(),
+            9: () => this.migrateFromV9ToV10(),
         })
 
         if (currentVersion === 0) {
@@ -210,10 +252,12 @@ export class Store {
                 local_id TEXT,
                 invoked_at INTEGER,
                 scheduled_at INTEGER,
+                content_uuid TEXT,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(session_id, local_id) WHERE local_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_messages_content_uuid ON messages(session_id, content_uuid) WHERE content_uuid IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_session_position
                 ON messages(session_id, COALESCE(invoked_at, created_at) DESC, seq DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_scheduled_pending
@@ -413,6 +457,26 @@ export class Store {
             CREATE INDEX IF NOT EXISTS idx_messages_scheduled_pending
                 ON messages(scheduled_at)
                 WHERE scheduled_at IS NOT NULL AND invoked_at IS NULL
+        `)
+    }
+
+    private migrateFromV9ToV10(): void {
+        const columns = this.getMessageColumnNames()
+        if (columns.size === 0) {
+            // No messages table yet — createSchema will build the up-to-date one.
+            return
+        }
+        if (!columns.has('content_uuid')) {
+            this.db.exec('ALTER TABLE messages ADD COLUMN content_uuid TEXT')
+        }
+        // Partial index backing the persistent content-uuid dedup that prevents
+        // reconnect-replayed agent messages from being re-inserted. Idempotent.
+        // Existing rows keep content_uuid = NULL (not backfilled); they were
+        // already de-duplicated by the one-time cleanup.
+        this.db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
+                ON messages(session_id, content_uuid)
+                WHERE content_uuid IS NOT NULL
         `)
     }
 
