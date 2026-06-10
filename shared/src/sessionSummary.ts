@@ -20,6 +20,7 @@ export type SessionSummaryMetadata = {
     worktree?: WorktreeMetadata
     agentSessionId?: string
     pinnedAt?: number | null
+    lifecycleState?: string
 }
 
 export type SessionSummary = {
@@ -72,7 +73,8 @@ export function toSessionSummary(session: Session): SessionSummary {
             ?? session.metadata.cursorSessionId
             ?? session.metadata.kimiSessionId
             ?? undefined,
-        pinnedAt: session.metadata.pinnedAt ?? null
+        pinnedAt: session.metadata.pinnedAt ?? null,
+        lifecycleState: session.metadata.lifecycleState
     } : null
 
     const todoProgress = session.todos?.length ? {

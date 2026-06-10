@@ -8,6 +8,8 @@ import {
 } from './utils/codexMcpConfig';
 import { codexSystemPrompt } from './utils/systemPrompt';
 import type { ReasoningEffort } from './appServerTypes';
+import { resolveCodexCommand } from './utils/codexExecutable';
+import type { McpServersConfig } from './utils/buildHapiMcpBridge';
 
 export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
     if (!sessionMatchToken) {
@@ -48,7 +50,7 @@ export async function codexLocal(opts: {
     onSessionFound: (id: string) => void;
     codexArgs?: string[];
     sessionMatchToken?: string;
-    mcpServers?: Record<string, { command: string; args: string[] }>;
+    mcpServers?: McpServersConfig;
     sessionHook?: {
         port: number;
         token: string;
@@ -97,9 +99,11 @@ export async function codexLocal(opts: {
         return;
     }
 
+    const codexCommand = resolveCodexCommand();
+
     await spawnWithTerminalGuard({
-        command: 'codex',
-        args,
+        command: codexCommand.command,
+        args: [...codexCommand.args, ...args],
         cwd: opts.path,
         env: process.env,
         signal: opts.abort,

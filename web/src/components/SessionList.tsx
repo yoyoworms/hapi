@@ -21,6 +21,8 @@ import { useSessionListStatusMode } from '@/hooks/useSessionListStatusMode'
 import { classifySessionAttention } from '@/lib/sessionAttention'
 import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
 import { getAttentionLabel, SessionAttentionIndicator } from '@/components/SessionAttentionIndicator'
+import { getCodexImportedAt, subscribeCodexImportedSessions } from '@/lib/codexImportedSessions'
+import { formatReopenError } from '@/lib/reopenError'
 
 type SessionGroup = {
     key: string
@@ -104,21 +106,29 @@ function getGroupDisplayName(directory: string): string {
 export const UNKNOWN_MACHINE_ID = '__unknown__'
 export const GROUP_SESSION_PREVIEW_LIMIT = DEFAULT_SESSION_PREVIEW_LIMIT
 
+export function getSessionDedupKey(session: SessionSummary): string | null {
+    const agentId = session.metadata?.agentSessionId?.trim()
+    if (!agentId) return null
+    // Scope by flavor: agentSessionId is flattened from native ids and can retain a
+    // stale cross-flavor value (codexSessionId ?? claudeSessionId ?? ...).
+    return `${session.metadata?.flavor ?? 'unknown'}:${agentId}`
+}
+
 export function deduplicateSessionsByAgentId(sessions: SessionSummary[], selectedSessionId?: string | null): SessionSummary[] {
     const byAgentId = new Map<string, SessionSummary[]>()
     const result: SessionSummary[] = []
 
     for (const session of sessions) {
-        const agentId = session.metadata?.agentSessionId
-        if (!agentId) {
+        const dedupKey = getSessionDedupKey(session)
+        if (!dedupKey) {
             result.push(session)
             continue
         }
-        const group = byAgentId.get(agentId)
+        const group = byAgentId.get(dedupKey)
         if (group) {
             group.push(session)
         } else {
-            byAgentId.set(agentId, [session])
+            byAgentId.set(dedupKey, [session])
         }
     }
 
@@ -159,6 +169,34 @@ export function getRecentSessions(
         if (rankA !== rankB) return rankA - rankB
         return b.updatedAt - a.updatedAt
     })
+}
+
+function hasSidebarTitleSignal(session: SessionSummary): boolean {
+    const meta = session.metadata
+    if (!meta) return false
+    if (meta.name?.trim()) return true
+    if (meta.summary?.text?.trim()) return true
+    return false
+}
+
+export function isSidebarEmptySessionStub(session: SessionSummary): boolean {
+    if (session.active) return false
+    const meta = session.metadata
+    if (!meta) return true
+    if (meta.agentSessionId?.trim()) return false
+    if (hasSidebarTitleSignal(session)) return false
+    return true
+}
+
+export function shouldShowSessionInSidebar(session: SessionSummary, selectedSessionId?: string | null): boolean {
+    if (session.id === selectedSessionId) return true
+    if (session.active) return true
+    return !isSidebarEmptySessionStub(session)
+}
+
+export function prepareSidebarSessions(sessions: SessionSummary[], selectedSessionId?: string | null): SessionSummary[] {
+    return deduplicateSessionsByAgentId(sessions, selectedSessionId)
+        .filter(session => shouldShowSessionInSidebar(session, selectedSessionId))
 }
 
 function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
@@ -555,6 +593,34 @@ function formatRelativeTime(value: number, t: (key: string, params?: Record<stri
     return new Date(ms).toLocaleDateString()
 }
 
+function formatCodexImportedRelativeTime(value: number, t: (key: string, params?: Record<string, string | number>) => string): string | null {
+    const ms = value < 1_000_000_000_000 ? value * 1000 : value
+    if (!Number.isFinite(ms)) return null
+    const delta = Date.now() - ms
+    if (delta < 60_000) return t('session.time.importedFromCodex.justNow')
+    const minutes = Math.floor(delta / 60_000)
+    if (minutes < 60) return t('session.time.importedFromCodex.minutesAgo', { n: minutes })
+    const hours = Math.floor(minutes / 60)
+    if (hours < 24) return t('session.time.importedFromCodex.hoursAgo', { n: hours })
+    const days = Math.floor(hours / 24)
+    if (days < 7) return t('session.time.importedFromCodex.daysAgo', { n: days })
+    return new Date(ms).toLocaleDateString()
+}
+
+function getSessionTimeLabel(session: SessionSummary, t: (key: string, params?: Record<string, string | number>) => string): string | null {
+    const codexSessionId = session.metadata?.agentSessionId
+    const importedAt = session.metadata?.flavor === 'codex'
+        ? getCodexImportedAt(codexSessionId)
+        : null
+
+    // 中文注释：导入标记存在时优先显示“xx 前从 Codex 客户端导入”；等用户在 Hapi 里继续发消息后，再由发送逻辑清除该标记。
+    if (importedAt !== null) {
+        return formatCodexImportedRelativeTime(importedAt, t)
+    }
+
+    return formatRelativeTime(session.updatedAt, t)
+}
+
 function SessionItem(props: {
     session: SessionSummary
     onSelect: (sessionId: string) => void
@@ -586,11 +652,26 @@ function SessionItem(props: {
     const [deleteOpen, setDeleteOpen] = useState(false)
 
     const navigate = useNavigate()
-    const { archiveSession, renameSession, deleteSession, resumeSession, isPending } = useSessionActions(
+    const { archiveSession, reopenSession, renameSession, deleteSession, resumeSession, isPending } = useSessionActions(
         api,
         s.id,
         s.metadata?.flavor ?? null
     )
+    const [reopenError, setReopenError] = useState<string | null>(null)
+
+    const handleReopen = async () => {
+        setReopenError(null)
+        try {
+            const result = await reopenSession()
+            // resumeSession may merge the row into a freshly-spawned sessionId.
+            // Follow it so the operator lands on the live session.
+            if (result.sessionId && result.sessionId !== s.id) {
+                onSelect(result.sessionId)
+            }
+        } catch (error) {
+            setReopenError(formatReopenError(error))
+        }
+    }
 
     const handleResume = useCallback(async () => {
         try {
@@ -708,7 +789,7 @@ function SessionItem(props: {
                             </span>
                         ) : null}
                         <span className="text-[var(--app-hint)]">
-                            {formatRelativeTime(s.updatedAt, t)}
+                            {getSessionTimeLabel(s, t)}
                         </span>
                     </div>
                 </div>
@@ -752,9 +833,23 @@ function SessionItem(props: {
                 onResume={handleResume}
                 onRestart={() => setRestartOpen(true)}
                 onArchive={() => setArchiveOpen(true)}
+                onReopen={handleReopen}
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}
             />
+
+            {reopenError ? (
+                <ConfirmDialog
+                    isOpen={true}
+                    onClose={() => setReopenError(null)}
+                    title={t('dialog.reopen.errorTitle')}
+                    description={reopenError}
+                    confirmLabel={t('dialog.reopen.dismiss')}
+                    confirmingLabel={t('dialog.reopen.dismiss')}
+                    onConfirm={async () => setReopenError(null)}
+                    isPending={false}
+                />
+            ) : null}
 
             <RenameSessionDialog
                 isOpen={renameOpen}
@@ -821,8 +916,16 @@ export function SessionList(props: {
     const { sessionListStatusMode } = useSessionListStatusMode()
     const showDetailedStatus = sessionListStatusMode === 'detailed'
     const [searchQuery, setSearchQuery] = useState('')
+    const [, setCodexImportedSessionsVersion] = useState(0)
     const normalizedQuery = normalizeSearch(searchQuery)
     const isSearching = normalizedQuery.length > 0
+
+    useEffect(() => {
+        // 中文注释：监听导入标记变化，让列表在“导入完成”或“用户已在 Hapi 中继续会话”后立即刷新时间文案。
+        return subscribeCodexImportedSessions(() => {
+            setCodexImportedSessionsVersion((value) => value + 1)
+        })
+    }, [])
 
     const resolveMachineLabel = (machineId: string | null): string => {
         if (machineId && machineLabelsById[machineId]) {
@@ -835,8 +938,8 @@ export function SessionList(props: {
     }
 
     const allSessions = useMemo(
-        () => props.sessions,
-        [props.sessions]
+        () => prepareSidebarSessions(props.sessions, selectedSessionId),
+        [props.sessions, selectedSessionId]
     )
     const visibleSessions = useMemo(
         () => isSearching
@@ -990,7 +1093,7 @@ export function SessionList(props: {
                     <div className="text-xs text-[var(--app-hint)]">
                         {isSearching
                             ? t('sessions.search.count', { n: visibleSessions.length, total: allSessions.length })
-                            : t('sessions.count', { n: props.sessions.length, m: allGroups.length })}
+                            : t('sessions.count', { n: allSessions.length, m: allGroups.length })}
                     </div>
                     <button
                         type="button"

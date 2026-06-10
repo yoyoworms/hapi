@@ -146,6 +146,11 @@ function isCodexFastMode(model?: string | null, effort?: string | null): boolean
     return normalizedModel.includes('mini') || normalizedModel.includes('fast')
 }
 
+/** Cursor native ACP does not emit usage_update; hide the bar to avoid empty/misleading UI. */
+export function shouldShowComposerStatusBar(agentFlavor: string | null | undefined): boolean {
+    return agentFlavor !== 'cursor'
+}
+
 function formatCost(cost: number): string {
     if (cost > 0 && cost < 0.01) return `$${cost.toFixed(3)}`
     return `$${cost.toFixed(2)}`

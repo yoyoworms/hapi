@@ -18,7 +18,9 @@ type SessionActionMenuProps = {
     onRename: () => void
     onResume?: () => void
     onRestart?: () => void
+    onExport?: () => void
     onArchive: () => void
+    onReopen?: () => void
     onDelete: () => void
     anchorPoint: { x: number; y: number }
     menuId?: string
@@ -126,6 +128,47 @@ function ArchiveIcon(props: { className?: string }) {
     )
 }
 
+function DownloadIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" x2="12" y1="15" y2="3" />
+        </svg>
+    )
+}
+
+function ReopenIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <path d="M3 12a9 9 0 1 0 3-6.7" />
+            <polyline points="3 4 3 10 9 10" />
+        </svg>
+    )
+}
+
 function TrashIcon(props: { className?: string }) {
     return (
         <svg
@@ -166,7 +209,9 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         onRename,
         onResume,
         onRestart,
+        onExport,
         onArchive,
+        onReopen,
         onDelete,
         anchorPoint,
         menuId
@@ -200,6 +245,16 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleArchive = () => {
         onClose()
         onArchive()
+    }
+
+    const handleReopen = () => {
+        onClose()
+        onReopen?.()
+    }
+
+    const handleExport = () => {
+        onClose()
+        onExport?.()
     }
 
     const handleDelete = () => {
@@ -359,6 +414,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     </button>
                 ) : null}
 
+                {onExport ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                        onClick={handleExport}
+                    >
+                        <DownloadIcon className="text-[var(--app-hint)]" />
+                        {t('session.action.export')}
+                    </button>
+                ) : null}
+
                 {sessionActive ? (
                     <button
                         type="button"
@@ -370,15 +437,28 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                         {t('session.action.archive')}
                     </button>
                 ) : (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} text-red-500 hover:bg-red-500/10`}
-                        onClick={handleDelete}
-                    >
-                        <TrashIcon className="text-red-500" />
-                        {t('session.action.delete')}
-                    </button>
+                    <>
+                        {onReopen ? (
+                            <button
+                                type="button"
+                                role="menuitem"
+                                className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                                onClick={handleReopen}
+                            >
+                                <ReopenIcon className="text-[var(--app-hint)]" />
+                                {t('session.action.reopen')}
+                            </button>
+                        ) : null}
+                        <button
+                            type="button"
+                            role="menuitem"
+                            className={`${baseItemClassName} text-red-500 hover:bg-red-500/10`}
+                            onClick={handleDelete}
+                        >
+                            <TrashIcon className="text-red-500" />
+                            {t('session.action.delete')}
+                        </button>
+                    </>
                 )}
             </div>
         </div>

@@ -277,7 +277,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
                 if (previousSessionId !== sessionId) {
                     logger.debug(`[START] Claude session ID changed: ${previousSessionId} -> ${sessionId}`);
                     const sessionFilePath = typeof data.transcript_path === 'string' ? data.transcript_path : undefined;
-                    currentSession.onSessionFound(sessionId, sessionFilePath);
+                    currentSession.onSessionFound(sessionId, undefined, sessionFilePath);
                 }
             }
 

@@ -28,10 +28,10 @@ describe('getModelOptionsForFlavor', () => {
             { value: 'sonnet[1m]', label: 'Sonnet 1M' },
             { value: 'opus', label: 'Opus' },
             { value: 'opus[1m]', label: 'Opus 1M' },
+            { value: 'fable', label: 'Fable' },
+            { value: 'fable[1m]', label: 'Fable 1M' },
             { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
-            { value: 'claude-fable-5', label: 'Fable 5' },
-            { value: 'claude-fable-5[1m]', label: 'Fable 5 1M' }
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
         ])
     })
 
@@ -46,10 +46,10 @@ describe('getModelOptionsForFlavor', () => {
             { value: 'sonnet[1m]', label: 'Sonnet 1M' },
             { value: 'opus', label: 'Opus' },
             { value: 'opus[1m]', label: 'Opus 1M' },
+            { value: 'fable', label: 'Fable' },
+            { value: 'fable[1m]', label: 'Fable 1M' },
             { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
-            { value: 'claude-fable-5', label: 'Fable 5' },
-            { value: 'claude-fable-5[1m]', label: 'Fable 5 1M' }
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
         ])
     })
 
@@ -106,6 +106,33 @@ describe('getModelOptionsForFlavor', () => {
         expect(options).toEqual([
             { value: 'composer-2.5', label: 'Composer 2.5' },
             { value: 'gpt-5.5-high-fast', label: 'GPT-5.5 High Fast' }
+        ])
+    })
+
+    it('does not inject raw wire id when dual picker base is already listed', () => {
+        const wire = 'claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]'
+        const options = getModelOptionsForFlavor('cursor', wire, [
+            { value: null, label: 'Default' },
+            { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
+            { value: 'composer-2.5', label: 'Composer 2.5' },
+        ])
+        expect(options).toEqual([
+            { value: null, label: 'Default' },
+            { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
+            { value: 'composer-2.5', label: 'Composer 2.5' },
+        ])
+    })
+
+    it('injects unknown wire id only when catalog lacks base and wire', () => {
+        const wire = 'claude-opus-4-9[effort=high,fast=false]'
+        const options = getModelOptionsForFlavor('cursor', wire, [
+            { value: null, label: 'Default' },
+            { value: 'composer-2.5', label: 'Composer 2.5' },
+        ])
+        expect(options).toEqual([
+            { value: null, label: 'Default' },
+            { value: wire, label: wire },
+            { value: 'composer-2.5', label: 'Composer 2.5' },
         ])
     })
 

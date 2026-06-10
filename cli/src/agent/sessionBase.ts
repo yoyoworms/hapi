@@ -23,7 +23,7 @@ export type AgentSessionBaseOptions<Mode> = {
     mode?: 'local' | 'remote';
     sessionLabel: string;
     sessionIdLabel: string;
-    applySessionIdToMetadata: (metadata: Metadata, sessionId: string) => Metadata;
+    applySessionIdToMetadata: (metadata: Metadata, sessionId: string, extras?: Partial<Metadata>) => Metadata;
     permissionMode?: SessionPermissionMode;
     model?: SessionModel;
     modelReasoningEffort?: SessionModelReasoningEffort;
@@ -44,7 +44,7 @@ export class AgentSessionBase<Mode> {
     thinking: boolean = false;
 
     private sessionFoundCallbacks: SessionFoundCallback[] = [];
-    private readonly applySessionIdToMetadata: (metadata: Metadata, sessionId: string) => Metadata;
+    private readonly applySessionIdToMetadata: (metadata: Metadata, sessionId: string, extras?: Partial<Metadata>) => Metadata;
     private readonly sessionLabel: string;
     private readonly sessionIdLabel: string;
     private keepAliveInterval: NodeJS.Timeout | null = null;
@@ -105,9 +105,9 @@ export class AgentSessionBase<Mode> {
         this._onModeChange(mode);
     };
 
-    onSessionFound = (sessionId: string, sessionFilePath?: string) => {
+    onSessionFound = (sessionId: string, extras?: Partial<Metadata>, sessionFilePath?: string) => {
         this.sessionId = sessionId;
-        this.client.updateMetadata((metadata) => this.applySessionIdToMetadata(metadata, sessionId));
+        this.client.updateMetadata((metadata) => this.applySessionIdToMetadata(metadata, sessionId, extras));
         logger.debug(`[${this.sessionLabel}] ${this.sessionIdLabel} session ID ${sessionId} added to metadata`);
 
         for (const callback of this.sessionFoundCallbacks) {

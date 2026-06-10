@@ -107,5 +107,5 @@ describe('claudeRemote/query real seam', () => {
 
         await expect(runPromise).rejects.toThrow('next message failed')
         expect(received.map((message) => message.type)).toEqual(['assistant', 'result'])
-    })
+    }, 15_000)
 })

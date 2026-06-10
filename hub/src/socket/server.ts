@@ -46,6 +46,7 @@ export type SocketServerDeps = {
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
     onSessionActivity?: (sessionId: string, updatedAt: number) => void
     onSweepImmediateQueued?: (sessionId: string, now: number) => void
+    onMessagesConsumed?: (sessionId: string) => void
 }
 
 export function createSocketServer(deps: SocketServerDeps): {
@@ -136,7 +137,8 @@ export function createSocketServer(deps: SocketServerDeps): {
         onWebappEvent: deps.onWebappEvent,
         onBackgroundTaskDelta: deps.onBackgroundTaskDelta,
         onSessionActivity: deps.onSessionActivity,
-        onSweepImmediateQueued: deps.onSweepImmediateQueued
+        onSweepImmediateQueued: deps.onSweepImmediateQueued,
+        onMessagesConsumed: deps.onMessagesConsumed
     }))
 
     terminalNs.use(async (socket, next) => {

@@ -10,12 +10,25 @@ import {
     extractLastAssistantSpeakable
 } from './contextFormatters'
 import { VOICE_CONFIG } from '../voiceConfig'
-import type { DecryptedMessage, Session } from '@/types/api'
+import { buildSessionVoiceContextPlan, type SessionVoiceContextPlan } from './voiceContextPlan'
+import { getFlavorLabel, isKnownFlavor } from '@hapi/protocol'
+import type { DecryptedMessage, Session, SessionMetadataSummary } from '@/types/api'
 
 interface SessionMetadata {
     summary?: { text?: string }
     path?: string
     machineId?: string
+}
+
+/**
+ * Resolve the display label for the session's agent flavor. Falls back to a
+ * generic "coding agent" string for unknown or missing flavors so the voice
+ * context never bottoms out with a literal "undefined" or the old hardcoded
+ * "Claude Code" (closes #680).
+ */
+function getAgentLabel(session: Session | null): string {
+    const flavor = (session?.metadata as SessionMetadataSummary | undefined)?.flavor
+    return isKnownFlavor(flavor) ? getFlavorLabel(flavor) : 'coding agent'
 }
 
 // Track which sessions have been reported
@@ -65,7 +78,7 @@ function reportSession(sessionId: string) {
     if (!session) return
 
     const messages = messagesGetter?.(sessionId) ?? []
-    const contextUpdate = formatSessionFull(session, messages)
+    const contextUpdate = formatSessionFull(session, messages, getAgentLabel(session))
     reportContextualUpdate(contextUpdate)
 }
 
@@ -105,13 +118,14 @@ export const voiceHooks = {
     },
 
     /**
-     * Called when Claude requests permission for a tool use
+     * Called when the active agent requests permission for a tool use
      */
     onPermissionRequested(sessionId: string, requestId: string, toolName: string, toolArgs: unknown) {
         if (VOICE_CONFIG.DISABLE_PERMISSION_REQUESTS) return
 
+        const session = sessionGetter?.(sessionId) ?? null
         reportSession(sessionId)
-        reportTextUpdate(formatPermissionRequest(sessionId, requestId, toolName, toolArgs))
+        reportTextUpdate(formatPermissionRequest(sessionId, requestId, toolName, toolArgs, getAgentLabel(session)))
     },
 
     /**
@@ -120,14 +134,15 @@ export const voiceHooks = {
     onMessages(sessionId: string, messages: DecryptedMessage[]) {
         if (VOICE_CONFIG.DISABLE_MESSAGES) return
 
+        const session = sessionGetter?.(sessionId) ?? null
         reportSession(sessionId)
-        reportContextualUpdate(formatNewMessages(sessionId, messages))
+        reportContextualUpdate(formatNewMessages(sessionId, messages, getAgentLabel(session)))
     },
 
     /**
-     * Called when voice session starts - returns initial context
+     * Build bootstrap + deferred stream plan when voice starts.
      */
-    onVoiceStarted(sessionId: string): string {
+    prepareVoiceSession(sessionId: string): SessionVoiceContextPlan {
         if (VOICE_CONFIG.ENABLE_DEBUG_LOGGING) {
             console.log('[Voice] Voice session started for:', sessionId)
         }
@@ -135,11 +150,14 @@ export const voiceHooks = {
 
         const session = sessionGetter?.(sessionId) ?? null
         const messages = messagesGetter?.(sessionId) ?? []
-
-        let prompt = 'THIS IS AN ACTIVE SESSION: \n\n' + formatSessionFull(session, messages)
+        const plan = buildSessionVoiceContextPlan(session, messages, getAgentLabel(session))
         shownSessions.add(sessionId)
+        return plan
+    },
 
-        return prompt
+    /** @deprecated Use prepareVoiceSession().bootstrap */
+    onVoiceStarted(sessionId: string): string {
+        return voiceHooks.prepareVoiceSession(sessionId).bootstrap
     },
 
     /**
@@ -151,7 +169,13 @@ export const voiceHooks = {
         reportSession(sessionId)
         const messages = messagesGetter?.(sessionId) ?? []
         const lastAssistantText = extractLastAssistantSpeakable(messages)
-        reportTextUpdate(formatReadyEvent(sessionId, lastAssistantText))
+        const update = formatReadyEvent(sessionId, lastAssistantText)
+        const proactive = localStorage.getItem('hapi-voice-proactive') === 'true'
+        if (proactive) {
+            reportTextUpdate(update)
+        } else {
+            reportContextualUpdate(update)
+        }
     },
 
     /**

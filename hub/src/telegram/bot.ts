@@ -6,10 +6,10 @@
  */
 
 import { Bot, Context, InlineKeyboard } from 'grammy'
-import { SyncEngine, Session } from '../sync/syncEngine'
+import { SyncEngine, Session, type Machine } from '../sync/syncEngine'
 import { handleCallback, CallbackContext } from './callbacks'
-import { formatSessionNotification, createNotificationKeyboard } from './sessionView'
-import { getAgentName, getSessionName } from '../notifications/sessionInfo'
+import { formatReadyNotification, formatSessionNotification, createNotificationKeyboard } from './sessionView'
+import { getAgentName } from '../notifications/sessionInfo'
 import type { NotificationChannel, TaskNotification } from '../notifications/notificationTypes'
 import type { Store } from '../store'
 
@@ -184,6 +184,28 @@ export class HappyBot implements NotificationChannel {
         return stored?.namespace ?? null
     }
 
+    private getSessionMachine(session: Session): Machine | undefined {
+        if (!this.syncEngine) {
+            return undefined
+        }
+
+        const machineId = session.metadata?.machineId
+        if (machineId) {
+            const machine = this.syncEngine.getMachineByNamespace(machineId, session.namespace)
+            if (machine) {
+                return machine
+            }
+        }
+
+        const host = session.metadata?.host
+        if (!host) {
+            return undefined
+        }
+
+        return this.syncEngine.getMachinesByNamespace(session.namespace)
+            .find((machine) => machine.metadata?.host === host)
+    }
+
     /**
      * Send a notification when agent is ready for input.
      */
@@ -192,19 +214,7 @@ export class HappyBot implements NotificationChannel {
             return
         }
 
-        const agentName = getAgentName(session)
-        const sessionName = getSessionName(session)
-        const sessionPath = session.metadata?.path || ''
-        const projectDir = sessionPath ? sessionPath.split('/').filter(Boolean).slice(-2).join('/') : ''
-
-        const lines: string[] = [`${agentName} is ready`]
-        if (sessionName && sessionName !== session.id.slice(0, 8)) {
-            lines.push(`📋 ${sessionName}`)
-        }
-        if (projectDir) {
-            lines.push(`📁 ${projectDir}`)
-        }
-
+        const text = formatReadyNotification(session, this.getSessionMachine(session))
         const url = buildMiniAppDeepLink(this.publicUrl, `session_${session.id}`)
         const keyboard = new InlineKeyboard()
             .webApp('Open Session', url)
@@ -218,7 +228,7 @@ export class HappyBot implements NotificationChannel {
             try {
                 await this.bot.api.sendMessage(
                     chatId,
-                    lines.join('\n'),
+                    text,
                     { reply_markup: keyboard }
                 )
             } catch (error) {
@@ -235,7 +245,7 @@ export class HappyBot implements NotificationChannel {
             return
         }
 
-        const text = formatSessionNotification(session)
+        const text = formatSessionNotification(session, this.getSessionMachine(session))
         const keyboard = createNotificationKeyboard(session, this.publicUrl)
 
         const chatIds = this.getBoundChatIds(session.namespace)
