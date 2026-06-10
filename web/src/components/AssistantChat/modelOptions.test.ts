@@ -29,7 +29,9 @@ describe('getModelOptionsForFlavor', () => {
             { value: 'opus', label: 'Opus' },
             { value: 'opus[1m]', label: 'Opus 1M' },
             { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
+            { value: 'claude-fable-5', label: 'Fable 5' },
+            { value: 'claude-fable-5[1m]', label: 'Fable 5 1M' }
         ])
     })
 
@@ -45,7 +47,9 @@ describe('getModelOptionsForFlavor', () => {
             { value: 'opus', label: 'Opus' },
             { value: 'opus[1m]', label: 'Opus 1M' },
             { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
+            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
+            { value: 'claude-fable-5', label: 'Fable 5' },
+            { value: 'claude-fable-5[1m]', label: 'Fable 5 1M' }
         ])
     })
 

@@ -20,11 +20,15 @@ describe('Claude model options', () => {
             'opus',
             'opus[1m]',
             'claude-opus-4-6[1m]',
-            'claude-opus-4-7[1m]'
+            'claude-opus-4-7[1m]',
+            'claude-fable-5',
+            'claude-fable-5[1m]'
         ])
         expect(getClaudeModelLabel('sonnet[1m]')).toBe('Sonnet 1M')
         expect(getClaudeModelLabel('opus[1m]')).toBe('Opus 1M')
         expect(getClaudeModelLabel('claude-opus-4-7[1m]')).toBe('Opus 4.7 1M')
+        expect(getClaudeModelLabel('claude-fable-5')).toBe('Fable 5')
+        expect(getClaudeModelLabel('claude-fable-5[1m]')).toBe('Fable 5 1M')
     })
 })
 
