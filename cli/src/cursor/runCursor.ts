@@ -81,7 +81,7 @@ export async function runCursor(opts: {
     });
 
     lifecycle.registerProcessHandlers();
-    registerKillSessionHandler(session.rpcHandlerManager, lifecycle.cleanupAndExit);
+    registerKillSessionHandler(session.rpcHandlerManager, lifecycle);
     registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle);
 
     const syncSessionMode = () => {
@@ -186,6 +186,11 @@ export async function runCursor(opts: {
         });
     } catch (error) {
         crashed = true;
+        const errMsg = error instanceof Error ? error.message : String(error);
+        session.sendSessionEvent({
+            type: 'message',
+            message: `Cursor Agent failed: ${errMsg}`
+        });
         lifecycle.markCrash(error);
         logger.debug('[cursor] Loop error:', error);
     } finally {

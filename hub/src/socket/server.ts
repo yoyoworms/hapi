@@ -10,6 +10,7 @@ import { registerCliHandlers } from './handlers/cli'
 import { registerTerminalHandlers } from './handlers/terminal'
 import { RpcRegistry } from './rpcRegistry'
 import type { AgentAccountStatus } from '@hapi/protocol/types'
+import { SOCKET_MAX_HTTP_BUFFER_SIZE } from './socketLimits'
 import type { SyncEvent } from '../sync/syncEngine'
 import { TerminalRegistry } from './terminalRegistry'
 import type { CliSocketWithData, SocketData, SocketServer } from './socketTypes'
@@ -38,6 +39,7 @@ export type SocketServerDeps = {
     getSession?: (sessionId: string) => { active: boolean; namespace: string } | null
     onWebappEvent?: (event: SyncEvent) => void
     onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote' }) => void
+    onSessionReady?: (payload: { sid: string; time: number }) => void
     onSessionEnd?: (payload: { sid: string; time: number }) => void
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
@@ -66,14 +68,14 @@ export function createSocketServer(deps: SocketServerDeps): {
 
     const io = new Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, SocketData>({
         cors: corsOptions,
-        maxHttpBufferSize: 100 * 1024 * 1024  // 100MB for file uploads
+        maxHttpBufferSize: Math.max(SOCKET_MAX_HTTP_BUFFER_SIZE, 100 * 1024 * 1024)  // 100MB floor for file uploads
     })
 
     const engine = new Engine({
         path: '/socket.io/',
         pingInterval: 10_000,
         pingTimeout: 30_000,
-        maxHttpBufferSize: 100 * 1024 * 1024,  // 100MB for file uploads
+        maxHttpBufferSize: Math.max(SOCKET_MAX_HTTP_BUFFER_SIZE, 100 * 1024 * 1024),  // 100MB floor for file uploads
         cors: corsOptions,
         allowRequest: async (req) => {
             const origin = req.headers.get('origin')
@@ -129,6 +131,7 @@ export function createSocketServer(deps: SocketServerDeps): {
         rpcRegistry,
         terminalRegistry,
         onSessionAlive: deps.onSessionAlive,
+        onSessionReady: deps.onSessionReady,
         onSessionEnd: deps.onSessionEnd,
         onSessionUsage: deps.onSessionUsage,
         onSessionAccountStatus: deps.onSessionAccountStatus,

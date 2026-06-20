@@ -1,11 +1,13 @@
 import packageJson from '../../package.json'
-import { ensureRuntimeAssets } from '@/runtime/assets'
 import { isBunCompiled } from '@/projectPath'
 import { logger } from '@/ui/logger'
 import { getCliArgs } from '@/utils/cliArgs'
+import { ensureLoopbackProxyBypass } from '@/utils/proxyEnv'
 import { resolveCommand } from './registry'
 
 export async function runCli(): Promise<void> {
+    ensureLoopbackProxyBypass()
+
     const args = getCliArgs()
 
     if (args.includes('-v') || args.includes('--version')) {
@@ -20,6 +22,7 @@ export async function runCli(): Promise<void> {
     const { command, context } = resolveCommand(args)
 
     if (command.requiresRuntimeAssets) {
+        const { ensureRuntimeAssets } = await import('@/runtime/assets')
         await ensureRuntimeAssets()
         logger.debug('Starting hapi CLI with args: ', process.argv)
     }

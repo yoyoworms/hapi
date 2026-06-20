@@ -226,6 +226,7 @@ export class Store {
                 model TEXT,
                 model_reasoning_effort TEXT,
                 effort TEXT,
+                service_tier TEXT,
                 todos TEXT,
                 todos_updated_at INTEGER,
                 team_state TEXT,
@@ -470,23 +471,28 @@ export class Store {
     }
 
     private migrateFromV9ToV10(): void {
-        const columns = this.getMessageColumnNames()
-        if (columns.size === 0) {
-            // No messages table yet — createSchema will build the up-to-date one.
-            return
+        // Fork: persistent content-uuid dedup on the messages table.
+        const messageColumns = this.getMessageColumnNames()
+        if (messageColumns.size > 0) {
+            if (!messageColumns.has('content_uuid')) {
+                this.db.exec('ALTER TABLE messages ADD COLUMN content_uuid TEXT')
+            }
+            // Partial index backing the persistent content-uuid dedup that prevents
+            // reconnect-replayed agent messages from being re-inserted. Idempotent.
+            // Existing rows keep content_uuid = NULL (not backfilled); they were
+            // already de-duplicated by the one-time cleanup.
+            this.db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
+                    ON messages(session_id, content_uuid)
+                    WHERE content_uuid IS NOT NULL
+            `)
         }
-        if (!columns.has('content_uuid')) {
-            this.db.exec('ALTER TABLE messages ADD COLUMN content_uuid TEXT')
+
+        // Upstream: Codex service-tier (fast mode) column on the sessions table.
+        const sessionColumns = this.getSessionColumnNames()
+        if (sessionColumns.size > 0 && !sessionColumns.has('service_tier')) {
+            this.db.exec('ALTER TABLE sessions ADD COLUMN service_tier TEXT')
         }
-        // Partial index backing the persistent content-uuid dedup that prevents
-        // reconnect-replayed agent messages from being re-inserted. Idempotent.
-        // Existing rows keep content_uuid = NULL (not backfilled); they were
-        // already de-duplicated by the one-time cleanup.
-        this.db.exec(`
-            CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
-                ON messages(session_id, content_uuid)
-                WHERE content_uuid IS NOT NULL
-        `)
     }
 
     private getSessionColumnNames(): Set<string> {
