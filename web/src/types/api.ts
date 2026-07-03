@@ -47,6 +47,7 @@ export type {
     Metadata,
     PermissionMode,
     Machine,
+    MachineHealth,
     PendingRequest,
     PendingRequestKind,
     RunnerState,
