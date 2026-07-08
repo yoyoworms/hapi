@@ -6,6 +6,7 @@ import { MachineStore } from './machineStore'
 import { MessageStore } from './messageStore'
 import { PushStore } from './pushStore'
 import { SessionStore } from './sessionStore'
+import { ShareStore } from './shareStore'
 import { UserStore } from './userStore'
 
 export type {
@@ -23,7 +24,7 @@ export { PushStore } from './pushStore'
 export { SessionStore } from './sessionStore'
 export { UserStore } from './userStore'
 
-const SCHEMA_VERSION: number = 10
+const SCHEMA_VERSION: number = 11
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -43,6 +44,7 @@ export class Store {
     readonly messages: MessageStore
     readonly users: UserStore
     readonly push: PushStore
+    readonly shares: ShareStore
 
     /**
      * Filesystem path of the underlying SQLite database, or ':memory:' for
@@ -98,6 +100,7 @@ export class Store {
         this.messages = new MessageStore(this.db)
         this.users = new UserStore(this.db)
         this.push = new PushStore(this.db)
+        this.shares = new ShareStore(this.db)
 
         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
             this.startMaintenance()
@@ -165,6 +168,7 @@ export class Store {
             7: () => this.migrateFromV7ToV8(),
             8: () => this.migrateFromV8ToV9(),
             9: () => this.migrateFromV9ToV10(),
+            10: () => this.migrateFromV10ToV11(),
         })
 
         if (currentVersion === 0) {
@@ -295,6 +299,30 @@ export class Store {
                 UNIQUE(namespace, endpoint)
             );
             CREATE INDEX IF NOT EXISTS idx_push_subscriptions_namespace ON push_subscriptions(namespace);
+
+            CREATE TABLE IF NOT EXISTS session_shares (
+                token TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_shares_session ON session_shares(session_id, namespace);
+        `)
+    }
+
+    private migrateFromV10ToV11(): void {
+        // Session share links (single-session, no-login access tokens).
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS session_shares (
+                token TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_shares_session ON session_shares(session_id, namespace);
         `)
     }
 

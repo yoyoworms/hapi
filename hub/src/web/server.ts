@@ -14,6 +14,7 @@ import { createAuthMiddleware, type WebAppEnv } from './middleware/auth'
 import { createAuthRoutes } from './routes/auth'
 import { createBindRoutes } from './routes/bind'
 import { createEventsRoutes } from './routes/events'
+import { createSharesRoutes } from './routes/shares'
 import { createSessionsRoutes } from './routes/sessions'
 import { createMessagesRoutes } from './routes/messages'
 import { createPermissionsRoutes } from './routes/permissions'
@@ -280,8 +281,9 @@ function createWebApp(options: {
         }
     })
 
-    app.use('/api/*', createAuthMiddleware(options.jwtSecret))
+    app.use('/api/*', createAuthMiddleware(options.jwtSecret, options.store))
     app.route('/api', createEventsRoutes(options.getSseManager, options.getSyncEngine, options.getVisibilityTracker))
+    app.route('/api', createSharesRoutes(options.getSyncEngine, options.store, options.jwtSecret))
     app.route('/api', createSessionsRoutes(options.getSyncEngine))
     app.route('/api', createMessagesRoutes(options.getSyncEngine))
     app.route('/api', createPermissionsRoutes(options.getSyncEngine))

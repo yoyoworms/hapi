@@ -156,7 +156,22 @@ function getMachineTitle(machine: Machine): string {
     return machine.id.slice(0, 8)
 }
 
+// Session-share viewer: authenticated by a share link, scoped to one session.
+// No sidebar / session list / new-session chrome — just the shared session.
+function SharedSessionsLayout() {
+    return (
+        <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
+            <Outlet />
+        </div>
+    )
+}
+
 function SessionsPage() {
+    const { sharedMode } = useAppContext()
+    return sharedMode ? <SharedSessionsLayout /> : <OwnerSessionsPage />
+}
+
+function OwnerSessionsPage() {
     const { api } = useAppContext()
     const navigate = useNavigate()
     const queryClient = useQueryClient()
@@ -948,7 +963,7 @@ function SessionPage() {
 }
 
 function SessionDetailRoute() {
-    const { api } = useAppContext()
+    const { api, sharedMode } = useAppContext()
     const pathname = useLocation({ select: location => location.pathname })
     const { sessionId } = useParams({ from: '/sessions/$sessionId' })
     const navigate = useNavigate()
@@ -957,16 +972,21 @@ function SessionDetailRoute() {
     const isChat = pathname === basePath || pathname === `${basePath}/`
 
     useEffect(() => {
-        if (!sessionNotFound) {
+        if (!sessionNotFound || sharedMode) {
+            // In shared mode there is no session list to fall back to; show the
+            // unavailable message instead of bouncing to a forbidden route.
             return
         }
         navigate({ to: '/sessions', replace: true })
-    }, [navigate, sessionNotFound])
+    }, [navigate, sessionNotFound, sharedMode])
 
     if (sessionNotFound) {
         return (
-            <div className="flex-1 flex items-center justify-center p-4">
-                <LoadingState label="Session not found. Returning to sessions…" className="text-sm" />
+            <div className="flex-1 flex items-center justify-center p-4 text-center">
+                <LoadingState
+                    label={sharedMode ? 'This shared session is no longer available.' : 'Session not found. Returning to sessions…'}
+                    className="text-sm"
+                />
             </div>
         )
     }
@@ -1103,8 +1123,30 @@ function BrowsePage() {
     )
 }
 
+// Share-link landing (`/s/<token>`). The share token is redeemed to a
+// session-scoped JWT by the auth layer (useAuthSource detects the path);
+// once authenticated we know the session id and redirect into it. The
+// session then renders in shared mode (no sidebar/nav).
+function ShareViewerPage() {
+    const { sharedSessionId } = useAppContext()
+    if (sharedSessionId) {
+        return <Navigate to="/sessions/$sessionId" params={{ sessionId: sharedSessionId }} replace />
+    }
+    return (
+        <div className="flex h-full items-center justify-center p-4">
+            <LoadingState label="Opening shared session…" className="text-sm" />
+        </div>
+    )
+}
+
 const rootRoute = createRootRoute({
     component: App,
+})
+
+const shareViewerRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/s/$token',
+    component: ShareViewerPage,
 })
 
 const indexRoute = createRoute({
@@ -1273,6 +1315,7 @@ export const routeTree = rootRoute.addChildren([
     browseRoute,
     settingsRoute,
     shareRoute,
+    shareViewerRoute,
 ])
 
 type RouterHistory = Parameters<typeof createRouter>[0]['history']

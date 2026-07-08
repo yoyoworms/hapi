@@ -7,8 +7,10 @@ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { fetchLatestMessages, seedMessageWindowFromSession } from '@/lib/message-window-store'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { SessionExportDialog } from '@/components/SessionExportDialog'
+import { ShareSessionDialog } from '@/components/ShareSessionDialog'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { useAppContext } from '@/lib/app-context'
 import { formatReopenError } from '@/lib/reopenError'
 import { getSessionModelLabel } from '@/lib/sessionModelLabel'
 import { useTranslation } from '@/lib/use-translation'
@@ -111,6 +113,7 @@ export function SessionHeader(props: {
     onSessionReopened?: (newSessionId: string) => void
 }) {
     const { t } = useTranslation()
+    const { sharedMode } = useAppContext()
     const { session, api, onSessionDeleted, onSessionReopened } = props
     const title = useMemo(() => getSessionTitle(session), [session])
     const worktreeBranch = session.metadata?.worktree?.branch
@@ -123,6 +126,7 @@ export function SessionHeader(props: {
     const [renameOpen, setRenameOpen] = useState(false)
     const [restartOpen, setRestartOpen] = useState(false)
     const [exportOpen, setExportOpen] = useState(false)
+    const [shareOpen, setShareOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
@@ -260,19 +264,21 @@ export function SessionHeader(props: {
                         </button>
                     ) : null}
 
-                    <button
-                        type="button"
-                        onClick={handleMenuToggle}
-                        onPointerDown={(e) => e.stopPropagation()}
-                        ref={menuAnchorRef}
-                        aria-haspopup="menu"
-                        aria-expanded={menuOpen}
-                        aria-controls={menuOpen ? menuId : undefined}
-                        className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
-                        title={t('session.more')}
-                    >
-                        <MoreVerticalIcon />
-                    </button>
+                    {!sharedMode ? (
+                        <button
+                            type="button"
+                            onClick={handleMenuToggle}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            ref={menuAnchorRef}
+                            aria-haspopup="menu"
+                            aria-expanded={menuOpen}
+                            aria-controls={menuOpen ? menuId : undefined}
+                            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
+                            title={t('session.more')}
+                        >
+                            <MoreVerticalIcon />
+                        </button>
+                    ) : null}
                 </div>
             </div>
 
@@ -284,6 +290,7 @@ export function SessionHeader(props: {
                 onResume={handleResume}
                 onRestart={() => setRestartOpen(true)}
                 onExport={() => setExportOpen(true)}
+                onShare={() => setShareOpen(true)}
                 onArchive={() => setArchiveOpen(true)}
                 onReopen={handleReopen}
                 onDelete={() => setDeleteOpen(true)}
@@ -310,6 +317,13 @@ export function SessionHeader(props: {
                 currentName={title}
                 onRename={renameSession}
                 isPending={isPending}
+            />
+
+            <ShareSessionDialog
+                isOpen={shareOpen}
+                onClose={() => setShareOpen(false)}
+                sessionId={session.id}
+                api={api}
             />
 
             <SessionExportDialog

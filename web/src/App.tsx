@@ -75,6 +75,20 @@ async function showSystemNotificationForToast(event: ToastEvent): Promise<void> 
     }
 }
 
+/** Decode the `sid` claim from a session-share scoped JWT (client-side, unverified). */
+function decodeJwtSessionId(token: string | null): string | undefined {
+    if (!token) return undefined
+    const part = token.split('.')[1]
+    if (!part) return undefined
+    try {
+        const b64 = part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '=')
+        const payload = JSON.parse(globalThis.atob(b64)) as { sid?: unknown }
+        return typeof payload.sid === 'string' ? payload.sid : undefined
+    } catch {
+        return undefined
+    }
+}
+
 function routerNavigate(url: string): void {
     if (!url) return
     window.location.assign(url)
@@ -104,6 +118,9 @@ function AppInner() {
     const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
     const { authSource, isLoading: isAuthSourceLoading, setAccessToken, clearAuth } = useAuthSource(baseUrl)
     const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
+    // Session-share viewer: authenticated by a share link, scoped to one session.
+    const sharedMode = authSource?.type === 'shareToken'
+    const sharedSessionId = useMemo(() => (sharedMode ? decodeJwtSessionId(token) : undefined), [sharedMode, token])
     const goBack = useAppGoBack()
     const pathname = useLocation({ select: (location) => location.pathname })
     const matchRoute = useMatchRoute()
@@ -502,7 +519,7 @@ function AppInner() {
     }
 
     return (
-        <AppContextProvider value={{ api, token, baseUrl, signOut: clearAuth }}>
+        <AppContextProvider value={{ api, token, baseUrl, signOut: clearAuth, sharedMode, sharedSessionId }}>
                 <PwaUpdateBannerWithStatusOffset
                     isSyncing={isSyncing}
                     isReconnecting={sseDisconnected && !isSyncing}

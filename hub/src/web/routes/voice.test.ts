@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { SignJWT } from 'jose'
 import type { WebAppEnv } from '../middleware/auth'
 import { createAuthMiddleware } from '../middleware/auth'
+import type { Store } from '../../store'
 import { createVoiceRoutes } from './voice'
 
 const JWT_SECRET = new TextEncoder().encode('test-secret')
@@ -18,7 +19,7 @@ async function authHeaders() {
 
 function createApp() {
     const app = new Hono<WebAppEnv>()
-    app.use('*', createAuthMiddleware(JWT_SECRET))
+    app.use('*', createAuthMiddleware(JWT_SECRET, { shares: { getShareByToken: () => null } } as unknown as Store))
     app.route('/api', createVoiceRoutes())
     return app
 }

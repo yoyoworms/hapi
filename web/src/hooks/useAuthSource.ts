@@ -27,6 +27,35 @@ function getTokenFromUrlParams(): string | null {
     return query.get('token')
 }
 
+const SHARE_TOKEN_KEY = 'hapi_share_token'
+
+/** Extract the share token from a `/s/<token>` URL, if present. */
+export function getShareTokenFromPath(): string | null {
+    if (typeof window === 'undefined') return null
+    const m = window.location.pathname.match(/^\/s\/([^/]+)\/?$/)
+    return m ? decodeURIComponent(m[1] ?? '') || null : null
+}
+
+/** Per-tab persistence so a shared viewer survives in-app navigation + reload
+ *  (the URL leaves /s/<token> once we redirect into the session). sessionStorage
+ *  keeps it scoped to the tab and cleared on close — it never clobbers an
+ *  owner's localStorage access token. */
+function getStoredShareToken(): string | null {
+    try {
+        return sessionStorage.getItem(SHARE_TOKEN_KEY)
+    } catch {
+        return null
+    }
+}
+
+function storeShareToken(token: string): void {
+    try {
+        sessionStorage.setItem(SHARE_TOKEN_KEY, token)
+    } catch {
+        // ignore
+    }
+}
+
 function getAccessTokenKey(baseUrl: string): string {
     return `${ACCESS_TOKEN_PREFIX}${baseUrl}`
 }
@@ -74,6 +103,17 @@ export function useAuthSource(baseUrl: string): {
         setAuthSource(null)
         setIsTelegram(false)
         setIsLoading(true)
+
+        // Share link: /s/<token> (or a token stashed for this tab) takes
+        // precedence over any stored/normal auth. Redeems to a
+        // single-session-scoped JWT (no login).
+        const shareToken = getShareTokenFromPath() ?? getStoredShareToken()
+        if (shareToken) {
+            storeShareToken(shareToken)
+            setAuthSource({ type: 'shareToken', token: shareToken })
+            setIsLoading(false)
+            return
+        }
 
         const telegramInitData = getTelegramInitData()
 

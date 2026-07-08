@@ -19,6 +19,12 @@ export function requireSession(
     sessionId: string,
     options?: { requireActive?: boolean }
 ): { sessionId: string; session: Session } | Response {
+    // Defense-in-depth for share links: a session-scoped token may only ever
+    // resolve its own session, regardless of what id the route received.
+    const sessionScope = c.get('sessionScope')
+    if (sessionScope && sessionScope !== sessionId) {
+        return c.json({ error: 'Session access denied' }, 403)
+    }
     const namespace = c.get('namespace')
     const access = engine.resolveSessionAccess(sessionId, namespace)
     if (!access.ok) {

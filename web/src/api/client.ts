@@ -168,6 +168,39 @@ export class ApiClient {
         return await res.json() as AuthResponse
     }
 
+    /** Redeem a session share link for a session-scoped JWT (no auth header). */
+    async redeemShare(shareToken: string): Promise<{ token: string; sessionId: string }> {
+        const res = await fetch(this.buildUrl(`/api/share/${encodeURIComponent(shareToken)}/auth`), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' }
+        })
+        if (!res.ok) {
+            const body = await res.text().catch(() => '')
+            throw new ApiError(`Share redeem failed: HTTP ${res.status}`, res.status, undefined, body || undefined)
+        }
+        return await res.json() as { token: string; sessionId: string }
+    }
+
+    /** Owner: current share status for a session. */
+    async getSessionShare(sessionId: string): Promise<{ shared: boolean; token: string | null }> {
+        return await this.request<{ shared: boolean; token: string | null }>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/share`
+        )
+    }
+
+    /** Owner: create (or reuse) a share link for a session. */
+    async createSessionShare(sessionId: string): Promise<{ shared: boolean; token: string }> {
+        return await this.request<{ shared: boolean; token: string }>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/share`,
+            { method: 'POST' }
+        )
+    }
+
+    /** Owner: revoke a session's share link(s). */
+    async revokeSessionShare(sessionId: string): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'DELETE' })
+    }
+
     async bind(auth: { initData: string; accessToken: string }): Promise<AuthResponse> {
         const res = await fetch(this.buildUrl('/api/bind'), {
             method: 'POST',

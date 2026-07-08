@@ -5,6 +5,20 @@ import type { AuthResponse } from '@/types/api'
 export type AuthSource =
     | { type: 'telegram'; initData: string }
     | { type: 'accessToken'; token: string }
+    | { type: 'shareToken'; token: string }
+
+/** Exchange an auth source for a JWT. Share links redeem via a different
+ *  endpoint (single-session scoped token) and have no user profile. */
+async function exchangeAuth(
+    client: ApiClient,
+    source: AuthSource
+): Promise<{ token: string; user: AuthResponse['user'] | null }> {
+    if (source.type === 'shareToken') {
+        const redeemed = await client.redeemShare(source.token)
+        return { token: redeemed.token, user: null }
+    }
+    return await client.authenticate(getAuthPayload(source))
+}
 
 function decodeJwtExpMs(token: string): number | null {
     const parts = token.split('.')
@@ -91,7 +105,7 @@ export function useAuth(authSource: AuthSource | null, baseUrl: string): {
 
             try {
                 const client = new ApiClient('', { baseUrl })
-                const auth = await client.authenticate(getAuthPayload(currentSource))
+                const auth = await exchangeAuth(client, currentSource)
                 tokenRef.current = auth.token
                 setToken(auth.token)
                 setUser(auth.user)
@@ -188,7 +202,7 @@ export function useAuth(authSource: AuthSource | null, baseUrl: string): {
             setNeedsBinding(false)
             try {
                 const client = new ApiClient('', { baseUrl }) // temporary for auth call
-                const auth = await client.authenticate(getAuthPayload(authSource))
+                const auth = await exchangeAuth(client, authSource)
                 if (isCancelled) return
                 setToken(auth.token)
                 setUser(auth.user)
