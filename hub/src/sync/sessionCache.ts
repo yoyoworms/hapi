@@ -904,6 +904,13 @@ export class SessionCache {
             this.publisher.emit({ type: 'messages-invalidated', sessionId: newSessionId, namespace })
         }
 
+        // Keep any share link alive across the id change (resume spawns a new
+        // session id and merges the old one in). Without this the shared link
+        // would 404 the moment the owner resumes the shared session.
+        if (options.deleteOldSession) {
+            this.store.shares.migrateShares(oldSessionId, newSessionId, namespace)
+        }
+
         const mergedMetadata = this.mergeSessionMetadata(oldStored.metadata, newStored.metadata)
         if (mergedMetadata !== null && mergedMetadata !== newStored.metadata) {
             for (let attempt = 0; attempt < 2; attempt += 1) {

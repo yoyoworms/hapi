@@ -80,4 +80,16 @@ export class ShareStore {
         ).run(sessionId, namespace)
         return result.changes > 0
     }
+
+    /**
+     * Re-point a session's shares to a new session id. Called when a session is
+     * merged into another (e.g. resume spawns a new id) so an outstanding share
+     * link keeps working across the id change instead of orphaning.
+     */
+    migrateShares(oldSessionId: string, newSessionId: string, namespace: string): number {
+        const result = this.db.prepare(
+            'UPDATE session_shares SET session_id = ? WHERE session_id = ? AND namespace = ?'
+        ).run(newSessionId, oldSessionId, namespace)
+        return result.changes
+    }
 }

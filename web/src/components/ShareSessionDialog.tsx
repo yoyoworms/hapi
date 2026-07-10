@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ApiClient } from '@/api/client'
 import { useToast } from '@/lib/toast-context'
 import { useTranslation } from '@/lib/use-translation'
@@ -34,6 +34,7 @@ export function ShareSessionDialog(props: ShareSessionDialogProps) {
     const [loading, setLoading] = useState(false)
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState<string | null>(null)
+    const urlInputRef = useRef<HTMLInputElement | null>(null)
 
     useEffect(() => {
         if (!props.isOpen || !props.api) return
@@ -84,12 +85,30 @@ export function ShareSessionDialog(props: ShareSessionDialogProps) {
     const handleCopy = async () => {
         if (!token) return
         const url = buildShareUrl(token)
+        // Primary: async Clipboard API (needs a secure context + focus). Some
+        // in-app webviews reject it silently, so fall back to selecting the
+        // input + execCommand, and finally to just selecting it for manual copy.
         try {
             await navigator.clipboard.writeText(url)
             toast.addToast({ title: t('session.share.copied'), body: '', sessionId: props.sessionId, url: '' })
+            return
         } catch {
-            setError('Copy failed — select and copy the link manually.')
+            // fall through
         }
+        const input = urlInputRef.current
+        if (input) {
+            input.focus()
+            input.select()
+            try {
+                if (document.execCommand('copy')) {
+                    toast.addToast({ title: t('session.share.copied'), body: '', sessionId: props.sessionId, url: '' })
+                    return
+                }
+            } catch {
+                // fall through
+            }
+        }
+        setError('Copy failed — the link is selected above; copy it manually.')
     }
 
     const url = token ? buildShareUrl(token) : null
@@ -108,9 +127,15 @@ export function ShareSessionDialog(props: ShareSessionDialogProps) {
                     <div className="py-4 text-sm text-[var(--app-hint)]">{t('misc.loading')}</div>
                 ) : url ? (
                     <div className="flex flex-col gap-3">
-                        <div className="break-all rounded-md bg-[var(--app-subtle-bg)] px-3 py-2 text-xs text-[var(--app-fg)]">
-                            {url}
-                        </div>
+                        <input
+                            ref={urlInputRef}
+                            type="text"
+                            readOnly
+                            value={url}
+                            onFocus={(e) => e.currentTarget.select()}
+                            onClick={(e) => e.currentTarget.select()}
+                            className="w-full break-all rounded-md bg-[var(--app-subtle-bg)] px-3 py-2 text-xs text-[var(--app-fg)]"
+                        />
                         <div className="flex flex-wrap gap-2">
                             <Button onClick={handleCopy} disabled={busy}>{t('session.share.copy')}</Button>
                             <Button variant="secondary" onClick={handleRevoke} disabled={busy}>

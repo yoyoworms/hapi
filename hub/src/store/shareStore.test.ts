@@ -51,4 +51,21 @@ describe('ShareStore', () => {
         expect(store.shares.getActiveShareForSession(session.id, 'nsA')?.token).toBe(share.token)
         expect(store.shares.getActiveShareForSession(session.id, 'nsB')).toBeNull()
     })
+
+    it('migrates a share to a new session id (survives resume/merge), token unchanged', () => {
+        const store = makeStore()
+        const oldSession = makeSession(store, 's5-old')
+        const newSession = makeSession(store, 's5-new')
+        const share = store.shares.createShare(oldSession.id, 'default')
+
+        const moved = store.shares.migrateShares(oldSession.id, newSession.id, 'default')
+        expect(moved).toBe(1)
+
+        // Same token, now resolving to the new session id.
+        const byToken = store.shares.getShareByToken(share.token)
+        expect(byToken?.token).toBe(share.token)
+        expect(byToken?.sessionId).toBe(newSession.id)
+        expect(store.shares.getActiveShareForSession(newSession.id, 'default')?.token).toBe(share.token)
+        expect(store.shares.getActiveShareForSession(oldSession.id, 'default')).toBeNull()
+    })
 })
