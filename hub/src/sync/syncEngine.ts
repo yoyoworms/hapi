@@ -886,7 +886,7 @@ export class SyncEngine {
         }
 
         const flavor = this.resolveFlavor(session)
-        if (flavor === 'codex') return metadata.codexSessionId ?? null
+        if (flavor === 'codex') return metadata.codexSessionId ?? this.recoverCodexSessionIdFromMessages(session.id, namespace)
         if (flavor === 'gemini') return metadata.geminiSessionId ?? null
         if (flavor === 'opencode') return metadata.opencodeSessionId ?? null
         if (flavor === 'cursor') return metadata.cursorSessionId ?? null
@@ -1593,15 +1593,7 @@ export class SyncEngine {
             return { type: 'error', message: scanResult.error || 'Failed to scan sessions', code: 'resume_failed' }
         }
 
-        const currentSessionId = flavor === 'codex'
-            ? metadata.codexSessionId
-            : flavor === 'gemini'
-                ? metadata.geminiSessionId
-                : flavor === 'opencode'
-                    ? metadata.opencodeSessionId
-                    : flavor === 'cursor'
-                        ? metadata.cursorSessionId
-                        : metadata.claudeSessionId
+        const currentSessionId = this.resolveAgentResumeId(session, namespace)
 
         return {
             type: 'success',
@@ -1622,13 +1614,57 @@ export class SyncEngine {
         return null
     }
 
+    private recoverCodexSessionIdFromMessages(sessionId: string, namespace: string): string | null {
+        const messages = this.messageService.getMessages(sessionId, 200)
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const found = this.extractCodexSessionId(messages[i].content)
+            if (!found) continue
+
+            this.persistRecoveredCodexSessionId(sessionId, namespace, found)
+            return found
+        }
+        return null
+    }
+
+    private extractCodexSessionId(value: unknown): string | null {
+        if (!value || typeof value !== 'object') {
+            return null
+        }
+
+        const obj = value as Record<string, unknown>
+        const scope = obj.scope && typeof obj.scope === 'object'
+            ? obj.scope as Record<string, unknown>
+            : null
+        const scopeRole = obj.scopeRole ?? obj.scope_role ?? scope?.role
+        if (scopeRole === 'child') {
+            return this.normalizeAgentSessionId(scope?.parentThreadId)
+                ?? this.normalizeAgentSessionId(scope?.parent_thread_id)
+                ?? this.normalizeAgentSessionId(obj.parentThreadId)
+                ?? this.normalizeAgentSessionId(obj.parent_thread_id)
+        }
+
+        const direct = this.normalizeAgentSessionId(obj.thread_id) ?? this.normalizeAgentSessionId(obj.threadId)
+        if (direct) {
+            return direct
+        }
+
+        for (const key of ['content', 'data', 'output']) {
+            const nested = obj[key]
+            if (!nested || typeof nested !== 'object') continue
+            const found = this.extractCodexSessionId(nested)
+            if (found) return found
+        }
+
+        return null
+    }
+
     private extractClaudeSessionId(value: unknown): string | null {
         if (!value || typeof value !== 'object') {
             return null
         }
 
         const obj = value as Record<string, unknown>
-        const direct = this.normalizeClaudeSessionId(obj.session_id) ?? this.normalizeClaudeSessionId(obj.sessionId)
+        const direct = this.normalizeAgentSessionId(obj.session_id) ?? this.normalizeAgentSessionId(obj.sessionId)
         if (direct) {
             return direct
         }
@@ -1648,7 +1684,7 @@ export class SyncEngine {
         return null
     }
 
-    private normalizeClaudeSessionId(value: unknown): string | null {
+    private normalizeAgentSessionId(value: unknown): string | null {
         if (typeof value !== 'string') {
             return null
         }
@@ -1656,6 +1692,30 @@ export class SyncEngine {
         return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)
             ? trimmed
             : null
+    }
+
+    private persistRecoveredCodexSessionId(sessionId: string, namespace: string, codexSessionId: string): void {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const latest = this.sessionCache.getSessionByNamespace(sessionId, namespace)
+                ?? this.sessionCache.refreshSession(sessionId)
+            if (!latest?.metadata) return
+            if (latest.metadata.codexSessionId === codexSessionId) return
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...latest.metadata, codexSessionId },
+                latest.metadataVersion,
+                namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'success') {
+                this.sessionCache.refreshSession(sessionId)
+                return
+            }
+            if (result.result !== 'version-mismatch') {
+                return
+            }
+        }
     }
 
     private persistRecoveredClaudeSessionId(sessionId: string, namespace: string, claudeSessionId: string): void {

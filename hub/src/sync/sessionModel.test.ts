@@ -1041,6 +1041,117 @@ describe('session model', () => {
         }
     })
 
+    it('recovers the newest codex thread ID from stored messages and persists it', () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession(
+                'session-codex-resume-from-message',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'codex'
+                },
+                null,
+                'default'
+            )
+            store.messages.addMessage(session.id, {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        thread_id: '11111111-1111-4111-8111-111111111111'
+                    }
+                }
+            })
+            store.messages.addMessage(session.id, {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        output: {
+                            threadId: '22222222-2222-4222-8222-222222222222'
+                        }
+                    }
+                }
+            })
+            store.messages.addMessage(session.id, {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        thread_id: '33333333-3333-4333-8333-333333333333',
+                        scopeRole: 'child',
+                        scope: {
+                            role: 'child',
+                            parentThreadId: '22222222-2222-4222-8222-222222222222'
+                        }
+                    }
+                }
+            })
+
+            const result = engine.resolveLocalResumeTarget(session.id, 'default')
+
+            expect(result.type).toBe('success')
+            if (result.type === 'success') {
+                expect(result.target.agentSessionId).toBe('22222222-2222-4222-8222-222222222222')
+            }
+            expect(store.sessions.getSession(session.id)?.metadata).toMatchObject({
+                codexSessionId: '22222222-2222-4222-8222-222222222222'
+            })
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('does not recover an invalid codex thread ID from stored messages', () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession(
+                'session-codex-resume-invalid-message',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'codex'
+                },
+                null,
+                'default'
+            )
+            store.messages.addMessage(session.id, {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        thread_id: 'not-a-codex-thread-id'
+                    }
+                }
+            })
+
+            expect(engine.resolveLocalResumeTarget(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Resume session ID unavailable. Start a new session in this directory, or retry after the agent has initialized.',
+                code: 'resume_unavailable'
+            })
+        } finally {
+            engine.stop()
+        }
+    })
+
     it('does not recover a non-UUID sessionId from stored messages', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
