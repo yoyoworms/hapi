@@ -1864,6 +1864,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             waiter();
         };
 
+        session.queue.setOnMessage(() => wakeLoop());
+
         const waitForTurnOrRecovery = (signal: AbortSignal): Promise<void> => new Promise((resolve) => {
             if (!turnInFlight && !recoveryInFlight) {
                 resolve();
@@ -3528,6 +3530,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return true;
             }
 
+            if (compactRecovery) {
+                sendVisibleStatus(
+                    'Compaction already in progress; the failed request will retry automatically when it finishes'
+                );
+                return true;
+            }
+
             await interruptActiveTurn();
             resetCurrentTurnState();
             const threadId = await resumeExistingThreadForCompact(message.mode);
@@ -3560,7 +3569,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
         while (!this.shouldExit) {
             logActiveHandles('loop-top');
-            if (!pending && recoveryInFlight) {
+            const queuedRecoveryCommand = parseCodexSpecialCommand(session.queue.peekMessage() ?? '');
+            if (!pending && recoveryInFlight && queuedRecoveryCommand.type !== 'compact') {
                 await waitForTurnOrRecovery(this.abortController.signal);
                 if (this.abortController.signal.aborted && !this.shouldExit) {
                     logger.debug('[codex]: Internal wait aborted while recovery was active; continuing');
@@ -3814,6 +3824,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         logger.debug('[codex-remote]: cleanup start');
+        this.session.queue.setOnMessage(null);
         this.appServerClient.setStderrHandler(null);
         try {
             await this.appServerClient.disconnect();

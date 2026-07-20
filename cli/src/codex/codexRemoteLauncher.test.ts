@@ -919,7 +919,8 @@ function createMode(): EnhancedMode {
 function createSessionStub(
     messages = ['hello from launcher test'],
     mode = createMode(),
-    isolateMessages = false
+    isolateMessages = false,
+    closeQueue = true
 ) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
     messages.forEach((message, index) => {
@@ -931,7 +932,9 @@ function createSessionStub(
             queue.push(message, mode);
         }
     });
-    queue.close();
+    if (closeQueue) {
+        queue.close();
+    }
 
     const sessionEvents: Array<{ type: string; [key: string]: unknown }> = [];
     const codexMessages: unknown[] = [];
@@ -1929,6 +1932,47 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents).not.toContainEqual({
             type: 'message',
             message: "Task failed: Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
+        });
+        expect(session.thinking).toBe(false);
+    });
+
+    it('acknowledges /compact while automatic compaction is still running', async () => {
+        harness.remainingThreadSystemErrors = 1;
+        harness.nextThreadSystemErrorMessage = "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.";
+        harness.deferCompactCompletion = true;
+        const mode = createMode();
+        const { session, sessionEvents } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.compactThreadIds).toEqual(['thread-1']);
+        });
+
+        session.queue.pushIsolateAndClear('/compact', mode);
+        await vi.waitFor(() => {
+            expect(sessionEvents).toContainEqual({
+                type: 'message',
+                message: 'Compaction already in progress; the failed request will retry automatically when it finishes'
+            });
+        });
+        expect(harness.compactThreadIds).toEqual(['thread-1']);
+
+        harness.dispatchNotification?.('item/completed', {
+            threadId: 'thread-1',
+            turnId: 'compact-1',
+            item: { id: 'compact-item-1', type: 'contextCompaction' }
+        });
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
+        });
+
+        session.queue.close();
+        const exitReason = await running;
+
+        expect(exitReason).toBe('exit');
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Context compacted; retrying same conversation'
         });
         expect(session.thinking).toBe(false);
     });
