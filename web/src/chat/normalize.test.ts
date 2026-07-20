@@ -13,6 +13,43 @@ function makeMessage(content: unknown): DecryptedMessage {
 }
 
 describe('normalizeDecryptedMessage', () => {
+    it('renders persisted agent message events', () => {
+        const message = makeMessage({
+            role: 'agent',
+            content: {
+                id: 'failure-1',
+                type: 'event',
+                data: {
+                    type: 'message',
+                    message: 'Task failed: upstream returned 413 Payload Too Large'
+                }
+            }
+        })
+
+        expect(normalizeDecryptedMessage(message)).toMatchObject({
+            id: 'msg-1',
+            role: 'event',
+            isSidechain: false,
+            content: {
+                type: 'message',
+                message: 'Task failed: upstream returned 413 Payload Too Large'
+            }
+        })
+    })
+
+    it('still hides persisted ready events', () => {
+        const message = makeMessage({
+            role: 'agent',
+            content: {
+                id: 'ready-1',
+                type: 'event',
+                data: { type: 'ready' }
+            }
+        })
+
+        expect(normalizeDecryptedMessage(message)).toBeNull()
+    })
+
     it('drops unsupported Claude system output records', () => {
         const message = makeMessage({
             role: 'agent',

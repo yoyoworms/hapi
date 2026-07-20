@@ -96,6 +96,48 @@ describe('cli session handlers', () => {
         })
     })
 
+    it('persists and broadcasts user-visible message events', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('message-event-session', {}, null, 'default')
+        const socket = new FakeSocket()
+        const webEvents: SyncEvent[] = []
+        const content = {
+            role: 'agent',
+            content: {
+                id: 'failure-1',
+                type: 'event',
+                data: {
+                    type: 'message',
+                    message: 'Task failed: Codex thread entered systemError'
+                }
+            }
+        }
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onWebappEvent: (event) => {
+                webEvents.push(event)
+            }
+        })
+
+        socket.trigger('message', {
+            sid: session.id,
+            message: content
+        })
+
+        expect(store.messages.getMessages(session.id)).toHaveLength(1)
+        expect(socket.roomEvents).toHaveLength(1)
+        expect(webEvents).toContainEqual(expect.objectContaining({
+            type: 'message-received',
+            sessionId: session.id,
+            message: expect.objectContaining({ content })
+        }))
+    })
+
     it('drops redundant goal status events before persistence and broadcast', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession('goal-status-session', {}, null, 'default')

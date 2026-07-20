@@ -417,8 +417,13 @@ export function isSkippableAgentContent(content: unknown): boolean {
     if (!isObject(content) || typeof content.type !== 'string') return false
 
     // Skip internal event types that should never be displayed
-    const internalTypes = new Set(['usage', 'ready', 'rate_limit_event', 'rate_limit_info', 'event'])
+    const internalTypes = new Set(['usage', 'ready', 'rate_limit_event', 'rate_limit_info'])
     if (internalTypes.has(content.type)) return true
+
+    if (content.type === 'event') {
+        const data = isObject(content.data) ? content.data : null
+        return !data || typeof data.type !== 'string' || HIDDEN_EVENT_TYPES.has(data.type)
+    }
 
     if (content.type !== 'output') return false
     const data = isObject(content.data) ? content.data : null

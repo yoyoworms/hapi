@@ -195,7 +195,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             ack?.()
             return
         }
-        if (_c?.type === 'event' || (_c?.role === 'agent' && _c?.content?.type === 'event')) {
+        // `message` events carry user-visible launcher failures (for example,
+        // exhausted Codex retries). Persist them like normal chat messages.
+        if (
+            agentEventType !== 'message'
+            && (_c?.type === 'event' || (_c?.role === 'agent' && _c?.content?.type === 'event'))
+        ) {
             ack?.()
             return
         }
