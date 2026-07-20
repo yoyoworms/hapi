@@ -11,6 +11,7 @@ import type { ConversationStatus } from '@/realtime/types'
 import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { getClaudeModelLabel } from '@hapi/protocol'
+import { formatCodexReasoningLabel, shouldShowCodexReasoningLabel } from '@/lib/codexStatusLabels'
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useAppContext } from '@/lib/app-context'
@@ -129,12 +130,6 @@ function formatTokenCount(tokens: number): string {
         return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1)}K`
     }
     return String(tokens)
-}
-
-function formatCodexReasoningLabel(effort?: string | null): string {
-    const normalized = effort?.trim().toLowerCase()
-    if (!normalized || normalized === 'default') return 'reasoning default'
-    return `reasoning ${normalized}`
 }
 
 function isCodexFastMode(model?: string | null, effort?: string | null): boolean {
@@ -407,7 +402,7 @@ export function StatusBar(props: {
         ].filter(Boolean).join('\n')
         : undefined
     const usageText = formatUsageText(props.usage, props.latestUsage)
-    const codexReasoningLabel = (props.agentFlavor === 'codex' || props.agentFlavor === 'opencode')
+    const codexReasoningLabel = shouldShowCodexReasoningLabel(props.agentFlavor)
         ? formatCodexReasoningLabel(props.modelReasoningEffort)
         : null
     // Prefer the explicit service tier (the real Fast-mode toggle) when set;

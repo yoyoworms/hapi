@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import type { AgentFlavor } from '@hapi/protocol'
+import type { AgentFlavor, PermissionMode } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
 import type { SpawnResponse } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
@@ -13,6 +13,7 @@ type SpawnInput = {
     modelReasoningEffort?: string
     yolo?: boolean
     sandbox?: boolean
+    permissionMode?: PermissionMode
     sessionType?: 'simple' | 'worktree'
     worktreeName?: string
 }
@@ -39,7 +40,8 @@ export function useSpawnSession(api: ApiClient | null): {
                 input.sessionType,
                 input.worktreeName,
                 input.effort,
-                input.sandbox
+                input.sandbox,
+                input.permissionMode
             )
         },
         onSuccess: () => {

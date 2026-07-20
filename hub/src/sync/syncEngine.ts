@@ -8,7 +8,7 @@
  */
 
 import { isKnownFlavor, type LocalResumeTarget, type ResumableSession } from '@hapi/protocol'
-import type { CursorMigrateOutcome, CursorMigrateToAcpRequest, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import type { CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { AgentAccountStatus, AgentFlavor, CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
 import { MetadataSchema } from '@hapi/protocol/schemas'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
@@ -31,10 +31,14 @@ import {
     type RpcGeneratedImageResponse,
     type RpcListDirectoryResponse,
     type RpcListCodexModelsResponse,
+    type RpcArchiveCodexSessionResponse,
     type RpcListCursorModelsResponse,
     type RpcListOpencodeModelsResponse,
+    type RpcListGrokModelsResponse,
+    type RpcListGrokReasoningEffortOptionsResponse,
     type RpcListOpencodeReasoningEffortOptionsResponse,
     type RpcCursorModel,
+    type RpcCursorChatStoreStatus,
     type RpcOpencodeModel,
     type RpcPathExistsResponse,
     type RpcReadFileResponse,
@@ -54,8 +58,11 @@ export type {
     RpcListCodexModelsResponse,
     RpcListCursorModelsResponse,
     RpcListOpencodeModelsResponse,
+    RpcListGrokModelsResponse,
+    RpcListGrokReasoningEffortOptionsResponse,
     RpcListOpencodeReasoningEffortOptionsResponse,
     RpcCursorModel,
+    RpcCursorChatStoreStatus,
     RpcOpencodeModel,
     RpcPathExistsResponse,
     RpcReadFileResponse,
@@ -93,6 +100,10 @@ export type LocalResumeTargetResult =
 export type LocalHandoffResult =
     | { type: 'success' }
     | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'handoff_failed' }
+
+export type CursorChatStoreStatusResult =
+    | { type: 'success'; status: CursorChatStoreStatus }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'resume_unavailable' | 'no_machine_online' | 'probe_failed' }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -201,6 +212,69 @@ export class SyncEngine {
         return this.sessionCache.getSessions()
     }
 
+    private resolveOnlineMachineForSession(
+        session: Session,
+        namespace: string,
+        options?: { strictMachineId?: boolean }
+    ): Machine | null {
+        const onlineMachines = this.machineCache.getOnlineMachinesByNamespace(namespace)
+        if (session.metadata?.machineId) {
+            const exact = onlineMachines.find((machine) => machine.id === session.metadata?.machineId)
+            if (exact) return exact
+            if (options?.strictMachineId) return null
+        }
+        if (session.metadata?.host) {
+            const hostMatch = onlineMachines.find((machine) => machine.metadata?.host === session.metadata?.host)
+            if (hostMatch) return hostMatch
+        }
+        return null
+    }
+
+    async getCursorChatStoreStatus(sessionId: string, namespace: string): Promise<CursorChatStoreStatusResult> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return {
+                type: 'error',
+                message: access.reason === 'access-denied' ? 'Session access denied' : 'Session not found',
+                code: access.reason === 'access-denied' ? 'access_denied' : 'session_not_found'
+            }
+        }
+
+        const metadata = access.session.metadata
+        if (metadata?.flavor !== 'cursor' || !metadata.path || !metadata.cursorSessionId) {
+            return {
+                type: 'error',
+                message: 'Cursor resume metadata is unavailable',
+                code: 'resume_unavailable'
+            }
+        }
+
+        const targetMachine = this.resolveOnlineMachineForSession(
+            access.session,
+            namespace,
+            { strictMachineId: true }
+        )
+        if (!targetMachine) {
+            return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
+        }
+
+        try {
+            const status = await this.rpcGateway.getCursorChatStoreStatus(
+                targetMachine.id,
+                metadata.path,
+                metadata.cursorSessionId,
+                metadata.homeDir
+            )
+            return { type: 'success', status }
+        } catch (error) {
+            return {
+                type: 'error',
+                message: error instanceof Error ? error.message : 'Failed to inspect Cursor chat store',
+                code: 'probe_failed'
+            }
+        }
+    }
+
     getSessionsByNamespace(namespace: string): Session[] {
         return this.sessionCache.getSessionsByNamespace(namespace)
     }
@@ -296,6 +370,10 @@ export class SyncEngine {
         }
     } {
         return this.messageService.getMessagesPage(sessionId, options)
+    }
+
+    getQueuedState(sessionId: string, localIds: string[]): QueuedStateResponse {
+        return this.messageService.getQueuedState(sessionId, localIds)
     }
 
     getSessionExport(sessionId: string, session: Session): HapiSessionExportResult {
@@ -489,9 +567,19 @@ export class SyncEngine {
         namespace: string,
         model?: string,
         effort?: string,
-        modelReasoningEffort?: string
+        modelReasoningEffort?: string,
+        requestedId?: string
     ): Session {
-        return this.sessionCache.getOrCreateSession(tag, metadata, agentState, namespace, model, effort, modelReasoningEffort)
+        return this.sessionCache.getOrCreateSession(
+            tag,
+            metadata,
+            agentState,
+            namespace,
+            model,
+            effort,
+            modelReasoningEffort,
+            requestedId
+        )
     }
 
     getOrCreateMachine(id: string, metadata: unknown, runnerState: unknown, namespace: string): Machine {
@@ -839,10 +927,11 @@ export class SyncEngine {
         worktreeName?: string,
         resumeSessionId?: string,
         effort?: string,
-        sandbox?: boolean,
-        continueLatest?: boolean,
         permissionMode?: PermissionMode,
-        serviceTier?: string
+        serviceTier?: string,
+        existingSessionId?: string,
+        sandbox?: boolean,
+        continueLatest?: boolean
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         return await this.rpcGateway.spawnSession(
             machineId,
@@ -855,10 +944,11 @@ export class SyncEngine {
             worktreeName,
             resumeSessionId,
             effort,
-            sandbox,
-            continueLatest,
             permissionMode,
-            serviceTier
+            serviceTier,
+            existingSessionId,
+            sandbox,
+            continueLatest
         )
     }
 
@@ -889,6 +979,7 @@ export class SyncEngine {
         if (flavor === 'codex') return metadata.codexSessionId ?? this.recoverCodexSessionIdFromMessages(session.id, namespace)
         if (flavor === 'gemini') return metadata.geminiSessionId ?? null
         if (flavor === 'opencode') return metadata.opencodeSessionId ?? null
+        if (flavor === 'grok') return metadata.grokSessionId ?? null
         if (flavor === 'cursor') return metadata.cursorSessionId ?? null
         if (flavor === 'kimi') return metadata.kimiSessionId ?? null
         if (flavor === 'pi') return metadata.piSessionId ?? null
@@ -1301,12 +1392,11 @@ export class SyncEngine {
             resumeToken = opts.resumeWithSessionId
         }
 
-        const onlineMachines = this.machineCache.getOnlineMachinesByNamespace(namespace)
-        if (onlineMachines.length === 0) {
-            return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
-        }
-
-        const targetMachine = this.findTargetMachine(onlineMachines, metadata)
+        const targetMachine = this.resolveOnlineMachineForSession(
+            session,
+            namespace,
+            { strictMachineId: flavor === 'cursor' }
+        )
         if (!targetMachine) {
             return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
         }
@@ -1334,9 +1424,36 @@ export class SyncEngine {
             }
         }
 
-        const preferredPermissionMode = opts?.permissionMode
-            ?? session.permissionMode
-            ?? session.metadata?.preferredPermissionMode
+        if (flavor === 'cursor' && resumeToken) {
+            try {
+                const chatStatus = await this.rpcGateway.getCursorChatStoreStatus(
+                    targetMachine.id,
+                    directory,
+                    resumeToken,
+                    metadata.homeDir
+                )
+                if (!chatStatus.onDisk) {
+                    return {
+                        type: 'error',
+                        message: 'Cursor chat data is no longer available on the recorded machine',
+                        code: 'resume_unavailable'
+                    }
+                }
+            } catch (error) {
+                return {
+                    type: 'error',
+                    message: error instanceof Error ? error.message : 'Failed to inspect Cursor chat store',
+                    code: 'resume_failed'
+                }
+            }
+        }
+
+        const metadataPermissionMode = session.metadata?.preferredPermissionMode
+        const preferredPermissionMode = metadataPermissionMode === 'yolo' && opts?.permissionMode === 'default'
+            ? metadataPermissionMode
+            : opts?.permissionMode
+                ?? session.permissionMode
+                ?? metadataPermissionMode
         let spawnResult = await this.rpcGateway.spawnSession(
             targetMachine.id,
             directory,
@@ -1348,18 +1465,29 @@ export class SyncEngine {
             undefined,
             resumeToken ?? undefined,
             session.effort ?? undefined,
-            undefined,
-            useContinue || undefined,
             preferredPermissionMode,
-            session.serviceTier ?? undefined
+            session.serviceTier ?? undefined,
+            access.sessionId,
+            undefined,
+            useContinue || undefined
         )
 
         // Fallback: if resume spawn fails, retry without resume token (start fresh session)
         if (spawnResult.type !== 'success') {
             spawnResult = await this.rpcGateway.spawnSession(
                 targetMachine.id,
-                metadata.path,
-                flavor
+                directory,
+                flavor,
+                session.model ?? undefined,
+                session.modelReasoningEffort ?? undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                session.effort ?? undefined,
+                preferredPermissionMode,
+                session.serviceTier ?? undefined,
+                access.sessionId
             )
         }
 
@@ -1403,6 +1531,7 @@ export class SyncEngine {
             }
         }
 
+        this.sessionCache.markSessionActive(spawnResult.sessionId)
         return { type: 'success', sessionId: spawnResult.sessionId }
     }
 
@@ -1750,6 +1879,7 @@ export class SyncEngine {
             && (prev?.claudeSessionId ?? null) === (next.claudeSessionId ?? null)
             && (prev?.geminiSessionId ?? null) === (next.geminiSessionId ?? null)
             && (prev?.opencodeSessionId ?? null) === (next.opencodeSessionId ?? null)
+            && (prev?.grokSessionId ?? null) === (next.grokSessionId ?? null)
             && (prev?.cursorSessionId ?? null) === (next.cursorSessionId ?? null)
             && (prev?.piSessionId ?? null) === (next.piSessionId ?? null)
             && (prev?.kimiSessionId ?? null) === (next.kimiSessionId ?? null)
@@ -1888,6 +2018,14 @@ export class SyncEngine {
         return await this.rpcGateway.listCodexModelsForMachine(machineId)
     }
 
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]) {
+        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds)
+    }
+
+    async archiveCodexSessionForMachine(machineId: string, sessionId: string): Promise<RpcArchiveCodexSessionResponse> {
+        return await this.rpcGateway.archiveCodexSessionForMachine(machineId, sessionId)
+    }
+
     async listCursorModelsForSession(sessionId: string): Promise<RpcListCursorModelsResponse> {
         return await this.rpcGateway.listCursorModelsForSession(sessionId)
     }
@@ -1902,6 +2040,18 @@ export class SyncEngine {
 
     async listOpencodeModelsForCwd(machineId: string, cwd: string): Promise<RpcListOpencodeModelsResponse> {
         return await this.rpcGateway.listOpencodeModelsForCwd(machineId, cwd)
+    }
+
+    async listGrokModelsForCwd(machineId: string, cwd: string): Promise<RpcListGrokModelsResponse> {
+        return await this.rpcGateway.listGrokModelsForCwd(machineId, cwd)
+    }
+
+    async listGrokModelsForSession(sessionId: string): Promise<RpcListGrokModelsResponse> {
+        return await this.rpcGateway.listGrokModelsForSession(sessionId)
+    }
+
+    async listGrokReasoningEffortOptionsForSession(sessionId: string): Promise<RpcListGrokReasoningEffortOptionsResponse> {
+        return await this.rpcGateway.listGrokReasoningEffortOptionsForSession(sessionId)
     }
 
     /** Generic Pi RPC — delegates to rpcGateway.callPiRpc. */

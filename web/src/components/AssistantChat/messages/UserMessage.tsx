@@ -1,4 +1,4 @@
-import { memo, useCallback, useState, type KeyboardEvent, type MouseEvent } from 'react'
+import { memo } from 'react'
 import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
 import { useHappyChatContext } from '@/components/AssistantChat/context'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
@@ -6,22 +6,18 @@ import { MessageStatusIndicator } from '@/components/AssistantChat/messages/Mess
 import { MessageAttachments } from '@/components/AssistantChat/messages/MessageAttachments'
 import { UserBubbleContent, getUserBubbleClassName, shouldShowMessageStatus } from '@/components/AssistantChat/messages/user-bubble'
 import { CliOutputBlock } from '@/components/CliOutputBlock'
-import { CopyIcon, CheckIcon } from '@/components/icons'
-import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 import { getConversationMessageAnchorId } from '@/chat/outline'
-import { MessageMetadata } from '@/components/AssistantChat/messages/MessageMetadata'
-import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
+import { MessageActions } from '@/components/AssistantChat/messages/MessageActions'
+import { CloseIcon } from '@/components/icons'
 
 function formatTimestamp(date: Date): string {
-    const h = date.getHours().toString().padStart(2, '0')
-    const m = date.getMinutes().toString().padStart(2, '0')
-    return `${h}:${m}`
+    const hours = date.getHours().toString().padStart(2, '0')
+    const minutes = date.getMinutes().toString().padStart(2, '0')
+    return `${hours}:${minutes}`
 }
 
 function HappyUserMessageImpl() {
     const ctx = useHappyChatContext()
-    const { copied, copy } = useCopyToClipboard()
-    const [showMetadata, setShowMetadata] = useState(false)
     const role = useAssistantState(({ message }) => message.role)
     const messageId = useAssistantState(({ message }) => message.id)
     const text = useAssistantState(({ message }) => {
@@ -58,23 +54,6 @@ function HappyUserMessageImpl() {
         if (custom?.kind !== 'cli-output') return ''
         return message.content.find((part) => part.type === 'text')?.text ?? ''
     })
-    const invokedAt = useAssistantState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.invokedAt)
-
-    const hasMetadata = invokedAt != null
-
-    const toggleMetadata = useCallback((event: MouseEvent<HTMLDivElement>) => {
-        const target = event.target as HTMLElement
-        if (target.closest('button, a, input, textarea, select')) return
-        setShowMetadata((open) => !open)
-    }, [])
-    const onMetadataKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
-        if (event.key !== 'Enter' && event.key !== ' ') return
-        const target = event.target as HTMLElement
-        if (target.closest('button, a, input, textarea, select')) return
-        event.preventDefault()
-        setShowMetadata((open) => !open)
-    }, [])
-
     if (role !== 'user') return null
     const canRetry = status === 'failed' && typeof localId === 'string' && Boolean(ctx.onRetryMessage)
     const onRetry = canRetry ? () => ctx.onRetryMessage!(localId) : undefined
@@ -86,26 +65,11 @@ function HappyUserMessageImpl() {
         return (
             <MessagePrimitive.Root
                 id={getConversationMessageAnchorId(messageId)}
-                className="scroll-mt-4 px-1 min-w-0 max-w-full overflow-x-clip"
+                className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full overflow-x-clip"
             >
                 <div className="ml-auto w-full max-w-[92%]">
                     <CliOutputBlock text={cliText} />
-                    <div className="mt-1 flex items-center justify-end gap-2">
-                        <MessageTimestamp className="text-[10px] leading-none text-[var(--app-hint)]" />
-                        {hasMetadata && (
-                            <button
-                                type="button"
-                                onClick={() => setShowMetadata((open) => !open)}
-                                aria-expanded={showMetadata}
-                                className="text-[10px] text-[var(--app-hint)] underline-offset-2 hover:text-[var(--app-fg)] hover:underline"
-                            >
-                                {showMetadata ? 'Hide info' : 'Show info'}
-                            </button>
-                        )}
-                    </div>
-                    {showMetadata && invokedAt != null && (
-                        <MessageMetadata invokedAt={invokedAt} />
-                    )}
+                    <MessageActions align="end" copyText={cliText} />
                 </div>
             </MessagePrimitive.Root>
         )
@@ -116,74 +80,45 @@ function HappyUserMessageImpl() {
 
     return (
         <>
-            {showTimestamp && createdAt && (
-                <div className="w-full text-center text-xs text-[var(--app-hint)] py-1 -mb-1">
+            {showTimestamp && createdAt ? (
+                <div className="w-full py-1 -mb-1 text-center text-xs text-[var(--app-hint)]">
                     {formatTimestamp(createdAt)}
                 </div>
-            )}
+            ) : null}
             <MessagePrimitive.Root
                 id={getConversationMessageAnchorId(messageId)}
-                className={`${getUserBubbleClassName(status)} group/msg scroll-mt-4 ${hasMetadata ? 'cursor-pointer' : ''} ${
-                    isQueued ? 'opacity-60 border-l-2 border-dashed border-[var(--app-hint)]' : ''
-                }`}
-                onClick={hasMetadata ? toggleMetadata : undefined}
-                onKeyDown={hasMetadata ? onMetadataKeyDown : undefined}
-                role={hasMetadata ? 'button' : undefined}
-                tabIndex={hasMetadata ? 0 : undefined}
-                aria-expanded={hasMetadata ? showMetadata : undefined}
+                className={`happy-message flex flex-col items-end scroll-mt-4 ${isQueued ? 'opacity-60' : ''}`}
             >
-                <div className="flex flex-col gap-1">
-                    <div className="flex items-start gap-2">
-                        <div className="min-w-0 flex-1">
-                            {hasText ? <UserBubbleContent text={text} /> : null}
-                            {hasAttachments ? <MessageAttachments attachments={attachments} /> : null}
+            <div className={`${getUserBubbleClassName(status)} ${isQueued ? 'border-l-2 border-dashed border-[var(--app-hint)]' : ''}`}>
+                <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                        {hasText ? <UserBubbleContent text={text} /> : null}
+                        {hasAttachments ? <MessageAttachments attachments={attachments} /> : null}
+                    </div>
+                    {(showStatus || isQueued) && (
+                        <div className="happy-message-actions-first-line flex shrink-0 items-center gap-1">
+                            {isQueued ? (
+                                <span className="whitespace-nowrap text-[10px] text-[var(--app-hint)]">
+                                    {status === 'paused' ? 'paused' : 'queued'}
+                                </span>
+                            ) : null}
+                            {canCancel ? (
+                                <button
+                                    type="button"
+                                    title="Cancel"
+                                    aria-label="Cancel queued message"
+                                    className="flex h-5 w-5 items-center justify-center rounded text-[var(--app-hint)] hover:bg-[var(--app-chat-user-chip-bg)] hover:text-[var(--app-fg)]"
+                                    onClick={() => ctx.onCancelQueued!(localId!)}
+                                >
+                                    <CloseIcon className="h-3.5 w-3.5" />
+                                </button>
+                            ) : null}
+                            {showStatus && !isQueued ? <MessageStatusIndicator status={status} onRetry={onRetry} /> : null}
                         </div>
-                        {(hasText || showStatus || isQueued) && (
-                            <div className="happy-message-actions-first-line flex shrink-0 items-center gap-1">
-                                {isQueued && (
-                                    <span className="text-[10px] text-[var(--app-hint)] whitespace-nowrap">
-                                        {status === 'paused' ? '⏸ paused' : '⏳ queued'}
-                                    </span>
-                                )}
-                                {canCancel && (
-                                    <button
-                                        type="button"
-                                        title="Cancel"
-                                        className="opacity-60 hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-[var(--app-subtle-bg)]"
-                                        onClick={(event) => {
-                                            event.stopPropagation()
-                                            ctx.onCancelQueued!(localId!)
-                                        }}
-                                    >
-                                        <svg className="h-3.5 w-3.5 text-[var(--app-hint)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                                    </button>
-                                )}
-                                {!isQueued && hasText && (
-                                    <button
-                                        type="button"
-                                        title="Copy"
-                                        className="rounded-md p-0.5 opacity-60 transition-[opacity,background-color] hover:bg-[var(--app-chat-user-chip-bg)] sm:opacity-0 sm:group-hover/msg:opacity-100"
-                                        onClick={(event) => {
-                                            event.stopPropagation()
-                                            copy(text)
-                                        }}
-                                    >
-                                        {copied
-                                            ? <CheckIcon className="h-3.5 w-3.5 text-green-500" />
-                                            : <CopyIcon className="h-3.5 w-3.5 text-[var(--app-hint)]" />}
-                                    </button>
-                                )}
-                                {showStatus && !isQueued ? <MessageStatusIndicator status={status} onRetry={onRetry} /> : null}
-                            </div>
-                        )}
-                    </div>
-                    <div className="flex justify-end">
-                        <MessageTimestamp className="text-[10px] leading-none text-[var(--app-hint)]" />
-                    </div>
-                    {showMetadata && invokedAt != null && (
-                        <MessageMetadata invokedAt={invokedAt} className="justify-end opacity-60" />
                     )}
                 </div>
+            </div>
+                <MessageActions align="end" copyText={!isQueued && hasText ? text : undefined} />
             </MessagePrimitive.Root>
         </>
     )

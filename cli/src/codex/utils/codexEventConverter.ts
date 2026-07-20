@@ -15,6 +15,11 @@ export type CodexMessage = {
     message: string;
     id: string;
 } | {
+    type: 'proposed_plan';
+    plan: string;
+    id: string;
+    turnId: string;
+} | {
     type: 'reasoning';
     message: string;
     id: string;
@@ -46,6 +51,8 @@ export type CodexConversionResult = {
         type: 'message';
         message: string;
     };
+    userActivity?: true;
+    finishedTurnId?: string;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -167,11 +174,9 @@ export function convertCodexEvent(rawEvent: unknown): CodexConversionResult | nu
             const message = asString(payloadRecord.message)
                 ?? asString(payloadRecord.text)
                 ?? asString(payloadRecord.content);
-            if (!message) {
-                return null;
-            }
             return {
-                userMessage: message
+                userActivity: true,
+                ...(message ? { userMessage: message } : {})
             };
         }
 
@@ -186,6 +191,53 @@ export function convertCodexEvent(rawEvent: unknown): CodexConversionResult | nu
                     message,
                     id: randomUUID()
                 }
+            };
+        }
+
+        if (eventType === 'item_completed') {
+            const item = asRecord(payloadRecord.item);
+            const itemType = asString(item?.type)?.toLowerCase();
+            const message = itemType === 'plan' ? asString(item?.text) : null;
+            const turnId = asString(payloadRecord.turn_id);
+            if (!message || message.trim().length === 0 || !turnId) {
+                return null;
+            }
+            return {
+                message: {
+                    type: 'proposed_plan',
+                    plan: message,
+                    id: asString(item?.id) ?? randomUUID(),
+                    turnId
+                }
+            };
+        }
+
+        if (eventType === 'task_complete' || eventType === 'turn_aborted') {
+            const turnId = asString(payloadRecord.turn_id);
+            return turnId ? { finishedTurnId: turnId } : null;
+        }
+
+        if (eventType === 'task_failed') {
+            const turnId = asString(payloadRecord.turn_id);
+            const errorRecord = asRecord(payloadRecord.error);
+            const willRetry = asBoolean(
+                payloadRecord.will_retry
+                ?? payloadRecord.willRetry
+                ?? errorRecord?.will_retry
+                ?? errorRecord?.willRetry
+            ) ?? false;
+            const message = willRetry ? null : extractErrorMessage(payloadRecord);
+            if (!turnId && !message) {
+                return null;
+            }
+            return {
+                ...(turnId ? { finishedTurnId: turnId } : {}),
+                ...(message ? {
+                    sessionEvent: {
+                        type: 'message' as const,
+                        message: formatVisibleErrorMessage(message)
+                    }
+                } : {})
             };
         }
 
@@ -230,7 +282,7 @@ export function convertCodexEvent(rawEvent: unknown): CodexConversionResult | nu
             };
         }
 
-        if (eventType === 'error' || eventType === 'task_failed' || eventType === 'stream_error') {
+        if (eventType === 'error' || eventType === 'stream_error') {
             const errorRecord = asRecord(payloadRecord.error);
             const willRetry = asBoolean(payloadRecord.will_retry ?? payloadRecord.willRetry ?? errorRecord?.will_retry ?? errorRecord?.willRetry) ?? false;
             if (willRetry) {
@@ -260,23 +312,7 @@ export function convertCodexEvent(rawEvent: unknown): CodexConversionResult | nu
         }
 
         if (itemType === 'message') {
-            const role = asString(payloadRecord.role);
-            const text = extractCodexText(payloadRecord.content);
-            if (!text) {
-                return null;
-            }
-            if (role === 'user') {
-                return { userMessage: text };
-            }
-            if (role === 'assistant') {
-                return {
-                    message: {
-                        type: 'message',
-                        message: text,
-                        id: randomUUID()
-                    }
-                };
-            }
+            // Response messages are model conversation state; event_msg carries visible chat.
             return null;
         }
 

@@ -26,7 +26,7 @@ import { validateWorkspaceDirectory } from './validateWorkspaceDirectory';
 import { join } from 'path';
 import { buildMachineMetadata } from '@/agent/sessionFactory';
 import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
-import { hashRunnerCliApiToken } from './runnerIdentity';
+import { hashRunnerCliApiToken, hashRunnerExtraHeaders } from './runnerIdentity';
 import { scheduleCursorModelsPrewarm } from '@/modules/common/cursorModelsPrewarm';
 
 export async function startRunner(options: { workspaceRoots?: string[] } = {}): Promise<void> {
@@ -337,20 +337,27 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       }
 
       if (sessionType === 'worktree') {
-        const worktreeResult = await createWorktree({
-          basePath: directory,
-          nameHint: worktreeName
-        });
-        if (!worktreeResult.ok) {
-          logger.debug(`[RUNNER RUN] Worktree creation failed: ${worktreeResult.error}`);
-          return {
-            type: 'error',
-            errorMessage: worktreeResult.error
-          };
+        // Cursor Agent has native `--worktree` under ~/.cursor/worktrees/. Prefer that
+        // over HAPI's sibling-directory worktree so Cursor sandbox/skills see the same layout.
+        if (agent === 'cursor') {
+          spawnDirectory = directory;
+          logger.debug(`[RUNNER RUN] Cursor-native worktree requested (nameHint=${worktreeName ?? '(auto)'})`);
+        } else {
+          const worktreeResult = await createWorktree({
+            basePath: directory,
+            nameHint: worktreeName
+          });
+          if (!worktreeResult.ok) {
+            logger.debug(`[RUNNER RUN] Worktree creation failed: ${worktreeResult.error}`);
+            return {
+              type: 'error',
+              errorMessage: worktreeResult.error
+            };
+          }
+          worktreeInfo = worktreeResult.info;
+          spawnDirectory = worktreeInfo.worktreePath;
+          logger.debug(`[RUNNER RUN] Created worktree ${worktreeInfo.worktreePath} (branch ${worktreeInfo.branch})`);
         }
-        worktreeInfo = worktreeResult.info;
-        spawnDirectory = worktreeInfo.worktreePath;
-        logger.debug(`[RUNNER RUN] Created worktree ${worktreeInfo.worktreePath} (branch ${worktreeInfo.branch})`);
       }
 
       const cleanupWorktree = async () => {
@@ -772,6 +779,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       startedWithApiUrl: configuration.apiUrl,
       startedWithMachineId: machineId,
       startedWithCliApiTokenHash: hashRunnerCliApiToken(configuration.cliApiToken),
+      startedWithExtraHeadersHash: hashRunnerExtraHeaders(configuration.extraHeaders),
       startedWithArgv,
       startedWithVersionHandoffDisabled,
       runnerLogPath: logger.logFilePath
@@ -1049,6 +1057,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           startedWithApiUrl: fileState.startedWithApiUrl,
           startedWithMachineId: fileState.startedWithMachineId,
           startedWithCliApiTokenHash: fileState.startedWithCliApiTokenHash,
+          startedWithExtraHeadersHash: fileState.startedWithExtraHeadersHash,
           startedWithArgv,
           startedWithVersionHandoffDisabled,
           lastHeartbeat: new Date().toLocaleString(),
@@ -1118,13 +1127,15 @@ export function buildCliArgs(
     ? 'codex'
     : agent === 'cursor'
       ? 'cursor'
-      : agent === 'kimi'
-        ? 'kimi'
-        : agent === 'opencode'
-          ? 'opencode'
-          : agent === 'pi'
-            ? 'pi'
-            : 'claude';
+      : agent === 'grok'
+        ? 'grok'
+        : agent === 'kimi'
+          ? 'kimi'
+          : agent === 'opencode'
+            ? 'opencode'
+            : agent === 'pi'
+              ? 'pi'
+              : 'claude';
   const args = [agentCommand];
   if (options.resumeSessionId) {
     if (agent === 'codex') {
@@ -1141,10 +1152,16 @@ export function buildCliArgs(
     args.push('--continue');
   }
   args.push('--hapi-starting-mode', 'remote', '--started-by', 'runner');
+  if (agent === 'codex') {
+    const existingSessionId = options.existingSessionId ?? options.sessionId;
+    if (existingSessionId) {
+      args.push('--existing-session-id', existingSessionId);
+    }
+  }
   if (options.model) {
     args.push('--model', options.model);
   }
-  if (options.effort && (agent === 'claude' || agent === 'pi')) {
+  if (options.effort && (agent === 'claude' || agent === 'grok' || agent === 'pi')) {
     args.push('--effort', options.effort);
   }
   if (options.modelReasoningEffort && (agent === 'codex' || agent === 'opencode')) {
@@ -1160,6 +1177,13 @@ export function buildCliArgs(
       args.push('--permission-mode', options.permissionMode);
     } else if (yolo) {
       args.push('--yolo');
+    }
+  }
+  if (agent === 'cursor' && options.sessionType === 'worktree') {
+    args.push('--cursor-worktree');
+    const name = options.worktreeName?.trim();
+    if (name) {
+      args.push(name);
     }
   }
   return args;

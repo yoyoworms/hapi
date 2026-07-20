@@ -7,6 +7,7 @@ import type {
     CodexDesktopScriptResponse,
     CodexDesktopSyncRequest,
     CodexDesktopStatusResponse,
+    CodexArchiveSessionResponse,
     CodexCollaborationMode,
     FileSearchResponse,
     MachinesResponse,
@@ -28,15 +29,19 @@ import type {
     CodexModelsResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
+    CursorChatStoreStatus,
     CursorModelsResponse,
     DeleteUploadResponse,
     FileReadResponse,
     GitCommandResponse,
+    GrokModelsResponse,
+    GrokReasoningEffortResponse,
     ListDirectoryResponse,
     MachineListDirectoryResponse,
     MachinePathsExistsResponse,
     OpencodeModelsResponse,
     OpencodeReasoningEffortResponse,
+    QueuedStateResponse,
     ReopenSessionResponse,
     UploadFileResponse
 } from '@hapi/protocol/apiTypes'
@@ -241,8 +246,19 @@ export class ApiClient {
         })
     }
 
-    async getCodexSessions(): Promise<CodexLocalSessionsResponse> {
-        return await this.request<CodexLocalSessionsResponse>('/api/codex/sessions')
+    async getCodexSessions(cwd?: string | null, machineId?: string | null): Promise<CodexLocalSessionsResponse> {
+        const params = new URLSearchParams()
+        if (cwd?.trim()) params.set('cwd', cwd.trim())
+        if (machineId?.trim()) params.set('machineId', machineId.trim())
+        const query = params.size ? `?${params.toString()}` : ''
+        return await this.request<CodexLocalSessionsResponse>(`/api/codex/sessions${query}`)
+    }
+
+    async archiveCodexSession(sessionId: string, machineId?: string | null): Promise<CodexArchiveSessionResponse> {
+        return await this.request<CodexArchiveSessionResponse>('/api/codex/archive-session', {
+            method: 'POST',
+            body: JSON.stringify({ sessionId, machineId: machineId ?? undefined })
+        })
     }
 
     async getCodexDesktopStatus(): Promise<CodexDesktopStatusResponse> {
@@ -437,6 +453,12 @@ export class ApiClient {
         return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/resume-options`)
     }
 
+    async getCursorChatStoreStatus(sessionId: string): Promise<CursorChatStoreStatus> {
+        return await this.request<CursorChatStoreStatus>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/cursor-chat-store`
+        )
+    }
+
     async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
@@ -447,6 +469,16 @@ export class ApiClient {
                 scheduledAt: scheduledAt ?? undefined
             })
         })
+    }
+
+    async getQueuedState(sessionId: string, localIds: string[]): Promise<QueuedStateResponse> {
+        return await this.request<QueuedStateResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/messages/queued-state`,
+            {
+                method: 'POST',
+                body: JSON.stringify({ localIds })
+            }
+        )
     }
 
     async cancelMessage(sessionId: string, messageId: string): Promise<CancelMessageResponse> {
@@ -651,11 +683,23 @@ export class ApiClient {
         sessionType?: 'simple' | 'worktree',
         worktreeName?: string,
         effort?: string,
-        sandbox?: boolean
+        sandbox?: boolean,
+        permissionMode?: PermissionMode
     ): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
-            body: JSON.stringify({ directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, effort, sandbox })
+            body: JSON.stringify({
+                directory,
+                agent,
+                model,
+                modelReasoningEffort,
+                yolo,
+                sessionType,
+                worktreeName,
+                effort,
+                sandbox,
+                permissionMode
+            })
         })
     }
 
@@ -706,6 +750,24 @@ export class ApiClient {
     async getMachineOpencodeModelsForCwd(machineId: string, cwd: string): Promise<OpencodeModelsResponse> {
         return await this.request<OpencodeModelsResponse>(
             `/api/machines/${encodeURIComponent(machineId)}/opencode-models?cwd=${encodeURIComponent(cwd)}`
+        )
+    }
+
+    async getMachineGrokModelsForCwd(machineId: string, cwd: string): Promise<GrokModelsResponse> {
+        return await this.request<GrokModelsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/grok-models?cwd=${encodeURIComponent(cwd)}`
+        )
+    }
+
+    async getSessionGrokModels(sessionId: string): Promise<GrokModelsResponse> {
+        return await this.request<GrokModelsResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/grok-models`
+        )
+    }
+
+    async getSessionGrokReasoningEffortOptions(sessionId: string): Promise<GrokReasoningEffortResponse> {
+        return await this.request<GrokReasoningEffortResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/grok-reasoning-effort-options`
         )
     }
 

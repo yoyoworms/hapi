@@ -1,6 +1,7 @@
 import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
 import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
+import { parseAgentTimestampMs } from '@/chat/agentTimestamp'
 
 function normalizeToolResultPermissions(value: unknown): ToolResultPermission | undefined {
     if (!isObject(value)) return undefined
@@ -230,6 +231,7 @@ function normalizeAssistantOutput(
     const uuid = asString(data.uuid) ?? messageId
     const parentUUID = asString(data.parentUuid) ?? null
     const isSidechain = Boolean(data.isSidechain)
+    const agentTimestamp = parseAgentTimestampMs(data.timestamp)
 
     const message = isObject(data.message) ? data.message : null
     if (!message) return null
@@ -273,6 +275,7 @@ function normalizeAssistantOutput(
         isSidechain,
         content: blocks,
         meta,
+        agentTimestamp,
         usage: inputTokens !== null && outputTokens !== null ? {
             input_tokens: inputTokens,
             output_tokens: outputTokens,
@@ -294,6 +297,7 @@ function normalizeUserOutput(
     const uuid = asString(data.uuid) ?? messageId
     const parentUUID = asString(data.parentUuid) ?? null
     const isSidechain = Boolean(data.isSidechain)
+    const agentTimestamp = parseAgentTimestampMs(data.timestamp)
 
     const message = isObject(data.message) ? data.message : null
     if (!message) return null
@@ -307,7 +311,8 @@ function normalizeUserOutput(
             createdAt,
             role: 'agent',
             isSidechain: true,
-            content: [{ type: 'sidechain', uuid, parentUUID, prompt: messageContent }]
+            content: [{ type: 'sidechain', uuid, parentUUID, prompt: messageContent }],
+            agentTimestamp
         }
     }
 
@@ -326,7 +331,8 @@ function normalizeUserOutput(
             createdAt,
             role: 'agent',
             isSidechain: true,
-            content: [{ type: 'sidechain', uuid, parentUUID, prompt: messageContent }]
+            content: [{ type: 'sidechain', uuid, parentUUID, prompt: messageContent }],
+            agentTimestamp
         }
     }
 
@@ -345,7 +351,8 @@ function normalizeUserOutput(
                 createdAt,
                 role: 'agent',
                 isSidechain: true,
-                content: [{ type: 'sidechain', uuid, parentUUID, prompt: textParts.join('\n\n') }]
+                content: [{ type: 'sidechain', uuid, parentUUID, prompt: textParts.join('\n\n') }],
+                agentTimestamp
             }
         }
     }
@@ -366,7 +373,8 @@ function normalizeUserOutput(
                 role: 'user',
                 isSidechain: false,
                 content: { type: 'text', text: textParts.join('\n\n') },
-                meta
+                meta,
+                agentTimestamp
             }
         }
     }
@@ -409,7 +417,8 @@ function normalizeUserOutput(
         role: 'agent',
         isSidechain,
         content: blocks,
-        meta
+        meta,
+        agentTimestamp
     }
 }
 
@@ -429,6 +438,10 @@ export function isSkippableAgentContent(content: unknown): boolean {
     const data = isObject(content.data) ? content.data : null
     if (!data) return false
     if (Boolean(data.isMeta) || Boolean(data.isCompactSummary)) return true
+    // A recap with no text is pure noise — drop it here rather than let it reach
+    // the away_summary branch (a bare "recap:" row) or, via a null return, fall
+    // through to the raw-JSON stringify fallback in normalize.ts.
+    if (data.type === 'system' && data.subtype === 'away_summary' && !asString(data.content)?.trim()) return true
     return !isClaudeChatVisibleMessage({ type: data.type, subtype: data.subtype })
 }
 
@@ -497,6 +510,22 @@ export function normalizeAgentRecord(
                     type: 'turn-duration',
                     durationMs: asNumber(data.durationMs) ?? 0,
                     targetMessageId: asString(data.messageId) ?? undefined
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+        if (data.type === 'system' && data.subtype === 'away_summary') {
+            // Recap text lives in `content`. Empty recaps are dropped upstream by
+            // isSkippableAgentContent, so content is a non-empty string here.
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'recap',
+                    text: asString(data.content) ?? ''
                 },
                 isSidechain: false,
                 meta

@@ -188,8 +188,8 @@ export function addMessage(
     // buffer through a fresh socket whose in-memory dedup set has been reset —
     // cannot re-insert the same message. (This was the cause of ~1GB of exact
     // duplicate rows: agent messages have no localId, so the unique local_id
-    // index never applied, and the consecutive-only fallback below missed
-    // multi-message replays.)
+    // index never applied.) Messages without a stable UUID are deliberately
+    // preserved because identical adjacent text can represent distinct turns.
     const contentUuid = extractContentUuid(content)
     if (!localId) {
         if (contentUuid) {
@@ -198,18 +198,6 @@ export function addMessage(
             ).get(sessionId, contentUuid) as DbMessageRow | undefined
             if (existing) {
                 return toStoredMessage(existing)
-            }
-        } else {
-            // No stable uuid: fall back to collapsing a consecutive duplicate of
-            // the immediately-preceding message (e.g. repeated user text).
-            const dedupeKey = getMessageMergeDedupeKey(content)
-            if (dedupeKey) {
-                const latest = db.prepare(
-                    'SELECT * FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1'
-                ).get(sessionId) as DbMessageRow | undefined
-                if (latest && getMessageMergeDedupeKey(safeJsonParse(latest.content)) === dedupeKey) {
-                    return toStoredMessage(latest)
-                }
             }
         }
     }
@@ -413,6 +401,35 @@ export function getUninvokedLocalMessages(
         'SELECT * FROM messages WHERE session_id = ? AND invoked_at IS NULL AND local_id IS NOT NULL ORDER BY seq ASC'
     ).all(sessionId) as DbMessageRow[]
     return rows.map(toStoredMessage)
+}
+
+export type LocalMessageState = {
+    localId: string
+    invokedAt: number | null
+}
+
+export function getLocalMessageStates(
+    db: Database,
+    sessionId: string,
+    localIds: string[]
+): LocalMessageState[] {
+    if (localIds.length === 0) {
+        return []
+    }
+    const placeholders = localIds.map(() => '?').join(', ')
+    const rows = db.prepare(`
+        SELECT local_id, invoked_at
+        FROM messages
+        WHERE session_id = ? AND local_id IN (${placeholders})
+        ORDER BY seq ASC
+    `).all(sessionId, ...localIds) as Array<{
+        local_id: string
+        invoked_at: number | null
+    }>
+    return rows.map((row) => ({
+        localId: row.local_id,
+        invokedAt: row.invoked_at
+    }))
 }
 
 /** Returns scheduled messages across all sessions whose scheduled_at <= beforeTime

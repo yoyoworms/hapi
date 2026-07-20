@@ -39,6 +39,7 @@ export type {
     CodexPermissionMode,
     CursorPermissionMode,
     GeminiPermissionMode,
+    GrokPermissionMode,
     KimiPermissionMode,
     OpencodePermissionMode,
     PermissionMode,

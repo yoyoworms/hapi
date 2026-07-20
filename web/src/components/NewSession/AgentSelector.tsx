@@ -1,7 +1,7 @@
-import { CREATABLE_AGENT_FLAVORS } from '@hapi/protocol'
+import { CREATABLE_AGENT_FLAVORS, getFlavorLabel } from '@hapi/protocol'
 import type { AgentType } from './types'
+import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
 import { useTranslation } from '@/lib/use-translation'
-import { AgentIcon, agentIconColor, getAgentDisplayName } from '@/components/AgentIcon'
 
 export function AgentSelector(props: {
     agent: AgentType
@@ -30,10 +30,8 @@ export function AgentSelector(props: {
                             disabled={props.isDisabled}
                             className="accent-[var(--app-link)]"
                         />
-                        <span className="inline-flex items-center gap-1.5 text-sm">
-                            <AgentIcon agent={agentType} className={`h-4 w-4 ${agentIconColor(agentType)}`} />
-                            {getAgentDisplayName(agentType)}
-                        </span>
+                        <AgentFlavorIcon flavor={agentType} className="h-4 w-4 shrink-0" />
+                        <span className="text-sm">{getFlavorLabel(agentType)}</span>
                     </label>
                 ))}
             </div>

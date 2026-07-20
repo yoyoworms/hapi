@@ -215,7 +215,11 @@ export function useSendMessage(
             await api.sendMessage(input.sessionId, input.text, input.localId, input.attachments, input.scheduledAt)
         },
         onSuccess: (_, input) => {
-            updateMessageStatus(input.sessionId, input.localId, 'sent')
+            updateMessageStatus(
+                input.sessionId,
+                input.localId,
+                thinkingRef.current ? 'queued' : 'sent'
+            )
             if (!thinkingRef.current) {
                 scheduleTurnLockRelease(input.sessionId, input.localId)
             }

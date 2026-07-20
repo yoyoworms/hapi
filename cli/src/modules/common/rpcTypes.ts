@@ -4,6 +4,7 @@ export interface SpawnSessionOptions {
     machineId?: string
     directory: string
     sessionId?: string
+    existingSessionId?: string
     resumeSessionId?: string
     continueLatest?: boolean
     approvedNewDirectoryCreation?: boolean
