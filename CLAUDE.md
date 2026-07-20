@@ -53,18 +53,21 @@ bun run test             # all packages
 This fork (`yoyoworms/hapi`) deploys to `liuxinhapi.1to10.cn`, **not** to `hapi.1to10.cn` (that's upstream `tiann/hapi`).
 
 ```bash
-bun run deploy:liuxin          # full deploy: tests + typecheck + rsync + remote build + pm2 restart
+bun run deploy:liuxin          # full deploy: tests + local web build + rsync + remote hub build + restart
 bun run deploy:liuxin:fast     # same but --skip-tests
 scripts/deploy-liuxinhapi.sh --dry-run   # preview without changing remote
 ```
 
 What the script does:
 1. Runs focused local tests + `bun typecheck`
-2. Creates a timestamped tar backup on remote at `/home/ubuntu/hapi-liuxin-src-backup-<ts>.tar.gz`
-3. rsyncs working tree to `ubuntu@liuxinhapi.1to10.cn:/home/ubuntu/hapi-liuxin-src/` (excludes `node_modules`, `*/dist/`, `.git`)
-4. Remote: `bun install` + `build:web` + `generate:embedded-web-assets` + `build:hub`
-5. `pm2 restart hapi-hub-liuxin --update-env && pm2 save`
-6. Smoke checks `https://liuxinhapi.1to10.cn` and `/sw.js`
+2. Builds `web/dist` locally and calculates a deterministic digest
+3. Creates a timestamped tar backup, including the active Web and Hub runtime artifacts
+4. rsyncs source plus the local Web artifact to `ubuntu@liuxinhapi.1to10.cn:/home/ubuntu/hapi-liuxin-src/`
+5. Remote: frozen dependency install + `generate:embedded-web-assets` + `build:hub` (never rebuilds Web remotely)
+6. Verifies the uploaded Web digest, restarts `hapi-hub-liuxin`, and retries `/health`, `/`, and `/sw.js`
+7. Restores the previous Web/Hub runtime artifacts automatically if post-restart smoke checks fail
+
+The remote dependency directories are persistent. If an old Bun `.bun` layout is detected, the script cleans every workspace's `node_modules` and runs `bun install --frozen-lockfile` before building. This prevents multiple physical React copies from entering a browser bundle; the Web bundle itself always comes from the verified local build, and Vite rejects duplicate React runtimes if a contaminated environment is used manually.
 
 **CLI binary is not deployed by this script** — it's a local-dev artifact. To install/refresh the local CLI binary, build with `cd cli && bun run build:exe` and copy to `/opt/homebrew/lib/node_modules/@twsxtd/hapi/node_modules/@twsxtd/hapi-darwin-arm64/bin/hapi`, then codesign (see Common Pitfalls).
 

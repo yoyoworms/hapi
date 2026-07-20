@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 import { readFileSync } from 'node:fs'
@@ -56,6 +56,47 @@ function getVendorChunkName(id: string): string | undefined {
     return undefined
 }
 
+function rejectDuplicateReactRuntimes(): Plugin {
+    return {
+        name: 'reject-duplicate-react-runtimes',
+        generateBundle() {
+            const packageLocations = new Map<string, Set<string>>()
+
+            for (const moduleId of this.getModuleIds()) {
+                const normalizedId = moduleId.replaceAll('\0', '').replaceAll('\\', '/').split('?')[0]
+                const match = normalizedId.match(/\/node_modules\/(react(?:-dom)?)(?:\/|$)/)
+
+                if (!match || match.index === undefined) {
+                    continue
+                }
+
+                const packageName = match[1]
+                const packageRoot = normalizedId.slice(
+                    0,
+                    match.index + `/node_modules/${packageName}`.length
+                )
+                const locations = packageLocations.get(packageName) ?? new Set<string>()
+                locations.add(packageRoot)
+                packageLocations.set(packageName, locations)
+            }
+
+            const duplicates = [...packageLocations.entries()]
+                .filter(([, locations]) => locations.size > 1)
+                .map(([packageName, locations]) => {
+                    const paths = [...locations].map(location => `  - ${location}`).join('\n')
+                    return `${packageName}:\n${paths}`
+                })
+
+            if (duplicates.length > 0) {
+                throw new Error(
+                    `Duplicate React runtime packages detected:\n${duplicates.join('\n')}\n` +
+                    'Remove node_modules and reinstall from the lockfile before building.'
+                )
+            }
+        }
+    }
+}
+
 export default defineConfig({
     define: {
         __APP_VERSION__: JSON.stringify(`${appVersion}.${getBuildNumber()}`),
@@ -76,6 +117,7 @@ export default defineConfig({
         }
     },
     plugins: [
+        rejectDuplicateReactRuntimes(),
         react(),
         VitePWA({
             // User-controlled reload avoids mid-session surprise reloads (autoUpdate reloads all tabs).
