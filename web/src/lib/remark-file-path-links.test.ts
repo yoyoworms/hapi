@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
+import { decodeFileDownloadHref, decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
 
 type TestNode = {
     type: string
@@ -19,6 +19,20 @@ function transform(text: string): TestNode[] {
 
 function linkedPath(node: TestNode): string | null {
     return typeof node.url === 'string' ? decodeFilePathHref(node.url) : null
+}
+
+function transformLink(url: string): TestNode {
+    const link: TestNode = {
+        type: 'link',
+        url,
+        children: [{ type: 'text', value: 'Download' }]
+    }
+    const tree: TestNode = {
+        type: 'root',
+        children: [{ type: 'paragraph', children: [link] }]
+    }
+    remarkFilePathLinks()(tree)
+    return link
 }
 
 describe('remarkFilePathLinks', () => {
@@ -48,5 +62,23 @@ describe('remarkFilePathLinks', () => {
         const nodes = transform('Visit https://example.com/web/src/router.tsx')
 
         expect(nodes.some((node) => node.type === 'link')).toBe(false)
+    })
+
+    it('rewrites an explicit macOS file link as a remote download', () => {
+        const link = transformLink('/Users/liuxin/Documents/project/outputs/report.xlsx')
+
+        expect(decodeFileDownloadHref(link.url!)).toBe('/Users/liuxin/Documents/project/outputs/report.xlsx')
+    })
+
+    it('rewrites file and sandbox URLs without exposing those schemes to the browser', () => {
+        expect(decodeFileDownloadHref(transformLink('file:///Users/dev/project/report.pdf').url!))
+            .toBe('/Users/dev/project/report.pdf')
+        expect(decodeFileDownloadHref(transformLink('sandbox:/Users/dev/project/report.docx').url!))
+            .toBe('/Users/dev/project/report.docx')
+    })
+
+    it('rewrites an explicit relative output artifact but preserves web links', () => {
+        expect(decodeFileDownloadHref(transformLink('outputs/report.csv').url!)).toBe('outputs/report.csv')
+        expect(transformLink('https://example.com/report.csv').url).toBe('https://example.com/report.csv')
     })
 })

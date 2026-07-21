@@ -115,4 +115,27 @@ describe('ApiClient error mapping', () => {
         })
         expect(new Headers(init?.headers).get('content-type')).toBe('application/json')
     })
+
+    it('downloads a session-machine file through the authenticated Hub relay', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
+                status: 200,
+                headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+            })
+        )
+
+        const api = new ApiClient('test-token')
+        const blob = await api.getSessionFileBlob(
+            'session /?#',
+            '/Users/liuxin/project/outputs/周报.xlsx'
+        )
+
+        expect(Array.from(new Uint8Array(await blob.arrayBuffer()))).toEqual([0x50, 0x4b, 0x03, 0x04])
+        const [url, init] = fetchMock.mock.calls[0] ?? []
+        const parsed = new URL(String(url), 'https://hapi.test')
+        expect(parsed.pathname).toBe('/api/sessions/session%20%2F%3F%23/file/raw')
+        expect(parsed.searchParams.get('path')).toBe('/Users/liuxin/project/outputs/周报.xlsx')
+        expect(parsed.searchParams.get('download')).toBe('true')
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer test-token')
+    })
 })

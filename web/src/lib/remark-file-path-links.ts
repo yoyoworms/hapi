@@ -1,13 +1,15 @@
 const FILE_PATH_HREF_PREFIX = 'hapi-file:'
+const FILE_DOWNLOAD_HREF_PREFIX = 'hapi-file-download:'
 
 const PATH_PATTERN = /(?:\.\/|[A-Za-z0-9_.-]+\/)[^\s`"\'<>]*?\.(?:[A-Za-z0-9]{1,12}|lock)(?::\d+(?::\d+)?)?|(?:[A-Za-z0-9_.-]+\.(?:[A-Za-z0-9]{1,12}|lock))(?::\d+(?::\d+)?)?/g
 
 const TRAILING_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?'])
 const COMMON_FILE_EXTENSIONS = new Set([
-    'avif', 'bmp', 'c', 'cjs', 'cpp', 'css', 'gif', 'go', 'h', 'hpp', 'html', 'ico', 'java',
-    'jpeg', 'jpg', 'js', 'json', 'jsx', 'kt', 'lock', 'md', 'mdx', 'mjs', 'png', 'py', 'rs',
-    'scss', 'sh', 'sql', 'svg', 'swift', 'toml', 'ts', 'tsx', 'txt', 'vue', 'webp', 'xml',
-    'yaml', 'yml', 'zsh'
+    'avif', 'bmp', 'c', 'cjs', 'cpp', 'csv', 'css', 'doc', 'docx', 'gif', 'go', 'gz', 'h',
+    'hpp', 'html', 'ico', 'java', 'jpeg', 'jpg', 'js', 'json', 'jsx', 'kt', 'lock', 'md', 'mdx',
+    'mjs', 'ods', 'odt', 'pdf', 'png', 'ppt', 'pptx', 'py', 'rar', 'rs', 'scss', 'sh', 'sql',
+    'svg', 'swift', 'tar', 'toml', 'ts', 'tsx', 'txt', 'vue', 'webp', 'xls', 'xlsm', 'xlsx',
+    'xml', 'yaml', 'yml', 'zip', 'zsh'
 ])
 
 type MarkdownNode = {
@@ -22,10 +24,23 @@ function createFileHref(path: string): string {
     return `${FILE_PATH_HREF_PREFIX}${encodeURIComponent(path)}`
 }
 
+function createFileDownloadHref(path: string): string {
+    return `${FILE_DOWNLOAD_HREF_PREFIX}${encodeURIComponent(path)}`
+}
+
 export function decodeFilePathHref(href: string): string | null {
     if (!href.startsWith(FILE_PATH_HREF_PREFIX)) return null
     try {
         return decodeURIComponent(href.slice(FILE_PATH_HREF_PREFIX.length))
+    } catch {
+        return null
+    }
+}
+
+export function decodeFileDownloadHref(href: string): string | null {
+    if (!href.startsWith(FILE_DOWNLOAD_HREF_PREFIX)) return null
+    try {
+        return decodeURIComponent(href.slice(FILE_DOWNLOAD_HREF_PREFIX.length))
     } catch {
         return null
     }
@@ -79,6 +94,32 @@ function shouldLinkPath(value: string): boolean {
     return hasKnownFileExtension(path)
 }
 
+function decodeExplicitLocalFilePath(value: string): string | null {
+    let path = value.trim()
+    if (!path) return null
+
+    try {
+        path = decodeURIComponent(path)
+    } catch {
+        // Keep the original text when a literal percent sign is present.
+    }
+
+    if (path.startsWith('file://')) {
+        path = path.slice('file://'.length)
+    } else if (path.startsWith('sandbox:')) {
+        path = path.slice('sandbox:'.length)
+    } else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(path) && !/^[A-Za-z]:[\\/]/.test(path)) {
+        return null
+    }
+
+    path = stripLineSuffix(path)
+    if (!hasKnownFileExtension(path)) return null
+
+    const isAbsolute = path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
+    const isRelative = path.startsWith('./') || (!path.startsWith('../') && !path.startsWith('~/'))
+    return isAbsolute || isRelative ? path : null
+}
+
 function linkTextNode(node: MarkdownNode): MarkdownNode[] {
     const value = node.value ?? ''
     const parts: MarkdownNode[] = []
@@ -122,6 +163,13 @@ function linkTextNode(node: MarkdownNode): MarkdownNode[] {
 }
 
 function visit(node: MarkdownNode, parentType: string | null = null): void {
+    if (node.type === 'link' && typeof node.url === 'string') {
+        const explicitFilePath = decodeExplicitLocalFilePath(node.url)
+        if (explicitFilePath) {
+            node.url = createFileDownloadHref(explicitFilePath)
+        }
+        return
+    }
     if (!node.children) return
     if (parentType === 'link' || parentType === 'linkReference') return
 

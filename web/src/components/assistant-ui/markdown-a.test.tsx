@@ -14,6 +14,8 @@ import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-libra
 import React from 'react'
 import { defaultComponents, classifyScheme, denyOnlyTransform, UriConfirmProvider } from '@/components/assistant-ui/markdown-text'
 import { I18nProvider } from '@/lib/i18n-context'
+import { HappyChatProvider } from '@/components/AssistantChat/context'
+import { ToastProvider } from '@/lib/toast-context'
 
 // defaultComponents.a is the memoized A component.
 const AnchorComponent = (defaultComponents as Record<string, unknown>).a as React.ComponentType<
@@ -30,6 +32,30 @@ function renderA(props: React.ComponentPropsWithoutRef<'a'>) {
             <UriConfirmProvider>
                 <AnchorComponent {...props} />
             </UriConfirmProvider>
+        </I18nProvider>
+    )
+}
+
+function renderFileA(props: React.ComponentPropsWithoutRef<'a'>, api: object) {
+    return render(
+        <I18nProvider>
+            <ToastProvider>
+                <HappyChatProvider value={{
+                    api,
+                    sessionId: 'session-1',
+                    metadata: null,
+                    terminalToolDisplayMode: 'compact',
+                    disabled: false,
+                    onRefresh: vi.fn(),
+                    hasMoreMessages: false,
+                    isLoadingMoreMessages: false,
+                    loadOlderMessagesPreservingScroll: vi.fn(async () => false)
+                } as never}>
+                    <UriConfirmProvider>
+                        <AnchorComponent {...props} />
+                    </UriConfirmProvider>
+                </HappyChatProvider>
+            </ToastProvider>
         </I18nProvider>
     )
 }
@@ -213,6 +239,34 @@ describe('markdown <A> component — click handler', () => {
         fireEvent.click(document.querySelector('a')!)
         expect(openSpy).not.toHaveBeenCalled()
         openSpy.mockRestore()
+    })
+})
+
+describe('markdown <A> component — remote session file download', () => {
+    it('downloads an explicit local artifact through the authenticated API instead of navigating to the Hub path', async () => {
+        const filePath = '/Users/liuxin/project/outputs/周报.xlsx'
+        const getSessionFileBlob = vi.fn(async () => new Blob(['xlsx']))
+        const createObjectUrl = vi.fn(() => 'blob:hapi-download')
+        const revokeObjectUrl = vi.fn()
+        Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+        Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
+        const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+        renderFileA({
+            href: `hapi-file-download:${encodeURIComponent(filePath)}`,
+            children: 'Download Excel'
+        }, { getSessionFileBlob })
+
+        const link = screen.getByRole('link', { name: 'Download Excel' })
+        expect(link.getAttribute('href')).toContain('/sessions/session-1/file?path=')
+        fireEvent.click(link)
+
+        await waitFor(() => {
+            expect(getSessionFileBlob).toHaveBeenCalledWith('session-1', filePath)
+        })
+        expect(createObjectUrl).toHaveBeenCalled()
+        expect(anchorClick).toHaveBeenCalled()
+        expect(revokeObjectUrl).toHaveBeenCalledWith('blob:hapi-download')
     })
 })
 

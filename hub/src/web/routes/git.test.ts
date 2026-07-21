@@ -59,3 +59,32 @@ describe('generated images route', () => {
         expect(rpcCalls).toBe(0)
     })
 })
+
+describe('session file relay', () => {
+    it('returns authenticated Runner bytes as a browser download with the correct filename and MIME type', async () => {
+        const xlsxBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04])
+        const session = { id: 'session-1', namespace: 'default', active: true } as unknown as Session
+        const requestedPaths: string[] = []
+        const engine = {
+            resolveSessionAccess: () => ({ ok: true as const, sessionId: 'session-1', session }),
+            readSessionFile: async (_sessionId: string, filePath: string) => {
+                requestedPaths.push(filePath)
+                return { success: true, content: xlsxBytes.toString('base64') }
+            }
+        } as unknown as Partial<SyncEngine>
+
+        const response = await buildApp(engine).request(
+            '/api/sessions/session-1/file/raw?path=' + encodeURIComponent('outputs/周报.xlsx') + '&download=true'
+        )
+
+        expect(response.status).toBe(200)
+        expect(requestedPaths).toEqual(['outputs/周报.xlsx'])
+        expect(response.headers.get('content-type')).toBe(
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        expect(response.headers.get('content-disposition')).toBe(
+            "attachment; filename*=UTF-8''%E5%91%A8%E6%8A%A5.xlsx"
+        )
+        expect(Buffer.from(await response.arrayBuffer())).toEqual(xlsxBytes)
+    })
+})

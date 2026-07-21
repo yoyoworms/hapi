@@ -402,6 +402,48 @@ export class ApiClient {
         return await this.request<FileReadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/file?${params.toString()}`)
     }
 
+    async getSessionFileBlob(
+        sessionId: string,
+        path: string,
+        attempt: number = 0,
+        overrideToken?: string | null
+    ): Promise<Blob> {
+        const params = new URLSearchParams()
+        params.set('path', path)
+        params.set('download', 'true')
+
+        const headers = new Headers()
+        const liveToken = this.getToken ? this.getToken() : null
+        const authToken = overrideToken !== undefined
+            ? (overrideToken ?? (liveToken ?? this.token))
+            : (liveToken ?? this.token)
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+
+        const res = await fetch(this.buildUrl(
+            `/api/sessions/${encodeURIComponent(sessionId)}/file/raw?${params.toString()}`
+        ), { headers })
+
+        if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
+            const refreshed = await this.onUnauthorized()
+            if (refreshed) {
+                this.token = refreshed
+                return await this.getSessionFileBlob(sessionId, path, attempt + 1, refreshed)
+            }
+        }
+        if (!res.ok) {
+            const body = await res.text().catch(() => '')
+            throw new ApiError(
+                `HTTP ${res.status} ${res.statusText}: ${body}`,
+                res.status,
+                parseErrorCode(body),
+                body || undefined
+            )
+        }
+        return await res.blob()
+    }
+
     async listSessionDirectory(sessionId: string, path?: string): Promise<ListDirectoryResponse> {
         const params = new URLSearchParams()
         if (path) {

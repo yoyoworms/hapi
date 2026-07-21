@@ -23,8 +23,11 @@ import { MermaidDiagram } from '@/components/assistant-ui/mermaid-diagram'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 import { CopyIcon, CheckIcon } from '@/components/icons'
 import { useOptionalHappyChatContext } from '@/components/AssistantChat/context'
-import { decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
+import { decodeFileDownloadHref, decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
 import { UriConfirmDialog } from '@/components/UriConfirmDialog'
+import { downloadBlobFile } from '@/lib/file-download'
+import { useToast } from '@/lib/toast-context'
+import { useTranslation } from '@/lib/use-translation'
 
 import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 
@@ -423,30 +426,92 @@ function Code(props: ComponentPropsWithoutRef<'code'>) {
 
 function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & { filePath: string; sessionId: string }) {
     const navigate = useNavigate()
-    const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
-    const search = new URLSearchParams({ path: encodeBase64(props.filePath) }).toString()
-    const href = `/sessions/${encodeURIComponent(props.sessionId)}/file?${search}`
+    const { filePath, sessionId, onClick, className, rel: requestedRel, ...anchorProps } = props
+    const rel = anchorProps.target === '_blank' ? (requestedRel ?? 'noreferrer') : requestedRel
+    const search = new URLSearchParams({ path: encodeBase64(filePath) }).toString()
+    const href = `/sessions/${encodeURIComponent(sessionId)}/file?${search}`
 
     const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-        props.onClick?.(event)
+        onClick?.(event)
         if (event.defaultPrevented) return
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
 
         event.preventDefault()
         void navigate({
             to: '/sessions/$sessionId/file',
-            params: { sessionId: props.sessionId },
-            search: { path: encodeBase64(props.filePath) }
+            params: { sessionId },
+            search: { path: encodeBase64(filePath) }
         })
     }
 
     return (
         <a
-            {...props}
+            {...anchorProps}
             href={href}
             rel={rel}
             onClick={handleClick}
-            className={cn('aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3', props.className)}
+            className={cn('aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3', className)}
+        />
+    )
+}
+
+function FileDownloadAnchor(props: ComponentPropsWithoutRef<'a'> & {
+    api: NonNullable<ReturnType<typeof useOptionalHappyChatContext>>['api']
+    filePath: string
+    sessionId: string
+}) {
+    const toast = useToast()
+    const { t } = useTranslation()
+    const [downloading, setDownloading] = useState(false)
+    const {
+        api,
+        filePath,
+        sessionId,
+        onClick,
+        className,
+        rel: requestedRel,
+        ...anchorProps
+    } = props
+    const search = new URLSearchParams({ path: encodeBase64(filePath) }).toString()
+    const href = `/sessions/${encodeURIComponent(sessionId)}/file?${search}`
+    const fileName = filePath.split(/[\\/]/).pop() || 'download'
+
+    const handleClick = async (event: MouseEvent<HTMLAnchorElement>) => {
+        onClick?.(event)
+        if (event.defaultPrevented) return
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+
+        event.preventDefault()
+        if (downloading) return
+
+        setDownloading(true)
+        try {
+            const blob = await api.getSessionFileBlob(sessionId, filePath)
+            downloadBlobFile(fileName, blob)
+        } catch (error) {
+            toast.addToast({
+                title: t('files.directories.download.error.title'),
+                body: error instanceof Error ? error.message : t('files.directories.download.error.default'),
+                sessionId,
+                url: href
+            })
+        } finally {
+            setDownloading(false)
+        }
+    }
+
+    return (
+        <a
+            {...anchorProps}
+            href={href}
+            rel={anchorProps.target === '_blank' ? (requestedRel ?? 'noreferrer') : requestedRel}
+            onClick={handleClick}
+            aria-busy={downloading}
+            className={cn(
+                'aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3',
+                downloading && 'cursor-wait opacity-70',
+                className
+            )}
         />
     )
 }
@@ -481,6 +546,7 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
     // <UriConfirmProvider> (or supply a mock UriConfirmContext.Provider).
     const ctx = useContext(UriConfirmContext)
     const filePath = typeof props.href === 'string' ? decodeFilePathHref(props.href) : null
+    const downloadPath = typeof props.href === 'string' ? decodeFileDownloadHref(props.href) : null
     const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
 
     if (filePath) {
@@ -488,6 +554,20 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
             return <>{props.children}</>
         }
         return <FilePathAnchor {...props} filePath={filePath} sessionId={chat.sessionId} />
+    }
+
+    if (downloadPath) {
+        if (!chat) {
+            return <>{props.children}</>
+        }
+        return (
+            <FileDownloadAnchor
+                {...props}
+                api={chat.api}
+                filePath={downloadPath}
+                sessionId={chat.sessionId}
+            />
+        )
     }
 
     const isAllowed = ctx?.isAllowed ?? (() => false)

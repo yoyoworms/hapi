@@ -166,6 +166,14 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         '.json': 'application/json',
         '.txt': 'text/plain',
         '.csv': 'text/csv',
+        '.xls': 'application/vnd.ms-excel',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.xlsm': 'application/vnd.ms-excel.sheet.macroEnabled.12',
+        '.doc': 'application/msword',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.ppt': 'application/vnd.ms-powerpoint',
+        '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        '.zip': 'application/zip',
         '.html': 'text/html',
         '.xml': 'application/xml',
         '.md': 'text/markdown',
@@ -203,11 +211,17 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         }
 
         const mimeType = getMimeType(parsed.data.path)
+        const fileName = parsed.data.path.split(/[\\/]/).pop() || 'download'
+        const download = parseBooleanParam(c.req.query('download')) === true
         return new Response(buffer, {
             headers: {
                 'content-type': mimeType,
                 'content-length': String(buffer.length),
                 'cache-control': 'private, max-age=60',
+                'x-content-type-options': 'nosniff',
+                ...(download ? {
+                    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`
+                } : {})
             }
         })
     })
