@@ -46,6 +46,13 @@
       },
       "description": "Allowed CORS origins. ENV: CORS_ORIGINS (comma-separated)"
     },
+    "autoArchiveIdleHours": {
+      "type": "integer",
+      "default": 48,
+      "minimum": 0,
+      "maximum": 8760,
+      "description": "Automatically archive safe, idle runner sessions after this many hours. Set 0 to disable. ENV: HAPI_AUTO_ARCHIVE_IDLE_HOURS"
+    },
     "telegramBotToken": {
       "type": "string",
       "description": "Telegram Bot API token from @BotFather. ENV: TELEGRAM_BOT_TOKEN"

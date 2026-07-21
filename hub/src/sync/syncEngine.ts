@@ -45,6 +45,7 @@ import {
     type RpcUploadFileResponse
 } from './rpcGateway'
 import { SessionCache } from './sessionCache'
+import { AutoArchiveService } from './autoArchive'
 
 export type { Session, SyncEvent } from '@hapi/protocol/types'
 export type { Machine } from './machineCache'
@@ -100,6 +101,10 @@ export type LocalResumeTargetResult =
 export type LocalHandoffResult =
     | { type: 'success' }
     | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'handoff_failed' }
+
+export interface SyncEngineOptions {
+    autoArchiveIdleHours?: number
+}
 
 export type CursorChatStoreStatusResult =
     | { type: 'success'; status: CursorChatStoreStatus }
@@ -160,6 +165,7 @@ export class SyncEngine {
     private readonly machineCache: MachineCache
     private readonly messageService: MessageService
     private readonly rpcGateway: RpcGateway
+    private readonly autoArchiveService: AutoArchiveService | null
     private inactivityTimer: NodeJS.Timeout | null = null
     /** Sessions that emitted `session-ready` (Cursor ACP load/newSession complete). */
     private readonly sessionReadyIds = new Set<string>()
@@ -168,7 +174,8 @@ export class SyncEngine {
         private readonly store: Store,
         io: Server,
         rpcRegistry: RpcRegistry,
-        sseManager: SSEManager
+        sseManager: SSEManager,
+        options: SyncEngineOptions = {}
     ) {
         this.eventPublisher = new EventPublisher(sseManager, (event) => this.resolveNamespace(event))
         this.sessionCache = new SessionCache(store, this.eventPublisher)
@@ -180,8 +187,19 @@ export class SyncEngine {
             (sessionId, updatedAt) => this.recordSessionActivity(sessionId, updatedAt)
         )
         this.rpcGateway = new RpcGateway(io, rpcRegistry)
+        const autoArchiveIdleHours = options.autoArchiveIdleHours ?? 0
+        this.autoArchiveService = autoArchiveIdleHours > 0
+            ? new AutoArchiveService({
+                idleHours: autoArchiveIdleHours,
+                getSessions: () => this.getSessions(),
+                getSession: (sessionId) => this.getSession(sessionId),
+                hasQueuedMessages: (sessionId) => this.store.messages.getUninvokedLocalMessages(sessionId).length > 0,
+                archiveSession: (sessionId, reason) => this.archiveSession(sessionId, { reason })
+            })
+            : null
         this.reloadAll()
         this.inactivityTimer = setInterval(() => this.expireInactive(), 5_000)
+        this.autoArchiveService?.start()
     }
 
     stop(): void {
@@ -189,6 +207,7 @@ export class SyncEngine {
             clearInterval(this.inactivityTimer)
             this.inactivityTimer = null
         }
+        this.autoArchiveService?.stop()
     }
 
     subscribe(listener: SyncEventListener): () => void {
@@ -647,7 +666,7 @@ export class SyncEngine {
         await this.rpcGateway.abortSession(sessionId)
     }
 
-    async archiveSession(sessionId: string): Promise<void> {
+    async archiveSession(sessionId: string, options?: { reason?: string }): Promise<void> {
         // tiann/hapi#916: when the CLI is already gone (e.g. after a
         // hub-restart cascade SIGTERMed the runner but the in-memory
         // `active` flag has not been reconciled yet) the kill-RPC throws
@@ -658,15 +677,32 @@ export class SyncEngine {
         // it inactive in the cache. Real RPC errors (timeout, protocol
         // failure) still propagate as 5xx.
         try {
-            await this.rpcGateway.killSession(sessionId)
+            if (options?.reason) {
+                await this.rpcGateway.killSession(sessionId, options.reason)
+            } else {
+                await this.rpcGateway.killSession(sessionId)
+            }
         } catch (error) {
             if (error instanceof RpcTargetMissingError) {
-                this.sessionCache.markSessionArchivedFromHub(sessionId, 'Archived from hub (CLI unreachable)')
+                this.sessionCache.markSessionArchivedFromHub(
+                    sessionId,
+                    options?.reason ?? 'Archived from hub (CLI unreachable)'
+                )
             } else {
                 throw error
             }
         }
+        if (options?.reason) {
+            // The normal runners stamp archive metadata themselves. Hub-side
+            // stamping also covers generic ACP runners and makes automatic
+            // archive metadata deterministic if the CLI exits first.
+            this.sessionCache.markSessionArchivedFromHub(sessionId, options.reason)
+        }
         this.handleSessionEnd({ sid: sessionId, time: Date.now() })
+    }
+
+    runAutoArchiveSweep(now: number = Date.now()): Promise<string[]> {
+        return this.autoArchiveService?.sweep(now) ?? Promise.resolve([])
     }
 
     /**

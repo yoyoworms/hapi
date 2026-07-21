@@ -142,8 +142,8 @@ export class RpcGateway {
         }
     }
 
-    async killSession(sessionId: string): Promise<void> {
-        await this.sessionRpc(sessionId, RPC_METHODS.KillSession, {})
+    async killSession(sessionId: string, reason?: string): Promise<void> {
+        await this.sessionRpc(sessionId, RPC_METHODS.KillSession, reason ? { reason } : {})
     }
 
     async handoffSessionToLocal(sessionId: string): Promise<void> {

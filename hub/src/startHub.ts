@@ -139,6 +139,10 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     console.log(`[Hub] HAPI_LISTEN_HOST: ${config.listenHost} (${formatSource(config.sources.listenHost)})`)
     console.log(`[Hub] HAPI_LISTEN_PORT: ${config.listenPort} (${formatSource(config.sources.listenPort)})`)
     console.log(`[Hub] HAPI_PUBLIC_URL: ${config.publicUrl} (${formatSource(config.sources.publicUrl)})`)
+    console.log(
+        `[Hub] Auto-archive: ${config.autoArchiveIdleHours > 0 ? `${config.autoArchiveIdleHours}h idle` : 'disabled'} ` +
+        `(${formatSource(config.sources.autoArchiveIdleHours)})`
+    )
 
     if (!config.telegramEnabled) {
         console.log('[Hub] Telegram: disabled (no TELEGRAM_BOT_TOKEN)')
@@ -197,7 +201,9 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         onMessagesConsumed: (sessionId) => syncEngine?.clearQueuedThinkingGrace(sessionId)
     })
 
-    syncEngine = new SyncEngine(store, socketServer.io, socketServer.rpcRegistry, sseManager)
+    syncEngine = new SyncEngine(store, socketServer.io, socketServer.rpcRegistry, sseManager, {
+        autoArchiveIdleHours: config.autoArchiveIdleHours
+    })
 
     const notificationChannels: NotificationChannel[] = [
         new PushNotificationChannel(pushService, sseManager, config.publicUrl)

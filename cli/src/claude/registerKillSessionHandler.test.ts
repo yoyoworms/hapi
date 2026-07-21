@@ -3,10 +3,9 @@ import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import { registerKillSessionHandler } from './registerKillSessionHandler'
 
 // tiann/hapi#914: the KillSession RPC is the authoritative "user-terminated"
-// signal because the hub only sends it when the operator clicks Archive in
-// the web UI. Out-of-band SIGTERM (hub-restart cascade, host-level `kill`)
-// hits the SIGTERM signal handler in runnerLifecycle, which now keeps the
-// default reason 'Hub restart' so the audit trail stays correct.
+// signal for user and automatic archive actions. Out-of-band SIGTERM
+// (hub-restart cascade, host-level `kill`) hits the SIGTERM signal handler in
+// runnerLifecycle, which keeps the default reason 'Hub restart'.
 describe('registerKillSessionHandler (tiann/hapi#914)', () => {
     function makeRegistry() {
         const handlers = new Map<string, (params?: unknown) => unknown>()
@@ -61,5 +60,25 @@ describe('registerKillSessionHandler (tiann/hapi#914)', () => {
         await handler?.()
 
         expect(cleanupAndExit).toHaveBeenCalled()
+    })
+
+    it('uses the archive reason supplied by the hub', async () => {
+        const registry = makeRegistry()
+        const lifecycle = {
+            setArchiveReason: vi.fn(),
+            cleanupAndExit: vi.fn(async () => {})
+        }
+
+        registerKillSessionHandler(
+            registry as unknown as Parameters<typeof registerKillSessionHandler>[0],
+            lifecycle
+        )
+
+        const handler = registry.handlers.get(RPC_METHODS.KillSession)
+        await handler?.({ reason: 'Auto-archived after 48 hours of inactivity' })
+
+        expect(lifecycle.setArchiveReason).toHaveBeenCalledWith(
+            'Auto-archived after 48 hours of inactivity'
+        )
     })
 })

@@ -51,6 +51,17 @@ function createGateway() {
 }
 
 describe('RpcGateway RPC timeouts', () => {
+    it('forwards an automatic archive reason to the session runner', async () => {
+        const { gateway, calls } = createGateway()
+
+        await gateway.killSession('session-1', 'Auto-archived after 48 hours of inactivity')
+
+        expect(calls).toEqual([{
+            method: 'session-1:killSession',
+            params: JSON.stringify({ reason: 'Auto-archived after 48 hours of inactivity' })
+        }])
+    })
+
     it('uses the default RPC timeout for regular machine RPCs', async () => {
         const { gateway, timeouts } = createGateway()
 

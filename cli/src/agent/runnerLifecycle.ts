@@ -28,7 +28,7 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
     // is the most common non-user cause). Genuine user actions (clicking
     // Archive in the web UI, or Ctrl-C in a local terminal) explicitly
     // reassign this via `setArchiveReason` BEFORE `cleanupAndExit` runs:
-    //   - KillSession RPC handler  → 'User terminated' (see registerKillSessionHandler)
+    //   - KillSession RPC handler  → supplied reason or 'User terminated'
     //   - SIGINT handler           → 'User terminated' (Ctrl-C in local terminal)
     //   - uncaughtException/Reject → 'Session crashed' (via markCrash)
     //

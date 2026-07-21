@@ -3,7 +3,7 @@ import { logger } from "@/lib";
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 
 interface KillSessionRequest {
-    // No parameters needed
+    reason?: string
 }
 
 interface KillSessionResponse {
@@ -14,10 +14,9 @@ interface KillSessionResponse {
 /**
  * tiann/hapi#914: callers can pass either a bare `cleanupAndExit` closure
  * (legacy) or an options object that lets the kill-RPC stamp an explicit
- * `archiveReason` before the lifecycle teardown runs. The hub only sends
- * KillSession when the operator clicked Archive in the UI, so this RPC is
- * the authoritative "user-terminated" signal; out-of-band SIGTERM from a
- * hub-restart cascade no longer collides with the default archive reason.
+ * `archiveReason` before the lifecycle teardown runs. The hub sends this
+ * RPC for explicit user archives and safe idle auto-archives; an optional
+ * reason keeps those paths distinguishable from out-of-band SIGTERM.
  */
 export interface KillSessionLifecycle {
     cleanupAndExit: () => Promise<void>;
@@ -32,15 +31,16 @@ export function registerKillSessionHandler(
         ? { cleanupAndExit: lifecycleOrCleanup }
         : lifecycleOrCleanup;
 
-    rpcHandlerManager.registerHandler<KillSessionRequest, KillSessionResponse>(RPC_METHODS.KillSession, async () => {
+    rpcHandlerManager.registerHandler<KillSessionRequest, KillSessionResponse>(RPC_METHODS.KillSession, async (request) => {
         logger.debug('Kill session request received');
 
-        // tiann/hapi#914: stamp the archive reason from the RPC path so the
-        // default in `runnerLifecycle.ts` can be reassigned away from
-        // 'User terminated'. A hub-restart-cascade SIGTERM does NOT go
-        // through this handler — it hits the SIGTERM signal handler — so
-        // those archives now stay labelled `'Hub restart'` (the new default).
-        lifecycle.setArchiveReason?.('User terminated');
+        // Stamp the archive reason before cleanup. A hub-restart-cascade
+        // SIGTERM does not go through this handler, so those archives keep
+        // the runner lifecycle's separate `Hub restart` reason.
+        const requestedReason = typeof request?.reason === 'string'
+            ? request.reason.trim().slice(0, 200)
+            : '';
+        lifecycle.setArchiveReason?.(requestedReason || 'User terminated');
 
         // This will start the cleanup process
         void lifecycle.cleanupAndExit();

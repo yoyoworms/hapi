@@ -182,6 +182,7 @@ On first run, HAPI:
 | `HAPI_LISTEN_PORT` | `3006` | `listenPort` | Hub HTTP port |
 | `HAPI_PUBLIC_URL` | - | `publicUrl` | Public URL for external access |
 | `CORS_ORIGINS` | - | `corsOrigins` | Allowed CORS origins (comma-separated) |
+| `HAPI_AUTO_ARCHIVE_IDLE_HOURS` | `48` | `autoArchiveIdleHours` | Auto-archive safe idle runner sessions; `0` disables it |
 | `TELEGRAM_BOT_TOKEN` | - | `telegramBotToken` | Telegram Bot API token |
 | `TELEGRAM_NOTIFICATION` | `true` | `telegramNotification` | Enable Telegram notifications |
 | `HAPI_RELAY_FORCE_TCP` | `false` | - | Force TCP mode for relay |
@@ -206,11 +207,14 @@ When ENV values are set and not present in settings.json, they are automatically
   "listenHost": "0.0.0.0",
   "listenPort": 3006,
   "publicUrl": "https://your-domain.com",
+  "autoArchiveIdleHours": 48,
   "extraHeaders": {
     "Cookie": "CF_Authorization=..."
   }
 }
 ```
+
+Auto-archive only applies to sessions launched by the runner that remain idle for the full threshold. Pinned sessions, local-control sessions, thinking sessions, background/team work, pending permission requests, and queued or scheduled messages are left running.
 
 JSON Schema: [settings.schema.json](https://hapi.run/schemas/settings.schema.json)
 </details>

@@ -20,6 +20,7 @@ export interface Settings {
     listenPort?: number
     publicUrl?: string
     corsOrigins?: string[]
+    autoArchiveIdleHours?: number
 }
 
 export function getSettingsFile(dataDir: string): string {
