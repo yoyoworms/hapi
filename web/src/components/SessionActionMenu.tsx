@@ -22,6 +22,7 @@ type SessionActionMenuProps = {
     onExport?: () => void
     onShare?: () => void
     onSyncCodex?: () => void
+    onSwitchCodexAccount?: () => void
     onArchive: () => void
     onReopen?: () => void
     reopenDisabledReason?: string
@@ -218,6 +219,28 @@ function SyncIcon(props: { className?: string }) {
     )
 }
 
+function AccountSwitchIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+            <circle cx="9" cy="7" r="4" />
+            <path d="m17 8 4-4" />
+            <path d="m17 4 4 4" />
+        </svg>
+    )
+}
+
 function TrashIcon(props: { className?: string }) {
     return (
         <svg
@@ -261,6 +284,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         onExport,
         onShare,
         onSyncCodex,
+        onSwitchCodexAccount,
         onArchive,
         onReopen,
         reopenDisabledReason,
@@ -317,6 +341,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleSyncCodex = () => {
         onClose()
         onSyncCodex?.()
+    }
+
+    const handleSwitchCodexAccount = () => {
+        onClose()
+        onSwitchCodexAccount?.()
     }
 
     const handleDelete = () => {
@@ -509,6 +538,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <SyncIcon className="text-[var(--app-hint)]" />
                         {t('session.action.syncCodex')}
+                    </button>
+                ) : null}
+
+                {onSwitchCodexAccount ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                        onClick={handleSwitchCodexAccount}
+                    >
+                        <AccountSwitchIcon className="text-[var(--app-hint)]" />
+                        {t('session.action.switchCodexAccount')}
                     </button>
                 ) : null}
 

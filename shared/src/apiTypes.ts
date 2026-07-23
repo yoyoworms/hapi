@@ -98,7 +98,9 @@ export const SessionPermissionModeRequestSchema = z.object({
 export type SessionPermissionModeRequest = z.infer<typeof SessionPermissionModeRequestSchema>
 
 export const ResumeSessionRequestSchema = z.object({
-    permissionMode: PermissionModeSchema.optional()
+    permissionMode: PermissionModeSchema.optional(),
+    resumeWithSessionId: z.string().min(1).optional(),
+    codexAccountId: z.string().min(1).optional()
 })
 
 export type ResumeSessionRequest = z.infer<typeof ResumeSessionRequestSchema>
@@ -323,6 +325,79 @@ export type QueuedStateResponse = {
     }>
 }
 
+export const CodexAccountLimitSchema = z.object({
+    usedPercent: z.number().min(0).max(100).nullable().optional(),
+    resetsAt: z.number().nullable().optional()
+})
+
+export const CodexAccountSummarySchema = z.object({
+    id: z.string().min(1),
+    label: z.string().min(1),
+    kind: z.enum(['system', 'managed', 'api']),
+    isDefault: z.boolean(),
+    authenticated: z.boolean(),
+    planType: z.string().nullable().optional(),
+    baseUrl: z.string().url().optional(),
+    model: z.string().min(1).optional(),
+    primaryLimit: CodexAccountLimitSchema.nullable().optional(),
+    secondaryLimit: CodexAccountLimitSchema.nullable().optional(),
+    error: z.string().nullable().optional()
+})
+
+export type CodexAccountSummary = z.infer<typeof CodexAccountSummarySchema>
+
+export const CodexAccountsResponseSchema = z.object({
+    success: z.boolean(),
+    accounts: z.array(CodexAccountSummarySchema),
+    defaultAccountId: z.string(),
+    error: z.string().optional()
+})
+
+export type CodexAccountsResponse = z.infer<typeof CodexAccountsResponseSchema>
+
+export const CodexAccountLoginStartResponseSchema = z.object({
+    success: z.boolean(),
+    attemptId: z.string().optional(),
+    accountId: z.string().optional(),
+    verificationUrl: z.string().optional(),
+    userCode: z.string().optional(),
+    error: z.string().optional()
+})
+
+export type CodexAccountLoginStartResponse = z.infer<typeof CodexAccountLoginStartResponseSchema>
+
+export const CodexAccountLoginStatusResponseSchema = z.object({
+    success: z.boolean(),
+    status: z.enum(['pending', 'completed', 'error', 'not_found']),
+    account: CodexAccountSummarySchema.optional(),
+    error: z.string().optional()
+})
+
+export type CodexAccountLoginStatusResponse = z.infer<typeof CodexAccountLoginStatusResponseSchema>
+
+export const AddCodexApiEndpointRequestSchema = z.object({
+    label: z.string().trim().min(1).max(80),
+    baseUrl: z.string().trim().url(),
+    apiKey: z.string().trim().min(1).max(8192),
+    model: z.string().trim().min(1).max(200)
+}).superRefine((value, context) => {
+    let url: URL
+    try {
+        url = new URL(value.baseUrl)
+    } catch {
+        return
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+        context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['baseUrl'],
+            message: 'Base URL must use http or https'
+        })
+    }
+})
+
+export type AddCodexApiEndpointRequest = z.infer<typeof AddCodexApiEndpointRequestSchema>
+
 export const SpawnSessionRequestSchema = z.object({
     directory: z.string().min(1),
     agent: AgentFlavorSchema.optional(),
@@ -331,6 +406,7 @@ export const SpawnSessionRequestSchema = z.object({
     modelReasoningEffort: z.string().optional(),
     yolo: z.boolean().optional(),
     permissionMode: PermissionModeSchema.optional(),
+    codexAccountId: z.string().min(1).optional(),
     sessionType: z.enum(['simple', 'worktree']).optional(),
     worktreeName: z.string().optional()
 })

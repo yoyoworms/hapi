@@ -15,6 +15,8 @@ export interface SpawnSessionOptions {
     yolo?: boolean
     permissionMode?: string
     serviceTier?: string
+    codexAccountId?: string
+    codexSourceAccountId?: string
     token?: string
     sessionType?: 'simple' | 'worktree'
     worktreeName?: string

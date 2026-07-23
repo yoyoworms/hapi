@@ -35,6 +35,11 @@ export const MetadataSchema = z.object({
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(),
     codexSessionId: z.string().optional(),
+    // Runner-local Codex account selection. Credentials never leave the runner;
+    // this opaque id only lets resume flows select the same isolated CODEX_HOME.
+    codexAccountId: z.string().optional(),
+    codexAccountLabel: z.string().optional(),
+    codexAccountKind: z.enum(['system', 'managed', 'api']).optional(),
     // 原始 Codex thread id。导入 Codex 历史后，HAPI 会 fork 出自己的续写 thread；
     // codexSessionId 保存 fork 后的 thread，codexSourceSessionId 保留来源 thread 便于同步/展示。
     codexSourceSessionId: z.string().optional(),

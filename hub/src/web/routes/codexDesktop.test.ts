@@ -401,6 +401,10 @@ describe('Codex Desktop import routes', () => {
             expect(result.success).toBe(true)
             const session = store.sessions.getSessionsByNamespace('default')[0]
             expect(session).toBeDefined()
+            expect(session.metadata).toMatchObject({
+                codexAccountId: 'system',
+                codexAccountLabel: 'System default'
+            })
             const messages = store.messages.getAllMessages(session.id)
             expect(messages).toHaveLength(2)
             expect(messages[0].content).toEqual({

@@ -2,10 +2,14 @@ import type { AgentFlavor, CodexCollaborationMode, PermissionMode } from '@hapi/
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import {
     ArchiveCodexSessionRpcResponseSchema,
+    CodexAccountLoginStatusResponseSchema,
+    CodexAccountLoginStartResponseSchema,
+    CodexAccountsResponseSchema,
     CursorChatStoreStatusSchema,
     ListCodexSessionsRpcResponseSchema
 } from '@hapi/protocol/apiTypes'
 import type {
+    AddCodexApiEndpointRequest,
     CodexModelSummary,
     CodexModelsResponse,
     CommandResponse,
@@ -21,6 +25,9 @@ import type {
     ListDirectoryResponse,
     ListCodexSessionsRpcResponse,
     ArchiveCodexSessionRpcResponse,
+    CodexAccountLoginStatusResponse,
+    CodexAccountLoginStartResponse,
+    CodexAccountsResponse,
     OpencodeModelsResponse,
     OpencodeModelSummary,
     OpencodeReasoningEffortResponse,
@@ -165,13 +172,15 @@ export class RpcGateway {
         serviceTier?: string,
         existingSessionId?: string,
         sandbox?: boolean,
-        continueLatest?: boolean
+        continueLatest?: boolean,
+        codexAccountId?: string,
+        codexSourceAccountId?: string
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         try {
             const result = await this.machineRpc(
                 machineId,
                 RPC_METHODS.SpawnHappySession,
-                { type: 'spawn-in-directory', directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, resumeSessionId, effort, sandbox, continueLatest, permissionMode, serviceTier, existingSessionId, sessionId: existingSessionId }
+                { type: 'spawn-in-directory', directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, resumeSessionId, effort, sandbox, continueLatest, permissionMode, serviceTier, existingSessionId, sessionId: existingSessionId, codexAccountId, codexSourceAccountId }
             )
             if (result && typeof result === 'object') {
                 const obj = result as Record<string, unknown>
@@ -204,6 +213,67 @@ export class RpcGateway {
         } catch (error) {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }
+    }
+
+    async listCodexAccountsForMachine(machineId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexAccounts, {}, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async startCodexAccountLogin(machineId: string): Promise<CodexAccountLoginStartResponse> {
+        const result = await this.machineRpc(
+            machineId,
+            RPC_METHODS.StartCodexAccountLogin,
+            {},
+            MODEL_LIST_RPC_TIMEOUT_MS
+        )
+        return CodexAccountLoginStartResponseSchema.parse(result)
+    }
+
+    async addCodexApiEndpoint(
+        machineId: string,
+        input: AddCodexApiEndpointRequest
+    ): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(
+            machineId,
+            RPC_METHODS.AddCodexApiEndpoint,
+            input,
+            MODEL_LIST_RPC_TIMEOUT_MS
+        )
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async getCodexAccountLoginStatus(
+        machineId: string,
+        attemptId: string
+    ): Promise<CodexAccountLoginStatusResponse> {
+        const result = await this.machineRpc(
+            machineId,
+            RPC_METHODS.GetCodexAccountLoginStatus,
+            { attemptId },
+            MODEL_LIST_RPC_TIMEOUT_MS
+        )
+        return CodexAccountLoginStatusResponseSchema.parse(result)
+    }
+
+    async setDefaultCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(
+            machineId,
+            RPC_METHODS.SetDefaultCodexAccount,
+            { accountId },
+            MODEL_LIST_RPC_TIMEOUT_MS
+        )
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async removeCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(
+            machineId,
+            RPC_METHODS.RemoveCodexAccount,
+            { accountId },
+            MODEL_LIST_RPC_TIMEOUT_MS
+        )
+        return CodexAccountsResponseSchema.parse(result)
     }
 
     async listMachineDirectory(machineId: string, path: string): Promise<RpcListDirectoryResponse> {

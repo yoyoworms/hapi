@@ -57,7 +57,10 @@ type ReopenResultMock =
     | { type: 'incomplete'; message: string; missing: [string, ...string[]] }
 
 function createApp(session: Session, opts?: {
-    resumeSession?: (sessionId: string, namespace: string, resumeOpts?: { permissionMode?: string }) => Promise<{ type: string; sessionId?: string; message?: string; code?: string }>
+    resumeSession?: (sessionId: string, namespace: string, resumeOpts?: {
+        permissionMode?: string
+        codexAccountId?: string
+    }) => Promise<{ type: string; sessionId?: string; message?: string; code?: string }>
     reopenSession?: (sessionId: string, namespace: string) => Promise<ReopenResultMock>
     listSlashCommands?: SyncEngine['listSlashCommands']
     getSessionExport?: (sessionId: string, session: Session) => unknown
@@ -934,6 +937,34 @@ describe('sessions routes', () => {
 
         expect(response.status).toBe(200)
         expect(capturedResumeOpts).toEqual({ permissionMode: 'bypassPermissions' })
+    })
+
+    it('passes a Codex account switch through resume without exposing credentials', async () => {
+        const session = createSession({
+            active: true,
+            metadata: {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                codexAccountId: 'old-account'
+            }
+        })
+        let capturedResumeOpts: { codexAccountId?: string } | undefined
+        const { app } = createApp(session, {
+            resumeSession: async (sessionId, _namespace, resumeOpts) => {
+                capturedResumeOpts = resumeOpts
+                return { type: 'success', sessionId }
+            }
+        })
+
+        const response = await app.request('/api/sessions/session-1/resume', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ codexAccountId: 'new-account' })
+        })
+
+        expect(response.status).toBe(200)
+        expect(capturedResumeOpts).toEqual({ codexAccountId: 'new-account' })
     })
 
     it('returns 409 when resume token is unavailable', async () => {

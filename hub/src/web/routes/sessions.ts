@@ -185,12 +185,15 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ error: 'Invalid body' }, 400)
         }
 
-        const { permissionMode } = parsed.data
+        const { permissionMode, codexAccountId } = parsed.data
         if (permissionMode !== undefined) {
             const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
             if (!isPermissionModeAllowedForFlavor(permissionMode, flavor)) {
                 return c.json({ error: 'Invalid permission mode for session flavor' }, 400)
             }
+        }
+        if (codexAccountId !== undefined && sessionResult.session.metadata?.flavor !== 'codex') {
+            return c.json({ error: 'Codex account switching is only available for Codex sessions' }, 400)
         }
 
         const namespace = c.get('namespace')
@@ -202,8 +205,9 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             sessionResult.sessionId,
             namespace,
             {
-                permissionMode,
-                resumeWithSessionId
+                ...(permissionMode !== undefined ? { permissionMode } : {}),
+                ...(resumeWithSessionId !== undefined ? { resumeWithSessionId } : {}),
+                ...(codexAccountId !== undefined ? { codexAccountId } : {})
             }
         )
         if (result.type === 'error') {

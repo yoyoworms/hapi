@@ -11,9 +11,15 @@ import { logger } from '@/ui/logger'
 import { configuration } from '@/configuration'
 import type { ClientToServerEvents, ServerToClientEvents, Update, UpdateMachineBody } from '@hapi/protocol'
 import {
+    AddCodexApiEndpointRequestSchema,
     ArchiveCodexSessionRpcRequestSchema,
+    CodexAccountLoginStatusResponseSchema,
+    CodexAccountsResponseSchema,
     ListCodexSessionsRpcRequestSchema,
     type ArchiveCodexSessionRpcResponse,
+    type CodexAccountLoginStatusResponse,
+    type CodexAccountLoginStartResponse,
+    type CodexAccountsResponse,
     type ListCodexSessionsRpcResponse,
     type MachineDirectoryEntry,
     type MachineListDirectoryResponse,
@@ -43,6 +49,7 @@ import { buildSocketIoExtraHeaderOptions } from './hubExtraHeaders'
 import { collectMachineHealth } from '@/utils/machineHealth'
 import { inspectCursorChatStore } from '@/cursor/cursorChatStoreStatus'
 import type { CursorChatStoreStatus } from '@hapi/protocol/apiTypes'
+import { codexAccountManager } from '@/codex/codexAccountManager'
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
@@ -62,6 +69,10 @@ interface CursorChatStoreStatusRequest {
     workspacePath: string
     cursorSessionId: string
     homeDir?: string
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === 'object' ? value as Record<string, unknown> : null
 }
 
 export function normalizeWindowsDriveRoot(path: string): string {
@@ -482,6 +493,72 @@ export class ApiMachineClient {
                 })
             }
         )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
+            RPC_METHODS.ListCodexAccounts,
+            async () => CodexAccountsResponseSchema.parse(await codexAccountManager.listAccounts())
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountLoginStartResponse>(
+            RPC_METHODS.StartCodexAccountLogin,
+            async () => await codexAccountManager.startLogin()
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountLoginStatusResponse>(
+            RPC_METHODS.GetCodexAccountLoginStatus,
+            async (params) => {
+                const attemptId = asRecord(params)?.attemptId
+                if (typeof attemptId !== 'string' || !attemptId.trim()) {
+                    return {
+                        success: false,
+                        status: 'not_found',
+                        error: 'Codex login attempt id is required'
+                    }
+                }
+                return CodexAccountLoginStatusResponseSchema.parse(
+                    codexAccountManager.getLoginStatus(attemptId)
+                )
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
+            RPC_METHODS.AddCodexApiEndpoint,
+            async (params) => {
+                const parsed = AddCodexApiEndpointRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    throw new Error(parsed.error.issues[0]?.message ?? 'Invalid Codex API endpoint')
+                }
+                return CodexAccountsResponseSchema.parse(
+                    await codexAccountManager.addApiEndpoint(parsed.data)
+                )
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
+            RPC_METHODS.SetDefaultCodexAccount,
+            async (params) => {
+                const accountId = asRecord(params)?.accountId
+                if (typeof accountId !== 'string' || !accountId.trim()) {
+                    throw new Error('Codex account id is required')
+                }
+                return CodexAccountsResponseSchema.parse(
+                    await codexAccountManager.setDefaultAccount(accountId)
+                )
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
+            RPC_METHODS.RemoveCodexAccount,
+            async (params) => {
+                const accountId = asRecord(params)?.accountId
+                if (typeof accountId !== 'string' || !accountId.trim()) {
+                    throw new Error('Codex account id is required')
+                }
+                return CodexAccountsResponseSchema.parse(
+                    await codexAccountManager.removeAccount(accountId)
+                )
+            }
+        )
     }
 
     private async isCodexSessionWithinWorkspaceRoots(session: { cwd?: string | null }): Promise<boolean> {
@@ -533,7 +610,7 @@ export class ApiMachineClient {
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
         this.rpcHandlerManager.registerHandler(RPC_METHODS.SpawnHappySession, async (params: any) => {
-            const { directory, sessionId, existingSessionId, resumeSessionId, continueLatest, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, token, sessionType, worktreeName, sandbox } = params || {}
+            const { directory, sessionId, existingSessionId, resumeSessionId, continueLatest, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, codexAccountId, codexSourceAccountId, token, sessionType, worktreeName, sandbox } = params || {}
 
             if (!directory) {
                 throw new Error('Directory is required')
@@ -559,6 +636,8 @@ export class ApiMachineClient {
                 yolo,
                 permissionMode,
                 serviceTier,
+                codexAccountId,
+                codexSourceAccountId,
                 token,
                 sessionType,
                 worktreeName,

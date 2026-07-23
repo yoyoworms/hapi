@@ -32,6 +32,7 @@ const harness = vi.hoisted(() => ({
     suppressGoalNotifications: false,
     suppressTurnCompletion: false,
     remainingThreadSystemErrors: 0,
+    remainingNonRetryableContextErrors: 0,
     emitFailedCompletionAfterThreadSystemError: false,
     emitCyberPolicyAfterThreadSystemError: false,
     emitSafetyBuffering: false,
@@ -241,6 +242,21 @@ vi.mock('./codexAppServerClient', () => {
                     harness.notifications.push({ method: 'turn/completed', params: completed });
                     this.notificationHandler?.('turn/completed', completed);
                 }
+                return { turn: { id: turnId } };
+            }
+
+            if (harness.remainingNonRetryableContextErrors > 0) {
+                harness.remainingNonRetryableContextErrors -= 1;
+                const contextError = {
+                    threadId,
+                    turnId,
+                    error: {
+                        message: "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
+                    },
+                    willRetry: false
+                };
+                harness.notifications.push({ method: 'error', params: contextError });
+                this.notificationHandler?.('error', contextError);
                 return { turn: { id: turnId } };
             }
 
@@ -1047,6 +1063,7 @@ function createSessionStub(
 
 describe('codexRemoteLauncher', () => {
     afterEach(() => {
+        delete process.env.HAPI_CODEX_RESUME_PATH;
         harness.notifications = [];
         harness.dispatchNotification = null;
         harness.registerRequestCalls = [];
@@ -1083,6 +1100,7 @@ describe('codexRemoteLauncher', () => {
         harness.startTurnMessages = [];
         harness.failResumeThreadIds = [];
         harness.remainingThreadSystemErrors = 0;
+        harness.remainingNonRetryableContextErrors = 0;
         harness.nextThreadSystemErrorMessage = null;
         harness.failNextCompact = false;
         harness.deferCompactCompletion = false;
@@ -1895,6 +1913,23 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('compacts direct context-window errors even when Codex will not retry them', async () => {
+        harness.remainingNonRetryableContextErrors = 1;
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.compactThreadIds).toEqual(['thread-1']);
+        expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1']);
+        expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
+        expect(sessionEvents).not.toContainEqual({
+            type: 'message',
+            message: "Task failed: Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
+        });
+        expect(session.thinking).toBe(false);
+    });
+
     it('retries asynchronous thread-level systemError notifications on the same thread', async () => {
         harness.remainingThreadSystemErrors = 1;
         harness.deferThreadStatusNotifications = true;
@@ -2031,6 +2066,20 @@ describe('codexRemoteLauncher', () => {
             message: 'Task failed: Codex conversation thread-old could not be resumed; no new conversation was created. Reason: resume failed'
         });
         expect(session.thinking).toBe(false);
+    });
+
+    it('resumes a migrated conversation by its explicit rollout path', async () => {
+        process.env.HAPI_CODEX_RESUME_PATH = '/tmp/migrated-thread.jsonl';
+        const { session } = createSessionStub(['continue']);
+        session.sessionId = 'thread-old';
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.resumeThreadParams).toHaveLength(1);
+        expect(harness.resumeThreadParams[0]?.path).toBe('/tmp/migrated-thread.jsonl');
+        expect(harness.startThreadIds).toEqual([]);
+        expect(harness.startTurnThreadIds).toEqual(['thread-old']);
     });
 
     it('does not start a fresh thread for the next queued message after thread-level systemError', async () => {

@@ -131,7 +131,7 @@ function writeCodexTranscript(codexHome: string, fileName: string, payload: Reco
 }
 
 describe('ApiMachineClient spawn handler', () => {
-    it('forwards continueLatest to the runner spawn options', async () => {
+    it('forwards resume and Codex account selection to the runner spawn options', async () => {
         const workspaceRoot = mkdtempSync(join(tmpdir(), 'hapi-spawn-machine-ws-'))
         const machine = makeMachine('spawn-machine')
         const client = new ApiMachineClient('cli-token', machine, [workspaceRoot])
@@ -145,12 +145,14 @@ describe('ApiMachineClient spawn handler', () => {
         try {
             expect(await callSpawnSession(client, machine.id, {
                 directory: workspaceRoot,
-                agent: 'claude',
-                continueLatest: true
+                agent: 'codex',
+                continueLatest: true,
+                codexAccountId: 'account-1'
             })).toEqual({ type: 'success', sessionId: 'spawned-session' })
             expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
                 directory: workspaceRoot,
-                continueLatest: true
+                continueLatest: true,
+                codexAccountId: 'account-1'
             }))
         } finally {
             client.shutdown()

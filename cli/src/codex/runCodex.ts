@@ -45,13 +45,26 @@ export async function runCodex(opts: {
         controlledByUser: false
     };
     const resumeTitle = resolveCodexResumeTitle(opts.resumeSessionId);
+    const accountKind = process.env.HAPI_CODEX_ACCOUNT_KIND === 'api'
+        || process.env.HAPI_CODEX_ACCOUNT_KIND === 'managed'
+        || process.env.HAPI_CODEX_ACCOUNT_KIND === 'system'
+        ? process.env.HAPI_CODEX_ACCOUNT_KIND as 'api' | 'managed' | 'system'
+        : undefined;
+    const accountMetadata = process.env.HAPI_CODEX_ACCOUNT_ID?.trim()
+        ? {
+            codexAccountId: process.env.HAPI_CODEX_ACCOUNT_ID.trim(),
+            codexAccountLabel: process.env.HAPI_CODEX_ACCOUNT_LABEL?.trim() || undefined,
+            codexAccountKind: accountKind
+        }
+        : {};
     const useLazyBootstrap = !opts.existingSessionId && startedBy === 'terminal';
     const bootstrap = opts.existingSessionId
         ? await bootstrapExistingSession({
             sessionId: opts.existingSessionId,
             flavor: 'codex',
             startedBy,
-            workingDirectory
+            workingDirectory,
+            metadataOverrides: accountMetadata
         })
         : await (useLazyBootstrap ? bootstrapLazySession : bootstrapSession)({
             flavor: 'codex',
@@ -60,7 +73,10 @@ export async function runCodex(opts: {
             agentState: state,
             model: opts.model,
             modelReasoningEffort: opts.modelReasoningEffort,
-            metadataOverrides: resumeTitle ? { name: resumeTitle } : undefined
+            metadataOverrides: {
+                ...(resumeTitle ? { name: resumeTitle } : {}),
+                ...accountMetadata
+            }
         });
     const { api, session, sessionInfo } = bootstrap;
     const codexSourceSessionId = typeof sessionInfo.metadata?.codexSourceSessionId === 'string'

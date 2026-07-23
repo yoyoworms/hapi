@@ -2529,8 +2529,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
             const isThreadStatusFailure = msgType === 'task_failed' && msg.terminal_source === 'thread_status';
             const error = msgType === 'task_failed' ? asString(msg.error) : null;
+            const isContextOverflowFailure = msgType === 'task_failed'
+                && isContextCompactRetryableCodexError(error);
+            const isPolicyBlockedFailure = msgType === 'task_failed'
+                && isPolicyBlockedCodexFailure(msg, error);
             const explicitlyNonRetryable = msgType === 'task_failed'
-                && (msg.retryable === false || isPolicyBlockedCodexFailure(msg, error));
+                && (isPolicyBlockedFailure || (msg.retryable === false && !isContextOverflowFailure));
 
             if (deferredThreadStatusFailure && isTerminalEvent && !isThreadStatusFailure) {
                 const sameThread = !eventThreadId || eventThreadId === deferredThreadStatusFailure.threadId;
@@ -2599,7 +2603,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
             const shouldCompactAndRetrySameThread = msgType === 'task_failed'
                 && !explicitlyNonRetryable
-                && isContextCompactRetryableCodexError(error)
+                && isContextOverflowFailure
                 && Boolean(activeMessage)
                 && Boolean(this.currentThreadId)
                 && sameThreadCompactAttempt < SAME_THREAD_MAX_COMPACT_RETRIES;
@@ -3300,6 +3304,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             try {
                 const resumeResponse = await appServerClient.resumeThread({
                     threadId: resumeCandidate,
+                    ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
+                        ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
+                        : {}),
                     ...threadParams
                 }, {
                     signal: this.abortController.signal
@@ -3362,6 +3369,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 try {
                     const resumeResponse = await appServerClient.resumeThread({
                         threadId: resumeCandidate,
+                        ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
+                            ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
+                            : {}),
                         ...threadParams
                     }, {
                         signal: this.abortController.signal
@@ -3658,6 +3668,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                                 })
                                 : await appServerClient.resumeThread({
                                     threadId: resumeCandidate,
+                                    ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
+                                        ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
+                                        : {}),
                                     ...threadParams
                                 }, {
                                     signal: this.abortController.signal

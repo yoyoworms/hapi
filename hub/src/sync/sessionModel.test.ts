@@ -913,7 +913,10 @@ describe('session model', () => {
                 'high',
                 'yolo',
                 'fast',
-                session.id
+                session.id,
+                undefined,
+                undefined,
+                'system'
             ])
         } finally {
             engine.stop()

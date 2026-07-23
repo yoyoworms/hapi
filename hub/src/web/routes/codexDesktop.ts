@@ -997,6 +997,15 @@ function buildImportedSessionMetadata(
         codexSourceSessionId: typeof existingMetadata?.codexSourceSessionId === 'string'
             ? existingMetadata.codexSourceSessionId
             : data.id,
+        // Local history import currently enumerates the runner's system
+        // CODEX_HOME. Pin it explicitly so changing HAPI's default account
+        // cannot resume this thread from another isolated account home.
+        codexAccountId: typeof existingMetadata?.codexAccountId === 'string'
+            ? existingMetadata.codexAccountId
+            : 'system',
+        codexAccountLabel: typeof existingMetadata?.codexAccountLabel === 'string'
+            ? existingMetadata.codexAccountLabel
+            : 'System default',
         ...(permissionMode ? { preferredPermissionMode: permissionMode } : {}),
         ...(machineId ? { machineId } : {}),
         lifecycleState: typeof existingMetadata?.lifecycleState === 'string'

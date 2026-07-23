@@ -8,7 +8,7 @@
  */
 
 import { isKnownFlavor, type LocalResumeTarget, type ResumableSession } from '@hapi/protocol'
-import type { CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { AgentAccountStatus, AgentFlavor, CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
 import { MetadataSchema } from '@hapi/protocol/schemas'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
@@ -967,7 +967,8 @@ export class SyncEngine {
         serviceTier?: string,
         existingSessionId?: string,
         sandbox?: boolean,
-        continueLatest?: boolean
+        continueLatest?: boolean,
+        codexAccountId?: string
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         return await this.rpcGateway.spawnSession(
             machineId,
@@ -984,8 +985,33 @@ export class SyncEngine {
             serviceTier,
             existingSessionId,
             sandbox,
-            continueLatest
+            continueLatest,
+            codexAccountId
         )
+    }
+
+    async listCodexAccountsForMachine(machineId: string) {
+        return await this.rpcGateway.listCodexAccountsForMachine(machineId)
+    }
+
+    async startCodexAccountLogin(machineId: string) {
+        return await this.rpcGateway.startCodexAccountLogin(machineId)
+    }
+
+    async addCodexApiEndpoint(machineId: string, input: AddCodexApiEndpointRequest) {
+        return await this.rpcGateway.addCodexApiEndpoint(machineId, input)
+    }
+
+    async getCodexAccountLoginStatus(machineId: string, attemptId: string) {
+        return await this.rpcGateway.getCodexAccountLoginStatus(machineId, attemptId)
+    }
+
+    async setDefaultCodexAccount(machineId: string, accountId: string) {
+        return await this.rpcGateway.setDefaultCodexAccount(machineId, accountId)
+    }
+
+    async removeCodexAccount(machineId: string, accountId: string) {
+        return await this.rpcGateway.removeCodexAccount(machineId, accountId)
     }
 
     private findTargetMachine(onlineMachines: Array<{ id: string; metadata?: { host?: string } | null }>, metadata: { machineId?: string; host?: string }) {
@@ -1370,7 +1396,11 @@ export class SyncEngine {
         return this.store.messages.getFirstMessages(sessionId, 1).length === 0
     }
 
-    async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode; resumeWithSessionId?: string }): Promise<ResumeSessionResult> {
+    async resumeSession(sessionId: string, namespace: string, opts?: {
+        permissionMode?: PermissionMode
+        resumeWithSessionId?: string
+        codexAccountId?: string
+    }): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -1490,6 +1520,15 @@ export class SyncEngine {
             : opts?.permissionMode
                 ?? session.permissionMode
                 ?? metadataPermissionMode
+        const sourceCodexAccountId = flavor === 'codex'
+            ? session.metadata?.codexAccountId ?? 'system'
+            : undefined
+        const targetCodexAccountId = flavor === 'codex'
+            ? opts?.codexAccountId ?? sourceCodexAccountId
+            : undefined
+        const switchingCodexAccount = flavor === 'codex'
+            && Boolean(opts?.codexAccountId)
+            && targetCodexAccountId !== sourceCodexAccountId
         let spawnResult = await this.rpcGateway.spawnSession(
             targetMachine.id,
             directory,
@@ -1505,11 +1544,13 @@ export class SyncEngine {
             session.serviceTier ?? undefined,
             access.sessionId,
             undefined,
-            useContinue || undefined
+            useContinue || undefined,
+            targetCodexAccountId,
+            switchingCodexAccount ? sourceCodexAccountId : undefined
         )
 
         // Fallback: if resume spawn fails, retry without resume token (start fresh session)
-        if (spawnResult.type !== 'success') {
+        if (spawnResult.type !== 'success' && !switchingCodexAccount) {
             spawnResult = await this.rpcGateway.spawnSession(
                 targetMachine.id,
                 directory,
@@ -1523,7 +1564,10 @@ export class SyncEngine {
                 session.effort ?? undefined,
                 preferredPermissionMode,
                 session.serviceTier ?? undefined,
-                access.sessionId
+                access.sessionId,
+                undefined,
+                undefined,
+                targetCodexAccountId
             )
         }
 

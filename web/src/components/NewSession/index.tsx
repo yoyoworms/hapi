@@ -54,6 +54,7 @@ import { SessionTypeSelector } from './SessionTypeSelector'
 import { SandboxToggle } from './SandboxToggle'
 import { YoloToggle } from './YoloToggle'
 import { CodexSessionSyncDialog } from '@/components/CodexSessionSyncDialog'
+import { CodexAccountSelector } from './CodexAccountSelector'
 import { formatRunnerSpawnError } from '../../utils/formatRunnerSpawnError'
 import { markCodexSessionsImported } from '@/lib/codexImportedSessions'
 
@@ -139,6 +140,7 @@ export function NewSession(props: {
     const [codexImportError, setCodexImportError] = useState<string | null>(null)
     const [isImportingCodexSession, setIsImportingCodexSession] = useState(false)
     const [isCodexImportDialogOpen, setIsCodexImportDialogOpen] = useState(false)
+    const [codexAccountId, setCodexAccountId] = useState<string | null>(null)
     const isFormDisabled = Boolean(isPending || props.isLoading || isImportingCodexSession)
     const worktreeInputRef = useRef<HTMLInputElement>(null)
 
@@ -164,6 +166,7 @@ export function NewSession(props: {
 
     useEffect(() => {
         if (agent !== 'codex') {
+            setCodexAccountId(null)
             setSelectedCodexImportSessionId(null)
             setCodexImportSessions([])
             setCodexImportMachineId(null)
@@ -563,6 +566,7 @@ export function NewSession(props: {
 
     const handleMachineChange = useCallback((newMachineId: string) => {
         setMachineId(newMachineId)
+        setCodexAccountId(null)
         setModel('auto')
         setCursorSelectedBase('auto')
         setSelectedCodexImportSessionId(null)
@@ -783,6 +787,7 @@ export function NewSession(props: {
                 yolo: agent === 'grok' ? undefined : yoloMode,
                 sandbox,
                 permissionMode: agent === 'grok' ? grokPermissionMode : undefined,
+                codexAccountId: agent === 'codex' ? codexAccountId ?? undefined : undefined,
                 sessionType,
                 worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined
             })
@@ -850,6 +855,15 @@ export function NewSession(props: {
                 isDisabled={isFormDisabled}
                 onAgentChange={setAgent}
             />
+            {agent === 'codex' ? (
+                <CodexAccountSelector
+                    api={props.api}
+                    machineId={machineId}
+                    value={codexAccountId}
+                    isDisabled={isFormDisabled}
+                    onChange={setCodexAccountId}
+                />
+            ) : null}
             {agent === 'codex' ? (
                 <CodexImportSelectButton
                     selectedSession={selectedCodexImportSession}

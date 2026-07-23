@@ -30,7 +30,11 @@ import type {
     ThreadGoalClearParams,
     ThreadGoalClearResponse,
     ExperimentalFeatureEnablementSetParams,
-    ExperimentalFeatureEnablementSetResponse
+    ExperimentalFeatureEnablementSetResponse,
+    GetAccountRateLimitsResponse,
+    GetAccountResponse,
+    LoginAccountParams,
+    LoginAccountResponse
 } from './appServerTypes';
 
 type JsonRpcLiteRequest = {
@@ -165,6 +169,10 @@ export class CodexAppServerClient extends JsonLineParser {
 
     static readonly DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 
+    constructor(private readonly options: { env?: Record<string, string> } = {}) {
+        super();
+    }
+
     setStderrHandler(handler: ((text: string) => void) | null): void {
         this.stderrHandler = handler;
     }
@@ -176,12 +184,16 @@ export class CodexAppServerClient extends JsonLineParser {
 
         const codexCommand = resolveCodexAppServerCommand();
         logger.debug(`[CodexAppServer] Starting ${codexCommand} app-server`);
+        const inheritedEnv = Object.keys(process.env).reduce((acc, key) => {
+            const value = process.env[key];
+            if (typeof value === 'string') acc[key] = value;
+            return acc;
+        }, {} as Record<string, string>);
         this.process = spawn(codexCommand, ['app-server'], {
-            env: Object.keys(process.env).reduce((acc, key) => {
-                const value = process.env[key];
-                if (typeof value === 'string') acc[key] = value;
-                return acc;
-            }, {} as Record<string, string>),
+            env: {
+                ...inheritedEnv,
+                ...this.options.env
+            },
             stdio: ['pipe', 'pipe', 'pipe'],
             shell: process.platform === 'win32',
             windowsHide: process.platform === 'win32'
@@ -243,6 +255,35 @@ export class CodexAppServerClient extends JsonLineParser {
             timeoutMs: 30_000
         });
         return response as ModelListResponse;
+    }
+
+    async loginAccount(params: LoginAccountParams): Promise<LoginAccountResponse> {
+        const response = await this.sendRequest('account/login/start', params, {
+            timeoutMs: 30_000
+        });
+        return response as LoginAccountResponse;
+    }
+
+    async cancelAccountLogin(loginId: string): Promise<void> {
+        await this.sendRequest('account/login/cancel', { loginId }, {
+            timeoutMs: 30_000
+        });
+    }
+
+    async readAccount(options?: { refreshToken?: boolean }): Promise<GetAccountResponse> {
+        const response = await this.sendRequest('account/read', {
+            refreshToken: options?.refreshToken ?? false
+        }, {
+            timeoutMs: 30_000
+        });
+        return response as GetAccountResponse;
+    }
+
+    async readAccountRateLimits(): Promise<GetAccountRateLimitsResponse> {
+        const response = await this.sendRequest('account/rateLimits/read', {}, {
+            timeoutMs: 30_000
+        });
+        return response as GetAccountRateLimitsResponse;
     }
 
     async listCollaborationModes(): Promise<CollaborationModeListResponse> {

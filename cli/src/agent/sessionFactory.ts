@@ -95,6 +95,9 @@ function pickExistingSessionMetadata(metadata: Metadata | null | undefined): Par
     if (metadata.summary !== undefined) preserved.summary = metadata.summary
     if (metadata.claudeSessionId !== undefined) preserved.claudeSessionId = metadata.claudeSessionId
     if (metadata.codexSessionId !== undefined) preserved.codexSessionId = metadata.codexSessionId
+    if (metadata.codexAccountId !== undefined) preserved.codexAccountId = metadata.codexAccountId
+    if (metadata.codexAccountLabel !== undefined) preserved.codexAccountLabel = metadata.codexAccountLabel
+    if (metadata.codexAccountKind !== undefined) preserved.codexAccountKind = metadata.codexAccountKind
     if (metadata.codexSourceSessionId !== undefined) preserved.codexSourceSessionId = metadata.codexSourceSessionId
     if (metadata.geminiSessionId !== undefined) preserved.geminiSessionId = metadata.geminiSessionId
     if (metadata.opencodeSessionId !== undefined) preserved.opencodeSessionId = metadata.opencodeSessionId

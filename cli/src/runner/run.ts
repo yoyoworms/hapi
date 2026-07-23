@@ -28,6 +28,7 @@ import { buildMachineMetadata } from '@/agent/sessionFactory';
 import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
 import { hashRunnerCliApiToken, hashRunnerExtraHeaders } from './runnerIdentity';
 import { scheduleCursorModelsPrewarm } from '@/modules/common/cursorModelsPrewarm';
+import { codexAccountManager } from '@/codex/codexAccountManager';
 
 export async function startRunner(options: { workspaceRoots?: string[] } = {}): Promise<void> {
   // We don't have cleanup function at the time of server construction
@@ -389,8 +390,82 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
       try {
 
-        // Resolve authentication token if provided
+        // Resolve account selection locally. The hub only sends an opaque id;
+        // Codex credentials and the isolated CODEX_HOME never leave this runner.
         let extraEnv: Record<string, string> = {};
+        let codexAccountModelOverride: string | null | undefined;
+        if (options.codexAccountId && options.agent !== 'codex') {
+          return {
+            type: 'error',
+            errorMessage: 'Codex account selection is only valid for Codex sessions'
+          };
+        }
+        if (options.codexAccountId && options.token) {
+          return {
+            type: 'error',
+            errorMessage: 'Codex account selection cannot be combined with token injection'
+          };
+        }
+        if (options.codexSourceAccountId && options.agent !== 'codex') {
+          return {
+            type: 'error',
+            errorMessage: 'Codex source account is only valid for Codex sessions'
+          };
+        }
+        if (options.agent === 'codex' && !options.token) {
+          // Sessions created before account selection existed have no account
+          // metadata. Keep those (and imported system transcripts) on the
+          // system home instead of silently moving them when the HAPI default
+          // account changes. Only brand-new sessions inherit the HAPI default.
+          const isExistingSession = Boolean(
+            options.sessionId
+            || options.existingSessionId
+            || options.resumeSessionId
+            || options.continueLatest
+          );
+          const account = await codexAccountManager.resolveAccount(
+            options.codexAccountId ?? (isExistingSession ? 'system' : undefined)
+          );
+          if (options.sandbox && account.kind !== 'system') {
+            return {
+              type: 'error',
+              errorMessage: 'Managed Codex identities are not available inside Docker sandbox sessions yet'
+            };
+          }
+          let migratedResumePath: string | null = null;
+          if (options.codexSourceAccountId && options.resumeSessionId) {
+            const sourceAccount = await codexAccountManager.resolveAccount(options.codexSourceAccountId);
+            migratedResumePath = await codexAccountManager.prepareSessionSwitch(
+              options.codexSourceAccountId,
+              account.id,
+              options.resumeSessionId
+            );
+            if (sourceAccount.kind === 'api' && account.kind !== 'api') {
+              // A private endpoint may expose a model id that ChatGPT does not.
+              // Dropping the old explicit model lets the destination account use
+              // its own Codex default instead of carrying an incompatible id.
+              codexAccountModelOverride = null;
+            }
+          }
+          if (account.model) {
+            codexAccountModelOverride = account.model;
+          }
+          // Docker does not mount host credential homes. Preserve the existing
+          // system-account sandbox behavior, but isolate every normal child.
+          if (!options.sandbox) {
+            extraEnv = {
+              CODEX_HOME: account.homeDir,
+              HAPI_CODEX_ACCOUNT_ID: account.id,
+              HAPI_CODEX_ACCOUNT_LABEL: account.label,
+              HAPI_CODEX_ACCOUNT_KIND: account.kind,
+              ...account.env,
+              ...(migratedResumePath ? { HAPI_CODEX_RESUME_PATH: migratedResumePath } : {})
+            };
+          }
+        }
+
+        // Legacy explicit token injection remains supported for callers that
+        // provide a complete Codex auth.json payload.
         if (options.token) {
           if (options.agent === 'codex') {
 
@@ -422,7 +497,13 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           };
         }
 
-        const args = buildCliArgs(agent, options, yolo);
+        const args = buildCliArgs(
+          agent,
+          codexAccountModelOverride !== undefined
+            ? { ...options, model: codexAccountModelOverride ?? undefined }
+            : options,
+          yolo
+        );
 
         // sessionId reserved for future use
         const MAX_TAIL_CHARS = 4000;

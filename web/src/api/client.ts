@@ -26,7 +26,11 @@ import type {
     UsageResponse
 } from '@/types/api'
 import type {
+    AddCodexApiEndpointRequest,
     CodexModelsResponse,
+    CodexAccountLoginStartResponse,
+    CodexAccountLoginStatusResponse,
+    CodexAccountsResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
     CursorChatStoreStatus,
@@ -472,11 +476,12 @@ export class ApiClient {
 
     async resumeSession(
         sessionId: string,
-        opts?: { permissionMode?: string; resumeWithSessionId?: string }
+        opts?: { permissionMode?: string; resumeWithSessionId?: string; codexAccountId?: string }
     ): Promise<string> {
         const body: Record<string, unknown> = {}
         if (opts?.permissionMode !== undefined) body.permissionMode = opts.permissionMode
         if (opts?.resumeWithSessionId !== undefined) body.resumeWithSessionId = opts.resumeWithSessionId
+        if (opts?.codexAccountId !== undefined) body.codexAccountId = opts.codexAccountId
         const hasBody = Object.keys(body).length > 0
         const response = await this.request<{ sessionId: string }>(
             `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
@@ -726,7 +731,8 @@ export class ApiClient {
         worktreeName?: string,
         effort?: string,
         sandbox?: boolean,
-        permissionMode?: PermissionMode
+        permissionMode?: PermissionMode,
+        codexAccountId?: string
     ): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
@@ -740,9 +746,68 @@ export class ApiClient {
                 worktreeName,
                 effort,
                 sandbox,
-                permissionMode
+                permissionMode,
+                codexAccountId
             })
         })
+    }
+
+    async getMachineCodexAccounts(machineId: string): Promise<CodexAccountsResponse> {
+        return await this.request<CodexAccountsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts`
+        )
+    }
+
+    async startMachineCodexAccountLogin(machineId: string): Promise<CodexAccountLoginStartResponse> {
+        return await this.request<CodexAccountLoginStartResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login`,
+            { method: 'POST' }
+        )
+    }
+
+    async addMachineCodexApiEndpoint(
+        machineId: string,
+        input: AddCodexApiEndpointRequest
+    ): Promise<CodexAccountsResponse> {
+        return await this.request<CodexAccountsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/api-endpoints`,
+            {
+                method: 'POST',
+                body: JSON.stringify(input)
+            }
+        )
+    }
+
+    async getMachineCodexAccountLoginStatus(
+        machineId: string,
+        attemptId: string
+    ): Promise<CodexAccountLoginStatusResponse> {
+        return await this.request<CodexAccountLoginStatusResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login/${encodeURIComponent(attemptId)}`
+        )
+    }
+
+    async setMachineDefaultCodexAccount(
+        machineId: string,
+        accountId: string
+    ): Promise<CodexAccountsResponse> {
+        return await this.request<CodexAccountsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/default`,
+            {
+                method: 'POST',
+                body: JSON.stringify({ accountId })
+            }
+        )
+    }
+
+    async removeMachineCodexAccount(
+        machineId: string,
+        accountId: string
+    ): Promise<CodexAccountsResponse> {
+        return await this.request<CodexAccountsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/${encodeURIComponent(accountId)}`,
+            { method: 'DELETE' }
+        )
     }
 
     async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {

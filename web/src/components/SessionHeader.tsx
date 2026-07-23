@@ -23,6 +23,7 @@ import { getSessionTitle } from '@/lib/sessionTitle'
 import { useToast } from '@/lib/toast-context'
 import { queryKeys } from '@/lib/query-keys'
 import { markCodexSessionsImported } from '@/lib/codexImportedSessions'
+import { CodexAccountSwitchDialog } from '@/components/CodexAccountSwitchDialog'
 
 function FilesIcon(props: { className?: string }) {
     return (
@@ -135,6 +136,7 @@ export function SessionHeader(props: {
     const [shareOpen, setShareOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
+    const [codexAccountSwitchOpen, setCodexAccountSwitchOpen] = useState(false)
     const [isSyncingCodex, setIsSyncingCodex] = useState(false)
 
     const navigate = useNavigate()
@@ -233,6 +235,19 @@ export function SessionHeader(props: {
             setMenuAnchorPoint({ x: rect.right, y: rect.bottom })
         }
         setMenuOpen((open) => !open)
+    }
+
+    const handleCodexAccountSwitched = (resolvedId: string) => {
+        if (resolvedId !== session.id) {
+            seedMessageWindowFromSession(session.id, resolvedId)
+        }
+        void queryClient.invalidateQueries({ queryKey: queryKeys.session(resolvedId) })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
+        navigate({
+            to: '/sessions/$sessionId',
+            params: { sessionId: resolvedId },
+            replace: true
+        })
     }
 
     // In Telegram, don't render header (Telegram provides its own)
@@ -350,6 +365,11 @@ export function SessionHeader(props: {
                 onExport={() => setExportOpen(true)}
                 onShare={() => setShareOpen(true)}
                 onSyncCodex={api && codexSessionId ? handleSyncCodex : undefined}
+                onSwitchCodexAccount={
+                    api && session.metadata?.flavor === 'codex'
+                        ? () => setCodexAccountSwitchOpen(true)
+                        : undefined
+                }
                 onArchive={() => setArchiveOpen(true)}
                 onReopen={props.canReopen === false ? undefined : handleReopen}
                 reopenDisabledReason={props.reopenDisabledReason}
@@ -378,6 +398,16 @@ export function SessionHeader(props: {
                 onRename={renameSession}
                 isPending={isPending}
             />
+
+            {api && session.metadata?.flavor === 'codex' ? (
+                <CodexAccountSwitchDialog
+                    isOpen={codexAccountSwitchOpen}
+                    onClose={() => setCodexAccountSwitchOpen(false)}
+                    session={session}
+                    api={api}
+                    onSwitched={handleCodexAccountSwitched}
+                />
+            ) : null}
 
             <ShareSessionDialog
                 isOpen={shareOpen}

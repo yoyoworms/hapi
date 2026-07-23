@@ -14,6 +14,7 @@ type SpawnInput = {
     yolo?: boolean
     sandbox?: boolean
     permissionMode?: PermissionMode
+    codexAccountId?: string
     sessionType?: 'simple' | 'worktree'
     worktreeName?: string
 }
@@ -41,7 +42,8 @@ export function useSpawnSession(api: ApiClient | null): {
                 input.worktreeName,
                 input.effort,
                 input.sandbox,
-                input.permissionMode
+                input.permissionMode,
+                input.codexAccountId
             )
         },
         onSuccess: () => {

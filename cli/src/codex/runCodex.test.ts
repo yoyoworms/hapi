@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { runCodex } from './runCodex'
 
 const mockCodexSession = vi.hoisted(() => ({
@@ -115,6 +115,8 @@ import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 
 describe('runCodex', () => {
     beforeEach(() => {
+        delete process.env.HAPI_CODEX_ACCOUNT_ID
+        delete process.env.HAPI_CODEX_ACCOUNT_LABEL
         harness.bootstrapArgs.length = 0
         harness.loopArgs.length = 0
         harness.sessionInfo = { serviceTier: null }
@@ -132,6 +134,25 @@ describe('runCodex', () => {
         lifecycleMock.setExitCode.mockClear()
         lifecycleMock.setArchiveReason.mockClear()
         lifecycleMock.setSessionEndReason.mockClear()
+    })
+
+    afterEach(() => {
+        delete process.env.HAPI_CODEX_ACCOUNT_ID
+        delete process.env.HAPI_CODEX_ACCOUNT_LABEL
+    })
+
+    it('records the runner-selected Codex account in session metadata', async () => {
+        process.env.HAPI_CODEX_ACCOUNT_ID = 'managed-1'
+        process.env.HAPI_CODEX_ACCOUNT_LABEL = 'managed@example.com'
+
+        await runCodexImpl({ workingDirectory: '/tmp/project' })
+
+        expect(harness.bootstrapArgs[0]).toEqual(expect.objectContaining({
+            metadataOverrides: expect.objectContaining({
+                codexAccountId: 'managed-1',
+                codexAccountLabel: 'managed@example.com'
+            })
+        }))
     })
 
     it('uses the requested collaboration mode when resuming locally', async () => {

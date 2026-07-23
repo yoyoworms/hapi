@@ -1,10 +1,12 @@
 import {
+    AddCodexApiEndpointRequestSchema,
     MachineListDirectoryRequestSchema,
     MachinePathsExistsRequestSchema,
     SpawnSessionRequestSchema
 } from '@hapi/protocol'
 import { Hono } from 'hono'
 import type { SyncEngine } from '../../sync/syncEngine'
+import { RpcTargetMissingError } from '../../sync/rpcGateway'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireMachine } from './guards'
 
@@ -61,7 +63,8 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             undefined, // serviceTier
             undefined, // existingSessionId
             sandbox,
-            continueLatest
+            continueLatest,
+            parsed.data.codexAccountId
         )
         return c.json(result)
     })
@@ -142,6 +145,138 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to list Codex models'
+            }, 500)
+        }
+    })
+
+    app.get('/machines/:id/codex-accounts', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, accounts: [], defaultAccountId: 'system', error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        try {
+            return c.json(await engine.listCodexAccountsForMachine(machineId))
+        } catch (error) {
+            if (error instanceof RpcTargetMissingError && error.code === 'handler-not-registered') {
+                return c.json({
+                    success: false,
+                    accounts: [],
+                    defaultAccountId: 'system',
+                    code: 'runner_update_required',
+                    error: 'This runner must be updated before HAPI can manage Codex accounts'
+                }, 409)
+            }
+            return c.json({
+                success: false,
+                accounts: [],
+                defaultAccountId: 'system',
+                error: error instanceof Error ? error.message : 'Failed to list Codex accounts'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/codex-accounts/login', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        try {
+            const result = await engine.startCodexAccountLogin(machineId)
+            return c.json(result, result.success ? 200 : 500)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to start Codex account login'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/codex-accounts/api-endpoints', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, accounts: [], defaultAccountId: 'system', error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        const body = await c.req.json().catch(() => null)
+        const parsed = AddCodexApiEndpointRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({
+                success: false,
+                accounts: [],
+                defaultAccountId: 'system',
+                error: parsed.error.issues[0]?.message ?? 'Invalid Codex API endpoint'
+            }, 400)
+        }
+        try {
+            return c.json(await engine.addCodexApiEndpoint(machineId, parsed.data))
+        } catch (error) {
+            return c.json({
+                success: false,
+                accounts: [],
+                defaultAccountId: 'system',
+                error: error instanceof Error ? error.message : 'Failed to add Codex API endpoint'
+            }, 500)
+        }
+    })
+
+    app.get('/machines/:id/codex-accounts/login/:attemptId', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, status: 'not_found', error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        try {
+            return c.json(await engine.getCodexAccountLoginStatus(machineId, c.req.param('attemptId')))
+        } catch (error) {
+            return c.json({
+                success: false,
+                status: 'error',
+                error: error instanceof Error ? error.message : 'Failed to inspect Codex account login'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/codex-accounts/default', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, accounts: [], defaultAccountId: 'system', error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        const body = await c.req.json().catch(() => null)
+        const accountId = body && typeof body === 'object' && typeof (body as Record<string, unknown>).accountId === 'string'
+            ? (body as Record<string, string>).accountId.trim()
+            : ''
+        if (!accountId) {
+            return c.json({ success: false, accounts: [], defaultAccountId: 'system', error: 'Account id is required' }, 400)
+        }
+        try {
+            return c.json(await engine.setDefaultCodexAccount(machineId, accountId))
+        } catch (error) {
+            return c.json({
+                success: false,
+                accounts: [],
+                defaultAccountId: 'system',
+                error: error instanceof Error ? error.message : 'Failed to set default Codex account'
+            }, 500)
+        }
+    })
+
+    app.delete('/machines/:id/codex-accounts/:accountId', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ success: false, accounts: [], defaultAccountId: 'system', error: 'Not connected' }, 503)
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) return machine
+        try {
+            return c.json(await engine.removeCodexAccount(machineId, c.req.param('accountId')))
+        } catch (error) {
+            return c.json({
+                success: false,
+                accounts: [],
+                defaultAccountId: 'system',
+                error: error instanceof Error ? error.message : 'Failed to remove Codex account'
             }, 500)
         }
     })

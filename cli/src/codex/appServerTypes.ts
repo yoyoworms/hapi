@@ -31,6 +31,57 @@ export interface InitializeResponse {
     [key: string]: unknown;
 }
 
+export type LoginAccountParams =
+    | {
+        type: 'chatgpt';
+        codexStreamlinedLogin?: boolean;
+        useHostedLoginSuccessPage?: boolean;
+        appBrand?: 'codex' | 'chatgpt' | null;
+    }
+    | {
+        type: 'chatgptDeviceCode';
+    };
+
+export type LoginAccountResponse =
+    | {
+        type: 'chatgpt';
+        loginId: string;
+        authUrl: string;
+    }
+    | {
+        type: 'chatgptDeviceCode';
+        loginId: string;
+        verificationUrl: string;
+        userCode: string;
+    };
+
+export interface GetAccountResponse {
+    account: {
+        type: 'chatgpt';
+        email: string | null;
+        planType: string;
+    } | {
+        type: string;
+        [key: string]: unknown;
+    } | null;
+    requiresOpenaiAuth: boolean;
+}
+
+export interface AccountRateLimitWindow {
+    usedPercent?: number | null;
+    resetsAt?: number | null;
+    [key: string]: unknown;
+}
+
+export interface GetAccountRateLimitsResponse {
+    rateLimits?: {
+        primary?: AccountRateLimitWindow | null;
+        secondary?: AccountRateLimitWindow | null;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
 export interface ModelListParams {
     includeHidden?: boolean;
 }
