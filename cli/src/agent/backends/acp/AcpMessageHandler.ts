@@ -419,6 +419,14 @@ export class AcpMessageHandler {
      * buffer. Callers must treat this as a text-segment boundary: it is
      * invoked internally before tool_call / plan events and externally at
      * turn boundaries by AcpSdkBackend.
+     *
+     * The internal-event check in `handleUpdate` only sees one chunk at a
+     * time, so it cannot recognise an envelope that arrived in pieces — in
+     * `delta` mode (OpenCode) every chunk is a fragment and none of them
+     * parses as JSON on its own. This flush boundary is the first place the
+     * reassembled text exists, so it is the only place a split envelope can
+     * be caught. Re-checking here is what makes the filter complete rather
+     * than merely likely to fire.
      */
     flushText(): void {
         if (!this.bufferedText) {
@@ -426,6 +434,9 @@ export class AcpMessageHandler {
         }
         const text = this.bufferedText;
         this.bufferedText = '';
+        if (isInternalEventJson(text)) {
+            return;
+        }
         this.onMessage({ type: 'text', text });
     }
 
@@ -704,7 +715,9 @@ export class AcpMessageHandler {
             id: toolCallId,
             name,
             input,
-            status
+            status,
+            ...(asString(update.title) ? { title: asString(update.title)! } : {}),
+            ...(asString(update.kind) ? { kind: asString(update.kind)! } : {})
         });
     }
 
@@ -714,6 +727,10 @@ export class AcpMessageHandler {
 
         const status = normalizeStatus(update.status);
         const existing = this.toolCalls.get(toolCallId);
+        const presentation = {
+            ...(asString(update.title) ? { title: asString(update.title)! } : {}),
+            ...(asString(update.kind) ? { kind: asString(update.kind)! } : {})
+        };
 
         if (isUsableRawInput(update.rawInput)) {
             const derivedName = deriveToolNameFromUpdate(update);
@@ -725,7 +742,8 @@ export class AcpMessageHandler {
                 id: toolCallId,
                 name,
                 input,
-                status
+                status,
+                ...presentation
             });
         } else if (existing) {
             // Enrich existing.input from update's kind+title when initial tool_call
@@ -758,7 +776,8 @@ export class AcpMessageHandler {
                     id: toolCallId,
                     name,
                     input,
-                    status
+                    status,
+                    ...presentation
                 });
             }
         }
@@ -784,7 +803,8 @@ export class AcpMessageHandler {
                         id: toolCallId,
                         name: hoisted.name,
                         input: hoisted.input,
-                        status
+                        status,
+                        ...presentation
                     });
                 }
             }

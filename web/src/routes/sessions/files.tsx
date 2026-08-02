@@ -18,15 +18,17 @@ import {
 } from '@/lib/files-i18n'
 import { encodeBase64 } from '@/lib/utils'
 import { queryKeys } from '@/lib/query-keys'
+import { formatFileMetadata } from '@/lib/file-metadata'
 import { useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from '@/lib/use-translation'
 import * as Popover from '@radix-ui/react-popover'
-import { CheckIcon } from '@/components/icons'
+import { CheckIcon, CloseIcon } from '@/components/icons'
 import {
     DEFAULT_DIRECTORY_SORT,
     type DirectorySort,
     type DirectorySortDirection,
     type DirectorySortField,
+    sortFileSearchItems,
 } from '@/lib/directory-sort'
 
 function RefreshIcon(props: { className?: string }) {
@@ -72,7 +74,7 @@ function readDirectorySort(): DirectorySort {
     return DEFAULT_DIRECTORY_SORT
 }
 
-function DirectorySortMenu(props: { sort: DirectorySort; onChange: (sort: DirectorySort) => void }) {
+function DirectorySortMenu(props: { sort: DirectorySort; onChange: (sort: DirectorySort) => void; embedded?: boolean }) {
     const { t } = useTranslation()
     const fields: Array<{ value: DirectorySortField; label: string }> = [
         { value: 'name', label: t('files.sort.name') },
@@ -89,7 +91,14 @@ function DirectorySortMenu(props: { sort: DirectorySort; onChange: (sort: Direct
     return (
         <Popover.Root>
             <Popover.Trigger asChild>
-                <button type="button" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]" title={t('files.sort.title')} aria-label={t('files.sort.title')}>
+                <button
+                    type="button"
+                    className={props.embedded
+                        ? 'flex w-10 shrink-0 self-stretch items-center justify-center rounded-r-md rounded-l-sm text-[var(--app-hint)] transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
+                        : 'flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]'}
+                    title={t('files.sort.title')}
+                    aria-label={t('files.sort.title')}
+                >
                     <SortIcon />
                 </button>
             </Popover.Trigger>
@@ -251,8 +260,9 @@ function SearchResultRow(props: {
     onOpen: () => void
     showDivider: boolean
 }) {
-    const { t } = useTranslation()
+    const { t, locale } = useTranslation()
     const subtitle = getProjectRootLabel(props.file.filePath, t)
+    const metadata = formatFileMetadata(props.file.size, props.file.modified, locale)
     const icon = props.file.fileType === 'file'
         ? <FileIcon fileName={props.file.fileName} size={22} />
         : <FolderIcon className="text-[var(--app-link)]" />
@@ -266,7 +276,10 @@ function SearchResultRow(props: {
             {icon}
             <div className="min-w-0 flex-1">
                 <div className="truncate font-medium">{props.file.fileName}</div>
-                <div className="truncate text-xs text-[var(--app-hint)]">{subtitle}</div>
+                <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--app-hint)]">
+                    <span className="truncate">{subtitle}</span>
+                    {metadata ? <span className="shrink-0">{metadata}</span> : null}
+                </div>
             </div>
         </button>
     )
@@ -297,19 +310,31 @@ const SCROLL_KEY_PREFIX = 'hapi-dir-scroll-'
 
 export default function FilesPage() {
     const { api } = useAppContext()
-    const { t } = useTranslation()
+    const { t, locale } = useTranslation()
     const navigate = useNavigate()
     const queryClient = useQueryClient()
     const goBack = useAppGoBack()
     const { sessionId } = useParams({ from: '/sessions/$sessionId/files' })
     const search = useSearch({ from: '/sessions/$sessionId/files' })
     const { session } = useSession(api, sessionId)
-    const [searchQuery, setSearchQuery] = useState('')
     const scrollRef = useRef<HTMLDivElement>(null)
 
     const initialTab = search.tab === 'directories' ? 'directories' : 'changes'
     const [activeTab, setActiveTab] = useState<'changes' | 'directories'>(initialTab)
     const [directorySort, setDirectorySort] = useState<DirectorySort>(readDirectorySort)
+    const searchQuery = search.query ?? ''
+
+    const setSearchQuery = useCallback((query: string) => {
+        navigate({
+            to: '/sessions/$sessionId/files',
+            params: { sessionId },
+            search: {
+                ...(activeTab === 'directories' ? { tab: 'directories' as const } : {}),
+                ...(query ? { query } : {}),
+            },
+            replace: true,
+        })
+    }, [activeTab, navigate, sessionId])
 
     useEffect(() => {
         try {
@@ -351,21 +376,24 @@ export default function FilesPage() {
     const searchResults = useSessionFileSearch(api, sessionId, searchQuery, {
         enabled: shouldSearch
     })
+    const sortedSearchResults = useMemo(
+        () => sortFileSearchItems(searchResults.files, directorySort, locale),
+        [directorySort, locale, searchResults.files]
+    )
 
     const handleOpenFile = useCallback((path: string, staged?: boolean) => {
-        const fileSearch = staged === undefined
-            ? (activeTab === 'directories'
-                ? { path: encodeBase64(path), tab: 'directories' as const }
-                : { path: encodeBase64(path) })
-            : (activeTab === 'directories'
-                ? { path: encodeBase64(path), staged, tab: 'directories' as const }
-                : { path: encodeBase64(path), staged })
+        const fileSearch = {
+            path: encodeBase64(path),
+            ...(staged !== undefined ? { staged } : {}),
+            ...(activeTab === 'directories' ? { tab: 'directories' as const } : {}),
+            ...(searchQuery ? { query: searchQuery } : {}),
+        }
         navigate({
             to: '/sessions/$sessionId/file',
             params: { sessionId },
             search: fileSearch
         })
-    }, [activeTab, navigate, sessionId])
+    }, [activeTab, navigate, searchQuery, sessionId])
 
     const branchLabel = getDetachedBranchLabel(gitStatus?.branch, t)
     const showGitErrorBanner = Boolean(gitError)
@@ -406,10 +434,13 @@ export default function FilesPage() {
         navigate({
             to: '/sessions/$sessionId/files',
             params: { sessionId },
-            search: nextTab === 'changes' ? {} : { tab: nextTab },
+            search: {
+                ...(nextTab === 'directories' ? { tab: nextTab } : {}),
+                ...(searchQuery ? { query: searchQuery } : {}),
+            },
             replace: true,
         })
-    }, [navigate, sessionId])
+    }, [navigate, searchQuery, sessionId])
 
     const handleToggleFiles = useCallback(() => {
         navigate({
@@ -456,20 +487,33 @@ export default function FilesPage() {
 
             <div className="bg-[var(--app-bg)]">
                 <div className="mx-auto flex w-full max-w-content items-center gap-2 border-b border-[var(--app-border)] p-3">
-                    <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md bg-[var(--app-subtle-bg)] px-3 py-2">
-                        <SearchIcon className="shrink-0 text-[var(--app-hint)]" />
+                    <div className="relative min-w-0 flex-1 rounded-md bg-[var(--app-subtle-bg)]">
+                        <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--app-hint)]" />
                         <input
                             value={searchQuery}
                             onChange={(event) => setSearchQuery(event.target.value)}
                             placeholder={t('files.page.searchPlaceholder')}
-                            className="min-w-0 flex-1 bg-transparent text-sm text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none"
+                            className="w-full bg-transparent py-2 pl-10 pr-20 text-sm text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none"
                             autoCapitalize="none"
                             autoCorrect="off"
                         />
+                        {searchQuery ? (
+                            <button
+                                type="button"
+                                onClick={() => setSearchQuery('')}
+                                className="absolute inset-y-0 right-10 flex items-center rounded p-0.5 text-[var(--app-hint)] hover:text-[var(--app-fg)]"
+                                title={t('sessions.search.clear')}
+                                aria-label={t('sessions.search.clear')}
+                            >
+                                <CloseIcon className="h-3.5 w-3.5" />
+                            </button>
+                        ) : null}
+                        {activeTab === 'directories' || searchQuery ? (
+                            <div className="absolute inset-y-0 right-0 flex items-stretch">
+                                <DirectorySortMenu sort={directorySort} onChange={setDirectorySort} embedded />
+                            </div>
+                        ) : null}
                     </div>
-                    {activeTab === 'directories' && !searchQuery ? (
-                        <DirectorySortMenu sort={directorySort} onChange={setDirectorySort} />
-                    ) : null}
                     <button
                         type="button"
                         onClick={handleRefresh}
@@ -546,12 +590,12 @@ export default function FilesPage() {
                             </div>
                         ) : (
                             <div className="border-t border-[var(--app-divider)]">
-                                {searchResults.files.map((file, index) => (
+                                {sortedSearchResults.map((file, index) => (
                                     <SearchResultRow
-                                        key={`${file.fullPath}-${index}`}
+                                        key={file.fullPath}
                                         file={file}
                                         onOpen={() => handleOpenFile(file.fullPath)}
-                                        showDivider={index < searchResults.files.length - 1}
+                                        showDivider={index < sortedSearchResults.length - 1}
                                     />
                                 ))}
                             </div>

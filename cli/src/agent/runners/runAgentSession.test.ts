@@ -74,7 +74,7 @@ vi.mock('@/claude/utils/startHappyServer', () => ({
         harness.startHappyServerOptions = options
         return {
             url: 'http://127.0.0.1:1234',
-            toolNames: ['change_title', 'display_image', 'skill_lookup'],
+            toolNames: ['change_title', 'display_image', 'ping_peer', 'inspect_peer', 'skill_lookup'],
             stop: harness.stopServer
         }
     })
@@ -167,7 +167,7 @@ describe('runAgentSession', () => {
             '--url',
             'http://127.0.0.1:1234',
             '--tools',
-            'change_title,display_image,skill_lookup'
+            'change_title,display_image,ping_peer,inspect_peer,skill_lookup'
         ])
         expect(harness.newSessionOptions).toMatchObject({
             cwd: '/tmp/project',
@@ -180,8 +180,10 @@ describe('runAgentSession', () => {
 
         const firstPrompt = JSON.stringify(harness.prompts[0])
         const secondPrompt = JSON.stringify(harness.prompts[1])
-        expect(firstPrompt).toContain('$name')
-        expect(firstPrompt).toContain('skill_lookup')
+        expect(firstPrompt).toContain('first')
+        expect(firstPrompt).not.toContain('skill_lookup')
+        expect(firstPrompt).not.toContain('$name')
+        expect(secondPrompt).toContain('second')
         expect(secondPrompt).not.toContain('skill_lookup')
     })
 })

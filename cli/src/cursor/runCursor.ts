@@ -98,9 +98,10 @@ export async function runCursor(opts: {
     };
 
     session.onUserMessage((message, localId) => {
+        const queuedModel = sessionWrapperRef.current?.getModel() ?? currentModel;
         const enhancedMode: EnhancedMode = {
             permissionMode: currentPermissionMode ?? 'yolo',
-            model: currentModel
+            model: queuedModel
         };
         const formattedText = formatMessageWithAttachments(message.content.text, message.content.attachments);
         enqueueCursorUserMessage(messageQueue, formattedText, enhancedMode, localId);
@@ -183,6 +184,9 @@ export async function runCursor(opts: {
             model: opts.model,
             sessionMetadata: bootstrap.metadata,
             onModeChange: createModeChangeHandler(session),
+            onPermissionModeChanged: (permissionMode) => {
+                currentPermissionMode = permissionMode;
+            },
             onSessionReady: (instance) => {
                 sessionWrapperRef.current = instance;
                 syncSessionMode();

@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { I18nProvider } from '@/lib/i18n-context'
-import { AppContextProvider } from '@/lib/app-context'
 import SettingsHubPage from './index'
 import SettingsGeneralPage from './general'
 import SettingsDisplayPage from './display'
@@ -11,7 +10,8 @@ import SettingsVoicePage from './voice'
 import SettingsVoiceVoicesPage from './voice-voices'
 import SettingsVoiceAdvancedPage from './voice-advanced'
 
-const { navigate, setAppearance, setColorTheme, setFontScale, setTerminalFontSize, setComposerEnterBehavior, setVoice, getUsage, signOut } = vi.hoisted(() => ({
+const { context, navigate, setAppearance, setColorTheme, setFontScale, setTerminalFontSize, setComposerEnterBehavior, setVoice } = vi.hoisted(() => ({
+    context: { token: '' },
     navigate: vi.fn(),
     setAppearance: vi.fn(),
     setColorTheme: vi.fn(),
@@ -19,8 +19,6 @@ const { navigate, setAppearance, setColorTheme, setFontScale, setTerminalFontSiz
     setTerminalFontSize: vi.fn(),
     setComposerEnterBehavior: vi.fn(),
     setVoice: vi.fn(),
-    getUsage: vi.fn(),
-    signOut: vi.fn(),
 }))
 
 vi.mock('@/hooks/useColorTheme', () => ({
@@ -78,6 +76,24 @@ vi.mock('@/hooks/useShowActiveSessionsOnly', () => ({
     useShowActiveSessionsOnly: () => ({ showActiveSessionsOnly: false, setShowActiveSessionsOnly: vi.fn() }),
 }))
 
+vi.mock('@/hooks/useSessionHeaderMetadata', () => ({
+    useSessionHeaderMetadata: () => ({
+        preferences: {
+            showLabels: true,
+            agent: true,
+            model: true,
+            reasoning: true,
+            fastMode: true,
+            machine: true,
+            lastActive: true,
+            createdAt: false,
+            updatedAt: false,
+            worktree: true,
+        },
+        setPreference: vi.fn(),
+    }),
+}))
+
 vi.mock('@/hooks/useSessionPreviewLimit', () => ({
     MIN_SESSION_PREVIEW_LIMIT: 1,
     MAX_SESSION_PREVIEW_LIMIT: 99,
@@ -129,6 +145,18 @@ vi.mock('@/hooks/useChatSurfaceColors', () => ({
     toCustomChatSurfaceColorPreference: (value: string) => `custom:${value}`,
 }))
 
+vi.mock('@/lib/app-context', () => ({
+    useAppContext: () => ({
+        api: {},
+        baseUrl: 'http://127.0.0.1:3006',
+        token: context.token,
+    }),
+}))
+
+vi.mock('@/components/settings/CompanionPairing', () => ({
+    CompanionPairing: () => <div>Companion pairing</div>,
+}))
+
 vi.mock('@/components/settings/VoiceAdvancedControls', () => ({
     VoiceRespondsControls: () => <div>Response length controls</div>,
     VoiceSoundsControls: () => <div>Sound controls</div>,
@@ -155,18 +183,14 @@ vi.mock('./useVoiceSettings', () => ({
 }))
 
 function renderPage(page: React.ReactElement) {
-    return render(
-        <AppContextProvider value={{ api: { getUsage } as never, token: 'test-token', baseUrl: '', signOut }}>
-            <I18nProvider>{page}</I18nProvider>
-        </AppContextProvider>
-    )
+    return render(<I18nProvider>{page}</I18nProvider>)
 }
 
 describe('responsive settings pages', () => {
     beforeEach(() => {
         vi.clearAllMocks()
         localStorage.clear()
-        getUsage.mockResolvedValue(null)
+        context.token = `x.${btoa(JSON.stringify({ ns: 'default' }))}.x`
     })
 
     it('renders the mobile hub categories with current summaries', () => {
@@ -183,18 +207,18 @@ describe('responsive settings pages', () => {
         expect(navigate).toHaveBeenCalledWith({ to: '/settings/general' })
     })
 
-    it('changes the application language inline', () => {
-        renderPage(<SettingsGeneralPage />)
-        fireEvent.click(screen.getByRole('radio', { name: '简体中文' }))
-        expect(localStorage.getItem('hapi-lang')).toBe('zh-CN')
+    it('hides Hub storage from tenant namespaces', () => {
+        context.token = `x.${btoa(JSON.stringify({ ns: 'tenant' }))}.x`
+        renderPage(<SettingsHubPage />)
+        expect(screen.queryByText('Hub database usage')).not.toBeInTheDocument()
     })
 
-    it('keeps the account sign-out action on the General page', () => {
-        const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+    it('changes the application language inline', () => {
         renderPage(<SettingsGeneralPage />)
-        fireEvent.click(screen.getByRole('button', { name: 'Sign Out' }))
-        expect(signOut).toHaveBeenCalledTimes(1)
-        confirm.mockRestore()
+        expect(screen.getByText('Companion')).toBeInTheDocument()
+        expect(screen.getByText('Companion pairing')).toBeInTheDocument()
+        fireEvent.click(screen.getByRole('radio', { name: '简体中文' }))
+        expect(localStorage.getItem('hapi-lang')).toBe('zh-CN')
     })
 
     it('renders compact display controls without dropdown popovers', () => {
@@ -204,7 +228,22 @@ describe('responsive settings pages', () => {
         expect(setColorTheme).toHaveBeenCalledWith('nord')
         expect(screen.getByRole('radio', { name: '120%' })).toBeInTheDocument()
         expect(screen.getByRole('spinbutton', { name: 'Sessions Before Folding' })).toHaveValue(8)
+        expect(screen.getByRole('checkbox', { name: 'Show field labels' })).toBeChecked()
+        expect(screen.getByRole('checkbox', { name: 'Reasoning effort' })).toBeChecked()
+        expect(screen.getByRole('checkbox', { name: 'Machine' })).toBeChecked()
+        expect(screen.getByRole('checkbox', { name: 'Active time' })).toBeChecked()
+        expect(screen.getByRole('checkbox', { name: 'Created time' })).not.toBeChecked()
+        expect(screen.getByRole('checkbox', { name: 'Updated time' })).not.toBeChecked()
         expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    })
+
+    it('keeps the session status description visible with its choice group', () => {
+        renderPage(<SettingsDisplayPage />)
+
+        const description = screen.getByText('Shows why a session stopped: permission, input, background work, new activity, or a scheduled message (clock icon).')
+        const choices = screen.getByRole('radiogroup', { name: 'Session list status' })
+        expect(description.parentElement?.parentElement).toBe(choices.parentElement)
+        expect(description.compareDocumentPosition(choices) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     })
 
     it('keeps chat enum choices inline', () => {
@@ -214,19 +253,13 @@ describe('responsive settings pages', () => {
         expect(screen.getByText('Grouped Tool Use Background')).toBeInTheDocument()
     })
 
-    it('renders About metadata, usage, and cache controls on its own route page', async () => {
-        getUsage.mockResolvedValueOnce({
-            subscriptionType: 'pro',
-            five_hour: { utilization: 42, resets_at: new Date(Date.now() + 3_600_000).toISOString() }
-        })
+    it('renders About metadata on its own route page', () => {
         renderPage(<SettingsAboutPage />)
-        await waitFor(() => expect(screen.getByText(/42% · resets in/)).toBeInTheDocument())
-        expect(screen.getByText('pro')).toBeInTheDocument()
+        expect(screen.queryByText('Companion')).not.toBeInTheDocument()
         expect(screen.getByText('App Version')).toBeInTheDocument()
         expect(screen.getByText(String(__APP_VERSION__))).toBeInTheDocument()
         expect(screen.getByText('Protocol Version')).toBeInTheDocument()
         expect(screen.getByRole('link', { name: 'hapi.run' })).toHaveAttribute('rel', 'noopener noreferrer')
-        expect(screen.getByRole('button', { name: 'Clear App Cache' })).toBeInTheDocument()
     })
 
     it('links common voice settings to full-page voices and advanced pages', () => {

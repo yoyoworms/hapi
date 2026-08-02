@@ -8,7 +8,7 @@
  */
 
 import { isKnownFlavor, type LocalResumeTarget, type ResumableSession } from '@hapi/protocol'
-import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessagesResponse, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { AgentAccountStatus, AgentFlavor, CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
 import { MetadataSchema } from '@hapi/protocol/schemas'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
@@ -30,6 +30,7 @@ import {
     type RpcDeleteUploadResponse,
     type RpcGeneratedImageResponse,
     type RpcListDirectoryResponse,
+    type RpcStatFilesResponse,
     type RpcListCodexModelsResponse,
     type RpcArchiveCodexSessionResponse,
     type RpcListCursorModelsResponse,
@@ -45,7 +46,11 @@ import {
     type RpcUploadFileResponse
 } from './rpcGateway'
 import { SessionCache } from './sessionCache'
-import { AutoArchiveService } from './autoArchive'
+import {
+    AutoArchiveService,
+    getAutoArchiveBlockReason,
+    type AutoArchiveGuard
+} from './autoArchive'
 
 export type { Session, SyncEvent } from '@hapi/protocol/types'
 export type { Machine } from './machineCache'
@@ -56,6 +61,7 @@ export type {
     RpcDeleteUploadResponse,
     RpcGeneratedImageResponse,
     RpcListDirectoryResponse,
+    RpcStatFilesResponse,
     RpcListCodexModelsResponse,
     RpcListCursorModelsResponse,
     RpcListOpencodeModelsResponse,
@@ -169,6 +175,10 @@ export class SyncEngine {
     private inactivityTimer: NodeJS.Timeout | null = null
     /** Sessions that emitted `session-ready` (Cursor ACP load/newSession complete). */
     private readonly sessionReadyIds = new Set<string>()
+    /** Prevent accepting a prompt after the final idle check has reserved a session for archive. */
+    private readonly autoArchivingSessionIds = new Set<string>()
+    /** Serialize scratchlist uploads per session so disk-byte caps cannot race. */
+    private readonly scratchlistUploadTails = new Map<string, Promise<unknown>>()
 
     constructor(
         private readonly store: Store,
@@ -194,7 +204,11 @@ export class SyncEngine {
                 getSessions: () => this.getSessions(),
                 getSession: (sessionId) => this.getSession(sessionId),
                 hasQueuedMessages: (sessionId) => this.store.messages.getUninvokedLocalMessages(sessionId).length > 0,
-                archiveSession: (sessionId, reason) => this.archiveSession(sessionId, { reason })
+                archiveSession: (sessionId, reason, guard) => this.archiveSessionIfStillIdle(
+                    sessionId,
+                    reason,
+                    guard
+                )
             })
             : null
         this.reloadAll()
@@ -376,18 +390,20 @@ export class SyncEngine {
         return this.machineCache.getOnlineMachinesByNamespace(namespace)
     }
 
+    async renameMachine(machineId: string, displayName: string): Promise<void> {
+        return this.machineCache.renameMachine(machineId, displayName)
+    }
+
     getMessagesPage(
         sessionId: string,
-        options: { limit: number; before?: { at: number; seq: number } | null }
-    ): {
-        messages: DecryptedMessage[]
-        page: {
+        options: {
             limit: number
-            nextBeforeSeq: number | null
-            nextBeforeAt: number | null
-            hasMore: boolean
+            before?: { at: number; seq: number } | null
+            after?: { at: number; seq: number } | null
+            until?: { at: number; seq: number } | null
+            epoch?: number | null
         }
-    } {
+    ): MessagesResponse {
         return this.messageService.getMessagesPage(sessionId, options)
     }
 
@@ -401,19 +417,6 @@ export class SyncEngine {
 
     getDeliverableMessagesAfter(sessionId: string, options: { afterSeq: number; limit: number; now: number }): DecryptedMessage[] {
         return this.messageService.getDeliverableMessagesAfter(sessionId, options)
-    }
-
-    /** Fork's incremental-sync path: returns messages with seq > afterSeq, including
-     *  scheduled rows that haven't matured yet. Backed by `getDeliverableMessagesAfter`
-     *  using `now = Date.now()` so future-scheduled rows are excluded for the CLI
-     *  backfill semantics; web's afterSeq sync still surfaces queued/scheduled rows
-     *  via the dedicated uninvoked-local query elsewhere. */
-    getMessagesAfter(sessionId: string, options: { afterSeq: number; limit: number }): DecryptedMessage[] {
-        return this.messageService.getDeliverableMessagesAfter(sessionId, {
-            afterSeq: options.afterSeq,
-            limit: options.limit,
-            now: Date.now()
-        })
     }
 
     handleRealtimeEvent(event: SyncEvent): void {
@@ -545,6 +548,282 @@ export class SyncEngine {
         })
     }
 
+    /**
+     * tiann/hapi#893 (scratchlist v2). Read-side: list entries for a
+     * session. Auth / namespace check is the route layer's job (via
+     * `requireSessionFromParam`); by the time we get here the caller
+     * already proved access.
+     */
+    listScratchlistEntries(sessionId: string): Array<{
+        entryId: string
+        text: string
+        createdAt: number
+        updatedAt: number
+        attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+    }> {
+        return this.store.scratchlist.list(sessionId).map((row) => ({
+            entryId: row.entryId,
+            text: row.text,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            attachments: row.attachments,
+        }))
+    }
+
+    countScratchlistEntries(sessionId: string): number {
+        return this.store.scratchlist.count(sessionId)
+    }
+
+    sumScratchlistAttachmentBytes(sessionId: string): number {
+        return this.store.scratchlist.sumAttachmentBytes(sessionId)
+    }
+
+    /**
+     * Read a single entry by id. The route layer uses this to short-
+     * circuit duplicate POSTs (migration retry) BEFORE running the
+     * server-side cap check; otherwise an idempotent retry against a
+     * session that has hit `SCRATCHLIST_MAX_ENTRIES` would 409 when it
+     * should 200 with the existing row.
+     */
+    getScratchlistEntry(
+        sessionId: string,
+        entryId: string
+    ): {
+        entryId: string
+        text: string
+        createdAt: number
+        updatedAt: number
+        attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+    } | null {
+        const row = this.store.scratchlist.get(sessionId, entryId)
+        if (!row) return null
+        return {
+            entryId: row.entryId,
+            text: row.text,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            attachments: row.attachments,
+        }
+    }
+
+    /**
+     * Insert a scratchlist entry. Returns the canonical row on success
+     * (so the route layer can serialise it without a follow-up read).
+     * Emits a `session-updated` SSE patch carrying `scratchlistUpdatedAt`
+     * so other clients viewing the same session refetch.
+     *
+     * `outcome: 'duplicate'` covers the migration path's idempotency:
+     * the web client may retry pushing a localStorage entry after a
+     * partial failure; the second attempt should be a no-op rather than
+     * a hard error. Route layer maps duplicate → 200/conflict per its
+     * own contract; this layer just reports it.
+     */
+    createScratchlistEntry(
+        sessionId: string,
+        text: string,
+        options?: {
+            entryId?: string
+            createdAt?: number
+            attachments?: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    ): {
+        outcome: 'created' | 'duplicate'
+        entry: {
+            entryId: string
+            text: string
+            createdAt: number
+            updatedAt: number
+            attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    } | { outcome: 'session-not-found' } {
+        const result = this.store.scratchlist.create(sessionId, text, options)
+        if (result.outcome === 'session-not-found') {
+            return result
+        }
+        if (result.outcome === 'created') {
+            this.sessionCache.emitScratchlistChanged(sessionId, result.entry.updatedAt)
+        }
+        return {
+            outcome: result.outcome,
+            entry: {
+                entryId: result.entry.entryId,
+                text: result.entry.text,
+                createdAt: result.entry.createdAt,
+                updatedAt: result.entry.updatedAt,
+                attachments: result.entry.attachments,
+            }
+        }
+    }
+
+    updateScratchlistEntry(
+        sessionId: string,
+        entryId: string,
+        patch: {
+            text?: string
+            attachments?: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    ): {
+        entryId: string
+        text: string
+        createdAt: number
+        updatedAt: number
+        attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+    } | null {
+        const updated = this.store.scratchlist.update(sessionId, entryId, patch)
+        if (!updated) return null
+        this.sessionCache.emitScratchlistChanged(sessionId, updated.updatedAt)
+        return {
+            entryId: updated.entryId,
+            text: updated.text,
+            createdAt: updated.createdAt,
+            updatedAt: updated.updatedAt,
+            attachments: updated.attachments,
+        }
+    }
+
+    deleteScratchlistEntry(sessionId: string, entryId: string): boolean {
+        const existing = this.store.scratchlist.get(sessionId, entryId)
+        const removed = this.store.scratchlist.delete(sessionId, entryId)
+        if (removed && existing) {
+            // Attachment ids may be shared across entries (direct REST).
+            // Only delete blobs that no remaining entry still references.
+            const remainingIds = new Set(
+                this.store.scratchlist
+                    .list(sessionId)
+                    .flatMap((entry) => entry.attachments.map((att) => att.id))
+            )
+            const orphaned = existing.attachments.filter((att) => !remainingIds.has(att.id))
+            if (orphaned.length > 0) {
+                void import('../scratchlistAttachments/storage').then(({ deleteScratchlistAttachmentFiles, getHapiHomeDir }) =>
+                    deleteScratchlistAttachmentFiles(getHapiHomeDir(), orphaned)
+                )
+            }
+            this.sessionCache.emitScratchlistChanged(sessionId, Date.now())
+        }
+        return removed
+    }
+
+    private async withScratchlistUploadLock<T>(
+        namespace: string,
+        sessionId: string,
+        fn: () => Promise<T>
+    ): Promise<T> {
+        const key = `${namespace}:${sessionId}`
+        const previous = this.scratchlistUploadTails.get(key) ?? Promise.resolve()
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        const tail = previous.catch(() => undefined).then(() => gate)
+        this.scratchlistUploadTails.set(key, tail)
+        await previous.catch(() => undefined)
+        try {
+            return await fn()
+        } finally {
+            release()
+            if (this.scratchlistUploadTails.get(key) === tail) {
+                this.scratchlistUploadTails.delete(key)
+            }
+        }
+    }
+
+async uploadScratchlistAttachment(
+        sessionId: string,
+        namespace: string,
+        filename: string,
+        contentBase64: string,
+        mimeType: string
+    ): Promise<{ success: true; attachment: import('@hapi/protocol').ScratchlistAttachmentMetadata } | { success: false; error: string; code?: string }> {
+        const { loadScratchlistAttachmentLimitsFromEnv, isAllowedScratchlistMime } = await import('../config/scratchlistAttachmentLimits')
+        const {
+            estimateBase64Bytes,
+            writeScratchlistAttachmentFile,
+            getHapiHomeDir,
+            sumScratchlistAttachmentBytesOnDisk,
+        } = await import('../scratchlistAttachments/storage')
+        const { validateScratchlistAttachmentsForWrite } = await import('../scratchlistAttachments/validate')
+
+        const limits = loadScratchlistAttachmentLimitsFromEnv()
+        const estimated = estimateBase64Bytes(contentBase64)
+        if (estimated > limits.maxBytesPerFile) {
+            return { success: false, error: 'File too large', code: 'scratchlist_attachment_too_large' }
+        }
+        if (!isAllowedScratchlistMime(mimeType, limits)) {
+            return { success: false, error: 'Mime type not allowed', code: 'scratchlist_attachment_mime' }
+        }
+
+        const hapiHome = getHapiHomeDir()
+        const buffer = Buffer.from(contentBase64, 'base64')
+        return await this.withScratchlistUploadLock(namespace, sessionId, async () => {
+            const sessionBytes = await sumScratchlistAttachmentBytesOnDisk(hapiHome, namespace, sessionId)
+            const provisional = {
+                id: 'pending',
+                filename,
+                mimeType,
+                size: buffer.length,
+                path: 'pending',
+            }
+            const validation = validateScratchlistAttachmentsForWrite([provisional], limits, sessionBytes)
+            if (!validation.ok) {
+                return { success: false, error: validation.error, code: validation.code }
+            }
+
+            const attachment = await writeScratchlistAttachmentFile(
+                hapiHome,
+                namespace,
+                sessionId,
+                filename,
+                mimeType,
+                buffer
+            )
+            return { success: true, attachment }
+        })
+    }
+
+    async resolveScratchlistAttachmentsForSession(
+        sessionId: string,
+        namespace: string,
+        claimed: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+    ): Promise<
+        | { ok: true; attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[] }
+        | { ok: false; error: string }
+    > {
+        const {
+            resolveScratchlistAttachmentsForSession: resolveAttachments,
+            getHapiHomeDir,
+        } = await import('../scratchlistAttachments/storage')
+        return resolveAttachments(getHapiHomeDir(), namespace, sessionId, claimed)
+    }
+
+    async sumScratchlistAttachmentBytesOnDisk(sessionId: string, namespace: string): Promise<number> {
+        const {
+            sumScratchlistAttachmentBytesOnDisk: sumOnDisk,
+            getHapiHomeDir,
+        } = await import('../scratchlistAttachments/storage')
+        return sumOnDisk(getHapiHomeDir(), namespace, sessionId)
+    }
+
+    async deleteScratchlistAttachmentById(
+        sessionId: string,
+        namespace: string,
+        attachmentId: string
+    ): Promise<boolean> {
+        const {
+            deleteScratchlistAttachmentById: deleteById,
+            getHapiHomeDir,
+        } = await import('../scratchlistAttachments/storage')
+        return deleteById(getHapiHomeDir(), namespace, sessionId, attachmentId)
+    }
+
+    async readScratchlistAttachment(
+        hubPath: string
+    ): Promise<{ buffer: Buffer; mimeType: string; filename: string } | null> {
+        const { readScratchlistAttachmentFile, getHapiHomeDir } = await import('../scratchlistAttachments/storage')
+        const read = await readScratchlistAttachmentFile(getHapiHomeDir(), hubPath)
+        if (!read) return null
+        return { buffer: read.buffer, mimeType: 'application/octet-stream', filename: 'attachment' }
+    }
+
     handleMachineAlive(payload: { machineId: string; time: number; health?: unknown }): void {
         this.machineCache.handleMachineAlive(payload)
     }
@@ -614,6 +893,16 @@ export class SyncEngine {
             scheduledAt?: number | null
         }
     ): Promise<void> {
+        if (this.autoArchivingSessionIds.has(sessionId)) {
+            throw new Error('Session is being auto-archived')
+        }
+
+        // Record acceptance before flushMessages' first await. Otherwise an
+        // already-started POST can remain invisible to the auto-archive guard
+        // while it waits for the runner flush, then persist into a killed
+        // session after the archive RPC has been dispatched.
+        this.sessionCache.recordSessionActivity(sessionId, Date.now())
+
         // Flush CLI's outgoing message queue before storing the user message.
         // This ensures any pending assistant responses get a lower seq number
         // than the new user message, preventing the "reply appears after next
@@ -622,6 +911,49 @@ export class SyncEngine {
         await this.messageService.sendMessage(sessionId, payload)
         this.sessionCache.markMessageQueued(sessionId)
         this.sessionCache.recordSessionActivity(sessionId, Date.now())
+    }
+
+    private async archiveSessionIfStillIdle(
+        sessionId: string,
+        reason: string,
+        guard: AutoArchiveGuard
+    ): Promise<boolean> {
+        if (this.autoArchivingSessionIds.has(sessionId)) {
+            return false
+        }
+
+        const latest = this.getSession(sessionId)
+        if (!latest) {
+            return false
+        }
+        if (
+            latest.updatedAt !== guard.updatedAt
+            || latest.metadataVersion !== guard.metadataVersion
+            || latest.agentStateVersion !== guard.agentStateVersion
+        ) {
+            return false
+        }
+
+        const blockReason = getAutoArchiveBlockReason(
+            latest,
+            guard.checkedAt,
+            guard.idleMs,
+            this.store.messages.getUninvokedLocalMessages(sessionId).length > 0
+        )
+        if (blockReason) {
+            return false
+        }
+
+        // From this synchronous reservation until the RPC settles, sendMessage
+        // refuses new prompts. This closes the post-check window where a prompt
+        // could otherwise be stored after killSession had already been sent.
+        this.autoArchivingSessionIds.add(sessionId)
+        try {
+            await this.archiveSession(sessionId, { reason })
+            return true
+        } finally {
+            this.autoArchivingSessionIds.delete(sessionId)
+        }
     }
 
     async cancelQueuedMessage(
@@ -960,7 +1292,8 @@ export class SyncEngine {
         existingSessionId?: string,
         sandbox?: boolean,
         continueLatest?: boolean,
-        codexAccountId?: string
+        codexAccountId?: string,
+        collaborationMode?: CodexCollaborationMode
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         return await this.rpcGateway.spawnSession(
             machineId,
@@ -978,7 +1311,9 @@ export class SyncEngine {
             existingSessionId,
             sandbox,
             continueLatest,
-            codexAccountId
+            codexAccountId,
+            undefined,
+            collaborationMode
         )
     }
 
@@ -1030,7 +1365,9 @@ export class SyncEngine {
         }
 
         const flavor = this.resolveFlavor(session)
-        if (flavor === 'codex') return metadata.codexSessionId ?? this.recoverCodexSessionIdFromMessages(session.id, namespace)
+        if (flavor === 'codex') {
+            return metadata.codexSessionId ?? this.recoverCodexSessionIdFromMessages(session.id, namespace)
+        }
         if (flavor === 'gemini') return metadata.geminiSessionId ?? null
         if (flavor === 'opencode') return metadata.opencodeSessionId ?? null
         if (flavor === 'grok') return metadata.grokSessionId ?? null
@@ -1521,7 +1858,7 @@ export class SyncEngine {
         const switchingCodexAccount = flavor === 'codex'
             && Boolean(opts?.codexAccountId)
             && targetCodexAccountId !== sourceCodexAccountId
-        let spawnResult = await this.rpcGateway.spawnSession(
+        const spawnResult = await this.rpcGateway.spawnSession(
             targetMachine.id,
             directory,
             flavor,
@@ -1538,30 +1875,9 @@ export class SyncEngine {
             undefined,
             useContinue || undefined,
             targetCodexAccountId,
-            switchingCodexAccount ? sourceCodexAccountId : undefined
+            switchingCodexAccount ? sourceCodexAccountId : undefined,
+            session.collaborationMode ?? undefined
         )
-
-        // Fallback: if resume spawn fails, retry without resume token (start fresh session)
-        if (spawnResult.type !== 'success' && !switchingCodexAccount) {
-            spawnResult = await this.rpcGateway.spawnSession(
-                targetMachine.id,
-                directory,
-                flavor,
-                session.model ?? undefined,
-                session.modelReasoningEffort ?? undefined,
-                undefined,
-                undefined,
-                undefined,
-                undefined,
-                session.effort ?? undefined,
-                preferredPermissionMode,
-                session.serviceTier ?? undefined,
-                access.sessionId,
-                undefined,
-                undefined,
-                targetCodexAccountId
-            )
-        }
 
         if (spawnResult.type !== 'success') {
             return { type: 'error', message: spawnResult.message, code: 'resume_failed' }
@@ -1809,54 +2125,113 @@ export class SyncEngine {
             const found = this.extractClaudeSessionId(messages[i].content)
             if (!found) continue
 
-            this.persistRecoveredClaudeSessionId(sessionId, namespace, found)
-            return found
+            return this.persistRecoveredAgentSessionId(sessionId, namespace, 'claudeSessionId', found)
         }
         return null
     }
 
     private recoverCodexSessionIdFromMessages(sessionId: string, namespace: string): string | null {
         const messages = this.messageService.getMessages(sessionId, 200)
+        let legacyChildParentId: string | null = null
         for (let i = messages.length - 1; i >= 0; i -= 1) {
-            const found = this.extractCodexSessionId(messages[i].content)
-            if (!found) continue
+            const content = messages[i].content
+            if (this.isCodexContextResetMessage(content)) return null
 
-            this.persistRecoveredCodexSessionId(sessionId, namespace, found)
-            return found
+            const found = this.extractCodexParentThreadId(content)
+            if (found) {
+                return this.persistRecoveredAgentSessionId(sessionId, namespace, 'codexSessionId', found)
+            }
+
+            const legacy = this.extractLegacyCodexThreadCandidate(content)
+            if (!legacy) continue
+            if (legacy.kind === 'child-parent') {
+                legacyChildParentId ??= legacy.id
+                continue
+            }
+            if (legacyChildParentId === legacy.id) {
+                return this.persistRecoveredAgentSessionId(sessionId, namespace, 'codexSessionId', legacy.id)
+            }
         }
         return null
     }
 
-    private extractCodexSessionId(value: unknown): string | null {
-        if (!value || typeof value !== 'object') {
+    private isCodexContextResetMessage(value: unknown): boolean {
+        const message = asRecord(value)
+        const content = asRecord(message?.content)
+        const event = asRecord(content?.data)
+        return message?.role === 'agent'
+            && content?.type === 'event'
+            && event?.type === 'message'
+            && event.message === 'Context was reset'
+    }
+
+    private extractCodexParentThreadId(value: unknown): string | null {
+        const message = asRecord(value)
+        const content = asRecord(message?.content)
+        const event = asRecord(content?.data)
+        if (message?.role !== 'agent' || content?.type !== 'codex' || !event) {
             return null
         }
 
-        const obj = value as Record<string, unknown>
-        const scope = obj.scope && typeof obj.scope === 'object'
-            ? obj.scope as Record<string, unknown>
-            : null
-        const scopeRole = obj.scopeRole ?? obj.scope_role ?? scope?.role
-        if (scopeRole === 'child') {
-            return this.normalizeAgentSessionId(scope?.parentThreadId)
-                ?? this.normalizeAgentSessionId(scope?.parent_thread_id)
-                ?? this.normalizeAgentSessionId(obj.parentThreadId)
-                ?? this.normalizeAgentSessionId(obj.parent_thread_id)
+        const scope = asRecord(event.scope)
+        const roles = [event.scope_role, event.scopeRole, scope?.role]
+            .filter((role) => role !== undefined)
+        if (roles.length === 0 || roles.some((role) => role !== 'parent')) {
+            return null
         }
 
-        const direct = this.normalizeAgentSessionId(obj.thread_id) ?? this.normalizeAgentSessionId(obj.threadId)
-        if (direct) {
-            return direct
+        const threadIds: string[] = []
+        for (const threadId of [event.thread_id, event.threadId, scope?.thread_id, scope?.threadId]) {
+            if (threadId === undefined) continue
+
+            const normalized = this.normalizeAgentSessionId(threadId)
+            if (!normalized) return null
+            threadIds.push(normalized)
+        }
+        const uniqueThreadIds = [...new Set(threadIds)]
+        return uniqueThreadIds.length === 1 ? uniqueThreadIds[0] : null
+    }
+
+    /** Compatibility for messages persisted before Codex emitted an explicit
+     * parent scope. Child events may still name their parent; unscoped legacy
+     * events may carry the thread id inside `output`. Never use a child's own
+     * thread id as the resumable parent. */
+    private extractLegacyCodexThreadCandidate(
+        value: unknown
+    ): { kind: 'child-parent' | 'unscoped'; id: string } | null {
+        const message = asRecord(value)
+        const content = asRecord(message?.content)
+        const event = asRecord(content?.data)
+        if (message?.role !== 'agent' || content?.type !== 'codex' || !event) {
+            return null
         }
 
-        for (const key of ['content', 'data', 'output']) {
-            const nested = obj[key]
-            if (!nested || typeof nested !== 'object') continue
-            const found = this.extractCodexSessionId(nested)
-            if (found) return found
+        const visit = (candidate: unknown): { kind: 'child-parent' | 'unscoped'; id: string } | null => {
+            const record = asRecord(candidate)
+            if (!record) return null
+            const scope = asRecord(record.scope)
+            const scopeRole = record.scopeRole ?? record.scope_role ?? scope?.role
+            if (scopeRole === 'child') {
+                const id = this.normalizeAgentSessionId(scope?.parentThreadId)
+                    ?? this.normalizeAgentSessionId(scope?.parent_thread_id)
+                    ?? this.normalizeAgentSessionId(record.parentThreadId)
+                    ?? this.normalizeAgentSessionId(record.parent_thread_id)
+                return id ? { kind: 'child-parent', id } : null
+            }
+            if (scopeRole !== undefined) return null
+
+            const direct = this.normalizeAgentSessionId(record.thread_id)
+                ?? this.normalizeAgentSessionId(record.threadId)
+            if (direct) return { kind: 'unscoped', id: direct }
+
+            for (const key of ['data', 'output']) {
+                const nested = visit(record[key])
+                if (nested) return nested
+            }
+            return null
         }
 
-        return null
+        return visit(event)
     }
 
     private extractClaudeSessionId(value: unknown): string | null {
@@ -1895,52 +2270,45 @@ export class SyncEngine {
             : null
     }
 
-    private persistRecoveredCodexSessionId(sessionId: string, namespace: string, codexSessionId: string): void {
+    private persistRecoveredAgentSessionId(
+        sessionId: string,
+        namespace: string,
+        field: 'claudeSessionId' | 'codexSessionId',
+        agentSessionId: string
+    ): string {
         for (let attempt = 0; attempt < 2; attempt += 1) {
             const latest = this.sessionCache.getSessionByNamespace(sessionId, namespace)
                 ?? this.sessionCache.refreshSession(sessionId)
-            if (!latest?.metadata) return
-            if (latest.metadata.codexSessionId === codexSessionId) return
+            if (!latest?.metadata) return agentSessionId
+
+            const existingAgentSessionId = latest.metadata[field]
+            if (typeof existingAgentSessionId === 'string') {
+                return existingAgentSessionId
+            }
 
             const result = this.store.sessions.updateSessionMetadata(
                 sessionId,
-                { ...latest.metadata, codexSessionId },
+                { ...latest.metadata, [field]: agentSessionId },
                 latest.metadataVersion,
                 namespace,
                 { touchUpdatedAt: false }
             )
             if (result.result === 'success') {
                 this.sessionCache.refreshSession(sessionId)
-                return
+                return agentSessionId
             }
             if (result.result !== 'version-mismatch') {
-                return
+                return agentSessionId
+            }
+
+            this.sessionCache.refreshSession(sessionId)
+            const refreshed = this.sessionCache.getSessionByNamespace(sessionId, namespace)
+            const authoritativeAgentSessionId = refreshed?.metadata?.[field]
+            if (typeof authoritativeAgentSessionId === 'string') {
+                return authoritativeAgentSessionId
             }
         }
-    }
-
-    private persistRecoveredClaudeSessionId(sessionId: string, namespace: string, claudeSessionId: string): void {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            const latest = this.sessionCache.getSessionByNamespace(sessionId, namespace)
-                ?? this.sessionCache.refreshSession(sessionId)
-            if (!latest?.metadata) return
-            if (latest.metadata.claudeSessionId === claudeSessionId) return
-
-            const result = this.store.sessions.updateSessionMetadata(
-                sessionId,
-                { ...latest.metadata, claudeSessionId },
-                latest.metadataVersion,
-                namespace,
-                { touchUpdatedAt: false }
-            )
-            if (result.result === 'success') {
-                this.sessionCache.refreshSession(sessionId)
-                return
-            }
-            if (result.result !== 'version-mismatch') {
-                return
-            }
-        }
+        return agentSessionId
     }
 
     private hasSameAgentSessionIds(
@@ -2050,6 +2418,10 @@ export class SyncEngine {
         return await this.rpcGateway.listDirectory(sessionId, path)
     }
 
+    async statFiles(sessionId: string, paths: string[]): Promise<RpcStatFilesResponse> {
+        return await this.rpcGateway.statFiles(sessionId, paths)
+    }
+
     async uploadFile(sessionId: string, filename: string, content: string, mimeType: string): Promise<RpcUploadFileResponse> {
         return await this.rpcGateway.uploadFile(sessionId, filename, content, mimeType)
     }
@@ -2080,10 +2452,6 @@ export class SyncEngine {
         error?: string
     }> {
         return await this.rpcGateway.listSkills(sessionId, flavor)
-    }
-
-    async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
-        return await this.rpcGateway.listCodexModelsForSession(sessionId)
     }
 
     async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {

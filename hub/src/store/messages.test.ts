@@ -24,6 +24,7 @@ describe('cancelQueuedMessage', () => {
         // Row should be gone from uninvoked list
         const remaining = store.messages.getUninvokedLocalMessages(session.id)
         expect(remaining).toHaveLength(0)
+        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
     })
 
     it('already-invoked: returns status=invoked with full message row, row stays in DB', () => {
@@ -67,6 +68,7 @@ describe('cancelQueuedMessage', () => {
         if (second.status === 'cancelled') {
             expect(second.localId).toBeNull()
         }
+        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
     })
 
     it('non-existent messageId: returns status=cancelled with localId=null', () => {
@@ -170,6 +172,90 @@ describe('cancelQueuedMessage', () => {
         // Row still exists
         const messages = store.messages.getMessages(session.id)
         expect(messages.some(m => m.id === msg.id)).toBe(true)
+    })
+})
+
+describe('recordMessagesConsumed', () => {
+    it('rolls back the invocation transition when the session namespace cannot be verified', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'consumed-rollback-wrong-namespace')
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'hello' } }, 'local-rollback')
+        const originalUpdatedAt = store.sessions.getSession(session.id)?.updatedAt
+
+        expect(() => store.recordMessagesConsumed(session.id, ['local-rollback'], 2_000, 'other-namespace'))
+            .toThrow('session not found after messages-consumed transition')
+        expect(store.messages.getLocalMessageStates(session.id, ['local-rollback']))
+            .toEqual([{ localId: 'local-rollback', invokedAt: null }])
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBe(originalUpdatedAt)
+    })
+})
+
+describe('position pagination and structural epochs', () => {
+    it('returns rows strictly after a cursor and respects an inclusive snapshot head', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'position-after')
+        const first = store.messages.addMessage(session.id, { text: 'first' })
+        const second = store.messages.addMessage(session.id, { text: 'second' })
+        const third = store.messages.addMessage(session.id, { text: 'third' })
+        store.messages.addMessage(session.id, { text: 'fourth' })
+
+        const rows = store.messages.getMessagesAfterPosition(
+            session.id,
+            10,
+            { at: first.invokedAt ?? first.createdAt, seq: first.seq },
+            { at: third.invokedAt ?? third.createdAt, seq: third.seq }
+        )
+
+        expect(rows.map((message) => message.id)).toEqual([second.id, third.id])
+    })
+
+    it('reports the newest composite position', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'position-head')
+        const first = store.messages.addMessage(session.id, { text: 'first' })
+        const second = store.messages.addMessage(session.id, { text: 'second' })
+
+        expect(store.messages.getNewestMessagePosition(session.id)).toEqual({
+            at: second.invokedAt ?? second.createdAt,
+            seq: second.seq
+        })
+        expect(first.seq).toBeLessThan(second.seq)
+    })
+
+    it('bumps both epochs when session history is merged', () => {
+        const store = makeStore()
+        const source = makeSession(store, 'epoch-merge-source')
+        const target = makeSession(store, 'epoch-merge-target')
+        store.messages.addMessage(source.id, { text: 'source' })
+        store.messages.addMessage(target.id, { text: 'target' })
+
+        const result = store.messages.mergeSessionMessages(source.id, target.id)
+
+        expect(result.moved).toBe(1)
+        expect(store.messages.getMessageEpoch(source.id)).toBe(1)
+        expect(store.messages.getMessageEpoch(target.id)).toBe(1)
+    })
+
+    it('bumps the target epoch when a copied message lands behind the cached head', () => {
+        const store = makeStore()
+        const target = makeSession(store, 'epoch-copy-target')
+        const head = store.messages.addMessage(target.id, { text: 'head' })
+        const headPosition = {
+            at: head.invokedAt ?? head.createdAt,
+            seq: head.seq
+        }
+
+        const copied = store.messages.copyMessageToSession(target.id, {
+            content: { text: 'historical' },
+            createdAt: headPosition.at - 1_000,
+            localId: null,
+            invokedAt: headPosition.at - 1_000,
+            scheduledAt: null
+        })
+
+        expect(copied.seq).toBeGreaterThan(head.seq)
+        expect(store.messages.getMessagesAfterPosition(target.id, 10, headPosition)).toEqual([])
+        expect(store.messages.getMessageEpoch(target.id)).toBe(1)
     })
 })
 
@@ -376,6 +462,24 @@ describe('content-uuid dedup (reconnect replay)', () => {
         store.messages.addMessage(session.id, agentOutput('u3', 'a'))
         expect(store.messages.getMessages(session.id)).toHaveLength(3)
     })
+
+    it('preserves the content uuid when copying a message to another session', () => {
+        const store = makeStore()
+        const target = makeSession(store, 'uuid-copy-target')
+        const content = agentOutput('uuid-copied', 'copied output')
+
+        const copied = store.messages.copyMessageToSession(target.id, {
+            content,
+            createdAt: Date.now() - 1_000,
+            localId: null,
+            invokedAt: Date.now() - 1_000,
+            scheduledAt: null
+        })
+        const replay = store.messages.addMessage(target.id, content)
+
+        expect(replay.id).toBe(copied.id)
+        expect(store.messages.getMessages(target.id)).toHaveLength(1)
+    })
 })
 
 describe('pruneOldMessages retention', () => {
@@ -385,13 +489,18 @@ describe('pruneOldMessages retention', () => {
         for (let i = 0; i < 10; i++) {
             store.messages.addMessage(session.id, agentOutput(`p${i}`, `m${i}`))
         }
+        expect(store.messages.getMessageEpoch(session.id)).toBe(0)
         const deleted = store.messages.pruneOldMessages(4)
         expect(deleted).toBe(6)
+        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
 
         const remaining = store.messages.getMessages(session.id)
         expect(remaining).toHaveLength(4)
         // The kept rows are the most recent by seq.
         expect(remaining.map(m => (m.content as any).content.data.uuid)).toEqual(['p6', 'p7', 'p8', 'p9'])
+
+        expect(store.messages.pruneOldMessages(4)).toBe(0)
+        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
     })
 
     it('never prunes pending (uninvoked) messages', () => {
@@ -404,6 +513,24 @@ describe('pruneOldMessages retention', () => {
         const deleted = store.messages.pruneOldMessages(1)
         expect(deleted).toBe(0)
         expect(store.messages.getMessages(session.id)).toHaveLength(5)
+        expect(store.messages.getMessageEpoch(session.id)).toBe(0)
+    })
+
+    it('bumps epochs only for sessions where rows were deleted', () => {
+        const store = makeStore()
+        const overCap = makeSession(store, 'prune-over-cap')
+        const atCap = makeSession(store, 'prune-at-cap')
+
+        for (let i = 0; i < 3; i++) {
+            store.messages.addMessage(overCap.id, agentOutput(`over-${i}`, `over ${i}`))
+        }
+        for (let i = 0; i < 2; i++) {
+            store.messages.addMessage(atCap.id, agentOutput(`at-${i}`, `at ${i}`))
+        }
+
+        expect(store.messages.pruneOldMessages(2)).toBe(1)
+        expect(store.messages.getMessageEpoch(overCap.id)).toBe(1)
+        expect(store.messages.getMessageEpoch(atCap.id)).toBe(0)
     })
 
     it('cap of 0 or negative is a no-op', () => {

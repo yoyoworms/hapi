@@ -52,6 +52,38 @@ function getExtFromMimeType(mimeType: string): string {
     return map[mimeType] || ''
 }
 
+export function sanitizeCosFilename(filename: string): string {
+    const basename = filename.replace(/\\/g, '/').split('/').pop() ?? ''
+    const sanitized = basename
+        .normalize('NFKC')
+        .replace(/[\u0000-\u001f\u007f]/g, '')
+        .replace(/[<>:"/\\|?*]/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/^\.+/, '')
+        .replace(/_+/g, '_')
+        .slice(0, 180)
+
+    return sanitized || 'upload'
+}
+
+export function buildCosObjectKey(
+    options: {
+        filename?: string
+        mimeType?: string
+        namespace?: string
+    },
+    uniqueId: string = randomUUID(),
+    now: Date = new Date()
+): string {
+    const date = now.toISOString().slice(0, 10).replace(/-/g, '')
+    const ext = options.mimeType ? getExtFromMimeType(options.mimeType) : ''
+    const basename = options.filename
+        ? sanitizeCosFilename(options.filename)
+        : `upload${ext}`
+    const namespace = options.namespace || 'default'
+    return `hapi/${namespace}/${date}/${uniqueId}-${basename}`
+}
+
 export interface CosUploadResult {
     success: boolean
     url?: string
@@ -72,11 +104,7 @@ export async function uploadToCos(
     }
 
     const client = getClient()
-    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
-    const ext = options.mimeType ? getExtFromMimeType(options.mimeType) : ''
-    const filename = options.filename || `${randomUUID()}${ext}`
-    const ns = options.namespace || 'default'
-    const key = `hapi/${ns}/${date}/${filename}`
+    const key = buildCosObjectKey(options)
 
     try {
         await new Promise<void>((resolve, reject) => {

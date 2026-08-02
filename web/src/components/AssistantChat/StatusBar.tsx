@@ -5,18 +5,21 @@ import {
     isPermissionModeAllowedForFlavor
 } from '@hapi/protocol'
 import type { PermissionModeTone } from '@hapi/protocol'
-import { useEffect, useMemo, useState } from 'react'
-import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode, UsageResponse } from '@/types/api'
+import * as Popover from '@radix-ui/react-popover'
+import { useMemo } from 'react'
+import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
-import { getClaudeModelLabel } from '@hapi/protocol'
-import { formatCodexReasoningLabel, shouldShowCodexReasoningLabel } from '@/lib/codexStatusLabels'
-import type { PlanProgress } from '@/chat/planProgress'
+import {
+    formatCodexReasoningLabel,
+    formatCompactCodexReasoningLabel,
+    shouldShowCodexReasoningLabel
+} from '@/lib/codexStatusLabels'
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
-import { useAppContext } from '@/lib/app-context'
-import type { LatestUsage } from '@/chat/reducer'
+import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
+import type { PlanProgress } from '@/chat/planProgress'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -109,43 +112,81 @@ function getConnectionStatus(
     }
 }
 
-function getContextWarning(contextSize: number, maxContextSize: number, t: (key: string, params?: Record<string, string | number>) => string): { text: string; color: string } | null {
+function getContextWarning(contextSize: number, maxContextSize: number): { color: string } | null {
     const percentageUsed = (contextSize / maxContextSize) * 100
     const percentageRemaining = Math.max(0, 100 - percentageUsed)
 
-    const percent = Math.round(percentageRemaining)
     if (percentageRemaining <= 5) {
-        return { text: t('misc.percentLeft', { percent }), color: 'text-red-500' }
+        return { color: 'text-red-500' }
     } else if (percentageRemaining <= 10) {
-        return { text: t('misc.percentLeft', { percent }), color: 'text-amber-500' }
+        return { color: 'text-amber-500' }
     } else {
-        return { text: t('misc.percentLeft', { percent }), color: 'text-[var(--app-hint)]' }
+        return { color: 'text-[var(--app-hint)]' }
     }
 }
 
-function formatTokenCount(tokens: number): string {
-    if (tokens >= 1_000_000) {
-        return `${(tokens / 1_000_000).toFixed(1)}M`
-    }
-    if (tokens >= 1_000) {
-        return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1)}K`
-    }
-    return String(tokens)
+function formatTokenCount(value: number): string {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+    if (value >= 1_000) return `${Math.round(value / 1_000)}k`
+    return String(value)
 }
 
-function isCodexFastMode(model?: string | null, effort?: string | null): boolean {
-    const normalizedEffort = effort?.trim().toLowerCase()
-    if (normalizedEffort === 'none' || normalizedEffort === 'minimal' || normalizedEffort === 'low') {
-        return true
-    }
-
-    const normalizedModel = model?.trim().toLowerCase() ?? ''
-    return normalizedModel.includes('mini') || normalizedModel.includes('fast')
+function getContextPercentages(contextSize: number, maxContextSize: number): {
+    usedPercentage: number
+    remainingPercentage: number
+} {
+    const usedPercentage = Math.min(100, Math.max(0, Math.round((contextSize / maxContextSize) * 100)))
+    return { usedPercentage, remainingPercentage: 100 - usedPercentage }
 }
 
-/** Cursor native ACP does not emit usage_update; hide the bar to avoid empty/misleading UI. */
-export function shouldShowComposerStatusBar(agentFlavor: string | null | undefined): boolean {
-    return agentFlavor !== 'cursor'
+export function formatContextUsageLabel(contextSize: number, maxContextSize: number | null | undefined): string {
+    if (!maxContextSize) return `${formatTokenCount(contextSize)} used`
+    const { usedPercentage } = getContextPercentages(contextSize, maxContextSize)
+    return `${usedPercentage}% · ${formatTokenCount(contextSize)} / ${formatTokenCount(maxContextSize)}`
+}
+
+export function formatCompactContextUsageLabel(contextSize: number, maxContextSize: number | null | undefined): string {
+    if (!maxContextSize) return `ctx ${formatTokenCount(contextSize)}`
+    const { remainingPercentage } = getContextPercentages(contextSize, maxContextSize)
+    return `ctx ${formatTokenCount(maxContextSize)} (${remainingPercentage}% left)`
+}
+
+export function getContextUsageDetails(
+    contextSize: number,
+    maxContextSize: number | null | undefined,
+    contextCacheRead: number | null | undefined
+): {
+    cacheRead: string | null
+    used: string
+    usedPercentage: number | null
+    remaining: string | null
+    remainingPercentage: number | null
+} {
+    if (!maxContextSize) {
+        return {
+            cacheRead: contextCacheRead && contextCacheRead > 0 ? formatTokenCount(contextCacheRead) : null,
+            used: formatTokenCount(contextSize),
+            usedPercentage: null,
+            remaining: null,
+            remainingPercentage: null
+        }
+    }
+
+    const { usedPercentage, remainingPercentage } = getContextPercentages(contextSize, maxContextSize)
+    return {
+        cacheRead: contextCacheRead && contextCacheRead > 0 ? formatTokenCount(contextCacheRead) : null,
+        used: formatTokenCount(contextSize),
+        usedPercentage,
+        remaining: formatTokenCount(Math.max(0, maxContextSize - contextSize)),
+        remainingPercentage
+    }
+}
+
+export function shouldShowCodexFastBadge(
+    agentFlavor: string | null | undefined,
+    serviceTier: string | null | undefined
+): boolean {
+    return agentFlavor === 'codex' && isFastServiceTier(serviceTier)
 }
 
 export function getVisibleCodexPlanProgress(
@@ -157,185 +198,21 @@ export function getVisibleCodexPlanProgress(
     return progress
 }
 
-function formatCost(cost: number): string {
-    if (cost > 0 && cost < 0.01) return `$${cost.toFixed(3)}`
-    return `$${cost.toFixed(2)}`
-}
-
-function formatDuration(ms: number | null | undefined): string | null {
-    if (ms === null || ms === undefined || !Number.isFinite(ms)) return null
-    const hours = Math.max(0, Math.floor(ms / 3_600_000))
-    if (hours >= 24) {
-        const days = Math.floor(hours / 24)
-        const remainingHours = hours % 24
-        return remainingHours > 0 ? `${days}d${remainingHours}h` : `${days}d`
-    }
-    if (hours > 0) return `${hours}h`
-    const minutes = Math.max(0, Math.floor(ms / 60_000))
-    return `${minutes}m`
-}
-
-function formatReset(resetAt: number | null | undefined): string | null {
-    if (!resetAt) return null
-    return new Date(resetAt).toLocaleString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-    })
-}
-
-function formatLimit(limit: AgentAccountStatus['window']): string | null {
-    if (!limit) return null
-    const duration = formatDuration(limit.remainingMs ?? (limit.resetAt ? limit.resetAt - Date.now() : null))
-    const pct = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
-        ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
-        : null
-    return duration && pct ? `${duration} ${pct}` : duration ?? pct
-}
-
-function formatUsageText(
-    usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null | undefined,
-    latestUsage: LatestUsage | null | undefined
-): { text: string; title: string } | null {
-    if (usage) {
-        const totalTokens = usage.totalInputTokens + usage.totalOutputTokens
-        return {
-            text: `${formatCost(usage.totalCostUsd)} · ${formatTokenCount(totalTokens)} tok`,
-            title: [
-                `Cost: ${formatCost(usage.totalCostUsd)}`,
-                `Input tokens: ${usage.totalInputTokens.toLocaleString()}`,
-                `Output tokens: ${usage.totalOutputTokens.toLocaleString()}`,
-                `Total tokens: ${totalTokens.toLocaleString()}`
-            ].join('\n')
-        }
-    }
-
-    if (!latestUsage) return null
-    const inputTokens = latestUsage.inputTokens + latestUsage.cacheCreation + latestUsage.cacheRead
-    const outputTokens = latestUsage.outputTokens
-    const totalTokens = inputTokens + outputTokens
-    if (totalTokens <= 0 && latestUsage.contextSize <= 0) return null
-
-    return {
-        text: `ctx ${formatTokenCount(latestUsage.contextSize)} · ${formatTokenCount(totalTokens)} tok`,
-        title: [
-            'Latest Claude Code usage from transcript',
-            `Context tokens: ${latestUsage.contextSize.toLocaleString()}`,
-            `Input tokens: ${latestUsage.inputTokens.toLocaleString()}`,
-            `Cache creation: ${latestUsage.cacheCreation.toLocaleString()}`,
-            `Cache read: ${latestUsage.cacheRead.toLocaleString()}`,
-            `Output tokens: ${latestUsage.outputTokens.toLocaleString()}`
-        ].join('\n')
-    }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
-}
-
-function asNumber(value: unknown): number | null {
-    if (typeof value === 'number' && Number.isFinite(value)) return value
-    if (typeof value === 'string' && value.trim()) {
-        const parsed = Number(value)
-        return Number.isFinite(parsed) ? parsed : null
-    }
-    return null
-}
-
-function parseResetAt(value: unknown): number | null {
-    if (typeof value === 'number' && Number.isFinite(value)) return value < 10_000_000_000 ? value * 1000 : value
-    if (typeof value === 'string' && value.trim()) {
-        const asTimestamp = Number(value)
-        if (Number.isFinite(asTimestamp)) return asTimestamp < 10_000_000_000 ? asTimestamp * 1000 : asTimestamp
-        const parsed = Date.parse(value)
-        return Number.isFinite(parsed) ? parsed : null
-    }
-    return null
-}
-
-function getLimitEntry(root: Record<string, unknown>, ...keys: string[]): AgentAccountStatus['window'] {
-    for (const key of keys) {
-        const entry = asRecord(root[key])
-        if (!entry) continue
-        const used = asNumber(
-            entry.utilization
-            ?? entry.used_percentage
-            ?? entry.usedPercentage
-            ?? entry.percent_used
-            ?? entry.percentUsed
-        )
-        if (used === null) continue
-        const usedPercent = Math.max(0, Math.min(100, used <= 1 ? used * 100 : used))
-        const resetAt = parseResetAt(entry.resets_at ?? entry.resetsAt ?? entry.reset_at ?? entry.resetAt)
-        return {
-            resetAt,
-            remainingMs: resetAt ? Math.max(0, resetAt - Date.now()) : null,
-            remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent))
-        }
-    }
-    return null
-}
-
-function accountStatusFromClaudeUsage(usage: UsageResponse | null): AgentAccountStatus | null {
-    const root = asRecord(usage)
-    if (!root) return null
-    const rateLimits = asRecord(root.rate_limits ?? root.rateLimits) ?? root
-    const window = getLimitEntry(rateLimits, 'five_hour', 'fiveHour')
-    const weekly = getLimitEntry(rateLimits, 'seven_day', 'sevenDay', 'seven_day_sonnet', 'sevenDaySonnet', 'seven_day_opus', 'sevenDayOpus')
-    if (!window && !weekly) return null
-    return {
-        provider: 'claude',
-        accountLabel: usage?.accountLabel ?? usage?.subscriptionType ?? null,
-        window,
-        weekly,
-        updatedAt: Date.now()
-    }
-}
-
-function useClaudeAccountStatus(enabled: boolean): AgentAccountStatus | null {
-    const { api } = useAppContext()
-    const [status, setStatus] = useState<AgentAccountStatus | null>(null)
-
-    useEffect(() => {
-        if (!enabled || !api) {
-            setStatus(null)
-            return
-        }
-
-        let cancelled = false
-        const load = async () => {
-            try {
-                const usage = await api.getUsage()
-                if (!cancelled) setStatus(accountStatusFromClaudeUsage(usage))
-            } catch {
-                if (!cancelled) setStatus(null)
-            }
-        }
-
-        void load()
-        const timer = window.setInterval(load, 120_000)
-        return () => {
-            cancelled = true
-            window.clearInterval(timer)
-        }
-    }, [api, enabled])
-
-    return status
-}
-
 export function StatusBar(props: {
     active: boolean
     thinking: boolean
-    sessionId?: string
     agentState: AgentState | null | undefined
     backgroundTaskCount?: number
     contextSize?: number
-    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
-    latestUsage?: LatestUsage | null
-    accountStatus?: AgentAccountStatus | null
     contextCacheRead?: number
     contextWindow?: number | null
+    /**
+     * Model to use for the context-window fallback heuristic when
+     * contextWindow is absent. Falls back to `model`. Callers pass the
+     * usage-bearing message's own model here so local Claude sessions (whose
+     * session.model is often null) still resolve a plausible window.
+     */
+    contextModel?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null
@@ -345,43 +222,40 @@ export function StatusBar(props: {
     planProgress?: PlanProgress | null
     agentFlavor?: string | null
     voiceStatus?: ConversationStatus
-    onModelChange?: (model: string | null) => void
 }) {
     const { t } = useTranslation()
-    const isClaudeFlavor = props.agentFlavor === 'claude' || props.agentFlavor === null
-    const claudeAccountStatus = useClaudeAccountStatus(isClaudeFlavor)
+    const { preferences: headerMetadata } = useSessionHeaderMetadata()
     const connectionStatus = useMemo(
         () => getConnectionStatus(props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount ?? 0, t),
         [props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount, t]
     )
 
+    const contextHeuristicModel = props.contextModel ?? props.model
     const contextWarning = useMemo(
         () => {
             if (props.contextSize === undefined) return null
-            const maxContextSize = props.contextWindow ?? getContextBudgetTokens(props.model, props.agentFlavor)
+            const maxContextSize = props.contextWindow ?? getContextBudgetTokens(contextHeuristicModel, props.agentFlavor)
             if (!maxContextSize) return null
-            return getContextWarning(props.contextSize, maxContextSize, t)
+            return getContextWarning(props.contextSize, maxContextSize)
         },
-        [props.contextSize, props.contextWindow, props.model, props.agentFlavor, t]
+        [props.contextSize, props.contextWindow, contextHeuristicModel, props.agentFlavor]
     )
     const contextUsageLabel = useMemo(() => {
         if (props.contextSize === undefined) return null
-        const maxContextSize = props.contextWindow ?? getContextBudgetTokens(props.model, props.agentFlavor)
-        if (!maxContextSize) return `ctx ${formatTokenCount(props.contextSize)}`
-        const percentageUsed = Math.min(100, Math.round((props.contextSize / maxContextSize) * 100))
-        return `ctx ${formatTokenCount(props.contextSize)}/${formatTokenCount(maxContextSize)} (${percentageUsed}%)`
-    }, [props.contextSize, props.contextWindow, props.model, props.agentFlavor])
+        const maxContextSize = props.contextWindow ?? getContextBudgetTokens(contextHeuristicModel, props.agentFlavor)
+        return formatContextUsageLabel(props.contextSize, maxContextSize)
+    }, [props.contextSize, props.contextWindow, contextHeuristicModel, props.agentFlavor])
     const compactContextUsageLabel = useMemo(() => {
         if (props.contextSize === undefined) return null
-        const maxContextSize = props.contextWindow ?? getContextBudgetTokens(props.model, props.agentFlavor)
-        if (!maxContextSize) return `ctx ${formatTokenCount(props.contextSize)}`
-        const percentageLeft = Math.max(0, Math.round(100 - (props.contextSize / maxContextSize) * 100))
-        return `ctx ${formatTokenCount(maxContextSize).toUpperCase()}, ${percentageLeft}% left`
-    }, [props.contextSize, props.contextWindow, props.model, props.agentFlavor])
-    const cacheHitLabel = useMemo(() => {
-        if (!props.contextCacheRead || props.contextCacheRead <= 0) return null
-        return `cache ${formatTokenCount(props.contextCacheRead)}`
-    }, [props.contextCacheRead])
+        const maxContextSize = props.contextWindow ?? getContextBudgetTokens(contextHeuristicModel, props.agentFlavor)
+        return formatCompactContextUsageLabel(props.contextSize, maxContextSize)
+    }, [props.contextSize, props.contextWindow, contextHeuristicModel, props.agentFlavor])
+    const contextUsageDetails = useMemo(() => {
+        if (props.contextSize === undefined) return null
+        const maxContextSize = props.contextWindow ?? getContextBudgetTokens(contextHeuristicModel, props.agentFlavor)
+        return getContextUsageDetails(props.contextSize, maxContextSize, props.contextCacheRead)
+    }, [props.contextSize, props.contextCacheRead, props.contextWindow, contextHeuristicModel, props.agentFlavor])
+    const contextUsedPercentage = contextUsageDetails?.usedPercentage ?? null
 
     const permissionMode = props.permissionMode
     const displayPermissionMode = permissionMode
@@ -399,30 +273,14 @@ export function StatusBar(props: {
     const collaborationModeLabel = displayCollaborationMode
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
-    const accountStatus = isClaudeFlavor
-        ? props.accountStatus ?? claudeAccountStatus ?? null
-        : props.accountStatus ?? null
-    const accountLimitText = accountStatus
-        ? [formatLimit(accountStatus.window), formatLimit(accountStatus.weekly)].filter(Boolean).join(' · ')
-        : ''
-    const accountTitle = accountStatus
-        ? [
-            accountStatus.accountLabel ? `Account: ${accountStatus.accountLabel}` : null,
-            accountStatus.window?.resetAt ? `Window reset: ${formatReset(accountStatus.window.resetAt)}` : null,
-            accountStatus.weekly?.resetAt ? `Weekly reset: ${formatReset(accountStatus.weekly.resetAt)}` : null
-        ].filter(Boolean).join('\n')
-        : undefined
-    const usageText = formatUsageText(props.usage, props.latestUsage)
-    const codexReasoningLabel = shouldShowCodexReasoningLabel(props.agentFlavor)
-        ? formatCodexReasoningLabel(props.modelReasoningEffort)
+    const displaysCodexReasoning = shouldShowCodexReasoningLabel(props.agentFlavor)
+    const codexReasoningLabel = displaysCodexReasoning
+        ? formatCodexReasoningLabel(props.modelReasoningEffort, headerMetadata.showLabels)
         : null
-    // Prefer the explicit service tier (the real Fast-mode toggle) when set;
-    // fall back to the effort/model heuristic only when the tier is unknown.
-    const codexFastMode = props.agentFlavor === 'codex'
-        ? (props.serviceTier != null
-            ? isFastServiceTier(props.serviceTier)
-            : isCodexFastMode(props.model, props.modelReasoningEffort))
-        : false
+    const compactCodexReasoningLabel = displaysCodexReasoning
+        ? formatCompactCodexReasoningLabel(props.modelReasoningEffort)
+        : null
+    const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
     const goalLabel = props.agentFlavor === 'codex' && props.threadGoal
         ? props.threadGoal.status === 'active'
             ? 'goal'
@@ -435,9 +293,9 @@ export function StatusBar(props: {
     )
 
     return (
-        <div className="flex min-w-0 items-center justify-between gap-2 px-2 pb-1">
-            <div className="flex min-w-0 flex-1 items-baseline gap-2 sm:gap-3">
-                <div className="flex shrink-0 items-center gap-1.5">
+        <div className="flex min-w-0 items-baseline justify-between gap-2 px-2 pb-1">
+            <div className="flex min-w-0 flex-1 items-baseline gap-2">
+                <div className="relative top-px sm:top-0.5 flex shrink-0 items-center gap-1.5">
                     <span
                         className={`h-2 w-2 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
                     />
@@ -455,42 +313,76 @@ export function StatusBar(props: {
                             completed: planProgress.completed,
                             total: planProgress.total
                         })}
-                        {planProgress.currentStep ? (
-                            <span> · {planProgress.currentStep}</span>
-                        ) : null}
+                        {planProgress.currentStep ? ` · ${planProgress.currentStep}` : null}
                     </span>
                 ) : null}
                 {contextUsageLabel ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} min-w-0 whitespace-nowrap text-[10px] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}>
-                        <span className="sm:hidden">
-                            {compactContextUsageLabel}
-                        </span>
-                        <span className="hidden sm:inline">
-                            {contextUsageLabel}{contextWarning ? ` · ${contextWarning.text}` : ''}
-                        </span>
-                    </span>
-                ) : null}
-                {cacheHitLabel ? (
-                    <span className="hidden whitespace-nowrap text-[10px] text-[var(--app-hint)] sm:inline">
-                        {cacheHitLabel}
-                    </span>
+                    <Popover.Root>
+                        <Popover.Trigger asChild>
+                            <button
+                                type="button"
+                                aria-label={t('misc.contextDetails')}
+                                className={`${planProgress ? 'hidden sm:inline-flex' : ''} min-w-0 cursor-pointer whitespace-nowrap rounded-sm bg-transparent p-0 text-[10px] leading-4 outline-none focus-visible:ring-1 focus-visible:ring-[var(--app-link)] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}
+                            >
+                                <span className="sm:hidden">{compactContextUsageLabel}</span>
+                                <span className="hidden items-center gap-2 sm:inline-flex">
+                                    {contextUsedPercentage !== null ? (
+                                        <span
+                                            aria-hidden="true"
+                                            className="h-1 w-12 shrink-0 overflow-hidden rounded-full bg-[var(--app-link-muted)]"
+                                        >
+                                            <span
+                                                className="block h-full rounded-full bg-current"
+                                                style={{ width: `${contextUsedPercentage}%` }}
+                                            />
+                                        </span>
+                                    ) : null}
+                                    <span>{contextUsageLabel}</span>
+                                </span>
+                            </button>
+                        </Popover.Trigger>
+                        <Popover.Portal>
+                            <Popover.Content
+                                side="top"
+                                align="start"
+                                sideOffset={6}
+                                collisionPadding={8}
+                                className="z-50 rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2 shadow-lg"
+                            >
+                                <div className="flex max-w-[min(22rem,calc(100vw-1rem))] flex-col gap-1 text-xs leading-tight text-[var(--app-fg)]">
+                                    {contextUsageDetails?.cacheRead ? (
+                                        <span className="break-words">
+                                            {t('misc.contextCache', { value: contextUsageDetails.cacheRead })}
+                                        </span>
+                                    ) : null}
+                                    <span className="break-words">
+                                        {contextUsageDetails?.usedPercentage === null
+                                            ? t('misc.contextUsedTokens', { value: contextUsageDetails.used })
+                                            : t('misc.contextUsed', {
+                                                value: contextUsageDetails?.used ?? '',
+                                                percent: contextUsageDetails?.usedPercentage ?? 0
+                                            })}
+                                    </span>
+                                    {contextUsageDetails?.remaining && contextUsageDetails.remainingPercentage !== null ? (
+                                        <span className="break-words">
+                                            {t('misc.contextRemaining', {
+                                                value: contextUsageDetails.remaining,
+                                                percent: contextUsageDetails.remainingPercentage
+                                            })}
+                                        </span>
+                                    ) : null}
+                                </div>
+                            </Popover.Content>
+                        </Popover.Portal>
+                    </Popover.Root>
                 ) : null}
             </div>
 
-            <div className="flex min-w-0 items-center justify-end gap-2">
-                {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} min-w-0 max-w-[46vw] truncate text-[10px] font-medium text-[var(--app-fg)]`} title={accountTitle}>
-                        {accountStatus.accountLabel ? `${accountStatus.accountLabel} ` : ''}{accountLimitText}
-                    </span>
-                ) : null}
-                {usageText ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} shrink-0 text-[10px] text-[var(--app-hint)]`} title={usageText.title}>
-                        {usageText.text}
-                    </span>
-                ) : null}
+            <div className="flex min-w-0 shrink-0 items-baseline gap-2">
                 {codexReasoningLabel ? (
                     <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-hint)]`}>
-                        {codexReasoningLabel}
+                        <span className="sm:hidden">{compactCodexReasoningLabel}</span>
+                        <span className="hidden sm:inline">{codexReasoningLabel}</span>
                     </span>
                 ) : null}
                 {codexFastMode ? (
@@ -503,11 +395,6 @@ export function StatusBar(props: {
                         {goalLabel}
                     </span>
                 ) : null}
-                {props.model ? (
-                    <span className="hidden text-[10px] text-[var(--app-hint)] md:inline">
-                        {getClaudeModelLabel(props.model)}
-                    </span>
-                ) : null}
                 {collaborationModeLabel ? (
                     <span className="whitespace-nowrap text-xs text-blue-500">
                         {collaborationModeLabel}
@@ -518,9 +405,6 @@ export function StatusBar(props: {
                         {permissionModeLabel}
                     </span>
                 ) : null}
-                <span className="hidden text-[10px] text-[var(--app-hint)] sm:inline">
-                    v{__APP_VERSION__}
-                </span>
             </div>
         </div>
     )

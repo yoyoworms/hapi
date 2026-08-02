@@ -1,5 +1,5 @@
 import { getCodexCollaborationModeOptions, getPermissionModeOptionsForFlavor } from '@hapi/protocol'
-import { ComposerPrimitive, useAssistantApi, useAssistantState } from '@assistant-ui/react'
+import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import {
     type ChangeEvent as ReactChangeEvent,
     type ClipboardEvent as ReactClipboardEvent,
@@ -12,13 +12,18 @@ import {
     useRef,
     useState
 } from 'react'
-import type { AgentState, AttachmentMetadata, CodexCollaborationMode, PermissionMode, PiModelSummary, ThreadGoal } from '@/types/api'
+import { isRichComposerMentionsEnabled } from '@/lib/composerSegments'
+import type { SessionMentionResolveResult } from '@/components/AssistantChat/RichComposerInput'
+import {
+    RichComposerInput,
+    type RichComposerInputHandle,
+} from '@/components/AssistantChat/RichComposerInput'
+import type { AgentState, CodexCollaborationMode, PermissionMode, PiModelSummary, ThreadGoal } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import type { ConversationStatus } from '@/realtime/types'
 import { useActiveWord } from '@/hooks/useActiveWord'
 import { useActiveSuggestions } from '@/hooks/useActiveSuggestions'
 import { applySuggestion } from '@/utils/applySuggestion'
-import { uploadedAttachmentPaths } from '@/lib/attachmentAdapter'
 import { usePlatform } from '@/hooks/usePlatform'
 import { usePWAInstall } from '@/hooks/usePWAInstall'
 import { supportsEffort, supportsModelChange, PI_THINKING_LEVEL_LABELS } from '@hapi/protocol'
@@ -28,19 +33,17 @@ import { useComposerDraft } from '@/hooks/useComposerDraft'
 import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
-import { shouldShowComposerStatusBar, StatusBar } from '@/components/AssistantChat/StatusBar'
-import { useHappyChatContext } from '@/components/AssistantChat/context'
+import { StatusBar } from '@/components/AssistantChat/StatusBar'
 import { ComposerButtons } from '@/components/AssistantChat/ComposerButtons'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
 import { useTranslation } from '@/lib/use-translation'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
-import type { LatestUsage } from '@/chat/reducer'
-import type { PlanProgress } from '@/chat/planProgress'
 import { getCodexComposerReasoningEffortOptions } from './codexReasoningEffortOptions'
 import { getDisplayedCodexServiceTier } from './codexFastMode'
 import { getPiThinkingLevelOptions, getHighestThinkingLevel, isThinkingLevelSupported } from './piThinkingLevelOptions'
+import type { PlanProgress } from '@/chat/planProgress'
 import { groupModelsByProvider } from './piModelGroups'
 import { PiModelPanel } from './PiModelPanel'
 import { PiThinkingLevelPanel } from './PiThinkingLevelPanel'
@@ -137,65 +140,6 @@ export function ModelEffortSettingsSection(props: {
     )
 }
 
-// Draft store: persist composer text per session across switches
-const draftStore = new Map<string, string>()
-const inputHistoryStore: Record<string, string[]> = (() => {
-    if (typeof window === 'undefined') return {}
-    try {
-        const raw = window.localStorage.getItem('hapi:composer-input-history:v2')
-        const parsed = raw ? JSON.parse(raw) : {}
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-        const result: Record<string, string[]> = {}
-        for (const [sessionId, value] of Object.entries(parsed)) {
-            if (typeof sessionId !== 'string' || !Array.isArray(value)) continue
-            const history = value
-                .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-                .slice(-100)
-            if (history.length > 0) {
-                result[sessionId] = history
-            }
-        }
-        return result
-    } catch {
-        return {}
-    }
-})()
-
-function persistInputHistory(): void {
-    if (typeof window === 'undefined') return
-    try {
-        window.localStorage.setItem('hapi:composer-input-history:v2', JSON.stringify(inputHistoryStore))
-    } catch {}
-}
-
-function getInputHistory(sessionId: string | undefined): string[] {
-    if (!sessionId) return []
-    return inputHistoryStore[sessionId] ?? []
-}
-
-function addInputHistory(sessionId: string | undefined, text: string): void {
-    if (!sessionId) return
-    const entry = text.trim()
-    if (!entry) return
-    const history = inputHistoryStore[sessionId] ?? []
-    const last = history[history.length - 1]
-    if (last === entry) return
-    history.push(entry)
-    if (history.length > 100) {
-        history.splice(0, history.length - 100)
-    }
-    inputHistoryStore[sessionId] = history
-    persistInputHistory()
-}
-
-function isCaretOnFirstLine(el: HTMLTextAreaElement): boolean {
-    return el.value.lastIndexOf('\n', Math.max(0, el.selectionStart - 1)) === -1
-}
-
-function isCaretOnLastLine(el: HTMLTextAreaElement): boolean {
-    return el.value.indexOf('\n', el.selectionEnd) === -1
-}
-
 export function HappyComposer(props: {
     sessionId?: string
     disabled?: boolean
@@ -212,11 +156,10 @@ export function HappyComposer(props: {
     agentState?: AgentState | null
     backgroundTaskCount?: number
     contextSize?: number
-    latestUsage?: LatestUsage | null
-    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
-    accountStatus?: import('@/types/api').Session['accountStatus']
     contextCacheRead?: number
     contextWindow?: number | null
+    /** Model for the context-window heuristic; see StatusBar.contextModel. */
+    contextModel?: string | null
     controlledByUser?: boolean
     agentFlavor?: string | null
     availableModelOptions?: Array<{ value: string | null; label: string }>
@@ -249,11 +192,6 @@ export function HappyComposer(props: {
     terminalUnsupported?: boolean
     autocompletePrefixes?: string[]
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
-    onDirectSend?: (text: string, attachments?: AttachmentMetadata[]) => void
-    queuedCount?: number
-    hasPausedQueue?: boolean
-    onClearQueue?: () => void
-    onResumeQueue?: () => void
     // Voice assistant props
     voiceStatus?: ConversationStatus
     voiceMicMuted?: boolean
@@ -274,6 +212,8 @@ export function HappyComposer(props: {
     // inline error affordance until the user dismisses or starts editing.
     sendError?: ComposerSendError | null
     onClearSendError?: () => void
+    /** Chip hover / aria-label resolver (SessionChat → useSessions). */
+    resolveSessionMentionTooltip?: (id: string, title: string) => SessionMentionResolveResult
 }) {
     const { t } = useTranslation()
     const {
@@ -294,6 +234,7 @@ export function HappyComposer(props: {
         contextSize,
         contextCacheRead,
         contextWindow,
+        contextModel,
         controlledByUser = false,
         agentFlavor,
         availableModelOptions,
@@ -325,7 +266,8 @@ export function HappyComposer(props: {
         onSchedule: onScheduleProp,
         onClearSchedule: onClearScheduleProp,
         sendError = null,
-        onClearSendError
+        onClearSendError,
+        resolveSessionMentionTooltip,
     } = props
 
     // Use ?? so missing values fall back to default (destructuring defaults only handle undefined)
@@ -337,43 +279,14 @@ export function HappyComposer(props: {
     const serviceTier = rawServiceTier ?? null
     const displayedServiceTier = getDisplayedCodexServiceTier(serviceTier)
 
-    const api = useAssistantApi()
+    const api = useAui()
     const { composerEnterBehavior } = useComposerEnterBehavior()
-    const composerText = useAssistantState(({ composer }) => composer.text)
-    const attachments = useAssistantState(({ composer }) => composer.attachments)
-    const threadIsRunning = useAssistantState(({ thread }) => thread.isRunning)
-    const threadIsDisabled = useAssistantState(({ thread }) => thread.isDisabled)
+    const composerText = useAuiState((s) => s.composer.text)
+    const attachments = useAuiState((s) => s.composer.attachments)
+    const threadIsRunning = useAuiState((s) => s.thread.isRunning)
+    const threadIsDisabled = useAuiState((s) => s.thread.isDisabled)
 
-    // Save draft on unmount or session change, restore on mount
-    const composerTextRef = useRef(composerText)
-    composerTextRef.current = composerText
-    const prevSessionIdRef = useRef(sessionId)
-
-    useEffect(() => {
-        historyIndexRef.current = null
-        historyDraftRef.current = ''
-        if (sessionId) {
-            const draft = draftStore.get(sessionId)
-            if (draft) {
-                api.composer().setText(draft)
-            }
-        }
-        return () => {
-            const id = prevSessionIdRef.current
-            if (id) {
-                const text = composerTextRef.current
-                if (text.trim()) {
-                    draftStore.set(id, text)
-                } else {
-                    draftStore.delete(id)
-                }
-            }
-        }
-    }, [sessionId, api])
-    prevSessionIdRef.current = sessionId
-
-    // threadIsDisabled kept for hook order but not used — queue allows sending while thinking
-    const controlsDisabled = disabled || (!active && !allowSendWhenInactive)
+    const controlsDisabled = disabled || (!active && !allowSendWhenInactive) || threadIsDisabled
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
     const hasAttachments = attachments.length > 0
@@ -406,11 +319,30 @@ export function HappyComposer(props: {
     const setPendingSchedule = isControlled ? onScheduleProp : setPendingScheduleLocal
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
+    const richInputRef = useRef<RichComposerInputHandle>(null)
+    // Kill-switch only (?richMentions=0 / localStorage=0 / VITE=false). Mount-time
+    // read — hard reload required, so no per-keystroke localStorage/URL parse.
+    const [richMentionsEnabled] = useState(() => isRichComposerMentionsEnabled())
     const prevControlledByUser = useRef(controlledByUser)
-    const historyIndexRef = useRef<number | null>(null)
-    const historyDraftRef = useRef('')
 
-    useComposerDraft(sessionId, composerText, (text) => api.composer().setText(text))
+    const attachmentDrafts = attachments.flatMap((attachment) => {
+        if (!attachment.file) return []
+        const upload = attachment as typeof attachment & { path?: string; previewUrl?: string }
+        return [{
+            id: attachment.id,
+            file: attachment.file,
+            path: upload.path,
+            previewUrl: upload.previewUrl,
+        }]
+    })
+    useComposerDraft(
+        sessionId,
+        composerText,
+        attachmentDrafts,
+        active,
+        (text) => api.composer().setText(text),
+        (file) => api.composer().addAttachment(file),
+    )
 
     // assistant-ui clears `composer.text` synchronously the moment a send is
     // invoked AND `SessionChat.handleSend` clears `pendingSchedule` the
@@ -447,6 +379,10 @@ export function HappyComposer(props: {
     }, [sendError, api, composerText, onScheduleProp])
 
     useEffect(() => {
+        if (richMentionsEnabled) {
+            // Rich input owns mirror text + selection via onMirrorChange.
+            return
+        }
         setInputState((prev) => {
             if (prev.text === composerText) return prev
             // When syncing from composerText, update selection to end of text
@@ -454,7 +390,7 @@ export function HappyComposer(props: {
             const newPos = composerText.length
             return { text: composerText, selection: { start: newPos, end: newPos } }
         })
-    }, [composerText])
+    }, [composerText, richMentionsEnabled])
 
     // Track one-time "continue" hint after switching from local to remote.
     useEffect(() => {
@@ -490,10 +426,32 @@ export function HappyComposer(props: {
 
     const handleSuggestionSelect = useCallback((index: number) => {
         const suggestion = suggestions[index]
-        if (!suggestion || !textareaRef.current) return
+        if (!suggestion) return
         if (suggestion.text.startsWith('$')) {
             markSkillUsed(suggestion.text.slice(1))
         }
+
+        if (richMentionsEnabled && richInputRef.current) {
+            // insert*/apply* emit mirror state via onMirrorChange (keep inputState in mirror space).
+            if (suggestion.sessionMention) {
+                richInputRef.current.insertSessionMention(
+                    suggestion.sessionMention,
+                    autocompletePrefixes
+                )
+            } else {
+                richInputRef.current.applyPlainSuggestion(
+                    suggestion.text,
+                    autocompletePrefixes
+                )
+            }
+            setTimeout(() => {
+                richInputRef.current?.focus()
+            }, 0)
+            haptic('light')
+            return
+        }
+
+        if (!textareaRef.current) return
 
         const result = applySuggestion(
             inputState.text,
@@ -521,9 +479,9 @@ export function HappyComposer(props: {
         }, 0)
 
         haptic('light')
-    }, [api, suggestions, inputState, autocompletePrefixes, haptic])
+    }, [api, suggestions, inputState, autocompletePrefixes, haptic, richMentionsEnabled])
 
-    const abortDisabled = controlsDisabled || isAborting || !thinking
+    const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
     const showSwitchButton = Boolean(controlledByUser && onSwitchToRemote)
     const showTerminalButton = Boolean(onTerminal || terminalUnsupported)
@@ -532,9 +490,9 @@ export function HappyComposer(props: {
 
     useEffect(() => {
         if (!isAborting) return
-        if (thinking) return
+        if (threadIsRunning) return
         setIsAborting(false)
-    }, [isAborting, thinking])
+    }, [isAborting, threadIsRunning])
 
     useEffect(() => {
         if (!isSwitching) return
@@ -630,7 +588,15 @@ export function HappyComposer(props: {
         [permissionModeOptions]
     )
 
-    const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    /** Flush rich chips → `[title](/sessions/<id>)` into composer.text, then send. */
+    const flushAndSend = useCallback(() => {
+        if (richMentionsEnabled && richInputRef.current) {
+            richInputRef.current.flushSerializedText()
+        }
+        api.composer().send()
+    }, [api, richMentionsEnabled])
+
+    const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
         const key = e.key
 
         // Avoid intercepting IME composition keystrokes (Enter, arrows, etc.)
@@ -638,9 +604,9 @@ export function HappyComposer(props: {
             return
         }
 
-        // Shift+Enter inserts a newline (standard behavior)
+        // Shift+Enter inserts a newline (textarea default; rich path inserts <br>).
         if (key === 'Enter' && e.shiftKey) {
-            return // let default textarea behavior handle newline
+            return
         }
 
         // Enter with suggestions visible: select the suggestion
@@ -651,20 +617,19 @@ export function HappyComposer(props: {
             return
         }
 
-        // Only plain Enter (no modifiers) sends on non-touch devices; other modifier
-        // combos are ignored. Touch devices show a dedicated send button.
-        if (key === 'Enter' && !isTouch) {
+        // Only plain Enter (no modifiers) sends; other modifier combos are ignored
+        if (key === 'Enter') {
             if (composerEnterBehavior === 'newline') {
                 if ((e.ctrlKey || e.metaKey) && !e.altKey && canSend) {
                     e.preventDefault()
-                    handleSend()
+                    flushAndSend()
                     setShowContinueHint(false)
                 }
                 return
             }
             e.preventDefault()
             if (!e.ctrlKey && !e.altKey && !e.metaKey && canSend) {
-                handleSend()
+                flushAndSend()
                 setShowContinueHint(false)
             }
             return
@@ -694,55 +659,7 @@ export function HappyComposer(props: {
             }
         }
 
-        const inputHistory = getInputHistory(sessionId)
-        if ((key === 'ArrowUp' || key === 'ArrowDown') && inputHistory.length > 0) {
-            const el = textareaRef.current
-            if (!el) return
-
-            const canNavigateUp = key === 'ArrowUp'
-                && el.selectionStart === el.selectionEnd
-                && (historyIndexRef.current !== null || isCaretOnFirstLine(el))
-            const canNavigateDown = key === 'ArrowDown'
-                && el.selectionStart === el.selectionEnd
-                && (historyIndexRef.current !== null || isCaretOnLastLine(el))
-
-            if (canNavigateUp || canNavigateDown) {
-                e.preventDefault()
-
-                if (key === 'ArrowUp') {
-                    if (historyIndexRef.current === null) {
-                        historyDraftRef.current = composerTextRef.current
-                        historyIndexRef.current = inputHistory.length - 1
-                    } else {
-                        historyIndexRef.current = Math.max(0, historyIndexRef.current - 1)
-                    }
-                } else if (historyIndexRef.current !== null) {
-                    if (historyIndexRef.current >= inputHistory.length - 1) {
-                        historyIndexRef.current = null
-                    } else {
-                        historyIndexRef.current += 1
-                    }
-                }
-
-                const nextText = historyIndexRef.current === null
-                    ? historyDraftRef.current
-                    : inputHistory[historyIndexRef.current] ?? ''
-                const cursorPosition = nextText.length
-                api.composer().setText(nextText)
-                setInputState({
-                    text: nextText,
-                    selection: { start: cursorPosition, end: cursorPosition }
-                })
-                setTimeout(() => {
-                    const input = textareaRef.current
-                    if (!input) return
-                    input.setSelectionRange(cursorPosition, cursorPosition)
-                }, 0)
-                return
-            }
-        }
-
-        if (key === 'Escape' && thinking) {
+        if (key === 'Escape' && threadIsRunning) {
             e.preventDefault()
             handleAbort()
             return
@@ -771,8 +688,9 @@ export function HappyComposer(props: {
         canSend,
         api,
         haptic,
-        sessionId,
-        composerEnterBehavior
+        composerEnterBehavior,
+        richMentionsEnabled,
+        flushAndSend,
     ])
 
     useEffect(() => {
@@ -798,8 +716,6 @@ export function HappyComposer(props: {
             start: e.target.selectionStart,
             end: e.target.selectionEnd
         }
-        historyIndexRef.current = null
-        historyDraftRef.current = ''
         setInputState({ text: e.target.value, selection })
         // Editing the restored text is the operator's "I'm handling it"
         // signal -- drop the inline error so the affordance doesn't shout
@@ -817,7 +733,7 @@ export function HappyComposer(props: {
         }))
     }, [])
 
-    const handlePaste = useCallback(async (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const handlePaste = useCallback(async (e: ReactClipboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
         const files = Array.from(e.clipboardData?.files || [])
         const imageFiles = files.filter(file => file.type.startsWith('image/'))
 
@@ -937,48 +853,10 @@ export function HappyComposer(props: {
         || showFastModeSettings
     )
     const showAbortButton = true
-    const voiceEnabled = false
+    const voiceEnabled = Boolean(onVoiceToggle)
 
     const handleSend = useCallback(() => {
-        if (sessionId) draftStore.delete(sessionId)
-        const textToRecord = composerTextRef.current
-        addInputHistory(sessionId, textToRecord)
-        historyIndexRef.current = null
-        historyDraftRef.current = ''
-        // When thinking, api.composer().send() is blocked by the library.
-        // Bypass by reading text directly and calling onDirectSend.
-        if (thinking && props.onDirectSend) {
-            const text = composerTextRef.current.trim()
-            if (!text && attachments.length === 0) return
-            // Extract attachment metadata from the shared upload map
-            const attachmentMetas: AttachmentMetadata[] = []
-            for (const att of attachments) {
-                const uploaded = uploadedAttachmentPaths.get(att.id)
-                if (uploaded) {
-                    attachmentMetas.push({
-                        id: att.id,
-                        filename: att.name,
-                        mimeType: att.contentType ?? 'application/octet-stream',
-                        size: (att as any).file?.size ?? 0,
-                        path: uploaded.path,
-                        previewUrl: uploaded.previewUrl
-                    })
-                }
-            }
-            props.onDirectSend(text, attachmentMetas.length > 0 ? attachmentMetas : undefined)
-            api.composer().setText('')
-            // Clear attachments after send - try multiple approaches since
-            // assistant-ui may block some operations during thinking state
-            const attIds = attachments.map(a => a.id)
-            for (const id of attIds) {
-                uploadedAttachmentPaths.delete(id)
-                try { (api.composer() as unknown as { removeAttachment?: (id: string) => void }).removeAttachment?.(id) } catch {}
-            }
-            // Fallback: reset the entire composer if attachments persist
-            try { api.composer().reset() } catch {}
-            return
-        }
-        api.composer().send()
+        flushAndSend()
         // SessionChat owns clearing the schedule — it clears only after awaiting
         // the send hook's accepted result, which covers both pre-mutation guards
         // and async inactive-session resume failure. Clearing here unconditionally
@@ -989,7 +867,7 @@ export function HappyComposer(props: {
         // the route-level state (`onSuccess`/`onError` in router.tsx) replaces
         // or clears it based on the actual mutation result, so the user keeps
         // the error context while the new attempt is in flight.
-    }, [api, sessionId, thinking, props.onDirectSend, attachments])
+    }, [flushAndSend])
 
     // Pi: selected model info for UI labels and thinking level filtering
     const piModelLabel = agentFlavor === 'pi'
@@ -1450,32 +1328,25 @@ export function HappyComposer(props: {
                 <ComposerPrimitive.Root className="relative" onSubmit={handleSubmit}>
                     {overlays}
 
-                    {/* QuickPermissionBar removed: PermissionFooter inside tool cards handles approvals */}
-
-                    {shouldShowComposerStatusBar(agentFlavor) ? (
-                        <StatusBar
-                            active={active}
-                            thinking={thinking}
-                            sessionId={props.sessionId}
-                            agentState={agentState}
-                            backgroundTaskCount={backgroundTaskCount}
-                            contextSize={contextSize}
-                            usage={props.usage}
-                            accountStatus={props.accountStatus}
-                            contextCacheRead={contextCacheRead}
-                            contextWindow={contextWindow}
-                            model={model}
-                            modelReasoningEffort={modelReasoningEffort}
-                            serviceTier={serviceTier}
-                            permissionMode={permissionMode}
-                            collaborationMode={collaborationMode}
-                            threadGoal={threadGoal}
-                            planProgress={planProgress}
-                            agentFlavor={agentFlavor}
-                            voiceStatus={voiceStatus}
-                            latestUsage={props.latestUsage}
-                        />
-                    ) : null}
+                    <StatusBar
+                        active={active}
+                        thinking={thinking}
+                        agentState={agentState}
+                        backgroundTaskCount={backgroundTaskCount}
+                        contextSize={contextSize}
+                        contextCacheRead={contextCacheRead}
+                        contextWindow={contextWindow}
+                        contextModel={contextModel}
+                        model={model}
+                        modelReasoningEffort={modelReasoningEffort}
+                        serviceTier={serviceTier}
+                        permissionMode={permissionMode}
+                        collaborationMode={collaborationMode}
+                        threadGoal={threadGoal}
+                        planProgress={planProgress}
+                        agentFlavor={agentFlavor}
+                        voiceStatus={voiceStatus}
+                    />
 
                     {sendError ? (
                         <div
@@ -1499,7 +1370,7 @@ export function HappyComposer(props: {
                     ) : null}
 
                     <div
-                        className={`overflow-hidden rounded-[20px] bg-[var(--app-secondary-bg)] ${
+                        className={`overflow-clip rounded-[20px] bg-[var(--app-secondary-bg)] ${
                             sendError ? 'ring-1 ring-red-500' : ''
                         }`}
                     >
@@ -1510,20 +1381,39 @@ export function HappyComposer(props: {
                         ) : null}
 
                         <div className="flex items-center px-4 py-3">
-                            <ComposerPrimitive.Input
-                                ref={textareaRef}
-                                autoFocus={!controlsDisabled && !isTouch}
-                                placeholder={showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage')}
-                                disabled={controlsDisabled}
-                                maxRows={5}
-                                submitOnEnter={false}
-                                cancelOnEscape={false}
-                                onChange={handleChange}
-                                onSelect={handleSelect}
-                                onKeyDown={handleKeyDown}
-                                onPaste={handlePaste}
-                                className="flex-1 resize-none bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                            />
+                            {richMentionsEnabled ? (
+                                <RichComposerInput
+                                    ref={richInputRef}
+                                    value={composerText}
+                                    autoFocus={!controlsDisabled && !isTouch}
+                                    placeholder={showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage')}
+                                    disabled={controlsDisabled}
+                                    onValueChange={(text) => api.composer().setText(text)}
+                                    onMirrorChange={(state) => setInputState(state)}
+                                    onKeyDown={handleKeyDown}
+                                    onPaste={handlePaste}
+                                    resolveSessionMentionTooltip={resolveSessionMentionTooltip}
+                                    onEdit={() => {
+                                        if (sendError && onClearSendError) onClearSendError()
+                                    }}
+                                    className="max-h-[7.5rem] min-h-[1.5rem] flex-1 overflow-y-auto whitespace-pre-wrap break-words bg-transparent text-base leading-snug text-[var(--app-fg)] focus:outline-none"
+                                />
+                            ) : (
+                                <ComposerPrimitive.Input
+                                    ref={textareaRef}
+                                    autoFocus={!controlsDisabled && !isTouch}
+                                    placeholder={showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage')}
+                                    disabled={controlsDisabled}
+                                    maxRows={5}
+                                    submitOnEnter={false}
+                                    cancelOnEscape={false}
+                                    onChange={handleChange}
+                                    onSelect={handleSelect}
+                                    onKeyDown={handleKeyDown}
+                                    onPaste={handlePaste}
+                                    className="flex-1 resize-none bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                                />
+                            )}
                         </div>
 
                         <ComposerButtons
@@ -1543,10 +1433,11 @@ export function HappyComposer(props: {
                             switchDisabled={switchDisabled}
                             isSwitching={isSwitching}
                             onSwitch={handleSwitch}
-                            voiceEnabled={false}
-                            voiceStatus={'disconnected'}
-                            onVoiceToggle={() => {}}
-
+                            voiceEnabled={voiceEnabled}
+                            voiceStatus={voiceStatus}
+                            voiceMicMuted={voiceMicMuted}
+                            onVoiceToggle={onVoiceToggle ?? (() => {})}
+                            onVoiceMicToggle={onVoiceMicToggle}
                             onSend={handleSend}
                             pendingSchedule={pendingSchedule}
                             onSchedule={setPendingSchedule}

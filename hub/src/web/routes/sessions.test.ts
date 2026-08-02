@@ -72,12 +72,6 @@ function createApp(session: Session, opts?: {
     const applySessionConfig = async (sessionId: string, config: Record<string, unknown>) => {
         applySessionConfigCalls.push([sessionId, config])
     }
-    const listCodexModelsForSession = async () => ({
-        success: true,
-        models: [
-            { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
-        ]
-    })
     const listOpencodeModelsForSession = async () => ({
         success: true,
         availableModels: [
@@ -131,7 +125,6 @@ function createApp(session: Session, opts?: {
             ? { ok: true, sessionId: session.id, session }
             : { ok: false, reason: 'not-found' },
         applySessionConfig,
-        listCodexModelsForSession,
         listCursorModelsForSession,
         listOpencodeModelsForSession,
         listOpencodeReasoningEffortOptionsForSession,
@@ -147,10 +140,11 @@ function createApp(session: Session, opts?: {
         getSessionExport: opts?.getSessionExport ?? (() => ({
             type: 'success',
             payload: {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 exportedAt: 1_762_000_000_000,
                 session,
-                messages: []
+                messages: [],
+                scratchlist: []
             }
         })),
         listSlashCommands: opts?.listSlashCommands ?? (async () => ({
@@ -201,10 +195,11 @@ describe('sessions routes', () => {
 
         expect(response.status).toBe(200)
         expect(await response.json()).toEqual({
-            schemaVersion: 1,
+            schemaVersion: 2,
             exportedAt: 1_762_000_000_000,
             session,
-            messages: []
+            messages: [],
+            scratchlist: []
         })
     })
 
@@ -234,10 +229,11 @@ describe('sessions routes', () => {
             getSessionExport: () => ({
                 type: 'success',
                 payload: {
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     exportedAt: 1_762_000_000_000,
                     session,
-                    messages
+                    messages,
+                    scratchlist: []
                 }
             })
         })
@@ -720,20 +716,6 @@ describe('sessions routes', () => {
         expect(localApp.applySessionConfigCalls).toEqual([])
     })
 
-    it('returns Codex models for active Codex sessions', async () => {
-        const { app } = createApp(createSession())
-
-        const response = await app.request('/api/sessions/session-1/codex-models')
-
-        expect(response.status).toBe(200)
-        expect(await response.json()).toEqual({
-            success: true,
-            models: [
-                { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
-            ]
-        })
-    })
-
     it('returns OpenCode reasoning effort options for active OpenCode sessions', async () => {
         const session = createSession({
             metadata: { path: '/tmp/project', host: 'localhost', flavor: 'opencode' }
@@ -1196,6 +1178,28 @@ describe('sessions routes', () => {
             expect(response.status).toBe(200)
             expect(await response.json()).toEqual({ ok: true })
             expect(calls).toEqual(['session-1'])
+        })
+
+        it('archives an active session with stale archived lifecycle metadata', async () => {
+            const calls: string[] = []
+            const session = createSession({
+                active: true,
+                metadata: {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    flavor: 'codex',
+                    lifecycleState: 'archived'
+                }
+            })
+            const { app } = createApp(session, {
+                archiveSession: async (sessionId: string) => { calls.push(sessionId) }
+            })
+
+            const response = await app.request('/api/sessions/session-1/archive', { method: 'POST' })
+
+            expect(response.status).toBe(200)
+            expect(calls).toEqual(['session-1'])
+            expect(await response.json()).toEqual({ ok: true })
         })
 
         it('returns 2xx and skips archiveSession when the row is already archived (idempotent)', async () => {

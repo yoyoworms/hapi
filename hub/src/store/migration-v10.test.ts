@@ -5,66 +5,148 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Store } from './index'
 
-/**
- * Tests for V9→V10 schema migration: adding the content_uuid column + partial
- * index that backs persistent agent-message dedup (prevents reconnect-replayed
- * duplicates from being re-inserted). Follows migration-v9.test.ts.
- */
-describe('Store V9→V10 migration: content_uuid column', () => {
-    it('fresh DB has content_uuid column in messages', () => {
+describe('Store divergent V10/V11 migration convergence', () => {
+    it('fresh DB has upstream and local extension tables/columns', () => {
         const store = new Store(':memory:')
-        try {
-            expect(getMessageColumns(store)).toContain('content_uuid')
-        } finally {
-            store.close()
-        }
+        expect(tableExists(store, 'fcm_devices')).toBe(true)
+        expect(tableExists(store, 'session_scratchlist')).toBe(true)
+        expect(tableExists(store, 'message_epochs')).toBe(true)
+        expect(tableExists(store, 'session_shares')).toBe(true)
+        expect(columnExists(store, 'messages', 'content_uuid')).toBe(true)
     })
 
-    it('V9 DB migrates to V10: content_uuid added, existing rows NULL, dedup works after', () => {
-        const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-v10-test-'))
+    it('upstream V10 DB reaches the converged schema', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-v11-test-'))
         const dbPath = join(dir, 'test.db')
         let store: Store | undefined
         try {
             const db = new Database(dbPath, { create: true, readwrite: true, strict: true })
             db.exec('PRAGMA journal_mode = WAL')
             db.exec('PRAGMA foreign_keys = ON')
-            createV9Schema(db)
-            db.exec('PRAGMA user_version = 9')
-            db.exec(`INSERT INTO sessions (id, namespace, created_at, updated_at, seq)
-                     VALUES ('s1', 'default', 1000, 1000, 0)`)
-            db.exec(`INSERT INTO messages (id, session_id, content, created_at, seq, local_id, invoked_at, scheduled_at)
-                     VALUES ('m1', 's1', '"hello"', 1000, 1, NULL, 1000, NULL)`)
+            createV10Schema(db)
+            db.exec('PRAGMA user_version = 10')
             db.close()
 
             store = new Store(dbPath)
-            expect(getMessageColumns(store)).toContain('content_uuid')
-
-            // Pre-existing row keeps a NULL content_uuid (not backfilled).
-            const rawUuid = (store as any).db
-                .prepare('SELECT content_uuid FROM messages WHERE id = ?')
-                .get('m1') as { content_uuid: string | null }
-            expect(rawUuid.content_uuid).toBeNull()
-
-            // New agent messages dedup by content uuid on the migrated DB.
-            const agent = (uuid: string) => ({ role: 'agent', content: { type: 'output', data: { uuid, text: 't' } } })
-            const first = store.messages.addMessage('s1', agent('u1'))
-            const replay = store.messages.addMessage('s1', agent('u1'))
-            expect(replay.id).toBe(first.id)
+            expect(tableExists(store, 'fcm_devices')).toBe(true)
+            expect(tableExists(store, 'session_scratchlist')).toBe(true)
+            expect(tableExists(store, 'message_epochs')).toBe(true)
+            expect(tableExists(store, 'session_shares')).toBe(true)
+            expect(columnExists(store, 'messages', 'content_uuid')).toBe(true)
         } finally {
             store?.close()
             rmSync(dir, { recursive: true, force: true })
         }
     })
+
+    it('local V11 DB keeps content UUID dedup and gains all upstream tables', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-local-v11-test-'))
+        const dbPath = join(dir, 'test.db')
+        let store: Store | undefined
+        try {
+            const db = new Database(dbPath, { create: true, readwrite: true, strict: true })
+            db.exec('PRAGMA journal_mode = WAL')
+            db.exec('PRAGMA foreign_keys = ON')
+            createV10Schema(db)
+            db.exec(`
+                ALTER TABLE messages ADD COLUMN content_uuid TEXT;
+                CREATE INDEX idx_messages_content_uuid
+                    ON messages(session_id, content_uuid)
+                    WHERE content_uuid IS NOT NULL;
+                CREATE TABLE session_shares (
+                    token TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO sessions (id, namespace, created_at, updated_at, seq)
+                    VALUES ('s1', 'default', 1000, 1000, 0);
+                INSERT INTO session_shares (token, session_id, namespace, revoked, created_at)
+                    VALUES ('valid-token', 's1', 'default', 0, 1000);
+                INSERT INTO session_shares (token, session_id, namespace, revoked, created_at)
+                    VALUES ('orphan-token', 'missing', 'default', 0, 1001);
+                PRAGMA user_version = 11;
+            `)
+            db.close()
+
+            store = new Store(dbPath)
+            expect(tableExists(store, 'fcm_devices')).toBe(true)
+            expect(tableExists(store, 'session_scratchlist')).toBe(true)
+            expect(tableExists(store, 'message_epochs')).toBe(true)
+            expect(tableExists(store, 'session_shares')).toBe(true)
+
+            const message = (uuid: string) => ({
+                role: 'agent',
+                content: { type: 'output', data: { uuid, text: 'same' } }
+            })
+            const first = store.messages.addMessage('s1', message('stable-uuid'))
+            const replay = store.messages.addMessage('s1', message('stable-uuid'))
+            expect(replay.id).toBe(first.id)
+
+            // V16 rebuilds the pre-FK local table: valid shares survive,
+            // pre-existing orphans are discarded, and future deletes cascade.
+            expect(store.shares.getShareByToken('valid-token')).toEqual(expect.objectContaining({
+                sessionId: 's1',
+                namespace: 'default'
+            }))
+            expect(store.shares.getShareByToken('orphan-token')).toBeNull()
+            expect(hasCascadeForeignKey(store, 'session_shares', 'sessions')).toBe(true)
+            expect(store.sessions.deleteSession('s1', 'default')).toBe(true)
+            expect(store.shares.getShareByToken('valid-token')).toBeNull()
+        } finally {
+            store?.close()
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+
+    it('upsert replaces token for same namespace+deviceId+platform', () => {
+        const store = new Store(':memory:')
+        store.fcm.upsertDevice('default', {
+            token: 'tok-a',
+            platform: 'phone',
+            deviceId: 'pixel-1'
+        })
+        store.fcm.upsertDevice('default', {
+            token: 'tok-b',
+            platform: 'phone',
+            deviceId: 'pixel-1'
+        })
+        const devices = store.fcm.getDevicesByNamespace('default')
+        expect(devices).toHaveLength(1)
+        expect(devices[0].token).toBe('tok-b')
+    })
 })
 
-function getMessageColumns(store: Store): string[] {
-    const db: Database = (store as any).db
-    const rows = db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>
-    return rows.map(r => r.name)
+function tableExists(store: Store, name: string): boolean {
+    const db: Database = (store as unknown as { db: Database }).db
+    const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+    ).get(name) as { name: string } | null
+    return row !== null
 }
 
-/** Minimal V9 schema: messages with scheduled_at but without content_uuid. */
-function createV9Schema(db: Database): void {
+function columnExists(store: Store, table: string, column: string): boolean {
+    const db: Database = (store as unknown as { db: Database }).db
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    return rows.some((row) => row.name === column)
+}
+
+function hasCascadeForeignKey(store: Store, table: string, target: string): boolean {
+    const db: Database = (store as unknown as { db: Database }).db
+    const rows = db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+        table: string
+        from: string
+        to: string
+        on_delete: string
+    }>
+    return rows.some((row) => row.table === target
+        && row.from === 'session_id'
+        && row.to === 'id'
+        && row.on_delete.toUpperCase() === 'CASCADE')
+}
+
+function createV10Schema(db: Database): void {
     db.exec(`
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -80,6 +162,7 @@ function createV9Schema(db: Database): void {
             model TEXT,
             model_reasoning_effort TEXT,
             effort TEXT,
+            service_tier TEXT,
             todos TEXT,
             todos_updated_at INTEGER,
             team_state TEXT,
@@ -114,12 +197,6 @@ function createV9Schema(db: Database): void {
             scheduled_at INTEGER,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(session_id, local_id) WHERE local_id IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_messages_session_position
-            ON messages(session_id, COALESCE(invoked_at, created_at) DESC, seq DESC);
-        CREATE INDEX IF NOT EXISTS idx_messages_scheduled_pending
-            ON messages(scheduled_at) WHERE scheduled_at IS NOT NULL AND invoked_at IS NULL;
 
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -15,6 +15,14 @@ export type AutoArchiveBlockReason =
     | 'queued-message'
     | 'not-idle-long-enough'
 
+export type AutoArchiveGuard = {
+    checkedAt: number
+    idleMs: number
+    updatedAt: number
+    metadataVersion: number
+    agentStateVersion: number
+}
+
 export function getAutoArchiveReason(idleHours: number): string {
     return `Auto-archived after ${idleHours} hours of inactivity`
 }
@@ -74,7 +82,12 @@ export interface AutoArchiveServiceOptions {
     getSessions: () => Session[]
     getSession: (sessionId: string) => Session | undefined
     hasQueuedMessages: (sessionId: string) => boolean
-    archiveSession: (sessionId: string, reason: string) => Promise<void>
+    /** Return false when the final activity/version gate no longer matches. */
+    archiveSession: (
+        sessionId: string,
+        reason: string,
+        guard: AutoArchiveGuard
+    ) => Promise<boolean>
     initialDelayMs?: number
     sweepIntervalMs?: number
     logger?: AutoArchiveLogger
@@ -160,7 +173,16 @@ export class AutoArchiveService {
             }
 
             try {
-                await this.options.archiveSession(latest.id, this.reason)
+                const didArchive = await this.options.archiveSession(latest.id, this.reason, {
+                    checkedAt: now,
+                    idleMs: this.idleMs,
+                    updatedAt: latest.updatedAt,
+                    metadataVersion: latest.metadataVersion,
+                    agentStateVersion: latest.agentStateVersion
+                })
+                if (!didArchive) {
+                    continue
+                }
                 archived.push(latest.id)
                 this.logger.info(`[AutoArchive] Archived idle session ${latest.id}`)
             } catch (error) {

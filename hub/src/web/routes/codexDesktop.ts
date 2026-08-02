@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+import type { CodexCollaborationMode } from '@hapi/protocol/types'
 import { Hono } from 'hono'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
 import type { Store, StoredMessage } from '../../store'
@@ -117,6 +118,7 @@ type ImportCandidate = {
     active: boolean
     updatedAt: number
     metadata: Record<string, unknown> | null
+    persisted: boolean
 }
 
 type ImportTargetSelection = {
@@ -130,6 +132,8 @@ type SyncSessionRequestParseResult = {
     machineId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
+    serviceTier?: string | null
+    collaborationMode?: CodexCollaborationMode
     yolo?: boolean
     error?: string
 }
@@ -1096,27 +1100,43 @@ function collectImportCandidates(
     namespace: string,
     getSyncEngine?: () => SyncEngine | null
 ): ImportCandidate[] {
-    const engineSessions = getSyncEngine?.()?.getSessionsByNamespace(namespace) ?? []
-    if (engineSessions.length > 0) {
-        return engineSessions.map((session) => ({
+    const candidatesBySessionId = new Map<string, ImportCandidate>()
+    for (const session of store.sessions.getSessionsByNamespace(namespace)) {
+        candidatesBySessionId.set(session.id, {
             sessionId: session.id,
             active: session.active,
             updatedAt: session.updatedAt,
-            metadata: asRecord(session.metadata)
-        }))
+            metadata: asRecord(session.metadata),
+            persisted: true
+        })
     }
 
-    return store.sessions.getSessionsByNamespace(namespace).map((session) => ({
-        sessionId: session.id,
-        active: session.active,
-        updatedAt: session.updatedAt,
-        metadata: asRecord(session.metadata)
-    }))
+    const engineSessions = getSyncEngine?.()?.getSessionsByNamespace(namespace) ?? []
+    for (const session of engineSessions) {
+        const existing = candidatesBySessionId.get(session.id)
+        candidatesBySessionId.set(session.id, {
+            sessionId: session.id,
+            active: session.active || Boolean(existing?.active),
+            updatedAt: Math.max(session.updatedAt, existing?.updatedAt ?? 0),
+            metadata: asRecord(session.metadata) ?? existing?.metadata ?? null,
+            persisted: Boolean(existing?.persisted)
+        })
+    }
+
+    return Array.from(candidatesBySessionId.values())
 }
 
 function getCodexImportIds(metadata: Record<string, unknown> | null | undefined): string[] {
-    return [metadata?.codexSessionId, metadata?.codexSourceSessionId]
-        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    return Array.from(new Set([metadata?.codexSessionId, metadata?.codexSourceSessionId]
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)))
+}
+
+function isImportCandidateReusable(candidate: ImportCandidate): boolean {
+    const lifecycleState = candidate.metadata?.lifecycleState
+    if (lifecycleState === 'archived' || lifecycleState === 'deleted') {
+        return false
+    }
+    return true
 }
 
 function selectImportTargetSession(
@@ -1127,6 +1147,7 @@ function selectImportTargetSession(
     sourceMachineId?: string | null
 ): ImportTargetSelection {
     const relatedCandidates = candidates
+        .filter((candidate) => candidate.persisted && isImportCandidateReusable(candidate))
         .filter((candidate) => (
             candidate.metadata?.codexSessionId === codexSessionId
             || candidate.metadata?.codexSourceSessionId === codexSessionId
@@ -1187,6 +1208,9 @@ function listDuplicateCodexSessionGroups(
 
     const groups = new Map<string, ImportCandidate[]>()
     for (const candidate of collectImportCandidates(store, namespace, getSyncEngine)) {
+        if (!candidate.persisted || !isImportCandidateReusable(candidate)) {
+            continue
+        }
         for (const codexSessionId of getCodexImportIds(candidate.metadata)) {
             if (!requestedSessionIds.has(codexSessionId)) {
                 continue
@@ -1254,7 +1278,8 @@ async function mergeSingleDuplicateCodexSessionGroup(options: {
     getSyncEngine?: () => SyncEngine | null
 }): Promise<CodexDuplicateSessionGroup> {
     const engine = options.getSyncEngine?.() ?? null
-    const sessionStates = options.group.sessions
+    const uniqueSessions = Array.from(new Map(options.group.sessions.map((session) => [session.sessionId, session])).values())
+    const sessionStates = uniqueSessions
         .map((candidate) => ({
             ...candidate,
             storedMessages: options.store.messages.getAllMessages(candidate.sessionId),
@@ -1688,7 +1713,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         return { sessionIds: [] }
     }
 
-    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; yolo?: unknown }
+    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
     const rawSessionIds = bodyRecord.sessionIds
     if (!Array.isArray(rawSessionIds)) {
         return { sessionIds: [], error: 'Invalid sessionIds' }
@@ -1707,6 +1732,14 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
 
     const hasModel = Object.prototype.hasOwnProperty.call(bodyRecord, 'model')
     const hasModelReasoningEffort = Object.prototype.hasOwnProperty.call(bodyRecord, 'modelReasoningEffort')
+    const hasServiceTier = Object.prototype.hasOwnProperty.call(bodyRecord, 'serviceTier')
+    const hasCollaborationMode = Object.prototype.hasOwnProperty.call(bodyRecord, 'collaborationMode')
+    if (hasServiceTier && bodyRecord.serviceTier !== null && bodyRecord.serviceTier !== 'fast' && bodyRecord.serviceTier !== 'standard') {
+        return { sessionIds: [], error: 'Invalid serviceTier' }
+    }
+    if (hasCollaborationMode && bodyRecord.collaborationMode !== 'default' && bodyRecord.collaborationMode !== 'plan') {
+        return { sessionIds: [], error: 'Invalid collaborationMode' }
+    }
 
     // 中文注释：前端允许多选，这里按 Codex thread 去重，避免重复导入同一条本地 transcript。
     return {
@@ -1715,6 +1748,8 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         machineId: typeof bodyRecord.machineId === 'string' && bodyRecord.machineId.trim() ? bodyRecord.machineId.trim() : null,
         model: hasModel ? (typeof bodyRecord.model === 'string' && bodyRecord.model.trim() ? bodyRecord.model.trim() : null) : undefined,
         modelReasoningEffort: hasModelReasoningEffort ? (typeof bodyRecord.modelReasoningEffort === 'string' && bodyRecord.modelReasoningEffort.trim() ? bodyRecord.modelReasoningEffort.trim() : null) : undefined,
+        serviceTier: hasServiceTier ? bodyRecord.serviceTier as 'fast' | 'standard' | null : undefined,
+        collaborationMode: hasCollaborationMode ? bodyRecord.collaborationMode as CodexCollaborationMode : undefined,
         yolo: bodyRecord.yolo === true
     }
 }
@@ -1939,6 +1974,8 @@ export async function importSelectedCodexSessions(options: {
     localSessions?: RemoteCodexSession[]
     model?: string | null
     modelReasoningEffort?: string | null
+    serviceTier?: string | null
+    collaborationMode?: CodexCollaborationMode
     yolo?: boolean
     machineId?: string | null
 }): Promise<ScriptLaunchResponse> {
@@ -1962,6 +1999,23 @@ export async function importSelectedCodexSessions(options: {
             machineId: options.machineId
         })
         results.push(result)
+
+        if (result.success && (options.serviceTier !== undefined || options.collaborationMode !== undefined)) {
+            const importedSessionId = result.hapiSessionIds?.[0]
+            const engine = options.getSyncEngine?.() ?? null
+            if (!importedSessionId || !engine) {
+                return createImportErrorResponse(codexSessionIds, 'Imported session config could not be applied before resume')
+            }
+            try {
+                await engine.applySessionConfig(importedSessionId, {
+                    ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+                    ...(options.collaborationMode !== undefined ? { collaborationMode: options.collaborationMode } : {})
+                })
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                return createImportErrorResponse(codexSessionIds, `Failed to apply imported session config: ${message}`)
+            }
+        }
 
         if (!result.success) {
             return {
@@ -2097,6 +2151,8 @@ export function createCodexDesktopRoutes(options: {
             machineId: remote.machineId ?? null,
             model: parsed.model,
             modelReasoningEffort: parsed.modelReasoningEffort,
+            serviceTier: parsed.serviceTier,
+            collaborationMode: parsed.collaborationMode,
             yolo: parsed.yolo
         })
         return c.json({

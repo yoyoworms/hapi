@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { useNavigate } from '@tanstack/react-router'
-import { AssistantRuntimeProvider, useAssistantApi, useAssistantState } from '@assistant-ui/react'
+import { AssistantRuntimeProvider, useAui, useAuiState } from '@assistant-ui/react'
 import { DragDropZone } from '@/components/AssistantChat/DragDropZone'
 import type { ApiClient } from '@/api/client'
-import { seedMessageWindowFromSession, fetchLatestMessages } from '@/lib/message-window-store'
 import type {
     AttachmentMetadata,
     CodexCollaborationMode,
@@ -21,22 +21,38 @@ import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
 import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
 import { getLatestPlanProgress, getPersistedPlanProgress } from '@/chat/planProgress'
-import { isQueuedForInvocation, mergeMessages } from '@/lib/messages'
+import { useUnseenBlockCount } from '@/hooks/useUnseenBlockCount'
+import { isQueuedForInvocation } from '@/lib/messages'
 import { inactiveSessionCanResume } from '@/lib/sessionResume'
 import {
     getCodexModelReasoningEfforts,
     supportsCodexReasoningEffort
 } from '@/lib/codexModelCapabilities'
 import { HappyComposer, type ComposerSendError } from '@/components/AssistantChat/HappyComposer'
-import { codexModelAdvertisesFastTier } from '@/components/AssistantChat/codexFastMode'
+import { codexModelAdvertisesFastTier, getEffectiveCodexServiceTier } from '@/components/AssistantChat/codexFastMode'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { HappyThread } from '@/components/AssistantChat/HappyThread'
 import { QueuedMessagesBar } from '@/components/AssistantChat/QueuedMessagesBar'
 import { ScratchlistDrawer } from '@/components/AssistantChat/ScratchlistPanel'
-import { useScratchlist } from '@/lib/use-scratchlist'
+import { useHubScratchlist } from '@/lib/use-hub-scratchlist'
+import { useSessions } from '@/hooks/queries/useSessions'
+import { getSessionTitle } from '@/lib/sessionTitle'
+import { formatSessionMentionTooltip } from '@/lib/sessionReference'
+import { classifySessionAttention, getSessionAttentionLabelKey } from '@/lib/sessionAttention'
+import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
+import { formatRelativeTime } from '@/lib/relativeTime'
+import { ScratchlistMigrationBanner } from '@/components/AssistantChat/ScratchlistMigrationBanner'
 import { useHappyRuntime } from '@/lib/assistant-runtime'
+import type { OlderLoadOutcome } from '@/lib/message-window-store'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
+import { createScratchlistAttachmentAdapter } from '@/lib/scratchlistAttachmentAdapter'
+import {
+    rehydrateScratchlistAttachmentsToComposer,
+    stageScratchlistAttachmentsForComposeSend
+} from '@/lib/scratchlistAttachmentFlow'
+import type { ScratchlistEntry } from '@/lib/scratchlist'
+import { isHubScratchlistAttachmentPath } from '@hapi/protocol'
 import { consumeSharePendingTransfer } from '@/lib/sharePendingState'
 import { deleteShareTransfer, getShareTransfer } from '@/lib/shareTransfer'
 import { getDraft } from '@/lib/composer-drafts'
@@ -71,8 +87,6 @@ import { useOpencodeReasoningEffortOptions } from '@/hooks/queries/useOpencodeRe
 import { useVoiceOptional } from '@/lib/voice-context'
 import { VoiceBackendSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
-import { HappyChatProvider } from '@/components/AssistantChat/context'
-import { useTerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
 
 type SessionModelSelection = { provider: string; modelId: string } | string | null
 
@@ -185,15 +199,8 @@ export function isScratchlistHotkeyBlockedTarget(target: EventTarget | null): bo
 
 /**
  * Decide whether a submit should be routed to the per-session scratchlist
- * or to the regular chat send. Scratchlist entries are pure text - they
- * don't carry attachments or schedules - so any submit that includes
- * either of those MUST fall through to the normal chat path even if the
- * scratchlist toggle is on. Otherwise the wrapper would silently drop
- * attachments / scheduled-send metadata while telling the composer the
- * submission succeeded (which then clears the composer state, losing
- * the user's data).
- *
- * Per upstream review on PR #798 (github-actions[bot] [Major]).
+ * or to the regular chat send. Scratchlist entries support text and hub-
+ * stored attachments; scheduled sends still fall through to chat.
  *
  * Pure / exported so it can be unit tested without mounting SessionChat.
  */
@@ -203,9 +210,11 @@ export function shouldRouteToScratchlist(
     scheduledAt: number | null | undefined,
 ): boolean {
     if (!scratchlistMode) return false
-    if (attachments && attachments.length > 0) return false
     if (scheduledAt != null) return false
-    return true
+    // Only park when every attachment is already hub-resident. Composer
+    // uploads made before scratchlist mode was enabled still have normal
+    // CLI paths; the hub rejects those as scratchlist metadata.
+    return (attachments ?? []).every((att) => isHubScratchlistAttachmentPath(att.path))
 }
 
 function isUninvokedScheduledMessage(message: DecryptedMessage): boolean {
@@ -235,8 +244,8 @@ function isUninvokedScheduledMessage(message: DecryptedMessage): boolean {
  *    refresh of /sessions/:id doesn't re-attach the same payload.
  */
 function ShareSeedConsumer(props: { sessionId: string; sessionActive: boolean }) {
-    const assistantApi = useAssistantApi()
-    const composerText = useAssistantState(({ composer }) => composer.text)
+    const assistantApi = useAui()
+    const composerText = useAuiState((s) => s.composer.text)
     const composerTextRef = useRef(composerText)
     const initRef = useRef(false)
     const transferIdRef = useRef<string | null>(null)
@@ -316,37 +325,51 @@ function ShareSeedConsumer(props: { sessionId: string; sessionActive: boolean })
  * composer-toolbar counter and the drawer share one source of truth.
  */
 export function ScratchlistDrawerHost(props: {
-    entries: ReturnType<typeof useScratchlist>['entries']
-    onMove: ReturnType<typeof useScratchlist>['move']
-    onDelete: ReturnType<typeof useScratchlist>['remove']
+    sessionId: string
+    api: ApiClient
+    entries: ReturnType<typeof useHubScratchlist>['entries']
+    onMove: ReturnType<typeof useHubScratchlist>['move']
+    onDelete: ReturnType<typeof useHubScratchlist>['remove']
     onSend: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
-    /**
-     * Called when the operator promotes an entry to the composer.
-     *
-     * Promoting means "I want to send this for real now" - so the host
-     * MUST exit scratchlist mode, otherwise the next composer submit
-     * routes back to scratchlist (per the v1.1 modal-mode contract) and
-     * the user re-adds the same text instead of sending it to chat.
-     * Per upstream review on PR #798 (HAPI Bot, v6 follow-up).
-     */
     onExitScratchlistMode: () => void
 }) {
-    const assistantApi = useAssistantApi()
-    const handlePromoteToComposer = useCallback((text: string) => {
-        assistantApi.composer().setText(text)
-        props.onExitScratchlistMode()
-    }, [assistantApi, props.onExitScratchlistMode])
-    const handlePromoteToQueue = useCallback(async (text: string) => {
-        // Promote-to-queue bypasses the scratchlist-mode wrapper by
-        // calling props.onSend directly (the chat send), so the queue
-        // entry lands in the conversation regardless of scratchlist
-        // mode. Mode itself stays on - the operator may still be
-        // capturing related notes.
-        return await props.onSend(text)
-    }, [props.onSend])
+    const assistantApi = useAui()
+    const handlePromoteToComposer = useCallback(async (entry: ScratchlistEntry) => {
+        assistantApi.composer().setText(entry.text)
+        // Exit scratchlist mode before rehydrating attachments so addAttachment
+        // uses the normal chat upload adapter (not the scratchlist hub adapter).
+        flushSync(() => {
+            props.onExitScratchlistMode()
+        })
+        if (entry.attachments && entry.attachments.length > 0) {
+            await rehydrateScratchlistAttachmentsToComposer(
+                props.api,
+                props.sessionId,
+                entry.attachments,
+                assistantApi.composer()
+            )
+        }
+    }, [assistantApi, props.api, props.onExitScratchlistMode, props.sessionId])
+    const handlePromoteToQueue = useCallback(async (entry: ScratchlistEntry) => {
+        let attachments: AttachmentMetadata[] | undefined
+        if (entry.attachments && entry.attachments.length > 0) {
+            attachments = await stageScratchlistAttachmentsForComposeSend(
+                props.api,
+                props.sessionId,
+                entry.attachments
+            )
+        }
+        const accepted = await props.onSend(entry.text, attachments)
+        if (accepted) {
+            props.onExitScratchlistMode()
+        }
+        return accepted
+    }, [props.api, props.onSend, props.onExitScratchlistMode, props.sessionId])
     return (
         <ScratchlistDrawer
             entries={props.entries}
+            sessionId={props.sessionId}
+            api={props.api}
             onMove={props.onMove}
             onDelete={props.onDelete}
             onPromoteToComposer={handlePromoteToComposer}
@@ -356,27 +379,9 @@ export function ScratchlistDrawerHost(props: {
 }
 
 export function buildGoalStateMessages(
-    messages: DecryptedMessage[],
-    pendingMessages: DecryptedMessage[] = []
+    messages: DecryptedMessage[]
 ): DecryptedMessage[] {
-    const eligibleMessages = messages.filter((message) => !isUninvokedScheduledMessage(message))
-    const eligiblePendingMessages = pendingMessages.filter((message) => !isUninvokedScheduledMessage(message))
-    return eligiblePendingMessages.length > 0
-        ? mergeMessages(eligibleMessages, eligiblePendingMessages)
-        : eligibleMessages
-}
-
-function getOutlineTitle(session: Session): string {
-    if (session.metadata?.name) {
-        return session.metadata.name
-    }
-    if (session.metadata?.summary?.text) {
-        return session.metadata.summary.text
-    }
-    if (session.metadata?.path) {
-        return session.metadata.path
-    }
-    return session.id.slice(0, 8)
+    return messages.filter((message) => !isUninvokedScheduledMessage(message))
 }
 
 function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
@@ -402,30 +407,25 @@ type SessionChatProps = {
     cursorChatOnDisk?: boolean
     reopenDisabledReason?: string
     messages: DecryptedMessage[]
-    pendingMessages?: DecryptedMessage[]
     messagesWarning: string | null
     hasMoreMessages: boolean
-    isLoadingMessages: boolean
+    isSyncingTail: boolean
     isLoadingMoreMessages: boolean
     isSending: boolean
-    pendingCount: number
+    viewMode: 'tail' | 'history'
     messagesVersion: number
+    historyVersion: number
     onBack: () => void
     onRefresh: () => void
-    onLoadMore: () => Promise<unknown>
+    onLoadMore: (onBeforeApply?: (historyVersion: number) => boolean) => Promise<OlderLoadOutcome>
+    onCancelLoadMore: () => void
     // Resolves true when the send was accepted by the underlying mutation, false when
     // pre-mutation guards (no-api / no-session / pending) rejected the call OR async
     // inactive-session resume failed. Composer state that should only be cleared on
     // actual send (pendingSchedule) must await this — see handleSend below.
     onSend: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
-    onFlushPending: () => void
-    onAtBottomChange: (atBottom: boolean) => void
+    onViewModeChange: (mode: 'tail' | 'history') => void
     onRetryMessage?: (localId: string) => void
-    onCancelQueued?: (localId: string) => void
-    queuedCount?: number
-    hasPausedQueue?: boolean
-    onClearQueue?: () => void
-    onResumeQueue?: () => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
     availableSlashCommands?: readonly SlashCommand[]
     // The latest send the hub rejected (4xx/5xx/network).  When set, the
@@ -469,7 +469,6 @@ function SessionChatInner(props: SessionChatProps) {
         props.cursorChatOnDisk
     )
     const terminalSupported = isRemoteTerminalSupported(props.session.metadata)
-    const { terminalToolDisplayMode } = useTerminalToolDisplayMode()
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
@@ -485,7 +484,42 @@ function SessionChatInner(props: SessionChatProps) {
 
     const [cursorSelectedBase, setCursorSelectedBase] = useState('auto')
     const lastSyncedCursorModelRef = useRef<string | null | undefined>(undefined)
-    const scratchlist = useScratchlist(props.session.id)
+    const scratchlist = useHubScratchlist(props.session.id, props.api)
+    const { sessions: allSessions } = useSessions(props.api)
+    const resolveSessionMentionTooltip = useCallback((id: string, title: string) => {
+        const hit = allSessions.find((s) => s.id === id) ?? null
+        if (!hit) {
+            return {
+                model: formatSessionMentionTooltip(null, title, id),
+                session: null,
+            }
+        }
+        const attention = classifySessionAttention(hit, {
+            selected: false,
+            lastSeenAt: getSessionLastSeenAt(hit.id),
+        })
+        const attentionLabel = attention
+            ? t(getSessionAttentionLabelKey(attention))
+            : null
+        return {
+            model: formatSessionMentionTooltip(
+                {
+                    id: hit.id,
+                    title: getSessionTitle(hit),
+                    active: hit.active,
+                    lifecycleState: hit.metadata?.lifecycleState ?? null,
+                    path: hit.metadata?.path ?? null,
+                    worktreePath: hit.metadata?.worktree?.worktreePath ?? null,
+                    relativeTime: formatRelativeTime(hit.updatedAt, t),
+                    thinking: hit.thinking,
+                    attentionLabel,
+                },
+                title,
+                id
+            ),
+            session: hit,
+        }
+    }, [allSessions, t])
     const [scratchlistMode, setScratchlistMode] = useState(false)
     // Mode resets across sessions implicitly: SessionChat is keyed by
     // session.id at the public-export boundary, so a session switch
@@ -529,14 +563,7 @@ function SessionChatInner(props: SessionChatProps) {
     }, [])
     /**
      * onSend wrapper: when scratchlist mode is on AND the submission is
-     * pure text (no attachments, no scheduledAt), the operator's submit
-     * is treated as "add to scratchlist" instead of "send to chat".
-     *
-     * If the submission carries attachments or a scheduledAt value,
-     * scratchlist can't represent it (entries are text-only), so we
-     * fall through to the normal chat send. Silently dropping
-     * attachments / schedule while reporting success to the composer
-     * caused PR #798 review's [Major] data-loss finding.
+     * not scheduled, route to scratchlist (text and/or hub attachments).
      *
      * The composer (HappyComposer) uses the boolean return value to
      * decide whether to clear text/attachments/schedule, so we resolve
@@ -552,20 +579,49 @@ function SessionChatInner(props: SessionChatProps) {
             scheduledAt?: number | null,
         ): Promise<boolean> => {
             if (shouldRouteToScratchlist(scratchlistMode, attachments, scheduledAt)) {
-                return scratchlist.add(text)
+                return scratchlist.add(text, attachments)
+            }
+            // If the user uploaded while scratchlist mode was on, then toggled
+            // it off before send, pending items still carry hub paths. Stage
+            // those through the normal CLI upload dir before chat send.
+            const list = attachments ?? []
+            const hubItems = list.filter((att) => isHubScratchlistAttachmentPath(att.path))
+            if (hubItems.length > 0) {
+                const normalItems = list.filter((att) => !isHubScratchlistAttachmentPath(att.path))
+                const staged = await stageScratchlistAttachmentsForComposeSend(
+                    props.api,
+                    props.session.id,
+                    hubItems,
+                )
+                const accepted = await props.onSend(text, [...normalItems, ...staged], scheduledAt)
+                if (accepted) {
+                    // Hub blobs were copied into the normal upload dir; drop the
+                    // scratchlist copies so they stop counting against the session cap.
+                    await Promise.allSettled(
+                        hubItems.map((att) => props.api.deleteScratchlistAttachment(props.session.id, att.id))
+                    )
+                }
+                return accepted
             }
             return props.onSend(text, attachments, scheduledAt)
         },
-        [props.onSend, scratchlist, scratchlistMode],
+        [props.onSend, props.api, props.session.id, scratchlist, scratchlistMode],
     )
     const agentFlavor = props.session.metadata?.flavor ?? null
     const controlledByUser = props.session.agentState?.controlledByUser === true
     const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
     const codexModelsState = useCodexModels({
         api: props.api,
-        sessionId: props.session.id,
+        machineId: props.session.metadata?.machineId ?? null,
         enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
     })
+    const effectiveCodexServiceTier = agentFlavor === 'codex'
+        ? getEffectiveCodexServiceTier(
+            props.session.serviceTier,
+            props.session.model,
+            codexModelsState.models
+        )
+        : undefined
     const codexModelOptions = useMemo(() => {
         if (agentFlavor !== 'codex') {
             return undefined
@@ -785,7 +841,6 @@ function SessionChatInner(props: SessionChatProps) {
         agentFlavor,
         codexCollaborationModeSupported
     )
-    const [headerResuming, setHeaderResuming] = useState(false)
 
     // Voice assistant integration
     const voice = useVoiceOptional()
@@ -932,8 +987,8 @@ function SessionChatInner(props: SessionChatProps) {
     }, [visibleMessages])
 
     const goalStateSourceMessages = useMemo(
-        () => buildGoalStateMessages(props.messages, props.pendingMessages ?? []),
-        [props.messages, props.pendingMessages]
+        () => buildGoalStateMessages(props.messages),
+        [props.messages]
     )
 
     const normalizedGoalStateMessages: NormalizedMessage[] = useMemo(() => {
@@ -967,50 +1022,35 @@ function SessionChatInner(props: SessionChatProps) {
     const visibleBlocks = useMemo(
         () => buildVisibleChatBlocks(reconciled.blocks, {
             hasMoreMessages: props.hasMoreMessages,
-            previousGroups: visibleGroupsRef.current,
-            // Codex progress/commentary and update_plan cards remain hard
-            // boundaries. Inside each phase, collapse low-signal execution
-            // noise without turning the whole turn into one opaque card.
-            mode: agentFlavor === 'codex' ? 'codex' : 'contiguous'
+            previousGroups: visibleGroupsRef.current
         }),
-        [agentFlavor, reconciled.blocks, props.hasMoreMessages]
+        [reconciled.blocks, props.hasMoreMessages]
     )
-    const latestPlanProgress = useMemo(
-        () => {
-            if (agentFlavor !== 'codex') return null
-
-            const currentTurnStartedAt = reconciled.blocks.reduce(
-                (latest, block) => block.kind === 'user-text'
-                    ? Math.max(latest, block.createdAt)
-                    : latest,
-                0
-            )
-            const messageProgress = getLatestPlanProgress(
-                reconciled.blocks.filter((block) => block.createdAt >= currentTurnStartedAt)
-            )
-            if (messageProgress) return messageProgress
-
-            return getPersistedPlanProgress(props.session.todos)
-        },
-        [
-            agentFlavor,
-            props.session.todos,
-            reconciled.blocks
-        ]
-    )
+    const latestPlanProgress = useMemo(() => {
+        if (agentFlavor !== 'codex') return null
+        const currentTurnStartedAt = reconciled.blocks.reduce(
+            (latest, block) => block.kind === 'user-text'
+                ? Math.max(latest, block.createdAt)
+                : latest,
+            0
+        )
+        return getLatestPlanProgress(
+            reconciled.blocks.filter((block) => block.createdAt >= currentTurnStartedAt)
+        ) ?? getPersistedPlanProgress(props.session.todos)
+    }, [agentFlavor, props.session.todos, reconciled.blocks])
 
     useEffect(() => {
         visibleGroupsRef.current = visibleBlocks.filter(isToolGroupBlock)
     }, [visibleBlocks])
 
+    // "N new messages" counts rendered blocks, not raw messages: a subagent run
+    // is dozens of sidechain messages but a single Task card, and a tool_use +
+    // tool_result pair is one card.
+    const unseenCount = useUnseenBlockCount(props.viewMode, visibleBlocks)
+
     const outlineItems = useMemo(
         () => buildConversationOutline(reconciled.blocks),
         [reconciled.blocks]
-    )
-
-    const outlineTitle = useMemo(
-        () => getOutlineTitle(props.session),
-        [props.session]
     )
 
     // Permission mode change handler
@@ -1236,12 +1276,16 @@ function SessionChatInner(props: SessionChatProps) {
         if (!props.session.active) {
             return undefined
         }
-        return createAttachmentAdapter(props.api, props.session.id)
-    }, [props.api, props.session.id, props.session.active])
+        return scratchlistMode
+            ? createScratchlistAttachmentAdapter(props.api, props.session.id)
+            : createAttachmentAdapter(props.api, props.session.id)
+    }, [props.api, props.session.id, props.session.active, scratchlistMode])
 
     const runtime = useHappyRuntime({
         session: props.session,
         blocks: visibleBlocks,
+        messagesVersion: props.messagesVersion,
+        historyVersion: props.historyVersion,
         isSending: props.isSending,
         isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
@@ -1252,9 +1296,10 @@ function SessionChatInner(props: SessionChatProps) {
     })
 
     return (
-        <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-full min-h-0 min-w-0 w-full overflow-clip flex-col">
             <SessionHeader
                 session={props.session}
+                serviceTier={effectiveCodexServiceTier}
                 onBack={props.onBack}
                 onToggleFiles={props.session.metadata?.path ? handleToggleFiles : undefined}
                 filesActive={false}
@@ -1264,7 +1309,6 @@ function SessionChatInner(props: SessionChatProps) {
                 canReopen={inactiveCanResume}
                 reopenDisabledReason={props.reopenDisabledReason}
                 onSessionDeleted={props.onBack}
-                onResuming={setHeaderResuming}
                 onSessionReopened={(newSessionId) => {
                     navigate({
                         to: '/sessions/$sessionId',
@@ -1281,26 +1325,18 @@ function SessionChatInner(props: SessionChatProps) {
             )}
 
             {sessionInactive ? (
-                <InactiveSessionBanner api={props.api} sessionId={props.session.id} externalResuming={headerResuming} />
+                <div className="px-3 pt-3">
+                    <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-[var(--app-hint)]">
+                        {inactiveCanResume
+                            ? t('session.inactive.autoResume')
+                            : t('session.inactive.cannotResume')}
+                    </div>
+                </div>
             ) : null}
 
             <AssistantRuntimeProvider runtime={runtime}>
-                <HappyChatProvider value={{
-                    api: props.api,
-                    sessionId: props.session.id,
-                    metadata: props.session.metadata ?? null,
-                    terminalToolDisplayMode,
-                    disabled: sessionInactive,
-                    onRefresh: props.onRefresh,
-                    onRetryMessage: props.onRetryMessage,
-                    onCancelQueued: props.onCancelQueued,
-                    hasMoreMessages: props.hasMoreMessages,
-                    isLoadingMoreMessages: props.isLoadingMoreMessages,
-                    loadOlderMessagesPreservingScroll: async () => false
-                }}>
                 <ShareSeedConsumer sessionId={props.session.id} sessionActive={props.session.active} />
                 <DragDropZone disabled={sessionInactive || props.isSending || pendingSchedule != null}>
-                <div className="relative flex min-h-0 flex-1 flex-col">
 
                     <HappyThread
                         // Key with prefix: different components under the same session
@@ -1309,67 +1345,85 @@ function SessionChatInner(props: SessionChatProps) {
                         // Without prefixes, React may reuse the wrong component's DOM/localStorage.
                         key={`thread-${props.session.id}`}
                         api={props.api}
+                        session={props.session}
                         sessionId={props.session.id}
                         metadata={props.session.metadata}
                         disabled={sessionInactive}
                         onRefresh={props.onRefresh}
                         onRetryMessage={props.onRetryMessage}
-                        onFlushPending={props.onFlushPending}
-                        onAtBottomChange={props.onAtBottomChange}
-                        isLoadingMessages={props.isLoadingMessages}
+                        onViewModeChange={props.onViewModeChange}
+                        isSyncingTail={props.isSyncingTail}
                         messagesWarning={props.messagesWarning}
                         hasMoreMessages={props.hasMoreMessages}
                         isLoadingMoreMessages={props.isLoadingMoreMessages}
                         onLoadMore={props.onLoadMore}
-                        pendingCount={props.pendingCount}
+                        onCancelLoadMore={props.onCancelLoadMore}
+                        unseenCount={unseenCount}
                         rawMessagesCount={visibleMessages.length}
                         normalizedMessagesCount={normalizedMessages.length}
                         messagesVersion={props.messagesVersion}
+                        historyVersion={props.historyVersion}
                         forceScrollToken={forceScrollToken}
                         outlineOpen={outlineOpen}
-                        outlineTitle={outlineTitle}
                         outlineItems={outlineItems}
                         onOutlineOpenChange={setOutlineOpen}
                     />
 
-                    {codexCollaborationModeSupported && codexModelsState.error ? (
-                        <div className="px-3 pb-2">
-                            <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-red-600">
-                                {t('session.codexModelsLoadFailed')}: {codexModelsState.error}
+                    <div className={outlineOpen ? 'max-sm:hidden' : undefined}>
+                        {codexCollaborationModeSupported && codexModelsState.error ? (
+                            <div className="px-3 pb-2">
+                                <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-red-600">
+                                    {t('session.codexModelsLoadFailed')}: {codexModelsState.error}
+                                </div>
                             </div>
-                        </div>
-                    ) : null}
-
-                    <div className="px-3">
-                        {/*
-                         * Scratchlist drawer - composer-controlled. Only
-                         * mounted when the operator clicks the notepad icon
-                         * in the composer toolbar. State lives in the
-                         * useScratchlist hook above (so the toolbar counter
-                         * and the drawer share one source of truth).
-                         */}
-                        {scratchlistMode ? (
-                            <ScratchlistDrawerHost
-                                entries={scratchlist.entries}
-                                onMove={scratchlist.move}
-                                onDelete={scratchlist.remove}
-                                onSend={props.onSend}
-                                onExitScratchlistMode={() => setScratchlistMode(false)}
-                            />
                         ) : null}
-                        <QueuedMessagesBar
-                            sessionId={props.session.id}
-                            api={props.api}
-                            onEdit={({ pendingSchedule: restored }) => {
-                                // Restore the schedule so the clock button re-activates
-                                setPendingSchedule(restored)
-                            }}
-                        />
-                    </div>
 
-                    <HappyComposer
+                        {/*
+                         * tiann/hapi#893: one-time banner shown on first
+                         * v2-load when localStorage entries got migrated to
+                         * the hub. Sits above the drawer so the operator
+                         * sees it whether or not the drawer is open.
+                         * Auto-renders nothing unless `migrationStatus ===
+                         * 'completed'`.
+                         */}
+                        <ScratchlistMigrationBanner
+                            migrationStatus={scratchlist.migrationStatus}
+                            onDismiss={scratchlist.dismissMigrationBanner}
+                        />
+
+                        <div className="px-3">
+                            {/*
+                             * Scratchlist drawer - composer-controlled. Only
+                             * mounted when the operator clicks the notepad icon
+                             * in the composer toolbar. State lives in the
+                             * useScratchlist hook above (so the toolbar counter
+                             * and the drawer share one source of truth).
+                             */}
+                            {scratchlistMode ? (
+                                <ScratchlistDrawerHost
+                                    sessionId={props.session.id}
+                                    api={props.api}
+                                    entries={scratchlist.entries}
+                                    onMove={scratchlist.move}
+                                    onDelete={scratchlist.remove}
+                                    onSend={props.onSend}
+                                    onExitScratchlistMode={() => setScratchlistMode(false)}
+                                />
+                            ) : null}
+                            <QueuedMessagesBar
+                                sessionId={props.session.id}
+                                api={props.api}
+                                onEdit={({ pendingSchedule: restored }) => {
+                                    // Restore the schedule so the clock button re-activates
+                                    setPendingSchedule(restored)
+                                }}
+                            />
+                        </div>
+
+                        <HappyComposer
                         key={`composer-${props.session.id}`}
                         sessionId={props.session.id}
+                        resolveSessionMentionTooltip={resolveSessionMentionTooltip}
                         disabled={props.isSending}
                         pendingSchedule={pendingSchedule}
                         onSchedule={setPendingSchedule}
@@ -1425,11 +1479,9 @@ function SessionChatInner(props: SessionChatProps) {
                         agentState={props.session.agentState}
                         backgroundTaskCount={props.session.backgroundTaskCount}
                         contextSize={reduced.latestUsage?.contextSize}
-                        latestUsage={reduced.latestUsage}
-                        usage={props.session.usage}
-                        accountStatus={props.session.accountStatus}
                         contextCacheRead={reduced.latestUsage?.cacheRead}
                         contextWindow={reduced.latestUsage?.contextWindow ?? piContextWindow}
+                        contextModel={reduced.latestUsage?.model ?? props.session.model}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
                             codexCollaborationModeSupported && props.session.active && !controlledByUser
@@ -1500,7 +1552,7 @@ function SessionChatInner(props: SessionChatProps) {
                                     : undefined)
                                 : handleEffortChange
                         }
-                        serviceTier={agentFlavor === 'codex' ? props.session.serviceTier : undefined}
+                        serviceTier={effectiveCodexServiceTier}
                         onServiceTierChange={
                             agentFlavor === 'codex'
                                 && props.session.active
@@ -1514,11 +1566,6 @@ function SessionChatInner(props: SessionChatProps) {
                         onTerminal={props.session.active && terminalSupported ? handleViewTerminal : undefined}
                         terminalUnsupported={props.session.active && !terminalSupported}
                         autocompleteSuggestions={props.autocompleteSuggestions}
-                        onDirectSend={handleSend}
-                        queuedCount={props.queuedCount ?? 0}
-                        hasPausedQueue={props.hasPausedQueue ?? false}
-                        onClearQueue={props.onClearQueue}
-                        onResumeQueue={props.onResumeQueue}
                         voiceStatus={voice?.status}
                         voiceMicMuted={voice?.micMuted}
                         onVoiceToggle={voice && voiceBackendReady ? handleVoiceToggle : undefined}
@@ -1528,10 +1575,9 @@ function SessionChatInner(props: SessionChatProps) {
                         onScratchlistToggle={handleScratchlistToggle}
                         sendError={props.sendError ?? null}
                         onClearSendError={props.onClearSendError}
-                    />
-                </div>
+                        />
+                    </div>
                 </DragDropZone>
-                </HappyChatProvider>
             </AssistantRuntimeProvider>
 
             {/* Voice session component - renders nothing but initializes voice backend */}
@@ -1543,159 +1589,6 @@ function SessionChatInner(props: SessionChatProps) {
                     onReadyChange={setVoiceBackendReady}
                 />
             )}
-        </div>
-    )
-}
-
-function InactiveSessionBanner({ api, sessionId, externalResuming }: { api: ApiClient; sessionId: string; externalResuming?: boolean }) {
-    const { t } = useTranslation()
-    const [expanded, setExpanded] = useState(false)
-    const [loading, setLoading] = useState(false)
-    const [sessions, setSessions] = useState<Array<{ sessionId: string; modifiedAt: number; sizeBytes: number; valid: boolean }>>([])
-    const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
-    const [error, setError] = useState<string | null>(null)
-    const [resuming, setResuming] = useState<string | null>(null)
-    const navigate = useNavigate()
-
-    const isResuming = resuming !== null || externalResuming
-
-    // One-click resume: just call resume without override, hub auto-discovers
-    const handleQuickResume = useCallback(async () => {
-        setResuming('quick')
-        setError(null)
-        try {
-            const resolvedId = await api.resumeSession(sessionId)
-            if (resolvedId !== sessionId) {
-                seedMessageWindowFromSession(sessionId, resolvedId)
-            }
-            try { await fetchLatestMessages(api, resolvedId) } catch {}
-            navigate({
-                to: '/sessions/$sessionId',
-                params: { sessionId: resolvedId },
-                replace: true
-            })
-        } catch (e) {
-            setError(e instanceof Error ? e.message : 'Resume failed')
-            setResuming(null)
-        }
-    }, [api, sessionId, navigate])
-
-    const handleBrowse = useCallback(async () => {
-        if (expanded) {
-            setExpanded(false)
-            return
-        }
-        setExpanded(true)
-        setLoading(true)
-        setError(null)
-        try {
-            const result = await api.getResumeOptions(sessionId)
-            setSessions(result.sessions.filter(s => s.valid))
-            setCurrentSessionId(result.currentSessionId)
-        } catch (e) {
-            setError(e instanceof Error ? e.message : 'Failed to scan')
-        } finally {
-            setLoading(false)
-        }
-    }, [api, sessionId, expanded])
-
-    const handleResume = useCallback(async (targetSessionId: string) => {
-        setResuming(targetSessionId)
-        setError(null)
-        try {
-            const resolvedId = await api.resumeSession(sessionId, { resumeWithSessionId: targetSessionId })
-            if (resolvedId !== sessionId) {
-                seedMessageWindowFromSession(sessionId, resolvedId)
-            }
-            try { await fetchLatestMessages(api, resolvedId) } catch {}
-            navigate({
-                to: '/sessions/$sessionId',
-                params: { sessionId: resolvedId },
-                replace: true
-            })
-        } catch (e) {
-            setError(e instanceof Error ? e.message : 'Resume failed')
-            setResuming(null)
-        }
-    }, [api, sessionId, navigate])
-
-    const formatTime = (ms: number) => {
-        const diff = Date.now() - ms
-        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
-        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
-        return new Date(ms).toLocaleDateString()
-    }
-
-    const formatSize = (bytes: number) => {
-        if (bytes < 1024) return `${bytes}B`
-        if (bytes < 1048576) return `${(bytes / 1024).toFixed(0)}KB`
-        return `${(bytes / 1048576).toFixed(1)}MB`
-    }
-
-    return (
-        <div className="px-3 pt-3">
-            <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm">
-                <div className="flex items-center justify-between gap-2">
-                    <span className="text-[var(--app-hint)]">
-                        {isResuming ? t('resume.resuming') : t('resume.inactiveBanner')}
-                    </span>
-                    <div className="flex shrink-0 items-center gap-1.5">
-                        <button
-                            onClick={handleBrowse}
-                            disabled={isResuming}
-                            className="rounded px-2 py-1 text-xs text-[var(--app-hint)] hover:bg-[var(--app-accent)]/10 disabled:opacity-50"
-                        >
-                            {expanded ? t('button.cancel') : t('resume.chooseSession')}
-                        </button>
-                        <button
-                            onClick={handleQuickResume}
-                            disabled={isResuming}
-                            className="rounded-md bg-[var(--app-accent)] px-3 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50"
-                        >
-                            {isResuming ? t('resume.resuming') : t('resume.resumeButton')}
-                        </button>
-                    </div>
-                </div>
-
-                {error && (
-                    <div className="mt-2 rounded bg-red-50 px-2 py-1.5 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
-                        {error}
-                    </div>
-                )}
-
-                {expanded && (
-                    <div className="mt-2 border-t border-[var(--app-border)] pt-2">
-                        {loading ? (
-                            <div className="py-2 text-center text-xs text-[var(--app-hint)]">{t('resume.scanning')}</div>
-                        ) : sessions.length === 0 ? (
-                            <div className="py-2 text-center text-xs text-[var(--app-hint)]">{t('resume.noSessions')}</div>
-                        ) : (
-                            <div className="flex flex-col gap-1">
-                                {sessions.map((s) => (
-                                    <button
-                                        key={s.sessionId}
-                                        onClick={() => handleResume(s.sessionId)}
-                                        disabled={isResuming}
-                                        className="flex items-center justify-between rounded px-2 py-1.5 text-left text-xs hover:bg-[var(--app-accent)]/10 disabled:opacity-50"
-                                    >
-                                        <span className="font-mono truncate max-w-[60%]">
-                                            {s.sessionId.slice(0, 8)}...
-                                            {s.sessionId === currentSessionId && (
-                                                <span className="ml-1 rounded bg-[var(--app-accent)]/20 px-1 text-[var(--app-accent)]">{t('resume.current')}</span>
-                                            )}
-                                        </span>
-                                        <span className="flex items-center gap-2 text-[var(--app-hint)]">
-                                            <span>{formatSize(s.sizeBytes)}</span>
-                                            <span>{formatTime(s.modifiedAt)}</span>
-                                            {resuming === s.sessionId && <span className="animate-pulse">...</span>}
-                                        </span>
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
         </div>
     )
 }

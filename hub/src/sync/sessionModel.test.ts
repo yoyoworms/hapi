@@ -61,6 +61,131 @@ function messageLabel(content: unknown): string {
     return 'unknown'
 }
 
+function productionCodexMessage(event: Record<string, unknown>): Record<string, unknown> {
+    return {
+        role: 'agent',
+        content: {
+            type: 'codex',
+            data: event
+        }
+    }
+}
+
+function productionCodexContextResetMessage(): Record<string, unknown> {
+    return {
+        role: 'agent',
+        content: {
+            id: 'context-reset-event',
+            type: 'event',
+            data: {
+                type: 'message',
+                message: 'Context was reset'
+            }
+        }
+    }
+}
+
+function productionCodexScope(
+    role: 'parent' | 'child',
+    threadId: string,
+    parentThreadId?: string
+): Record<string, unknown> {
+    const parent = parentThreadId
+        ? { parent_thread_id: parentThreadId, parentThreadId }
+        : {}
+    return {
+        thread_id: threadId,
+        threadId,
+        ...parent,
+        scope_role: role,
+        scopeRole: role,
+        scope: { role, thread_id: threadId, threadId, ...parent }
+    }
+}
+
+async function runCodexResumeScenario(
+    messages: Record<string, unknown>[],
+    codexSessionId?: string,
+    options?: {
+        archived?: boolean
+        concurrentMetadata?: Record<string, unknown>
+    }
+) {
+    const store = new Store(':memory:')
+    const engine = new SyncEngine(
+        store,
+        {} as never,
+        new RpcRegistry(),
+        { broadcast() {} } as never
+    )
+    const session = engine.getOrCreateSession(
+        'session-codex-resume-from-messages',
+        {
+            path: '/tmp/project',
+            host: 'localhost',
+            machineId: 'machine-1',
+            flavor: 'codex',
+            ...(codexSessionId ? { codexSessionId } : {}),
+            ...(options?.archived
+                ? {
+                    lifecycleState: 'archived',
+                    archivedBy: 'cli',
+                    archiveReason: 'Context reset before exit'
+                }
+                : {})
+        },
+        null,
+        'default',
+        'gpt-5'
+    )
+    engine.getOrCreateMachine(
+        'machine-1',
+        { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+        null,
+        'default'
+    )
+    engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+    for (const message of messages) {
+        store.messages.addMessage(session.id, message)
+    }
+    if (options?.concurrentMetadata) {
+        const current = store.sessions.getSessionByNamespace(session.id, 'default')!
+        const result = store.sessions.updateSessionMetadata(
+            session.id,
+            { ...current.metadata!, ...options.concurrentMetadata },
+            current.metadataVersion,
+            'default',
+            { touchUpdatedAt: false }
+        )
+        if (result.result !== 'success') throw new Error('Failed to prepare stale metadata fixture')
+    }
+    const before = store.sessions.getSession(session.id)!
+    const capturedResumeSessionIds: Array<string | undefined> = []
+    ;(engine as any).rpcGateway.spawnSession = async (...args: Parameters<SyncEngine['spawnSession']>) => {
+        capturedResumeSessionIds.push(args[8])
+        return { type: 'success', sessionId: session.id }
+    }
+    ;(engine as any).waitForSessionActive = async () => true
+
+    try {
+        const result = options?.archived
+            ? await engine.reopenSession(session.id, 'default')
+            : await engine.resumeSession(session.id, 'default')
+        const after = store.sessions.getSession(session.id)!
+        return {
+            result,
+            capturedResumeSessionIds,
+            before,
+            after,
+            persistedCodexSessionId: (after.metadata as { codexSessionId?: string } | null)?.codexSessionId,
+            cachedCodexSessionId: engine.getSession(session.id)?.metadata?.codexSessionId
+        }
+    } finally {
+        engine.stop()
+    }
+}
+
 describe('session model', () => {
     it('includes explicit model in session summaries', () => {
         const store = new Store(':memory:')
@@ -606,7 +731,7 @@ describe('session model', () => {
         }
     })
 
-    it('reports session activity when CLI receives a turn-ready event over socket', () => {
+    it('records CLI user text activity and drops internal ready events', () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []
         const cache = new SessionCache(store, createPublisher(events))
@@ -618,12 +743,13 @@ describe('session model', () => {
         )
         const handlers = new Map<string, (payload: unknown) => void>()
         const activity: Array<{ sessionId: string; updatedAt: number }> = []
+        const roomEvents: unknown[] = []
 
         registerSessionHandlers({
             on: (event: string, handler: (payload: unknown) => void) => {
                 handlers.set(event, handler)
             },
-            to: () => ({ emit() {} })
+            to: () => ({ emit: (_event: string, update: unknown) => roomEvents.push(update) })
         } as never, {
             store,
             resolveSessionAccess: (sessionId) => {
@@ -636,7 +762,10 @@ describe('session model', () => {
             }
         })
 
-        const before = Date.now()
+        handlers.get('message')?.({
+            sid: session.id,
+            message: JSON.stringify({ role: 'user', content: { type: 'text', text: 'hello' } })
+        })
         handlers.get('message')?.({
             sid: session.id,
             message: JSON.stringify({
@@ -648,9 +777,305 @@ describe('session model', () => {
             })
         })
 
+        const messages = store.messages.getMessages(session.id)
+        expect(messages).toHaveLength(1)
+        expect(roomEvents).toHaveLength(1)
         expect(activity).toHaveLength(1)
         expect(activity[0].sessionId).toBe(session.id)
-        expect(activity[0].updatedAt).toBeGreaterThanOrEqual(before)
+        expect(activity[0].updatedAt).toBe(messages[0]?.createdAt)
+    })
+
+    it('records activity only for the first messages-consumed transition while retaining duplicate acknowledgements', () => {
+        const originalDateNow = Date.now
+        let now = 1_000
+        Date.now = () => now
+        try {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+            const session = cache.getOrCreateSession(
+                'session-cli-consumed-activity',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            const queued = store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'hello' } },
+                'local-activity'
+            )
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const activity: Array<{ sessionId: string; updatedAt: number }> = []
+            const webEvents: SyncEvent[] = []
+
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit() {} })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onSessionActivity: (sessionId, updatedAt) => {
+                    activity.push({ sessionId, updatedAt })
+                    cache.recordSessionActivity(sessionId, updatedAt)
+                },
+                onWebappEvent: (event) => webEvents.push(event)
+            })
+
+            now = 2_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-activity'] })
+            now = 3_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-activity'] })
+            now = 4_000
+            handlers.get('message')?.({
+                sid: session.id,
+                message: JSON.stringify({
+                    role: 'agent',
+                    content: { type: 'event', data: { type: 'ready' } }
+                })
+            })
+
+            const invoked = store.messages.getMessages(session.id).find((message) => message.id === queued.id)
+            expect(invoked?.invokedAt).toBe(2_000)
+            expect(activity).toEqual([
+                { sessionId: session.id, updatedAt: 2_000 },
+                { sessionId: session.id, updatedAt: 2_000 }
+            ])
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(2_000)
+            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(1)
+            expect(webEvents.filter((event) => event.type === 'messages-consumed')).toHaveLength(2)
+        } finally {
+            Date.now = originalDateNow
+        }
+    })
+
+    it('replays the persisted invocation timestamp after the first activity callback fails', () => {
+        const originalDateNow = Date.now
+        const originalConsoleError = console.error
+        let now = 1_000
+        Date.now = () => now
+        console.error = () => {}
+        try {
+            const store = new Store(':memory:')
+            const session = store.sessions.getOrCreateSession(
+                'session-cli-consumed-replay',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'hello' } },
+                'local-replay'
+            )
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const activity: Array<{ sessionId: string; updatedAt: number }> = []
+            const webEvents: SyncEvent[] = []
+            let failActivity = true
+
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit() {} })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onSessionActivity: (sessionId, updatedAt) => {
+                    if (failActivity) throw new Error('activity callback failed')
+                    activity.push({ sessionId, updatedAt })
+                },
+                onWebappEvent: (event) => webEvents.push(event)
+            })
+
+            now = 2_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-replay'] })
+            failActivity = false
+            now = 3_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-replay'] })
+
+            expect(store.messages.getLocalMessageStates(session.id, ['local-replay']))
+                .toEqual([{ localId: 'local-replay', invokedAt: 2_000 }])
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(2_000)
+            expect(activity).toEqual([{ sessionId: session.id, updatedAt: 2_000 }])
+            expect(webEvents.filter((event) => event.type === 'messages-consumed').map((event) => event.invokedAt))
+                .toEqual([2_000, 3_000])
+        } finally {
+            Date.now = originalDateNow
+            console.error = originalConsoleError
+        }
+    })
+
+    it('uses the newest persisted invocation timestamp for a partial messages-consumed batch', () => {
+        const originalDateNow = Date.now
+        let now = 1_000
+        Date.now = () => now
+        try {
+            const store = new Store(':memory:')
+            const session = store.sessions.getOrCreateSession(
+                'session-cli-consumed-partial',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'old' } }, 'local-old')
+            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'fresh' } }, 'local-fresh')
+            store.messages.markMessagesInvoked(session.id, ['local-old'], 1_500)
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const activity: Array<{ sessionId: string; updatedAt: number }> = []
+            const webEvents: SyncEvent[] = []
+
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit() {} })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onSessionActivity: (sessionId, updatedAt) => activity.push({ sessionId, updatedAt }),
+                onWebappEvent: (event) => webEvents.push(event)
+            })
+
+            now = 2_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-old', 'local-fresh'] })
+
+            expect(store.messages.getLocalMessageStates(session.id, ['local-old', 'local-fresh']))
+                .toEqual([
+                    { localId: 'local-old', invokedAt: 1_500 },
+                    { localId: 'local-fresh', invokedAt: 2_000 }
+                ])
+            expect(activity).toEqual([{ sessionId: session.id, updatedAt: 2_000 }])
+            expect(webEvents.filter((event) => event.type === 'messages-consumed').map((event) => event.invokedAt))
+                .toEqual([2_000])
+        } finally {
+            Date.now = originalDateNow
+        }
+    })
+
+    it('keeps the batch ACK timestamp for heterogeneous sibling-preinvoked and unknown IDs', () => {
+        const originalDateNow = Date.now
+        let now = 1_000
+        Date.now = () => now
+        try {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+            const session = cache.getOrCreateSession(
+                'session-cli-consumed-sibling-preinvoked',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'already sent by sibling' } },
+                'local-sibling-preinvoked'
+            )
+            store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'second sibling send' } },
+                'local-sibling-preinvoked-newer'
+            )
+            store.messages.markMessagesInvoked(session.id, ['local-sibling-preinvoked'], 1_500)
+            store.messages.markMessagesInvoked(session.id, ['local-sibling-preinvoked-newer'], 1_800)
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const activity: Array<{ sessionId: string; updatedAt: number }> = []
+            const webEvents: SyncEvent[] = []
+
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit() {} })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onSessionActivity: (sessionId, updatedAt) => {
+                    activity.push({ sessionId, updatedAt })
+                    cache.recordSessionActivity(sessionId, updatedAt)
+                },
+                onWebappEvent: (event) => webEvents.push(event)
+            })
+
+            now = 2_000
+            handlers.get('messages-consumed')?.({
+                sid: session.id,
+                localIds: ['local-sibling-preinvoked', 'local-sibling-preinvoked-newer', 'local-unknown']
+            })
+
+            expect(store.messages.getLocalMessageStates(session.id, [
+                'local-sibling-preinvoked',
+                'local-sibling-preinvoked-newer'
+            ])).toEqual([
+                { localId: 'local-sibling-preinvoked', invokedAt: 1_500 },
+                { localId: 'local-sibling-preinvoked-newer', invokedAt: 1_800 }
+            ])
+            expect(activity).toEqual([{ sessionId: session.id, updatedAt: 1_000 }])
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(1_000)
+            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(0)
+            expect(webEvents.filter((event) => event.type === 'messages-consumed').map((event) => event.invokedAt))
+                .toEqual([2_000])
+        } finally {
+            Date.now = originalDateNow
+        }
+    })
+
+    it('keeps the ACK timestamp for messages-consumed SSE when local IDs are unknown', () => {
+        const originalDateNow = Date.now
+        let now = 1_000
+        Date.now = () => now
+        try {
+            const store = new Store(':memory:')
+            const session = store.sessions.getOrCreateSession(
+                'session-cli-consumed-unknown-id',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const webEvents: SyncEvent[] = []
+
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit() {} })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onWebappEvent: (event) => webEvents.push(event)
+            })
+
+            now = 2_000
+            handlers.get('messages-consumed')?.({ sid: session.id, localIds: ['local-unknown'] })
+
+            expect(webEvents.filter((event) => event.type === 'messages-consumed').map((event) => event.invokedAt))
+                .toEqual([2_000])
+        } finally {
+            Date.now = originalDateNow
+        }
     })
 
     it('does not report session activity for CLI tool messages', () => {
@@ -835,7 +1260,7 @@ describe('session model', () => {
         }
     })
 
-    it('preserves session config when resume spawn falls back to a fresh spawn', async () => {
+    it('does not replace a failed resume with a fresh conversation', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
             store,
@@ -875,17 +1300,19 @@ describe('session model', () => {
             const calls: unknown[][] = []
             ;(engine as any).rpcGateway.spawnSession = async (...args: unknown[]) => {
                 calls.push(args)
-                return calls.length === 1
-                    ? { type: 'error', message: 'resume failed' }
-                    : { type: 'success', sessionId: session.id }
+                return { type: 'error', message: 'resume failed' }
             }
             ;(engine as any).waitForSessionActive = async () => true
 
             const result = await engine.resumeSession(session.id, 'default')
 
-            expect(result).toEqual({ type: 'success', sessionId: session.id })
-            expect(calls).toHaveLength(2)
-            expect(calls[0]?.slice(0, 13)).toEqual([
+            expect(result).toEqual({
+                type: 'error',
+                message: 'resume failed',
+                code: 'resume_failed'
+            })
+            expect(calls).toHaveLength(1)
+            expect(calls[0]).toEqual([
                 'machine-1',
                 '/tmp/project',
                 'codex',
@@ -898,25 +1325,12 @@ describe('session model', () => {
                 'high',
                 'yolo',
                 'fast',
-                session.id
-            ])
-            expect(calls[1]).toEqual([
-                'machine-1',
-                '/tmp/project',
-                'codex',
-                'gpt-5.4',
-                'xhigh',
-                undefined,
-                undefined,
-                undefined,
-                undefined,
-                'high',
-                'yolo',
-                'fast',
                 session.id,
                 undefined,
                 undefined,
-                'system'
+                'system',
+                undefined,
+                undefined
             ])
         } finally {
             engine.stop()
@@ -1336,6 +1750,191 @@ describe('session model', () => {
         }
     })
 
+    it('recovers the explicit Codex parent thread when a newer child event exists', async () => {
+        const rootThreadId = '33333333-3333-4333-8333-333333333333'
+        const childThreadId = '44444444-4444-4444-8444-444444444444'
+        const outcome = await runCodexResumeScenario([
+            productionCodexMessage({
+                type: 'token_count',
+                ...productionCodexScope('parent', rootThreadId)
+            }),
+            productionCodexMessage({
+                type: 'agent-run-trace',
+                ...productionCodexScope('child', childThreadId, rootThreadId)
+            })
+        ])
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([rootThreadId])
+        expect([
+            outcome.persistedCodexSessionId,
+            outcome.cachedCodexSessionId,
+            outcome.after.metadataVersion,
+            outcome.after.updatedAt
+        ]).toEqual([
+            rootThreadId,
+            rootThreadId,
+            outcome.before.metadataVersion + 1,
+            outcome.before.updatedAt
+        ])
+    })
+
+    it('prefers the Codex resume ID already stored in metadata', async () => {
+        const metadataThreadId = 'metadata-codex-thread'
+        const messageThreadId = '55555555-5555-4555-8555-555555555555'
+        const outcome = await runCodexResumeScenario(
+            [productionCodexMessage(productionCodexScope('parent', messageThreadId))],
+            metadataThreadId
+        )
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([metadataThreadId])
+        expect(outcome.after).toMatchObject({
+            metadata: { codexSessionId: metadataThreadId },
+            metadataVersion: outcome.before.metadataVersion,
+            updatedAt: outcome.before.updatedAt
+        })
+    })
+
+    it('does not recover a Codex thread from before an explicit context reset', async () => {
+        const oldThreadId = '88888888-8888-4888-8888-888888888888'
+        const outcome = await runCodexResumeScenario([
+            productionCodexMessage(productionCodexScope('parent', oldThreadId)),
+            productionCodexContextResetMessage()
+        ], undefined, { archived: true })
+
+        expect(outcome.result).toMatchObject({ type: 'error', code: 'resume_unavailable' })
+        expect(outcome.capturedResumeSessionIds).toEqual([])
+        expect(outcome.persistedCodexSessionId).toBeUndefined()
+        expect(outcome.after.metadata).toMatchObject({
+            lifecycleState: 'archived',
+            archivedBy: 'cli',
+            archiveReason: 'Context reset before exit'
+        })
+    })
+
+    it('recovers a new Codex parent thread created after a context reset', async () => {
+        const oldThreadId = '88888888-8888-4888-8888-888888888888'
+        const newThreadId = '99999999-9999-4999-8999-999999999999'
+        const outcome = await runCodexResumeScenario([
+            productionCodexMessage(productionCodexScope('parent', oldThreadId)),
+            productionCodexContextResetMessage(),
+            productionCodexMessage(productionCodexScope('parent', newThreadId))
+        ])
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([newThreadId])
+        expect(outcome.persistedCodexSessionId).toBe(newThreadId)
+    })
+
+    it('does not treat raw user /clear text as a Codex context reset boundary', async () => {
+        const threadId = '88888888-8888-4888-8888-888888888888'
+        const outcome = await runCodexResumeScenario([
+            productionCodexMessage(productionCodexScope('parent', threadId)),
+            { role: 'user', content: { type: 'text', text: '/clear' } }
+        ])
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([threadId])
+        expect(outcome.persistedCodexSessionId).toBe(threadId)
+    })
+
+    it('prefers a Codex resume ID written concurrently during recovery persistence', async () => {
+        const messageThreadId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        const concurrentThreadId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        const outcome = await runCodexResumeScenario(
+            [productionCodexMessage(productionCodexScope('parent', messageThreadId))],
+            undefined,
+            {
+                concurrentMetadata: { codexSessionId: concurrentThreadId }
+            }
+        )
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([concurrentThreadId])
+        expect([
+            outcome.persistedCodexSessionId,
+            outcome.cachedCodexSessionId,
+            outcome.after.metadataVersion,
+            outcome.after.updatedAt
+        ]).toEqual([
+            concurrentThreadId,
+            concurrentThreadId,
+            outcome.before.metadataVersion,
+            outcome.before.updatedAt
+        ])
+    })
+
+    it('retries Codex recovery persistence after an unrelated concurrent metadata write', async () => {
+        const messageThreadId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+        const outcome = await runCodexResumeScenario(
+            [productionCodexMessage(productionCodexScope('parent', messageThreadId))],
+            undefined,
+            {
+                concurrentMetadata: { name: 'Concurrent rename' }
+            }
+        )
+
+        expect(outcome.result).toEqual({ type: 'success', sessionId: outcome.after.id })
+        expect(outcome.capturedResumeSessionIds).toEqual([messageThreadId])
+        expect(outcome.after.metadata).toMatchObject({
+            codexSessionId: messageThreadId,
+            name: 'Concurrent rename'
+        })
+        expect([
+            outcome.cachedCodexSessionId,
+            outcome.after.metadataVersion,
+            outcome.after.updatedAt
+        ]).toEqual([
+            messageThreadId,
+            outcome.before.metadataVersion + 1,
+            outcome.before.updatedAt
+        ])
+    })
+
+    const safeParentThreadId = '66666666-6666-4666-8666-666666666666'
+    const otherThreadId = '77777777-7777-4777-8777-777777777777'
+    const explicitParentEvent = productionCodexScope('parent', safeParentThreadId)
+    const rejectedCodexRecoveryCases: Array<[string, Record<string, unknown>[]]> = [
+        ['child-only event, including parent_thread_id', [
+            productionCodexMessage(productionCodexScope('child', otherThreadId, safeParentThreadId))
+        ]],
+        ['roleless event', [productionCodexMessage({
+            thread_id: safeParentThreadId,
+            scope: { threadId: safeParentThreadId }
+        })]],
+        ['malformed UUID', [productionCodexMessage(productionCodexScope('parent', 'not-a-uuid'))]],
+        ['conflicting role aliases', [productionCodexMessage({
+            ...explicitParentEvent,
+            scopeRole: 'child'
+        })]],
+        ['conflicting thread IDs', [productionCodexMessage({
+            ...explicitParentEvent,
+            scope: { role: 'parent', thread_id: otherThreadId, threadId: otherThreadId }
+        })]],
+        ['valid and malformed thread aliases', [productionCodexMessage({
+            ...explicitParentEvent,
+            threadId: 'not-a-uuid'
+        })]],
+        ['unrelated nested payload', [productionCodexMessage({ payload: explicitParentEvent })]],
+        ['non-production outer envelopes', [
+            { role: 'user', content: { type: 'codex', data: explicitParentEvent } },
+            { role: 'agent', content: { type: 'output', data: explicitParentEvent } }
+        ]]
+    ]
+
+    it.each(rejectedCodexRecoveryCases)('does not recover a Codex resume ID from %s', async (name, messages) => {
+        const outcome = await runCodexResumeScenario(messages)
+
+        expect(outcome.result).toMatchObject({ type: 'error', code: 'resume_unavailable' })
+        expect([
+            outcome.capturedResumeSessionIds,
+            outcome.persistedCodexSessionId,
+            outcome.after.metadataVersion,
+            outcome.after.updatedAt
+        ]).toEqual([[], undefined, outcome.before.metadataVersion, outcome.before.updatedAt])
+    })
+
     it('does not let stale default resume option override persisted Codex yolo', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
@@ -1558,6 +2157,158 @@ describe('session model', () => {
             expect(mergeCalls).toBe(1)
             expect(engine.getSession(spawnedSessionId)?.permissionMode).toBe('yolo')
             expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('cursor ACP resume passes existingSessionId and reuses row without session-ready wait (#991)', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const oldSession = engine.getOrCreateSession(
+                'cursor-reopen-old',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'cursor',
+                    cursorSessionId: 'cursor-csid-load-fail',
+                    cursorSessionProtocol: 'acp'
+                },
+                null,
+                'default'
+            )
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: oldSession.id, time: Date.now() })
+
+            let capturedExistingSessionId: string | undefined
+            let waitForSessionReadyCalls = 0
+            let mergeCalls = 0
+            const sessionCache = (engine as any).sessionCache
+            const mergeSessions = sessionCache.mergeSessions.bind(sessionCache)
+            sessionCache.mergeSessions = async (oldSessionId: string, newSessionId: string, namespace: string) => {
+                mergeCalls += 1
+                return mergeSessions(oldSessionId, newSessionId, namespace)
+            }
+
+            ;(engine as any).rpcGateway.spawnSession = async (
+                _machineId: string,
+                _directory: string,
+                _agent: string,
+                _model?: string,
+                _modelReasoningEffort?: string,
+                _yolo?: boolean,
+                _sessionType?: string,
+                _worktreeName?: string,
+                _resumeSessionId?: string,
+                _effort?: string,
+                _permissionMode?: string,
+                _serviceTier?: string,
+                existingSessionId?: string
+            ) => {
+                capturedExistingSessionId = existingSessionId
+                engine.handleSessionAlive({ sid: oldSession.id, time: Date.now() })
+                return { type: 'success', sessionId: oldSession.id }
+            }
+            ;(engine as any).rpcGateway.getCursorChatStoreStatus = async () => ({ onDisk: true, store: 'acp' })
+            ;(engine as any).waitForSessionActive = async () => true
+            ;(engine as any).waitForSessionReady = async () => {
+                waitForSessionReadyCalls += 1
+                return 'timeout'
+            }
+
+            const result = await engine.resumeSession(oldSession.id, 'default')
+
+            expect(result).toEqual({ type: 'success', sessionId: oldSession.id })
+            expect(capturedExistingSessionId).toBe(oldSession.id)
+            expect(waitForSessionReadyCalls).toBe(0)
+            expect(mergeCalls).toBe(0)
+            expect(store.sessions.getSession(oldSession.id)).not.toBeNull()
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('cursor ACP resume succeeds on same row without merge (#991)', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const oldSession = engine.getOrCreateSession(
+                'cursor-reopen-old-ready',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'cursor',
+                    cursorSessionId: 'cursor-csid-load-ok',
+                    cursorSessionProtocol: 'acp'
+                },
+                null,
+                'default'
+            )
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: oldSession.id, time: Date.now() })
+
+            let mergeCalls = 0
+            const sessionCache = (engine as any).sessionCache
+            const mergeSessions = sessionCache.mergeSessions.bind(sessionCache)
+            sessionCache.mergeSessions = async (oldSessionId: string, newSessionId: string, namespace: string) => {
+                mergeCalls += 1
+                return mergeSessions(oldSessionId, newSessionId, namespace)
+            }
+
+            ;(engine as any).rpcGateway.spawnSession = async (
+                _machineId: string,
+                _directory: string,
+                _agent: string,
+                _model?: string,
+                _modelReasoningEffort?: string,
+                _yolo?: boolean,
+                _sessionType?: string,
+                _worktreeName?: string,
+                _resumeSessionId?: string,
+                _effort?: string,
+                _permissionMode?: string,
+                _serviceTier?: string,
+                existingSessionId?: string
+            ) => {
+                expect(existingSessionId).toBe(oldSession.id)
+                engine.handleSessionAlive({ sid: oldSession.id, time: Date.now() })
+                return { type: 'success', sessionId: oldSession.id }
+            }
+            ;(engine as any).rpcGateway.getCursorChatStoreStatus = async () => ({ onDisk: true, store: 'acp' })
+            ;(engine as any).waitForSessionActive = async () => true
+
+            const result = await engine.resumeSession(oldSession.id, 'default')
+
+            expect(result).toEqual({ type: 'success', sessionId: oldSession.id })
+            expect(mergeCalls).toBe(0)
+            expect(store.sessions.getSession(oldSession.id)).not.toBeNull()
         } finally {
             engine.stop()
         }
@@ -3260,9 +4011,11 @@ describe('session model', () => {
                 'default'
             )
 
+            const updatedAtBeforeArchive = store.sessions.getSession(session.id)?.updatedAt
             cache.markSessionArchivedFromHub(session.id, 'Archived from hub (CLI unreachable)')
 
             const meta = cache.getSession(session.id)?.metadata as Record<string, unknown> | null | undefined
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(updatedAtBeforeArchive)
             expect(meta?.lifecycleState).toBe('archived')
             expect(meta?.archivedBy).toBe('hub')
             expect(meta?.archiveReason).toBe('Archived from hub (CLI unreachable)')

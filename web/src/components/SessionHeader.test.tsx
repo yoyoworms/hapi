@@ -1,0 +1,127 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { Session } from '@/types/api'
+import { I18nProvider } from '@/lib/i18n-context'
+import { ToastProvider } from '@/lib/toast-context'
+import { AppContextProvider } from '@/lib/app-context'
+import type { ApiClient } from '@/api/client'
+import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
+
+afterEach(() => cleanup())
+
+function baseSession(overrides: Partial<Session> = {}): Session {
+    return {
+        id: 'session-1',
+        namespace: 'default',
+        seq: 0,
+        createdAt: 0,
+        updatedAt: 0,
+        active: true,
+        activeAt: 0,
+        metadata: { flavor: 'codex', path: '/repo', host: 'machine' },
+        metadataVersion: 0,
+        agentState: null,
+        agentStateVersion: 0,
+        thinking: false,
+        thinkingAt: 0,
+        model: null,
+        modelReasoningEffort: null,
+        effort: null,
+        serviceTier: null,
+        ...overrides
+    }
+}
+
+function renderHeader(session: Session, extra?: { serviceTier?: string | null }) {
+    const contextApi = {} as ApiClient
+    return render(
+        <QueryClientProvider client={new QueryClient()}>
+            <AppContextProvider value={{ api: contextApi, token: 'test-token', baseUrl: '' }}>
+                <ToastProvider>
+                    <I18nProvider>
+                        <SessionHeader
+                            session={session}
+                            serviceTier={extra?.serviceTier}
+                            onBack={vi.fn()}
+                            api={null}
+                        />
+                    </I18nProvider>
+                </ToastProvider>
+            </AppContextProvider>
+        </QueryClientProvider>
+    )
+}
+
+describe('resolveSessionHeaderMachineLabel', () => {
+    it('prefers cached/display labels, then host, then short machine id', () => {
+        expect(resolveSessionHeaderMachineLabel(
+            baseSession({ metadata: { flavor: 'cursor', path: '/r', host: 'host.local', machineId: 'abc123456789' } }),
+            { abc123456789: 'Workstation' }
+        )).toBe('Workstation')
+
+        expect(resolveSessionHeaderMachineLabel(
+            baseSession({ metadata: { flavor: 'cursor', path: '/r', host: 'host.local', machineId: 'abc123456789' } }),
+            {}
+        )).toBe('host.local')
+
+        expect(resolveSessionHeaderMachineLabel(
+            baseSession({ metadata: { flavor: 'cursor', path: '/r', host: '', machineId: 'abc123456789' } }),
+            {}
+        )).toBe('abc12345')
+
+        expect(resolveSessionHeaderMachineLabel(
+            baseSession({ metadata: { flavor: 'cursor', path: '/r', host: '' } }),
+            {}
+        )).toBeNull()
+    })
+})
+
+describe('SessionHeader', () => {
+    it('shows an inherited catalog-default Fast tier', () => {
+        renderHeader(baseSession(), { serviceTier: 'priority' })
+        expect(screen.getByText('fast')).toBeInTheDocument()
+        expect(screen.queryByText('reasoning default')).not.toBeInTheDocument()
+    })
+
+    it('shows machine label and relative last-active age in the meta row', () => {
+        const fiveMinutesAgo = Date.now() - 5 * 60_000
+        renderHeader(baseSession({
+            activeAt: fiveMinutesAgo,
+            updatedAt: fiveMinutesAgo,
+            metadata: {
+                flavor: 'cursor',
+                path: '/home/heavygee/coding/hapi',
+                host: 'oos-linux',
+                machineId: 'machine-deadbeef'
+            }
+        }))
+
+        expect(screen.getByTestId('session-header-machine')).toHaveTextContent(/oos-linux/)
+        expect(screen.getByTestId('session-header-age')).toHaveTextContent(/5m ago|5分钟前/)
+    })
+
+    it('advances relative age on the minute tick without a session prop change', () => {
+        vi.useFakeTimers()
+        const now = new Date('2026-07-29T16:00:00.000Z')
+        vi.setSystemTime(now)
+
+        try {
+            renderHeader(baseSession({
+                activeAt: now.getTime() - 30_000,
+                updatedAt: now.getTime() - 30_000,
+                metadata: { flavor: 'cursor', path: '/r', host: 'host.local' }
+            }))
+
+            expect(screen.getByTestId('session-header-age')).toHaveTextContent(/just now|刚刚/)
+
+            act(() => {
+                vi.advanceTimersByTime(60_000)
+            })
+
+            expect(screen.getByTestId('session-header-age')).toHaveTextContent(/1m ago|1分钟前/)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+})

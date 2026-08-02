@@ -50,7 +50,8 @@ export class SSEManager {
         this.visibilityTracker.registerConnection(
             subscription.id,
             subscription.namespace,
-            options.visibility ?? 'hidden'
+            options.visibility ?? 'hidden',
+            subscription.sessionId
         )
         this.ensureHeartbeat()
         return {
@@ -78,6 +79,13 @@ export class SSEManager {
         const deliveries: Array<Promise<{ id: string; ok: boolean }>> = []
         for (const connection of this.connections.values()) {
             if (connection.namespace !== namespace) {
+                continue
+            }
+            // Session-scoped connections (including share-link viewers) must
+            // never receive a toast for another session. Toast delivery uses a
+            // dedicated path rather than broadcast(), so enforce the same
+            // session boundary here as the normal event filter.
+            if (connection.sessionId && connection.sessionId !== event.data.sessionId) {
                 continue
             }
             if (!options?.includeHidden && !this.visibilityTracker.isVisibleConnection(connection.id)) {

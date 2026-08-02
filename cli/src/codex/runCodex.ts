@@ -1,6 +1,6 @@
 import { logger } from '@/ui/logger';
 import { randomUUID } from 'node:crypto';
-import { loop, type EnhancedMode, type PermissionMode } from './loop';
+import { loop, type CodexPersonality, type EnhancedMode, type PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
@@ -92,7 +92,9 @@ export async function runCodex(opts: {
         model: mode.model,
         modelReasoningEffort: mode.modelReasoningEffort,
         collaborationMode: mode.collaborationMode,
-        serviceTier: mode.serviceTier
+        proactiveMultiAgent: mode.proactiveMultiAgent,
+        serviceTier: mode.serviceTier,
+        personality: mode.personality
     }));
 
     const codexCliOverrides = parseCodexCliOverrides(opts.codexArgs);
@@ -106,8 +108,11 @@ export async function runCodex(opts: {
         ?? (persistedPermissionMode && isPermissionModeAllowedForFlavor(persistedPermissionMode, 'codex') ? persistedPermissionMode as PermissionMode : undefined)
         ?? 'yolo';
     let currentModel = opts.model;
-    let currentModelReasoningEffort: ReasoningEffort | undefined = opts.modelReasoningEffort;
+    // Three states matter here: `undefined` inherits Codex configuration,
+    // `null` explicitly clears a HAPI override, and a string explicitly sets it.
+    let currentModelReasoningEffort: ReasoningEffort | null | undefined = opts.modelReasoningEffort;
     let currentCollaborationMode: EnhancedMode['collaborationMode'] = opts.collaborationMode ?? 'default';
+    let currentProactiveMultiAgent: boolean | undefined;
     // Service tier (Fast mode), stored representation: `'fast'` and
     // `'standard'` are explicit user choices, `undefined`/`null` mean untouched
     // (use the account default). Prefer the spawn-time override (set by the hub
@@ -115,6 +120,8 @@ export async function runCodex(opts: {
     // thread immediately runs with the right tier; otherwise seed from the
     // persisted session. A persisted/absent `null` stays untouched (omitted).
     let currentServiceTier: string | null | undefined = opts.serviceTier ?? sessionInfo.serviceTier ?? undefined;
+    /** In-session override only. Undefined = omit app-server field (inherit Codex config/thread). */
+    let currentPersonality: CodexPersonality | undefined;
 
     const lifecycle = createRunnerLifecycle({
         session,
@@ -135,7 +142,11 @@ export async function runCodex(opts: {
         if (options?.syncModel !== false) {
             sessionInstance.setModel(currentModel ?? null);
         }
-        sessionInstance.setModelReasoningEffort(currentModelReasoningEffort ?? null);
+        // Do not collapse inherited Codex config into an explicit default.
+        // Explicit clears remain `null` and must still be synchronized.
+        if (currentModelReasoningEffort !== undefined) {
+            sessionInstance.setModelReasoningEffort(currentModelReasoningEffort);
+        }
         // Preserve the third state: only sync when the user/persisted session
         // has an explicit tier. `undefined` means "omit" so the keepalive does
         // not overwrite the account-default or persisted Fast tier with null.
@@ -156,6 +167,8 @@ export async function runCodex(opts: {
         modelReasoningEffort?: ReasoningEffort | null;
         collaborationMode?: EnhancedMode['collaborationMode'];
         serviceTier?: string | null;
+        proactiveMultiAgent?: boolean;
+        personality?: CodexPersonality;
     } | undefined): void => {
         if (!updates) return;
         if (updates.permissionMode !== undefined) {
@@ -165,13 +178,19 @@ export async function runCodex(opts: {
             currentModel = updates.model ?? undefined;
         }
         if (updates.modelReasoningEffort !== undefined) {
-            currentModelReasoningEffort = updates.modelReasoningEffort ?? undefined;
+            currentModelReasoningEffort = updates.modelReasoningEffort;
         }
         if (updates.collaborationMode !== undefined) {
             currentCollaborationMode = updates.collaborationMode;
         }
         if (updates.serviceTier !== undefined) {
             currentServiceTier = updates.serviceTier;
+        }
+        if (updates.proactiveMultiAgent !== undefined) {
+            currentProactiveMultiAgent = updates.proactiveMultiAgent;
+        }
+        if (updates.personality !== undefined) {
+            currentPersonality = updates.personality;
         }
         applyCurrentConfigToSession();
     };
@@ -187,7 +206,7 @@ export async function runCodex(opts: {
         }
         const sessionModelReasoningEffort = sessionWrapperRef.current?.getModelReasoningEffort();
         if (sessionModelReasoningEffort !== undefined) {
-            currentModelReasoningEffort = (sessionModelReasoningEffort ?? undefined) as ReasoningEffort | undefined;
+            currentModelReasoningEffort = sessionModelReasoningEffort as ReasoningEffort | null;
         }
         const sessionCollaborationMode = sessionWrapperRef.current?.getCollaborationMode();
         if (sessionCollaborationMode) {
@@ -212,8 +231,10 @@ export async function runCodex(opts: {
                     permissionMode: currentPermissionMode,
                     collaborationMode: currentCollaborationMode,
                     model: currentModel,
-                    modelReasoningEffort: currentModelReasoningEffort,
-                    serviceTier: currentServiceTier
+                    modelReasoningEffort: currentModelReasoningEffort ?? undefined,
+                    serviceTier: currentServiceTier,
+                    proactiveMultiAgent: currentProactiveMultiAgent,
+                    personality: currentPersonality
                 });
                 if (slash.kind === 'goal') {
                     if (slash.message) {
@@ -231,9 +252,10 @@ export async function runCodex(opts: {
                     messageQueue.pushIsolateAndClear(goalCommand, {
                         permissionMode: currentPermissionMode ?? 'default',
                         model: currentModel,
-                        modelReasoningEffort: currentModelReasoningEffort,
+                        modelReasoningEffort: currentModelReasoningEffort ?? undefined,
                         collaborationMode: currentCollaborationMode,
-                        serviceTier: currentServiceTier
+                        serviceTier: currentServiceTier,
+                        personality: currentPersonality
                     }, localId);
                     return;
                 }
@@ -270,9 +292,11 @@ export async function runCodex(opts: {
                 const enhancedMode: EnhancedMode = {
                     permissionMode: messagePermissionMode ?? 'yolo',
                     model: currentModel,
-                    modelReasoningEffort: currentModelReasoningEffort,
+                    modelReasoningEffort: currentModelReasoningEffort ?? undefined,
                     collaborationMode: currentCollaborationMode,
-                    serviceTier: currentServiceTier
+                    proactiveMultiAgent: currentProactiveMultiAgent,
+                    serviceTier: currentServiceTier,
+                    personality: currentPersonality
                 };
                 if (isolatedCommandText) {
                     messageQueue.pushIsolateAndClear(isolatedCommandText, enhancedMode, localId);
@@ -284,9 +308,11 @@ export async function runCodex(opts: {
                 const enhancedMode: EnhancedMode = {
                     permissionMode: currentPermissionMode ?? 'yolo',
                     model: currentModel,
-                    modelReasoningEffort: currentModelReasoningEffort,
+                    modelReasoningEffort: currentModelReasoningEffort ?? undefined,
                     collaborationMode: currentCollaborationMode,
-                    serviceTier: currentServiceTier
+                    proactiveMultiAgent: currentProactiveMultiAgent,
+                    serviceTier: currentServiceTier,
+                    personality: currentPersonality
                 };
                 messageQueue.push(formatMessageWithAttachments(message.content.text, message.content.attachments), enhancedMode, localId);
             }
@@ -377,7 +403,7 @@ export async function runCodex(opts: {
         }
 
         if (config.modelReasoningEffort !== undefined) {
-            currentModelReasoningEffort = parseReasoningEffortValue(config.modelReasoningEffort);
+            currentModelReasoningEffort = parseReasoningEffortValue(config.modelReasoningEffort) ?? null;
         }
 
         if (config.collaborationMode !== undefined) {
@@ -423,7 +449,7 @@ export async function runCodex(opts: {
             startedBy,
             permissionMode: currentPermissionMode,
             model: currentModel,
-            modelReasoningEffort: currentModelReasoningEffort,
+            modelReasoningEffort: currentModelReasoningEffort ?? undefined,
             collaborationMode: currentCollaborationMode,
             resumeSessionId: opts.resumeSessionId,
             sourceSessionId: codexSourceSessionId,

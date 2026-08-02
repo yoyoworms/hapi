@@ -25,23 +25,22 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const limit = parsed.data.limit ?? 50
-
-        // Fork's incremental-sync mode: afterSeq is not part of MessagesQuerySchema,
-        // so it's extracted directly from the raw query string. When present, return
-        // only messages with seq > afterSeq.
-        const rawAfterSeq = c.req.query('afterSeq')
-        if (rawAfterSeq !== undefined) {
-            const afterSeqNum = Number(rawAfterSeq)
-            if (Number.isFinite(afterSeqNum) && afterSeqNum >= 0) {
-                const messages = engine.getMessagesAfter(sessionId, { afterSeq: afterSeqNum, limit })
-                return c.json({ messages, page: { limit, afterSeq: afterSeqNum, hasMore: messages.length >= limit } })
-            }
-        }
-
         const before = parsed.data.beforeAt !== undefined && parsed.data.beforeSeq !== undefined
             ? { at: parsed.data.beforeAt, seq: parsed.data.beforeSeq }
             : null
-        return c.json(engine.getMessagesPage(sessionId, { limit, before }))
+        const after = parsed.data.afterAt !== undefined && parsed.data.afterSeq !== undefined
+            ? { at: parsed.data.afterAt, seq: parsed.data.afterSeq }
+            : null
+        const until = parsed.data.untilAt !== undefined && parsed.data.untilSeq !== undefined
+            ? { at: parsed.data.untilAt, seq: parsed.data.untilSeq }
+            : null
+        return c.json(engine.getMessagesPage(sessionId, {
+            limit,
+            before,
+            after,
+            until,
+            epoch: parsed.data.epoch ?? null
+        }))
     })
 
     app.delete('/sessions/:id/messages/:messageId', async (c) => {

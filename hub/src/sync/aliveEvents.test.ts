@@ -206,6 +206,38 @@ describe('alive incremental events', () => {
         expect(events.find((event) => event.type === 'session-updated')).toBeUndefined()
     })
 
+    it('publishes a complete stopped state when inactivity expiry ends a running task', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'session-expire-complete-state',
+            { path: '/tmp/project', host: 'localhost' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+
+        cache.handleSessionAlive({ sid: session.id, time: now - 31_000, thinking: true })
+        cache.applyBackgroundTaskDelta(session.id, { started: 2, completed: 0 })
+        cache.getSession(session.id)!.activeAt = now - 31_000
+        events.length = 0
+
+        expect(cache.expireInactive(now)).toEqual([session.id])
+        expect(cache.getSession(session.id)).toEqual(expect.objectContaining({
+            active: false,
+            thinking: false,
+            backgroundTaskCount: 0
+        }))
+
+        const update = events.find((event) => event.type === 'session-updated')
+        expect(update?.type === 'session-updated' ? update.data : null).toEqual({
+            active: false,
+            thinking: false,
+            backgroundTaskCount: 0
+        })
+    })
+
     it('keeps queued thinking true across false heartbeats during the grace window', () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []

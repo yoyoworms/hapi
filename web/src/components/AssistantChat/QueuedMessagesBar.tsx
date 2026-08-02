@@ -1,4 +1,4 @@
-import { useAssistantApi } from '@assistant-ui/react'
+import { useAui } from '@assistant-ui/react'
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
 import type { ApiClient } from '@/api/client'
 import { getMessageWindowState, subscribeMessageWindow } from '@/lib/message-window-store'
@@ -71,8 +71,7 @@ function useQueuedMessages(sessionId: string): DecryptedMessage[] {
     // useSyncExternalStore guarantees a stable reference when the snapshot is
     // unchanged, so [state] as the dependency avoids unnecessary re-sorts.
     return useMemo(() => {
-        const allMessages = [...state.messages, ...state.pending]
-        return sortQueuedMessages(allMessages.filter(isQueuedForInvocation))
+        return sortQueuedMessages(state.messages.filter(isQueuedForInvocation))
     }, [state])
 }
 
@@ -163,7 +162,7 @@ export function QueuedMessagesBar({
     onEdit?: (params: { text: string; pendingSchedule: PendingSchedule | null }) => void
 }) {
     const queued = useQueuedMessages(sessionId)
-    const assistantApi = useAssistantApi()
+    const assistantApi = useAui()
     const cancelMutation = useCancelQueuedMessage(api)
     const { t } = useTranslation()
     const { addToast } = useToast()

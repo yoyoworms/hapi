@@ -118,4 +118,39 @@ describe('SSEManager namespace filtering', () => {
         expect(received).toHaveLength(1)
         expect(received[0]?.id).toBe('visible')
     })
+
+    it('does not leak toasts across session-scoped connections', async () => {
+        const manager = new SSEManager(0, new VisibilityTracker())
+        const received: string[] = []
+
+        for (const [id, sessionId] of [
+            ['matching', 'session-1'],
+            ['other', 'session-2'],
+            ['global', null],
+        ] as const) {
+            manager.subscribe({
+                id,
+                namespace: 'alpha',
+                sessionId,
+                visibility: 'visible',
+                send: () => {
+                    received.push(id)
+                },
+                sendHeartbeat: () => {}
+            })
+        }
+
+        const delivered = await manager.sendToast('alpha', {
+            type: 'toast',
+            data: {
+                title: 'Private title',
+                body: 'Private body',
+                sessionId: 'session-1',
+                url: '/sessions/session-1'
+            }
+        })
+
+        expect(delivered).toBe(2)
+        expect(received.sort()).toEqual(['global', 'matching'])
+    })
 })

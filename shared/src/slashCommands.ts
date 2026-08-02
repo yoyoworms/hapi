@@ -12,6 +12,7 @@ export const BUILTIN_SLASH_COMMANDS = {
         { name: 'status', description: 'Show Claude Code status including version, model, account, and API connectivity', source: 'builtin' },
     ],
     codex: [
+        { name: 'agent', description: 'Toggle proactive Codex multi-agent delegation', source: 'builtin' },
         { name: 'clear', description: 'Clear current Codex thread context', source: 'builtin' },
         { name: 'compact', description: 'Compact current Codex thread context', source: 'builtin' },
         { name: 'goal', description: 'Set, view, pause, resume, or clear a persistent Codex goal', source: 'builtin' },
@@ -23,6 +24,7 @@ export const BUILTIN_SLASH_COMMANDS = {
         { name: 'model', description: 'Show or set Codex model, e.g. /model gpt-5.5', source: 'builtin' },
         { name: 'reasoning', description: 'Show or set reasoning effort', source: 'builtin' },
         { name: 'effort', description: 'Alias for /reasoning', source: 'builtin' },
+        { name: 'personality', description: 'Show or set response style: friendly, pragmatic, or none', source: 'builtin' },
         { name: 'permissions', description: 'Show or set permission mode', source: 'builtin' },
         { name: 'permission', description: 'Alias for /permissions', source: 'builtin' },
     ],
@@ -50,6 +52,8 @@ export const BUILTIN_SLASH_COMMANDS = {
     cursor: [
         { name: 'compress', description: 'Compress conversation context to free window space (pass-through to Cursor agent)', source: 'builtin' },
     ],
+    kimi: [],
+    pi: [],
 } as const satisfies Record<string, readonly SlashCommand[]>
 
 export function getBuiltinSlashCommands(agent: string): SlashCommand[] {

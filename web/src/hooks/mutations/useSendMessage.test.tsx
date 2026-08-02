@@ -7,9 +7,9 @@ import { ApiError, type ApiClient } from '@/api/client'
 
 vi.mock('@/lib/message-window-store', () => ({
     appendOptimisticMessage: vi.fn(),
-    getMessageWindowState: vi.fn(() => ({ messages: [], pending: [] })),
+    getMessageWindowState: vi.fn(() => ({ messages: [] })),
     updateMessageStatus: vi.fn(),
-    fetchLatestMessages: vi.fn(async () => {}),
+    syncTailMessages: vi.fn(async () => {}),
     removeOptimisticMessage: vi.fn(),
 }))
 
@@ -453,8 +453,7 @@ describe('useSendMessage', () => {
                 originalText: 'photo + text',
             }
             stateMock.mockReturnValue({
-                messages: [failedAttachmentMessage],
-                pending: []
+                messages: [failedAttachmentMessage]
             } as unknown as ReturnType<typeof getMessageWindowState>)
 
             const { result } = renderHook(
@@ -684,8 +683,7 @@ describe('useSendMessage', () => {
 
         const { getMessageWindowState } = await import('@/lib/message-window-store')
         vi.mocked(getMessageWindowState).mockReturnValueOnce({
-            messages: [],
-            pending: [{
+            messages: [{
                 id: 'local-retry-1',
                 seq: null,
                 localId: 'local-retry-1',

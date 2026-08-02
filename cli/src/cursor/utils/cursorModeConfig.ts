@@ -1,5 +1,5 @@
 import type { CursorPermissionMode } from '@hapi/protocol/types';
-import { cursorCliSkuBaseId, cursorModelBaseId, matchCliSkuToAcpWireId } from '@hapi/protocol';
+import { cursorCliSkuBaseId, cursorModelBaseId, matchCliSkuToAcpWireId, resolveCursorLegacyModelBase } from '@hapi/protocol';
 import type { AcpSdkBackend } from '@/agent/backends/acp';
 import { logger } from '@/ui/logger';
 
@@ -16,6 +16,20 @@ export function toCursorAcpMode(mode: CursorPermissionMode | undefined): CursorA
     if (mode === 'debug') return 'debug';
     // autoReview / yolo / default map to agent; auto-review is a spawn flag + slash, not ACP mode.
     return 'agent';
+}
+
+/**
+ * Permission mode to use after the operator accepts a CreatePlan request.
+ * Plan/ask are read-only planning modes — leave them for an executable mode so
+ * "Yes" means continue the task, not "plan complete, stop".
+ */
+export function resolveCursorModeAfterPlanApproval(
+    mode: CursorPermissionMode | undefined
+): CursorPermissionMode {
+    if (mode === 'plan' || mode === 'ask' || mode === undefined) {
+        return 'default';
+    }
+    return mode;
 }
 
 /** True when HAPI permission mode should spawn/toggle Cursor Auto-review. */
@@ -84,6 +98,10 @@ type ParameterizedCursorModelResult = ApplyCursorAcpModelResult | 'unsupported' 
 export function wireIdForCursorSessionState(requested: string, resolved: string): string {
     const trimmed = requested.trim();
     if (trimmed.includes('[')) {
+        const legacyBase = resolveCursorLegacyModelBase(cursorModelBaseId(trimmed));
+        if (legacyBase !== cursorModelBaseId(trimmed)) {
+            return resolved;
+        }
         return trimmed;
     }
     return resolved;

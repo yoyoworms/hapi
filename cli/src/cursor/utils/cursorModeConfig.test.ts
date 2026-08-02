@@ -5,6 +5,7 @@ import {
     applyCursorAcpMode,
     isCursorAutoReviewMode,
     resolveCursorAcpWireId,
+    resolveCursorModeAfterPlanApproval,
     toCursorAcpMode,
     wireIdForCursorSessionState
 } from './cursorModeConfig';
@@ -27,6 +28,21 @@ describe('toCursorAcpMode', () => {
         expect(isCursorAutoReviewMode('autoReview')).toBe(true);
         expect(isCursorAutoReviewMode('yolo')).toBe(false);
         expect(toCursorAcpMode(undefined)).toBe('agent');
+    });
+});
+
+describe('resolveCursorModeAfterPlanApproval', () => {
+    it('leaves plan/ask for default so Yes can execute the task', () => {
+        expect(resolveCursorModeAfterPlanApproval('plan')).toBe('default');
+        expect(resolveCursorModeAfterPlanApproval('ask')).toBe('default');
+        expect(resolveCursorModeAfterPlanApproval(undefined)).toBe('default');
+    });
+
+    it('preserves executable modes (yolo, default, debug, autoReview)', () => {
+        expect(resolveCursorModeAfterPlanApproval('yolo')).toBe('yolo');
+        expect(resolveCursorModeAfterPlanApproval('default')).toBe('default');
+        expect(resolveCursorModeAfterPlanApproval('debug')).toBe('debug');
+        expect(resolveCursorModeAfterPlanApproval('autoReview')).toBe('autoReview');
     });
 });
 
@@ -111,6 +127,15 @@ describe('wireIdForCursorSessionState', () => {
                 'composer-2.5[fast=true]'
             )
         ).toBe('composer-2.5[fast=false]');
+    });
+
+    it('stores remapped catalog ids when a legacy wire base was upgraded', () => {
+        expect(
+            wireIdForCursorSessionState(
+                'grok-4.5[fast=false]',
+                'cursor-grok-4.5-medium'
+            )
+        ).toBe('cursor-grok-4.5-medium');
     });
 
     it('uses resolved wire id for base-only requests', () => {

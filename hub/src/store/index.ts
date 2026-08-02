@@ -5,6 +5,8 @@ import { dirname } from 'node:path'
 import { MachineStore } from './machineStore'
 import { MessageStore } from './messageStore'
 import { PushStore } from './pushStore'
+import { FcmStore } from './fcmStore'
+import { ScratchlistStore } from './scratchlistStore'
 import { SessionStore } from './sessionStore'
 import { ShareStore } from './shareStore'
 import { UserStore } from './userStore'
@@ -13,6 +15,8 @@ export type {
     StoredMachine,
     StoredMessage,
     StoredPushSubscription,
+    StoredFcmDevice,
+    StoredScratchlistEntry,
     StoredSession,
     StoredUser,
     VersionedUpdateResult
@@ -21,16 +25,27 @@ export type { CancelQueuedMessageResult, LookupQueuedMessageResult } from './mes
 export { MachineStore } from './machineStore'
 export { MessageStore } from './messageStore'
 export { PushStore } from './pushStore'
+export { FcmStore } from './fcmStore'
+export { ScratchlistStore } from './scratchlistStore'
 export { SessionStore } from './sessionStore'
+export { ShareStore } from './shareStore'
 export { UserStore } from './userStore'
 
-const SCHEMA_VERSION: number = 11
+// V10 and V11 were used for different features on the upstream and liuxin
+// branches. V16 is an explicit convergence point: every upgrade path ends with
+// both upstream's FCM/scratchlist/message-epoch schema and the local
+// content-UUID/session-share schema present.
+const SCHEMA_VERSION: number = 16
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
     'messages',
+    'message_epochs',
     'users',
-    'push_subscriptions'
+    'push_subscriptions',
+    'fcm_devices',
+    'session_scratchlist',
+    'session_shares'
 ] as const
 
 export class Store {
@@ -44,6 +59,8 @@ export class Store {
     readonly messages: MessageStore
     readonly users: UserStore
     readonly push: PushStore
+    readonly fcm: FcmStore
+    readonly scratchlist: ScratchlistStore
     readonly shares: ShareStore
 
     /**
@@ -79,10 +96,7 @@ export class Store {
         this.db.exec('PRAGMA synchronous = NORMAL')
         this.db.exec('PRAGMA foreign_keys = ON')
         this.db.exec('PRAGMA busy_timeout = 5000')
-        // Cap the WAL file so it is truncated back down after each checkpoint.
-        // Without this (SQLite default is -1 = unbounded) the WAL only ever grows
-        // to its high-water mark and never shrinks — one busy instance reached a
-        // 1.2GB WAL on disk.  64MB is well above the 4MB autocheckpoint threshold.
+        // Keep the WAL below its historical high-water mark after checkpoints.
         this.db.exec('PRAGMA journal_size_limit = 67108864')
         this.initSchema()
 
@@ -100,6 +114,8 @@ export class Store {
         this.messages = new MessageStore(this.db)
         this.users = new UserStore(this.db)
         this.push = new PushStore(this.db)
+        this.fcm = new FcmStore(this.db)
+        this.scratchlist = new ScratchlistStore(this.db)
         this.shares = new ShareStore(this.db)
 
         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
@@ -107,9 +123,8 @@ export class Store {
         }
     }
 
-    // Periodically enforce the per-session message retention cap so the DB does
-    // not grow without bound (one session had reached 47k messages). Opt-out by
-    // setting HAPI_MAX_MESSAGES_PER_SESSION=0.
+    // Bound persistent history growth without touching queued prompts. Operators
+    // can disable retention with HAPI_MAX_MESSAGES_PER_SESSION=0.
     private startMaintenance(): void {
         const raw = process.env.HAPI_MAX_MESSAGES_PER_SESSION
         const cap = raw === undefined || raw === '' ? 5000 : Number(raw)
@@ -130,8 +145,47 @@ export class Store {
 
         this.maintenanceTimer = setInterval(run, 6 * 60 * 60 * 1000)
         this.maintenanceTimer.unref?.()
-        // First sweep shortly after startup (do not block construction).
         setTimeout(run, 60_000).unref?.()
+    }
+
+    /**
+     * Atomically records a CLI prompt-consumption acknowledgement and returns
+     * the persisted session activity timestamp. A duplicate or sibling-stamped
+     * acknowledgement leaves the session untouched while returning its existing
+     * timestamp for replay-safe in-memory cache synchronization.
+     */
+    recordMessagesConsumed(
+        sessionId: string,
+        localIds: string[],
+        invokedAt: number,
+        namespace: string
+    ): { updatedAt: number; todosCleared: boolean } {
+        return this.db.transaction(() => {
+            const before = this.sessions.getSessionByNamespace(sessionId, namespace)
+            if (!before) {
+                throw new Error('session not found after messages-consumed transition')
+            }
+
+            const changes = this.messages.markMessagesInvoked(sessionId, localIds, invokedAt)
+            // A consumed prompt begins a new turn. Clear the previous plan in the
+            // same transaction so every terminal observes the same todo state.
+            const todosCleared = Array.isArray(before.todos) && before.todos.length > 0
+                ? this.sessions.setSessionTodos(sessionId, [], invokedAt, namespace)
+                : false
+            if (changes > 0 && !todosCleared) {
+                this.sessions.touchSessionUpdatedAt(sessionId, invokedAt, namespace)
+            }
+
+            const session = this.sessions.getSessionByNamespace(sessionId, namespace)
+            if (!session) {
+                throw new Error('session not found after messages-consumed transition')
+            }
+            if (changes > 0 && session.updatedAt < invokedAt) {
+                throw new Error('session activity was not persisted after messages-consumed transition')
+            }
+
+            return { updatedAt: session.updatedAt, todosCleared }
+        })()
     }
 
     close(): void {
@@ -169,6 +223,11 @@ export class Store {
             8: () => this.migrateFromV8ToV9(),
             9: () => this.migrateFromV9ToV10(),
             10: () => this.migrateFromV10ToV11(),
+            11: () => this.migrateFromV11ToV12(),
+            12: () => this.migrateFromV12ToV13(),
+            13: () => this.migrateFromV13ToV14(),
+            14: () => this.migrateFromV14ToV15(),
+            15: () => this.migrateFromV15ToV16(),
         })
 
         if (currentVersion === 0) {
@@ -278,6 +337,12 @@ export class Store {
                 ON messages(scheduled_at)
                 WHERE scheduled_at IS NOT NULL AND invoked_at IS NULL;
 
+            CREATE TABLE IF NOT EXISTS message_epochs (
+                session_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 platform TEXT NOT NULL,
@@ -300,6 +365,32 @@ export class Store {
             );
             CREATE INDEX IF NOT EXISTS idx_push_subscriptions_namespace ON push_subscriptions(namespace);
 
+            CREATE TABLE IF NOT EXISTS fcm_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL,
+                token TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(namespace, device_id, platform)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fcm_devices_namespace ON fcm_devices(namespace);
+            CREATE INDEX IF NOT EXISTS idx_fcm_devices_token ON fcm_devices(token);
+
+            CREATE TABLE IF NOT EXISTS session_scratchlist (
+                session_id TEXT NOT NULL,
+                entry_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                attachments TEXT DEFAULT NULL,
+                PRIMARY KEY (session_id, entry_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_scratchlist_session_created
+                ON session_scratchlist(session_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS session_shares (
                 token TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -307,20 +398,6 @@ export class Store {
                 revoked INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_shares_session ON session_shares(session_id, namespace);
-        `)
-    }
-
-    private migrateFromV10ToV11(): void {
-        // Session share links (single-session, no-login access tokens).
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS session_shares (
-                token TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_session_shares_session ON session_shares(session_id, namespace);
         `)
@@ -499,28 +576,168 @@ export class Store {
     }
 
     private migrateFromV9ToV10(): void {
-        // Fork: persistent content-uuid dedup on the messages table.
+        const columns = this.getSessionColumnNames()
+        if (columns.size === 0) return
+        if (!columns.has('service_tier')) {
+            this.db.exec('ALTER TABLE sessions ADD COLUMN service_tier TEXT')
+        }
+    }
+
+    private migrateFromV10ToV11(): void {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS fcm_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL,
+                token TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(namespace, device_id, platform)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fcm_devices_namespace ON fcm_devices(namespace);
+            CREATE INDEX IF NOT EXISTS idx_fcm_devices_token ON fcm_devices(token);
+        `)
+    }
+
+    /**
+     * tiann/hapi#893 (scratchlist v2): introduce the per-session
+     * `session_scratchlist` typed table. Upstream main took V10→V11 for
+     * `fcm_devices`; scratchlist is V11→V12.
+     *
+     * Idempotent via `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT
+     * EXISTS`. Cascade-delete from `sessions(id)` handles delete-session
+     * cleanup. No data backfill: the web client's first-run migration
+     * pushes any existing `localStorage` entries up via REST.
+     *
+     * Rollback: `DROP TABLE session_scratchlist; PRAGMA user_version = 11;`
+     */
+    private migrateFromV11ToV12(): void {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS session_scratchlist (
+                session_id TEXT NOT NULL,
+                entry_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, entry_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_scratchlist_session_created
+                ON session_scratchlist(session_id, created_at DESC);
+        `)
+    }
+
+    private migrateFromV12ToV13(): void {
+        // Two development branches previously used schema v12 for different
+        // tables. Reconcile both shapes before advancing the version.
+        this.migrateFromV11ToV12()
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS message_epochs (
+                session_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+        `)
+    }
+
+    private migrateFromV13ToV14(): void {
+        // Repair v13 databases produced before the divergent v12 migrations
+        // were reconciled. Both underlying migrations are idempotent.
+        this.migrateFromV12ToV13()
+    }
+
+    /**
+     * tiann/hapi#921 (scratchlist v2.2): attachment metadata JSON column.
+     * Bytes live on hub filesystem under HAPI_HOME/scratchlist-attachments/.
+     * Upstream ladder: V11→V12 = session_scratchlist (#896); V12–V14 =
+     * message_epochs reconciliation; this step is V14→V15 for attachments.
+     *
+     * Rollback: `ALTER TABLE session_scratchlist DROP COLUMN attachments` is
+     * unsupported on older SQLite; rebuild DB or leave column unused.
+     */
+    private migrateFromV14ToV15(): void {
+        const columns = this.db.prepare('PRAGMA table_info(session_scratchlist)').all() as Array<{ name: string }>
+        if (!columns.some((col) => col.name === 'attachments')) {
+            this.db.exec(`ALTER TABLE session_scratchlist ADD COLUMN attachments TEXT DEFAULT NULL`)
+        }
+    }
+
+    /**
+     * Converge the two schema ladders that independently occupied V10/V11.
+     * This is deliberately idempotent so it upgrades an upstream V15 DB, a
+     * local V11 DB, or a partially migrated development DB without guessing
+     * which branch produced its user_version.
+     */
+    private migrateFromV15ToV16(): void {
+        this.migrateFromV9ToV10()
+        this.migrateFromV10ToV11()
+        this.migrateFromV12ToV13()
+        this.migrateFromV14ToV15()
+
         const messageColumns = this.getMessageColumnNames()
         if (messageColumns.size > 0) {
             if (!messageColumns.has('content_uuid')) {
                 this.db.exec('ALTER TABLE messages ADD COLUMN content_uuid TEXT')
             }
-            // Partial index backing the persistent content-uuid dedup that prevents
-            // reconnect-replayed agent messages from being re-inserted. Idempotent.
-            // Existing rows keep content_uuid = NULL (not backfilled); they were
-            // already de-duplicated by the one-time cleanup.
             this.db.exec(`
                 CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
                     ON messages(session_id, content_uuid)
                     WHERE content_uuid IS NOT NULL
             `)
         }
+        this.rebuildSessionSharesWithForeignKey()
+    }
 
-        // Upstream: Codex service-tier (fast mode) column on the sessions table.
-        const sessionColumns = this.getSessionColumnNames()
-        if (sessionColumns.size > 0 && !sessionColumns.has('service_tier')) {
-            this.db.exec('ALTER TABLE sessions ADD COLUMN service_tier TEXT')
-        }
+    /**
+     * The local V11 schema created `session_shares` without a foreign key while
+     * the converged schema requires delete-session to revoke shares immediately.
+     * `CREATE TABLE IF NOT EXISTS` cannot add that constraint, so rebuild the
+     * table and retain only rows whose target session still exists.
+     */
+    private rebuildSessionSharesWithForeignKey(): void {
+        const hadShares = this.hasTable('session_shares')
+        const hasSessions = this.hasTable('sessions')
+
+        this.db.transaction(() => {
+            this.db.exec(`
+                DROP TABLE IF EXISTS session_shares_v16;
+                CREATE TABLE session_shares_v16 (
+                    token TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+            `)
+
+            if (hadShares && hasSessions) {
+                this.db.exec(`
+                    INSERT INTO session_shares_v16 (
+                        token, session_id, namespace, revoked, created_at
+                    )
+                    SELECT shares.token,
+                           shares.session_id,
+                           shares.namespace,
+                           shares.revoked,
+                           shares.created_at
+                    FROM session_shares AS shares
+                    INNER JOIN sessions
+                        ON sessions.id = shares.session_id
+                       AND sessions.namespace = shares.namespace;
+                `)
+            }
+
+            if (hadShares) {
+                this.db.exec('DROP TABLE session_shares')
+            }
+            this.db.exec(`
+                ALTER TABLE session_shares_v16 RENAME TO session_shares;
+                CREATE INDEX idx_session_shares_session
+                    ON session_shares(session_id, namespace);
+            `)
+        })()
     }
 
     private getSessionColumnNames(): Set<string> {
@@ -552,6 +769,13 @@ export class Store {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
         ).get() as { name?: string } | undefined
         return Boolean(row?.name)
+    }
+
+    private hasTable(name: string): boolean {
+        const row = this.db.prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
+        ).get(name) as { present: number } | undefined
+        return row?.present === 1
     }
 
     private assertRequiredTablesPresent(): void {

@@ -9,6 +9,19 @@ const state = {
 };
 
 describe('resolveCodexSlashCommand', () => {
+    it('toggles proactive multi-agent mode', () => {
+        expect(resolveCodexSlashCommand('/agent', state)).toMatchObject({
+            updates: { proactiveMultiAgent: true }
+        });
+        expect(resolveCodexSlashCommand('/agent off', { ...state, proactiveMultiAgent: true })).toMatchObject({
+            updates: { proactiveMultiAgent: false }
+        });
+        expect(resolveCodexSlashCommand('/agent status', { ...state, proactiveMultiAgent: true })).toEqual({
+            kind: 'handled',
+            message: 'Codex proactive multi-agent mode: on'
+        });
+    });
+
     it('enables plan mode without sending a turn', () => {
         expect(resolveCodexSlashCommand('/plan', state)).toEqual({
             kind: 'handled',
@@ -49,6 +62,40 @@ describe('resolveCodexSlashCommand', () => {
         });
         expect(resolveCodexSlashCommand('/permissions yolo', state)).toMatchObject({
             updates: { permissionMode: 'yolo' }
+        });
+    });
+
+    it('sets personality without inventing hub state or a fake clear', () => {
+        expect(resolveCodexSlashCommand('/personality', state)).toEqual({
+            kind: 'handled',
+            message: 'Codex personality: unset (Codex config / thread sticky)'
+        });
+        expect(resolveCodexSlashCommand('/personality', { ...state, personality: 'friendly' })).toEqual({
+            kind: 'handled',
+            message: 'Codex personality: friendly'
+        });
+        expect(resolveCodexSlashCommand('/personality pragmatic', state)).toEqual({
+            kind: 'handled',
+            message: 'Codex personality set to pragmatic',
+            updates: { personality: 'pragmatic' }
+        });
+        expect(resolveCodexSlashCommand('/personality none', state)).toEqual({
+            kind: 'handled',
+            message: 'Codex personality set to none',
+            updates: { personality: 'none' }
+        });
+        // Sticky: omit-after-override would leave the prior value active, so refuse clear aliases.
+        expect(resolveCodexSlashCommand('/personality default', { ...state, personality: 'friendly' })).toEqual({
+            kind: 'handled',
+            message: 'Codex personality is sticky on the thread; set friendly, pragmatic, or none (cannot restore config.toml by clearing)'
+        });
+        expect(resolveCodexSlashCommand('/personality clear', { ...state, personality: 'pragmatic' })).toEqual({
+            kind: 'handled',
+            message: 'Codex personality is sticky on the thread; set friendly, pragmatic, or none (cannot restore config.toml by clearing)'
+        });
+        expect(resolveCodexSlashCommand('/personality spicy', state)).toEqual({
+            kind: 'handled',
+            message: 'Unknown Codex personality: spicy'
         });
     });
 

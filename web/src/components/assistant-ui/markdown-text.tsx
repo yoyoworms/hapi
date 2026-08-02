@@ -1,7 +1,7 @@
 import '@assistant-ui/react-markdown/styles/dot.css'
 
-import type { ComponentPropsWithoutRef, MouseEvent } from 'react'
-import { useState, useCallback, useEffect, useMemo, createContext, useContext, type ReactNode } from 'react'
+import type { ComponentPropsWithoutRef, ComponentType, MouseEvent, ReactNode } from 'react'
+import { useState, useCallback, useEffect, useMemo, createContext, useContext } from 'react'
 import {
     MarkdownTextPrimitive,
     unstable_memoizeMarkdownComponents as memoizeMarkdownComponents,
@@ -21,24 +21,28 @@ import { cn, encodeBase64 } from '@/lib/utils'
 import { SyntaxHighlighter } from '@/components/assistant-ui/shiki-highlighter'
 import { MermaidDiagram } from '@/components/assistant-ui/mermaid-diagram'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
-import { CopyIcon, CheckIcon } from '@/components/icons'
+import { useCodeWrap } from '@/hooks/useCodeWrap'
+import { CopyIcon, CheckIcon, WrapIcon } from '@/components/icons'
+import { useTranslation } from '@/lib/use-translation'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 import { useOptionalHappyChatContext } from '@/components/AssistantChat/context'
 import { decodeFileDownloadHref, decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
+import { remarkSessionPathLinks } from '@/lib/remark-session-path-links'
+import { buildSessionReferencePath, parseSessionPathHref } from '@/lib/sessionReference'
 import { UriConfirmDialog } from '@/components/UriConfirmDialog'
 import { downloadBlobFile } from '@/lib/file-download'
 import { useToast } from '@/lib/toast-context'
-import { useTranslation } from '@/lib/use-translation'
-import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 
 // ── Plugin array ────────────────────────────────────────────────────────────
-// Order: remarkGfm → remarkRepairTables → remarkNonHttpsAutolink → remarkStripCjkAutolink → remarkMath → remarkDisableIndentedCode → remarkFilePathLinks
+// Order: remarkGfm → remarkRepairTables → remarkNonHttpsAutolink → remarkStripCjkAutolink → remarkMath → remarkDisableIndentedCode → remarkSessionPathLinks → remarkFilePathLinks
 // remarkRepairTables must run immediately after remarkGfm — it reads file.value
 // (raw source) to pad short separator rows before remark-gfm parses the table.
 // remarkNonHttpsAutolink must run BEFORE remarkStripCjkAutolink so that the
 // CJK strip plugin sees the new link nodes and can trim trailing CJK punctuation
 // from them. Both must come before remarkMath (to avoid treating TeX as URI).
+// remarkSessionPathLinks turns bare /sessions/<id> citations into links.
 // remarkFilePathLinks runs last to convert file paths → links after all other
 // transforms have settled.
 //
@@ -48,18 +52,39 @@ import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 // This matches GitHub-flavored markdown behavior. The option lives on the
 // shared TAIL so both MARKDOWN_PLUGINS (default) and MARKDOWN_PLUGINS_WITH_BREAKS
 // (user-prompt rendering with hard breaks) inherit the fix.
-const MARKDOWN_PLUGIN_TAIL = [
+const MARKDOWN_PLUGIN_TAIL_HEAD = [
     remarkNonHttpsAutolink,
     remarkStripCjkAutolink,
     [remarkMath, { singleDollarTextMath: false }],
     remarkDisableIndentedCode,
+] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
+
+const MARKDOWN_PLUGIN_TAIL = [
+    ...MARKDOWN_PLUGIN_TAIL_HEAD,
+    remarkSessionPathLinks,     // bare /sessions/<id> → clickable session citation
     remarkFilePathLinks,        // upstream — file path → link conversion, runs last
+] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
+
+// Standalone surfaces (file-preview) render without HappyChatContext, so the
+// FilePathAnchor cannot route hapi-file: hrefs — rewriting explicit markdown
+// links there would collapse them to plain text. Keep bare-path / inlineCode
+// autolinks (already inert on that surface) but disable explicit-link rewrite.
+const MARKDOWN_PLUGIN_TAIL_STANDALONE = [
+    ...MARKDOWN_PLUGIN_TAIL_HEAD,
+    remarkSessionPathLinks,
+    [remarkFilePathLinks, { rewriteExplicitLinks: false }],
 ] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
 
 export const MARKDOWN_PLUGINS = [
     remarkGfm,
     remarkRepairTables,
     ...MARKDOWN_PLUGIN_TAIL,
+] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
+
+export const MARKDOWN_PLUGINS_STANDALONE = [
+    remarkGfm,
+    remarkRepairTables,
+    ...MARKDOWN_PLUGIN_TAIL_STANDALONE,
 ] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
 
 // User-authored prompts should preserve Shift+Enter/newline intent without
@@ -69,6 +94,13 @@ export const MARKDOWN_PLUGINS_WITH_BREAKS = [
     remarkRepairTables,
     remarkBreaks,
     ...MARKDOWN_PLUGIN_TAIL,
+] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
+
+export const MARKDOWN_PLUGINS_STANDALONE_WITH_BREAKS = [
+    remarkGfm,
+    remarkRepairTables,
+    remarkBreaks,
+    ...MARKDOWN_PLUGIN_TAIL_STANDALONE,
 ] satisfies NonNullable<MarkdownTextPrimitiveProps['remarkPlugins']>
 
 export const MARKDOWN_REHYPE_PLUGINS = [rehypeKatex] satisfies NonNullable<MarkdownTextPrimitiveProps['rehypePlugins']>
@@ -366,37 +398,76 @@ export function UriConfirmProvider({ children }: { children: ReactNode }) {
 // ── Components ───────────────────────────────────────────────────────────────
 
 function CodeHeader(props: CodeHeaderProps) {
+    const { t } = useTranslation()
     const { copied, copy } = useCopyToClipboard()
+    const { codeWrap, setCodeWrap } = useCodeWrap()
     const language = props.language && props.language !== 'unknown' ? props.language : 'text'
 
     return (
-        <div className="aui-code-shell-header flex items-center justify-between gap-3 rounded-t-xl bg-[var(--app-code-header-bg)] px-3 py-2 text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">
+        <div data-hapi-code-header="true" className="aui-code-shell-header flex items-center justify-between gap-3 rounded-t-xl bg-[var(--app-code-header-bg)] px-3 py-2 text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">
             <div className="min-w-0 flex-1 truncate font-mono">
                 {language}
             </div>
-            <button
-                type="button"
-                onClick={() => copy(props.code)}
-                className="shrink-0 rounded-md p-1 text-[var(--app-code-header-fg)] transition-colors hover:bg-[var(--app-code-copy-hover-bg)] hover:text-[var(--app-fg)]"
-                title="Copy"
-            >
-                {copied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
-            </button>
+            <div className="flex shrink-0 items-center gap-1">
+                <button
+                    type="button"
+                    data-hapi-code-wrap-toggle="true"
+                    data-hapi-wrap-enable-label={t('code.wrap.enable')}
+                    data-hapi-wrap-disable-label={t('code.wrap.disable')}
+                    data-hapi-share-export-exclude="true"
+                    onClick={() => setCodeWrap(!codeWrap)}
+                    className={`rounded-md p-1 transition-colors hover:bg-[var(--app-code-copy-hover-bg)] hover:text-[var(--app-fg)] ${codeWrap ? 'text-[var(--app-fg)]' : 'text-[var(--app-code-header-fg)]'}`}
+                    title={t(codeWrap ? 'code.wrap.disable' : 'code.wrap.enable')}
+                    aria-pressed={codeWrap}
+                >
+                    <WrapIcon className="h-3.5 w-3.5" />
+                </button>
+                <button
+                    type="button"
+                    data-hapi-code-copy="true"
+                    data-hapi-copy-label={t('code.copy')}
+                    data-hapi-copied-label={t('message.copied')}
+                    data-hapi-share-export-exclude="true"
+                    onClick={() => copy(props.code)}
+                    className="rounded-md p-1 text-[var(--app-code-header-fg)] transition-colors hover:bg-[var(--app-code-copy-hover-bg)] hover:text-[var(--app-fg)]"
+                    title={t('code.copy')}
+                >
+                    <span data-hapi-copy-default="true" className={copied ? 'hidden' : ''}>
+                        <CopyIcon className="h-3.5 w-3.5" />
+                    </span>
+                    <span data-hapi-copy-success="true" className={copied ? '' : 'hidden'}>
+                        <CheckIcon className="h-3.5 w-3.5" />
+                    </span>
+                </button>
+            </div>
         </div>
     )
 }
 
 function Pre(props: ComponentPropsWithoutRef<'pre'>) {
-    const { className, ...rest } = props
+    const { className, style, ...rest } = props
+    const { codeWrap } = useCodeWrap()
 
     return (
-        <div className="aui-md-pre-wrapper min-w-0 w-full max-w-full overflow-x-auto overflow-y-clip">
+        <div className={cn(
+            'aui-md-pre-wrapper min-w-0 w-full max-w-full overflow-y-clip',
+            codeWrap ? '' : 'overflow-x-auto'
+        )} data-hapi-code-body="true">
             <pre
+                data-hapi-code-grid="true"
                 {...rest}
                 className={cn(
-                    'aui-md-pre m-0 w-max min-w-full rounded-b-xl bg-[var(--app-code-bg)] px-4 py-3 text-sm',
+                    'aui-md-pre m-0 rounded-b-xl bg-[var(--app-code-bg)] px-4 py-3 text-sm',
+                    codeWrap ? '' : 'w-max min-w-full',
                     className
                 )}
+                // Inline style, not a `whitespace-pre-wrap` class: index.css
+                // has an unlayered `.aui-md :where(pre) { white-space: pre }`
+                // rule that always beats Tailwind's `@layer utilities`
+                // regardless of specificity (unlayered CSS always outranks
+                // any `@layer` in the cascade). See shiki-highlighter.tsx
+                // for the same fix + fuller explanation.
+                style={codeWrap ? { ...style, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } : style}
             />
         </div>
     )
@@ -427,31 +498,30 @@ function Code(props: ComponentPropsWithoutRef<'code'>) {
 
 function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & { filePath: string; sessionId: string }) {
     const navigate = useNavigate()
-    const { filePath, sessionId, onClick, className, rel: requestedRel, ...anchorProps } = props
-    const rel = anchorProps.target === '_blank' ? (requestedRel ?? 'noreferrer') : requestedRel
-    const search = new URLSearchParams({ path: encodeBase64(filePath) }).toString()
-    const href = `/sessions/${encodeURIComponent(sessionId)}/file?${search}`
+    const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
+    const search = new URLSearchParams({ path: encodeBase64(props.filePath) }).toString()
+    const href = `/sessions/${encodeURIComponent(props.sessionId)}/file?${search}`
 
     const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-        onClick?.(event)
+        props.onClick?.(event)
         if (event.defaultPrevented) return
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
 
         event.preventDefault()
         void navigate({
             to: '/sessions/$sessionId/file',
-            params: { sessionId },
-            search: { path: encodeBase64(filePath) }
+            params: { sessionId: props.sessionId },
+            search: { path: encodeBase64(props.filePath) }
         })
     }
 
     return (
         <a
-            {...anchorProps}
+            {...props}
             href={href}
             rel={rel}
             onClick={handleClick}
-            className={cn('aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3', className)}
+            className={cn('aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3', props.className)}
         />
     )
 }
@@ -517,6 +587,35 @@ function FileDownloadAnchor(props: ComponentPropsWithoutRef<'a'> & {
     )
 }
 
+function SessionPathAnchor(props: ComponentPropsWithoutRef<'a'> & { targetSessionId: string }) {
+    const navigate = useNavigate()
+    const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
+    // Preserve Vite BASE_URL for copy / open-in-new-tab (SPA click uses navigate).
+    const href = buildSessionReferencePath(props.targetSessionId)
+
+    const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+        props.onClick?.(event)
+        if (event.defaultPrevented) return
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+
+        event.preventDefault()
+        void navigate({
+            to: '/sessions/$sessionId',
+            params: { sessionId: props.targetSessionId },
+        })
+    }
+
+    return (
+        <a
+            {...props}
+            href={href}
+            rel={rel}
+            onClick={handleClick}
+            className={cn('aui-md-a font-medium text-[var(--app-link)] underline decoration-[color:var(--app-link-muted)] underline-offset-3', props.className)}
+        />
+    )
+}
+
 /**
  * Anchor component with URI scheme policy enforcement.
  *
@@ -532,6 +631,7 @@ function FileDownloadAnchor(props: ComponentPropsWithoutRef<'a'> & {
  * - Custom schemes, already allowed by user: live href in DOM; middle-click works.
  * - File-path links (decoded by remarkFilePathLinks): delegated to FilePathAnchor
  *   which uses useNavigate for SPA routing.
+ * - Session citation paths (`/sessions/<id>`): SessionPathAnchor SPA navigation.
  */
 function A(props: ComponentPropsWithoutRef<'a'>) {
     const chat = useOptionalHappyChatContext()
@@ -548,6 +648,7 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
     const ctx = useContext(UriConfirmContext)
     const filePath = typeof props.href === 'string' ? decodeFilePathHref(props.href) : null
     const downloadPath = typeof props.href === 'string' ? decodeFileDownloadHref(props.href) : null
+    const targetSessionId = typeof props.href === 'string' ? parseSessionPathHref(props.href) : null
     const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
 
     if (filePath) {
@@ -569,6 +670,10 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
                 sessionId={chat.sessionId}
             />
         )
+    }
+
+    if (targetSessionId) {
+        return <SessionPathAnchor {...props} targetSessionId={targetSessionId} />
     }
 
     const isAllowed = ctx?.isAllowed ?? (() => false)
@@ -737,7 +842,15 @@ function Image(props: ComponentPropsWithoutRef<'img'>) {
     return <img {...props} className={cn('aui-md-img my-3 max-w-full rounded-xl', props.className)} />
 }
 
-export const defaultComponents = memoizeMarkdownComponents({
+type DefaultComponentsMap = {
+    [key: string]: ComponentType<any>
+    code: ComponentType<any>
+    pre: ComponentType<any>
+    CodeHeader: ComponentType<any>
+    SyntaxHighlighter: ComponentType<any>
+}
+
+export const defaultComponents: DefaultComponentsMap = memoizeMarkdownComponents({
     SyntaxHighlighter,
     CodeHeader,
     pre: Pre,
@@ -764,7 +877,7 @@ export const defaultComponents = memoizeMarkdownComponents({
     th: Th,
     td: Td,
     img: Image,
-} as const)
+} as const) as unknown as DefaultComponentsMap
 
 export function MarkdownText() {
     return (

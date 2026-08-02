@@ -6,13 +6,18 @@
 import { z } from "zod";
 
 // Usage statistics for assistant messages - used in apiSession.ts
+// `passthrough` for the same reason as RawMessageSchema below: the SDK path
+// injects `context_window` onto this object (sdkToLogConverter.ts) and Anthropic
+// keeps adding usage breakdowns. Under Zod's default `strip`, the local-JSONL
+// path silently dropped `context_window`, which made the web status bar fall
+// back to a heuristic denominator for local sessions only.
 export const UsageSchema = z.object({
   input_tokens: z.number().int().nonnegative(),
   cache_creation_input_tokens: z.number().int().nonnegative().optional(),
   cache_read_input_tokens: z.number().int().nonnegative().optional(),
   output_tokens: z.number().int().nonnegative(),
   service_tier: z.string().optional(),
-});
+}).passthrough();
 
 // `passthrough` keeps fields the SDK adds going forward (e.g. `model`, future
 // usage breakdowns) so the hub forwards them verbatim. Without it, Zod's
@@ -29,6 +34,11 @@ const RawJSONLinesBaseSchema = z.object({
   uuid: z.string().optional(),
   parentUuid: z.string().nullable().optional(),
   isSidechain: z.boolean().optional(),
+  // The tool_use id of the Agent/Task tool_use that spawned this sidechain
+  // message, when present. Preserved (not just consumed) so downstream (web
+  // tracer) can group sidechain messages directly by this id rather than
+  // solely by exact-matching a sidechain root's prompt text.
+  parentToolUseId: z.string().optional(),
   isMeta: z.boolean().optional(),
   isCompactSummary: z.boolean().optional(),
   userType: z.string().optional(),

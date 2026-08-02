@@ -1,20 +1,19 @@
-import { memo } from 'react'
-import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
+import { MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { getEventPresentation } from '@/chat/presentation'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
 import { getConversationMessageAnchorId } from '@/chat/outline'
 import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
 
-function HappySystemMessageImpl() {
-    const role = useAssistantState(({ message }) => message.role)
-    const messageId = useAssistantState(({ message }) => message.id)
-    const text = useAssistantState(({ message }) => {
-        if (message.role !== 'system') return ''
-        return message.content[0]?.type === 'text' ? message.content[0].text : ''
+export function HappySystemMessage() {
+    const role = useAuiState((s) => s.message.role)
+    const messageId = useAuiState((s) => s.message.id)
+    const text = useAuiState((s) => {
+        if (s.message.role !== 'system') return ''
+        return s.message.content[0]?.type === 'text' ? s.message.content[0].text : ''
     })
-    const icon = useAssistantState(({ message }) => {
-        if (message.role !== 'system') return null
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const icon = useAuiState((s) => {
+        if (s.message.role !== 'system') return null
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         const event = custom?.kind === 'event' ? custom.event : undefined
         return event ? getEventPresentation(event).icon : null
     })
@@ -33,5 +32,3 @@ function HappySystemMessageImpl() {
         </MessagePrimitive.Root>
     )
 }
-
-export const HappySystemMessage = memo(HappySystemMessageImpl)

@@ -13,6 +13,20 @@ const harness = vi.hoisted(() => ({
     listCollaborationModeCalls: 0,
     collaborationModeResponse: { data: [{ mode: 'default' }, { mode: 'plan' }] } as unknown,
     failListCollaborationModes: false,
+    listSkillsCalls: [] as unknown[],
+    skillsListResponse: {
+        data: [{
+            cwd: '/tmp/hapi-update',
+            skills: [{
+                name: 'hapi',
+                description: 'Manage HAPI',
+                path: '/home/user/.agents/skills/hapi/SKILL.md',
+                scope: 'user',
+                enabled: true
+            }],
+            errors: []
+        }]
+    } as unknown,
     startThreadIds: [] as string[],
     startThreadParams: [] as Array<Record<string, unknown>>,
     resumeThreadIds: [] as string[],
@@ -67,6 +81,7 @@ const harness = vi.hoisted(() => ({
     emitSecondParentSpawnStartWithoutEnd: false,
     emitParentSendInputFailure: false,
     emitParentResumeSuccess: false,
+    emitParentV2AgentTools: false,
     emitRunningChildTurnBeforeSuppressedParent: false,
     emitCompletedChildTurnBeforeSuppressedParent: false,
     emitTurnAbortedOnInterrupt: false,
@@ -100,6 +115,11 @@ vi.mock('./codexAppServerClient', () => {
                 throw new Error('collaborationMode/list failed');
             }
             return harness.collaborationModeResponse;
+        }
+
+        async listSkills(params: unknown): Promise<unknown> {
+            harness.listSkillsCalls.push(params);
+            return harness.skillsListResponse;
         }
 
         async setExperimentalFeatureEnablement(params: unknown): Promise<unknown> {
@@ -442,6 +462,48 @@ vi.mock('./codexAppServerClient', () => {
                     const parentCompact = { thread: { id: threadId } };
                     harness.notifications.push({ method: 'thread/compacted', params: parentCompact });
                     this.notificationHandler?.('thread/compacted', parentCompact);
+                }
+
+                if (harness.emitParentV2AgentTools) {
+                    const v2Calls = [{
+                        callId: 'v2-spawn',
+                        name: 'spawn_agent',
+                        input: { task_name: 'review', message: 'Review this' },
+                        output: { task_name: '/root/review', nickname: 'Reviewer' }
+                    }, {
+                        callId: 'v2-wait',
+                        name: 'wait_agent',
+                        input: { timeout_ms: 10_000 },
+                        output: { message: 'Wait timed out.', timed_out: true }
+                    }];
+
+                    for (const call of v2Calls) {
+                        const started = {
+                            threadId,
+                            turnId,
+                            item: {
+                                type: 'function_call',
+                                namespace: 'collaboration',
+                                name: call.name,
+                                arguments: JSON.stringify(call.input),
+                                call_id: call.callId
+                            }
+                        };
+                        harness.notifications.push({ method: 'rawResponseItem/completed', params: started });
+                        this.notificationHandler?.('rawResponseItem/completed', started);
+
+                        const completed = {
+                            threadId,
+                            turnId,
+                            item: {
+                                type: 'function_call_output',
+                                call_id: call.callId,
+                                output: JSON.stringify(call.output)
+                            }
+                        };
+                        harness.notifications.push({ method: 'rawResponseItem/completed', params: completed });
+                        this.notificationHandler?.('rawResponseItem/completed', completed);
+                    }
                 }
 
                 if (harness.emitParentSpawnFailureWithoutAgentId || harness.emitParentSpawnStartWithoutEnd) {
@@ -1089,6 +1151,20 @@ describe('codexRemoteLauncher', () => {
         harness.listCollaborationModeCalls = 0;
         harness.collaborationModeResponse = { data: [{ mode: 'default' }, { mode: 'plan' }] };
         harness.failListCollaborationModes = false;
+        harness.listSkillsCalls = [];
+        harness.skillsListResponse = {
+            data: [{
+                cwd: '/tmp/hapi-update',
+                skills: [{
+                    name: 'hapi',
+                    description: 'Manage HAPI',
+                    path: '/home/user/.agents/skills/hapi/SKILL.md',
+                    scope: 'user',
+                    enabled: true
+                }],
+                errors: []
+            }]
+        };
         harness.startThreadIds = [];
         harness.startThreadParams = [];
         harness.resumeThreadIds = [];
@@ -1143,6 +1219,7 @@ describe('codexRemoteLauncher', () => {
         harness.emitSecondParentSpawnStartWithoutEnd = false;
         harness.emitParentSendInputFailure = false;
         harness.emitParentResumeSuccess = false;
+        harness.emitParentV2AgentTools = false;
         harness.emitRunningChildTurnBeforeSuppressedParent = false;
         harness.emitCompletedChildTurnBeforeSuppressedParent = false;
         harness.emitTurnAbortedOnInterrupt = false;
@@ -1184,6 +1261,73 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(thinkingChanges).toContain(true);
         expect(session.thinking).toBe(false);
+    });
+
+    it('uses the native skill catalog for completion and structured turn input', async () => {
+        const { session, rpcHandlers } = createSessionStub(['$hapi inspect']);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(harness.listSkillsCalls).toEqual([{
+            cwds: ['/tmp/hapi-update'],
+            forceReload: false
+        }]);
+        expect(Array.from(rpcHandlers.keys())).toContain('listSkills');
+        expect(await rpcHandlers.get('listSkills')?.({})).toEqual({
+            success: true,
+            skills: [{ name: 'hapi', description: 'Manage HAPI' }]
+        });
+        expect(harness.startTurnParams[0]?.input).toEqual([
+            { type: 'skill', name: 'hapi', path: '/home/user/.agents/skills/hapi/SKILL.md' },
+            { type: 'text', text: ' inspect' }
+        ]);
+    });
+
+    it('keeps the filesystem skill handler when native discovery reports errors', async () => {
+        harness.skillsListResponse = {
+            data: [{
+                cwd: '/tmp/hapi-update',
+                skills: [],
+                errors: ['failed to read skills']
+            }]
+        };
+        const { session, rpcHandlers } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(rpcHandlers.has('listSkills')).toBe(false);
+    });
+
+    it('reloads the native skill catalog after skills/changed', async () => {
+        const { session, rpcHandlers } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+        harness.skillsListResponse = {
+            data: [{
+                cwd: '/tmp/hapi-update',
+                skills: [{
+                    name: 'new-skill',
+                    description: 'New skill',
+                    path: '/tmp/new-skill/SKILL.md',
+                    scope: 'repo',
+                    enabled: true
+                }],
+                errors: []
+            }]
+        };
+
+        harness.dispatchNotification?.('skills/changed', {});
+        await vi.waitFor(() => {
+            expect(harness.listSkillsCalls.at(-1)).toEqual({
+                cwds: ['/tmp/hapi-update'],
+                forceReload: true
+            });
+        });
+
+        expect(await rpcHandlers.get('listSkills')?.({})).toEqual({
+            success: true,
+            skills: [{ name: 'new-skill', description: 'New skill' }]
+        });
     });
 
     it('routes app-server MCP elicitation through the existing user-input transport', async () => {
@@ -2613,6 +2757,44 @@ describe('codexRemoteLauncher', () => {
                 status: 'failed',
                 error: 'invalid spawn arguments'
             })
+        }));
+    });
+
+    it('forwards shared MultiAgent V2 tools as direct tool cards', async () => {
+        harness.emitParentV2AgentTools = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'tool-call',
+            name: 'spawn_agent',
+            callId: 'v2-spawn',
+            input: { task_name: 'review', message: 'Review this' }
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'tool-call-result',
+            callId: 'v2-spawn',
+            output: '{"task_name":"/root/review","nickname":"Reviewer"}'
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'tool-call',
+            name: 'wait_agent',
+            callId: 'v2-wait',
+            input: { timeout_ms: 10_000 }
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'tool-call-result',
+            callId: 'v2-wait',
+            output: '{"message":"Wait timed out.","timed_out":true}'
+        }));
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'agent-run-start',
+            cardId: 'v2-spawn'
+        }));
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'agent-run-update',
+            agentId: 'spawn-error:v2-spawn'
         }));
     });
 

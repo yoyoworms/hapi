@@ -6,7 +6,7 @@ import { logger } from '@/ui/logger';
 import { getHappyCliCommand } from '@/utils/spawnHappyCLI';
 
 type HookCommandConfig = {
-    matcher: string;
+    matcher?: string;
     hooks: Array<{
         type: 'command';
         command: string;
@@ -19,6 +19,8 @@ type HookSettings = {
     };
     hooks: {
         SessionStart: HookCommandConfig[];
+        UserPromptSubmit?: HookCommandConfig[];
+        PreToolUse?: HookCommandConfig[];
     };
     statusLine?: {
         type: 'command';
@@ -31,6 +33,14 @@ export type HookSettingsOptions = {
     filenamePrefix: string;
     logLabel: string;
     hooksEnabled?: boolean;
+    /**
+     * Also forward UserPromptSubmit and PreToolUse hooks. Unlike SessionStart,
+     * their payloads carry `permission_mode`, letting HAPI track the mode the
+     * user picks inside the interactive TUI (shift+tab). Keep this off for the
+     * remote SDK process: these hooks block Claude while the forwarder runs,
+     * and remote permission state is owned by the hub/RPC path anyway.
+     */
+    trackPermissionMode?: boolean;
 };
 
 function shellQuote(value: string): string {
@@ -63,29 +73,36 @@ function readUserStatusLineCommand(): string | null {
     }
 }
 
-function buildHookSettings(command: string, statusLineCommand: string, hooksEnabled?: boolean): HookSettings {
-    const hooks: HookSettings['hooks'] = {
-        SessionStart: [
+export function buildHookSettings(
+    command: string,
+    hooksEnabled?: boolean,
+    trackPermissionMode?: boolean,
+    statusLineCommand?: string
+): HookSettings {
+    const commandHook = {
+        hooks: [
             {
-                matcher: '*',
-                hooks: [
-                    {
-                        type: 'command',
-                        command
-                    }
-                ]
+                type: 'command' as const,
+                command
             }
         ]
     };
+    const hooks: HookSettings['hooks'] = {
+        SessionStart: [{ matcher: '*', ...commandHook }]
+    };
+    if (trackPermissionMode) {
+        hooks.UserPromptSubmit = [commandHook];
+        hooks.PreToolUse = [{ matcher: '*', ...commandHook }];
+    }
 
-    const settings: HookSettings = {
-        hooks,
-        statusLine: {
+    const settings: HookSettings = { hooks };
+    if (statusLineCommand) {
+        settings.statusLine = {
             type: 'command',
             command: statusLineCommand,
             padding: 0
-        }
-    };
+        };
+    }
     if (hooksEnabled !== undefined) {
         settings.hooksConfig = {
             enabled: hooksEnabled
@@ -128,7 +145,12 @@ export function generateHookSettingsFile(
     }
     const statusLineCommand = shellJoin([command, ...statusLineArgs]);
 
-    const settings = buildHookSettings(hookCommand, statusLineCommand, options.hooksEnabled);
+    const settings = buildHookSettings(
+        hookCommand,
+        options.hooksEnabled,
+        options.trackPermissionMode,
+        statusLineCommand
+    );
 
     writeFileSync(filepath, JSON.stringify(settings, null, 4));
     logger.debug(`[${options.logLabel}] Created hook settings file: ${filepath}`);

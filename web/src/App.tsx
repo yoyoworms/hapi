@@ -9,16 +9,17 @@ import { useAuth } from '@/hooks/useAuth'
 import { useAuthSource } from '@/hooks/useAuthSource'
 import { useServerUrl } from '@/hooks/useServerUrl'
 import { useSSE } from '@/hooks/useSSE'
+import { useReconnectingState } from '@/hooks/useReconnectingState'
 import { useSyncingState } from '@/hooks/useSyncingState'
 import { usePushNotifications } from '@/hooks/usePushNotifications'
 import { useViewportHeight } from '@/hooks/useViewportHeight'
 import { useVisibilityReporter } from '@/hooks/useVisibilityReporter'
 import { queryKeys } from '@/lib/query-keys'
 import { AppContextProvider } from '@/lib/app-context'
-import { clearMessageWindow, fetchLatestMessages } from '@/lib/message-window-store'
+import { clearMessageWindow, syncTailMessages } from '@/lib/message-window-store'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useTranslation } from '@/lib/use-translation'
-// import { VoiceProvider } from '@/lib/voice-context' // voice disabled
+import { VoiceProvider } from '@/lib/voice-context'
 import { requireHubUrlForLogin } from '@/lib/runtime-config'
 import { getAppGlobalSseSubscription, getAppSessionSseSubscription } from '@/lib/appSseSubscriptions'
 import { reconcileQueuedStateAfterConnect } from '@/lib/queued-state-reconciliation'
@@ -28,7 +29,7 @@ import { OfflineBanner } from '@/components/OfflineBanner'
 import { PwaUpdateBanner, PwaUpdateBannerWithStatusOffset } from '@/components/PwaUpdateBanner'
 import { SyncingBanner } from '@/components/SyncingBanner'
 import { ReconnectingBanner } from '@/components/ReconnectingBanner'
-// import { VoiceErrorBanner } from '@/components/VoiceErrorBanner' // voice disabled
+import { VoiceErrorBanner } from '@/components/VoiceErrorBanner'
 import { LoadingState } from '@/components/LoadingState'
 import { ToastContainer } from '@/components/ToastContainer'
 import { PwaUpdateProvider } from '@/lib/pwa-update-context'
@@ -38,43 +39,6 @@ import type { SyncEvent } from '@/types/api'
 type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
 
 const REQUIRE_SERVER_URL = requireHubUrlForLogin()
-
-function canUseBrowserNotifications(): boolean {
-    return typeof window !== 'undefined' && 'Notification' in window
-}
-
-async function showSystemNotificationForToast(event: ToastEvent): Promise<void> {
-    if (!canUseBrowserNotifications() || Notification.permission !== 'granted') {
-        return
-    }
-
-    const options: NotificationOptions = {
-        body: event.data.body,
-        tag: `toast-${event.data.sessionId}`,
-        data: { url: event.data.url },
-        icon: '/pwa-192x192.png',
-        badge: '/pwa-64x64.png'
-    }
-
-    if ('serviceWorker' in navigator) {
-        try {
-            const registration = await navigator.serviceWorker.ready
-            await registration.showNotification(event.data.title, options)
-            return
-        } catch {
-            // fall through to page Notification
-        }
-    }
-
-    const notification = new Notification(event.data.title, options)
-    notification.onclick = () => {
-        window.focus()
-        if (event.data.url) {
-            routerNavigate(event.data.url)
-        }
-        notification.close()
-    }
-}
 
 /** Decode the `sid` claim from a session-share scoped JWT (client-side, unverified). */
 function decodeJwtSessionId(token: string | null): string | undefined {
@@ -88,11 +52,6 @@ function decodeJwtSessionId(token: string | null): string | undefined {
     } catch {
         return undefined
     }
-}
-
-function routerNavigate(url: string): void {
-    if (!url) return
-    window.location.assign(url)
 }
 
 function withPwaBanner(content: ReactNode) {
@@ -119,7 +78,6 @@ function AppInner() {
     const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
     const { authSource, isLoading: isAuthSourceLoading, setAccessToken, clearAuth } = useAuthSource(baseUrl)
     const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
-    // Session-share viewer: authenticated by a share link, scoped to one session.
     const sharedMode = authSource?.type === 'shareToken'
     const sharedSessionId = useMemo(() => (sharedMode ? decodeJwtSessionId(token) : undefined), [sharedMode, token])
     const goBack = useAppGoBack()
@@ -198,8 +156,12 @@ function AppInner() {
     const sessionMatch = matchRoute({ to: '/sessions/$sessionId' })
     const selectedSessionId = sessionMatch && sessionMatch.sessionId !== 'new' ? sessionMatch.sessionId : null
     const { isSyncing, startSync, endSync } = useSyncingState()
-    const [sseDisconnected, setSseDisconnected] = useState(false)
-    const [sseDisconnectReason, setSseDisconnectReason] = useState<string | null>(null)
+    const {
+        isReconnecting: sseDisconnected,
+        reason: sseDisconnectReason,
+        reportConnect: reportSseConnect,
+        reportDisconnect: reportSseDisconnect
+    } = useReconnectingState()
     const syncTokenRef = useRef(0)
     const isFirstConnectRef = useRef(true)
     const baseUrlRef = useRef(baseUrl)
@@ -246,57 +208,32 @@ function AppInner() {
         pushPromptedRef.current = true
 
         const run = async () => {
-            const currentPermission = canUseBrowserNotifications() ? Notification.permission : pushPermission
-            if (currentPermission === 'granted') {
-                const subscribed = await subscribe()
-                if (!subscribed) {
-                    pushPromptedRef.current = false
-                }
+            if (pushPermission === 'granted') {
+                await subscribe()
                 return
             }
-            if (currentPermission === 'default') {
+            if (pushPermission === 'default') {
                 const granted = await requestPermission()
                 if (granted) {
-                    const subscribed = await subscribe()
-                    if (!subscribed) {
-                        pushPromptedRef.current = false
-                    }
-                    return
+                    await subscribe()
                 }
             }
-            pushPromptedRef.current = false
         }
 
         void run()
     }, [api, isPushSupported, pushPermission, requestPermission, subscribe, token])
 
-    // When app returns from background, fetch any missed messages
-    useEffect(() => {
-        const handleVisibilityChange = () => {
-            if (document.visibilityState === 'visible' && api && selectedSessionId) {
-                fetchLatestMessages(api, selectedSessionId, { incremental: true })
-                    .catch(() => {})
-            }
-        }
-        document.addEventListener('visibilitychange', handleVisibilityChange)
-        return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-    }, [api, selectedSessionId])
-
     const handleSseConnect = useCallback(() => {
         // Clear disconnected state on successful connection
-        setSseDisconnected(false)
-        setSseDisconnectReason(null)
+        reportSseConnect()
 
         // Increment token to track this specific connection
         const token = ++syncTokenRef.current
 
-        // Capture before mutating - used to decide incremental vs full fetch
-        const isFirstConnect = isFirstConnectRef.current
-
         // Only force show banner on first connect (page load)
         // Subsequent connects (session switches) use non-forced mode
         // which only shows banner when returning from background
-        if (isFirstConnect) {
+        if (isFirstConnectRef.current) {
             isFirstConnectRef.current = false
             startSync({ force: true })
         } else {
@@ -311,10 +248,8 @@ function AppInner() {
             // cached data on remount.  See tiann/hapi#884.
             queryClient.invalidateQueries({ queryKey: ['session'] })
         ]
-        // Use incremental fetch on reconnect (not first connect) to avoid
-        // re-displaying old messages that were already shown before disconnect
         const refreshMessages = (selectedSessionId && api)
-            ? fetchLatestMessages(api, selectedSessionId, { incremental: !isFirstConnect })
+            ? syncTailMessages(api, selectedSessionId)
             : Promise.resolve()
         Promise.all([...invalidations, refreshMessages])
             .catch((error) => {
@@ -326,15 +261,14 @@ function AppInner() {
                     endSync()
                 }
             })
-    }, [api, queryClient, selectedSessionId, startSync, endSync])
+    }, [api, queryClient, selectedSessionId, startSync, endSync, reportSseConnect])
 
     const handleSseDisconnect = useCallback((reason: string) => {
         // Only show reconnecting banner if we've already connected once
         if (!isFirstConnectRef.current) {
-            setSseDisconnected(true)
-            setSseDisconnectReason(reason)
+            reportSseDisconnect(reason)
         }
-    }, [])
+    }, [reportSseDisconnect])
 
     const handleSseEvent = useCallback((event: SyncEvent) => {
         if (event.type !== 'messages-invalidated') {
@@ -344,7 +278,7 @@ function AppInner() {
             return
         }
         clearMessageWindow(event.sessionId)
-        void fetchLatestMessages(api, event.sessionId)
+        void syncTailMessages(api, event.sessionId)
     }, [api, selectedSessionId])
 
     const handleSessionSseConnect = useCallback(() => {
@@ -408,7 +342,6 @@ function AppInner() {
             sessionId: event.data.sessionId,
             url: event.data.url
         })
-        void showSystemNotificationForToast(event)
     }, [addToast, translateIncomingToast])
 
     const globalEventSubscription = useMemo(() => getAppGlobalSseSubscription(), [])
@@ -417,6 +350,7 @@ function AppInner() {
         [selectedSessionId]
     )
     const sseEnabled = Boolean(api && token)
+    const showReconnectingBanner = sseDisconnected && !isSyncing
 
     const { subscriptionId: globalSubscriptionId } = useSSE({
         enabled: sseEnabled,
@@ -532,21 +466,27 @@ function AppInner() {
 
     return (
         <AppContextProvider value={{ api, token, baseUrl, signOut: clearAuth, sharedMode, sharedSessionId }}>
+            <VoiceProvider>
                 <PwaUpdateBannerWithStatusOffset
                     isSyncing={isSyncing}
-                    isReconnecting={sseDisconnected && !isSyncing}
+                    isReconnecting={showReconnectingBanner}
                 />
                 <SyncingBanner isSyncing={isSyncing} />
                 <ReconnectingBanner
-                    isReconnecting={sseDisconnected && !isSyncing}
+                    isReconnecting={showReconnectingBanner}
                     reason={sseDisconnectReason}
                 />
-                <OfflineBanner />
+                <VoiceErrorBanner />
+                <OfflineBanner
+                    isHubConnected={globalSubscriptionId !== null}
+                    isReconnecting={showReconnectingBanner}
+                />
                 <div className="h-full min-h-0 overflow-hidden flex flex-col">
                     <Outlet />
                 </div>
                 <ToastContainer />
                 <InstallPrompt />
+            </VoiceProvider>
         </AppContextProvider>
     )
 }

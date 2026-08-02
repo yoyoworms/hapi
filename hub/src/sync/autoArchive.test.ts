@@ -92,6 +92,7 @@ describe('AutoArchiveService', () => {
             if (sessionId === 'failed') {
                 throw new Error('RPC failed')
             }
+            return true
         })
         const service = new AutoArchiveService({
             idleHours: 48,
@@ -106,12 +107,17 @@ describe('AutoArchiveService', () => {
         expect(archiveSession).toHaveBeenCalledTimes(2)
         expect(archiveSession).toHaveBeenCalledWith(
             'eligible',
-            'Auto-archived after 48 hours of inactivity'
+            'Auto-archived after 48 hours of inactivity',
+            expect.objectContaining({
+                checkedAt: NOW,
+                idleMs: IDLE_MS,
+                updatedAt: eligible.updatedAt
+            })
         )
     })
 
     it('does nothing when disabled', async () => {
-        const archiveSession = mock(async () => {})
+        const archiveSession = mock(async () => true)
         const service = new AutoArchiveService({
             idleHours: 0,
             getSessions: () => [createSession()],
@@ -166,6 +172,170 @@ describe('SyncEngine auto-archive integration', () => {
                 archiveReason: 'Auto-archived after 48 hours of inactivity'
             }))
         } finally {
+            engine.stop()
+        }
+    })
+
+    it('skips kill when a message starts after the sweep guard was captured', async () => {
+        const store = new Store(':memory:')
+        const io = {
+            of: () => ({
+                to: () => ({ emit: () => {} })
+            })
+        }
+        const engine = new SyncEngine(
+            store,
+            io as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never,
+            { autoArchiveIdleHours: 48 }
+        )
+        const killSession = mock(async () => {})
+        let releaseFlush!: () => void
+        const flushMessages = mock(async () => await new Promise<void>((resolve) => {
+            releaseFlush = resolve
+        }))
+        const gateway = (engine as unknown as {
+            rpcGateway: {
+                killSession: typeof killSession
+                flushMessages: typeof flushMessages
+            }
+        }).rpcGateway
+        gateway.killSession = killSession
+        gateway.flushMessages = flushMessages
+
+        try {
+            const created = engine.getOrCreateSession(
+                'auto-archive-message-race',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    startedFromRunner: true,
+                    startedBy: 'runner',
+                    lifecycleState: 'running',
+                    lifecycleStateSince: NOW - IDLE_MS - 10_000
+                },
+                { controlledByUser: false, requests: {} },
+                'default'
+            )
+            const before = engine.getSession(created.id)!
+            const lastActivityAt = Math.max(
+                before.createdAt,
+                before.updatedAt,
+                before.metadata?.lifecycleStateSince ?? 0
+            )
+            const guard = {
+                checkedAt: lastActivityAt + IDLE_MS + 1,
+                idleMs: IDLE_MS,
+                updatedAt: before.updatedAt,
+                metadataVersion: before.metadataVersion,
+                agentStateVersion: before.agentStateVersion
+            }
+
+            // sendMessage records activity synchronously before awaiting this
+            // deliberately stalled flush, making the final archive guard see it.
+            const originalNow = Date.now
+            Date.now = () => before.updatedAt + 1
+            let pendingSend: Promise<void>
+            try {
+                pendingSend = engine.sendMessage(created.id, {
+                    text: 'arrived during sweep',
+                    localId: 'race-message',
+                    sentFrom: 'webapp'
+                })
+            } finally {
+                Date.now = originalNow
+            }
+
+            const archived = await (engine as unknown as {
+                archiveSessionIfStillIdle: (
+                    sessionId: string,
+                    reason: string,
+                    candidateGuard: typeof guard
+                ) => Promise<boolean>
+            }).archiveSessionIfStillIdle(created.id, 'automatic', guard)
+
+            expect(archived).toBe(false)
+            expect(killSession).not.toHaveBeenCalled()
+
+            releaseFlush()
+            await pendingSend!
+            expect(store.messages.getMessages(created.id).some((message) =>
+                message.localId === 'race-message'
+            )).toBe(true)
+        } finally {
+            releaseFlush?.()
+            engine.stop()
+        }
+    })
+
+    it('refuses a new message after the final gate reserves the session', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never,
+            { autoArchiveIdleHours: 48 }
+        )
+        let releaseKill!: () => void
+        const killSession = mock(async () => await new Promise<void>((resolve) => {
+            releaseKill = resolve
+        }))
+        ;(engine as unknown as {
+            rpcGateway: { killSession: typeof killSession }
+        }).rpcGateway.killSession = killSession
+
+        try {
+            const created = engine.getOrCreateSession(
+                'auto-archive-reservation',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    startedFromRunner: true,
+                    startedBy: 'runner',
+                    lifecycleState: 'running',
+                    lifecycleStateSince: NOW - IDLE_MS - 10_000
+                },
+                { controlledByUser: false, requests: {} },
+                'default'
+            )
+            const before = engine.getSession(created.id)!
+            const lastActivityAt = Math.max(
+                before.createdAt,
+                before.updatedAt,
+                before.metadata?.lifecycleStateSince ?? 0
+            )
+            const guard = {
+                checkedAt: lastActivityAt + IDLE_MS + 1,
+                idleMs: IDLE_MS,
+                updatedAt: before.updatedAt,
+                metadataVersion: before.metadataVersion,
+                agentStateVersion: before.agentStateVersion
+            }
+            const archivePromise = (engine as unknown as {
+                archiveSessionIfStillIdle: (
+                    sessionId: string,
+                    reason: string,
+                    candidateGuard: typeof guard
+                ) => Promise<boolean>
+            }).archiveSessionIfStillIdle(created.id, 'automatic', guard)
+
+            await Promise.resolve()
+            expect(killSession).toHaveBeenCalledTimes(1)
+            expect((engine as unknown as { autoArchivingSessionIds: Set<string> })
+                .autoArchivingSessionIds.has(created.id)).toBe(true)
+            await expect(engine.sendMessage(created.id, {
+                text: 'too late',
+                localId: 'late-message',
+                sentFrom: 'webapp'
+            })).rejects.toThrow('Session is being auto-archived')
+            expect(store.messages.getMessages(created.id)).toEqual([])
+
+            releaseKill()
+            await expect(archivePromise).resolves.toBe(true)
+        } finally {
+            releaseKill?.()
             engine.stop()
         }
     })

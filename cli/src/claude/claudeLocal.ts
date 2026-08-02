@@ -8,6 +8,27 @@ import { spawnWithTerminalGuard } from "@/utils/spawnWithTerminalGuard";
 import { getHapiBlobsDir } from "@/constants/uploadPaths";
 import { stripNewlinesForWindowsShellArg } from "@/utils/shellEscape";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
+import type { SessionModel } from "@/api/types";
+
+function withoutTrackedModelArgs(args: string[]): string[] {
+    const filtered: string[] = [];
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--model') {
+            if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+                i++;
+            }
+            continue;
+        }
+        if (arg.startsWith('--model=')) {
+            continue;
+        }
+        filtered.push(arg);
+    }
+
+    return filtered;
+}
 
 export async function claudeLocal(opts: {
     abort: AbortSignal,
@@ -16,6 +37,7 @@ export async function claudeLocal(opts: {
     path: string,
     claudeEnvVars?: Record<string, string>,
     claudeArgs?: string[]
+    model?: SessionModel
     allowedTools?: string[]
     hookSettingsPath: string
 }) {
@@ -62,9 +84,15 @@ export async function claudeLocal(opts: {
         args.push('--allowedTools', opts.allowedTools.join(','));
     }
 
-    // Add custom Claude arguments
-    if (opts.claudeArgs) {
-        args.push(...opts.claudeArgs);
+    // Once model state is available, it is authoritative over startup args.
+    const claudeArgs = opts.model === undefined || !opts.claudeArgs
+        ? opts.claudeArgs
+        : withoutTrackedModelArgs(opts.claudeArgs);
+    if (claudeArgs) {
+        args.push(...claudeArgs);
+    }
+    if (opts.model) {
+        args.push('--model', opts.model);
     }
 
     // Add hook settings for session tracking
@@ -78,7 +106,7 @@ export async function claudeLocal(opts: {
     // Prepare environment variables
     // Note: Local mode uses global Claude installation
     //
-    // SDK metadata extraction (extractSDKMetadataAsync → query()) sets
+    // SDK metadata extraction (extractSDKMetadata → query()) sets
     // CLAUDE_CODE_ENTRYPOINT='sdk-ts' on the current process. If leaked
     // into the local spawn, Claude Code thinks it was SDK-launched and
     // excludes the session from `claude --resume`. Destructure it out

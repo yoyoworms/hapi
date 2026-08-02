@@ -1,10 +1,31 @@
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
-import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { useTranslation } from '@/lib/use-translation'
 
+
+function CodexImportIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            {/* 中文注释：导入 Codex 历史依赖当前目录，放在 Browse 后面表达“选目录后导入”；图标用“下载进托盘”样式，与刷新图标区分。 */}
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>
+    )
+}
 
 function FolderIcon(props: { className?: string }) {
     return (
@@ -69,7 +90,7 @@ export function DirectorySection(props: {
                         type="button"
                         onClick={props.onChooseFolder}
                         disabled={props.isDisabled}
-                        className="shrink-0 flex items-center gap-1 rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-2 py-2 text-xs text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors disabled:opacity-50"
+                        className="self-stretch shrink-0 flex items-center gap-1 rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-2 py-2 text-xs text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors disabled:opacity-50"
                         title={t('newSession.browse')}
                     >
                         <FolderIcon className="h-3.5 w-3.5" />
@@ -87,10 +108,7 @@ export function DirectorySection(props: {
                         className="shrink-0 flex items-center gap-1 rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-2 py-2 text-xs text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors disabled:opacity-50"
                         title={t('codexSync.tooltip')}
                     >
-                        <AgentFlavorIcon
-                            flavor="codex"
-                            className={`h-3.5 w-3.5 ${props.isImportingCodexHistory ? 'animate-spin' : ''}`}
-                        />
+                        <CodexImportIcon className={`h-3.5 w-3.5 ${props.isImportingCodexHistory ? 'animate-spin' : ''}`} />
                         {t('codexSync.newSessionAction')}
                     </button>
                 ) : null}

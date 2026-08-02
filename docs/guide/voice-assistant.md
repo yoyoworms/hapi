@@ -10,7 +10,7 @@ The voice assistant lets you:
 - **Approve permissions by voice** - Say "yes" or "no" to approve or deny permission requests
 - **Monitor progress** - Receive spoken updates when tasks complete or errors occur
 
-The assistant bridges voice communication with your active coding agent (Claude Code, Codex, Gemini, or OpenCode), relaying your requests and summarizing responses in natural speech.
+The assistant bridges voice communication with your active coding agent (Claude Code, Codex, Cursor Agent, Grok Build, or OpenCode), relaying your requests and summarizing responses in natural speech.
 
 ## Prerequisites
 
@@ -108,6 +108,10 @@ Set `ELEVENLABS_API_KEY` in your environment and restart the hub.
 - Check browser permissions for microphone access
 - Ensure no other app is using the microphone
 - Try refreshing the page
+
+### Microphone permission fails on Xiaomi/MIUI devices
+
+If voice cannot start on a Xiaomi/MIUI device, or the browser cannot request microphone permission, check the "Display over other apps" permission for Xiaomi Wallet and similar apps. Floating windows, payment or wallet overlays, chat bubbles, screen recorders, translation tools, eye-comfort tools, and game assistants may interfere with the browser's microphone permission prompt. Disable active overlays, reopen HAPI, and grant microphone access again.
 
 ### Voice not responding
 

@@ -40,6 +40,7 @@ interface LoopOptions {
     onSessionReady?: (session: Session) => void
     hookSettingsPath: string
     resumeSessionId?: string | null
+    localHookSettingsPath?: string
 }
 
 export async function loop(opts: LoopOptions) {
@@ -64,6 +65,7 @@ export async function loop(opts: LoopOptions) {
         startedBy,
         startingMode,
         hookSettingsPath: opts.hookSettingsPath,
+        localHookSettingsPath: opts.localHookSettingsPath,
         permissionMode: opts.permissionMode ?? 'bypassPermissions',
         model: opts.model,
         effort: opts.effort

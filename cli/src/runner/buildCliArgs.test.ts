@@ -84,6 +84,23 @@ describe('buildCliArgs', () => {
         expect(args).toContain('fast')
     })
 
+    it('passes --collaboration-mode through for codex Plan mode', () => {
+        const args = buildCliArgs('codex', {
+            directory: '/tmp',
+            collaborationMode: 'plan',
+        })
+        expect(args).toContain('--collaboration-mode')
+        expect(args).toContain('plan')
+    })
+
+    it('omits --collaboration-mode for default collaboration mode', () => {
+        const args = buildCliArgs('codex', {
+            directory: '/tmp',
+            collaborationMode: 'default',
+        })
+        expect(args).not.toContain('--collaboration-mode')
+    })
+
     it('does not pass --service-tier for non-codex agents', () => {
         const args = buildCliArgs('claude', {
             directory: '/tmp',
@@ -119,7 +136,7 @@ describe('buildCliArgs', () => {
 
 
 
-    it('does not pass Codex-only existing session id flag to non-Codex agents', () => {
+    it('does not pass existing session id flag to agents that do not reuse HAPI rows', () => {
         const args = buildCliArgs('claude', {
             directory: '/tmp',
             resumeSessionId: 'claude-session-1',
@@ -129,6 +146,26 @@ describe('buildCliArgs', () => {
         expect(args).toContain('claude-session-1')
         expect(args).not.toContain('--existing-session-id')
         expect(args).not.toContain('hapi-session-1')
+    })
+
+    it('passes --existing-session-id for cursor resume when sessionId is set (#991)', () => {
+        const args = buildCliArgs('cursor', {
+            directory: '/tmp',
+            resumeSessionId: 'cursor-csid-1',
+            sessionId: 'hapi-session-991',
+        })
+        expect(args).toContain('--existing-session-id')
+        expect(args).toContain('hapi-session-991')
+        expect(args).toContain('--resume')
+        expect(args).toContain('cursor-csid-1')
+    })
+
+    it('does not pass --collaboration-mode for non-codex agents', () => {
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            collaborationMode: 'plan',
+        })
+        expect(args).not.toContain('--collaboration-mode')
     })
 
     it('validates all known permission modes', () => {

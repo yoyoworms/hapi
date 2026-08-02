@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import type { ChatBlock } from '@/chat/types'
 import type { GeneratedImageBlock, ToolCallBlock } from '@/chat/types'
@@ -199,7 +199,7 @@ function HappyNestedBlockList(props: {
                     const taskChildren = isTask ? splitTaskChildren(block) : null
 
                     return (
-                        <div key={`tool:${block.id}`} className="py-1">
+                        <div key={`tool:${block.id}`} data-hapi-share-exclude="true" className="py-1">
                             <ToolCard
                                 api={ctx.api}
                                 sessionId={ctx.sessionId}
@@ -244,13 +244,13 @@ function HappyNestedBlockList(props: {
     )
 }
 
-function HappyToolMessageImpl(props: ToolCallMessagePartProps) {
+export function HappyToolMessage(props: ToolCallMessagePartProps) {
     const ctx = useHappyChatContext()
     const artifact = props.artifact
 
     if (isToolGroupBlock(artifact)) {
         return (
-            <div className="py-1 min-w-0 max-w-full overflow-x-clip">
+            <div data-hapi-share-exclude="true" className="py-1 min-w-0 max-w-full overflow-x-clip">
                 <ToolGroupCard
                     block={artifact}
                     metadata={ctx.metadata}
@@ -274,7 +274,7 @@ function HappyToolMessageImpl(props: ToolCallMessagePartProps) {
         const resultText = hasResult ? safeStringify(props.result) : ''
 
         return (
-            <div className="py-1 min-w-0 max-w-full overflow-x-clip">
+            <div data-hapi-share-exclude="true" className="py-1 min-w-0 max-w-full overflow-x-clip">
                 <div className="overflow-clip rounded-[20px] bg-[var(--app-tool-card-bg)] p-3 shadow-none">
                     <div className="flex items-center gap-2 text-xs">
                         <div className="font-mono text-[var(--app-tool-card-accent)]">
@@ -310,7 +310,7 @@ function HappyToolMessageImpl(props: ToolCallMessagePartProps) {
     const taskChildren = isTask ? splitTaskChildren(block) : null
 
     return (
-        <div className="py-1 min-w-0 max-w-full overflow-x-clip">
+        <div data-hapi-share-exclude="true" className="py-1 min-w-0 max-w-full overflow-x-clip">
             <ToolCard
                 api={ctx.api}
                 sessionId={ctx.sessionId}
@@ -348,5 +348,3 @@ function HappyToolMessageImpl(props: ToolCallMessagePartProps) {
         </div>
     )
 }
-
-export const HappyToolMessage = memo(HappyToolMessageImpl)

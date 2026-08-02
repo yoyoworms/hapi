@@ -55,8 +55,58 @@ function sortSessionSummaries(left: SessionSummary, right: SessionSummary): numb
     return right.updatedAt - left.updatedAt
 }
 
+/**
+ * True when applying `patch` to `session` would change nothing that renders.
+ *
+ * Keep-alive patches re-send fields about every ~10s. SessionHeader reads
+ * `activeAt` for relative age, but `formatRelativeTime` only changes at
+ * minute boundaries (`just now` while delta < 60s). Sub-minute `activeAt`
+ * moves are therefore skipped here so the detail cache does not replace the
+ * Session object (and re-render SessionChat / HappyThread) six times a
+ * minute for an invisible label change. A delta of ≥60s is still
+ * render-relevant so the header stays on `just now` for live sessions.
+ * The session-list path still uses {@link isRenderIrrelevantPatch}, which
+ * ignores `activeAt` entirely.
+ */
+export function isRenderIrrelevantSessionPatch(session: Session, patch: SessionPatch): boolean {
+    const current = session as unknown as Record<string, unknown>
+    for (const [key, value] of Object.entries(patch)) {
+        if (
+            key === 'activeAt'
+            && typeof value === 'number'
+            && Math.abs(value - session.activeAt) < 60_000
+        ) {
+            continue
+        }
+        if (current[key] !== value) {
+            return false
+        }
+    }
+    return true
+}
+
 function isSessionRecord(value: unknown): value is Session {
     return SessionSchema.safeParse(value).success
+}
+
+/**
+ * True when the only difference between two summaries is `activeAt`.
+ *
+ * The CLI keep-alive makes the hub re-broadcast a full session patch about
+ * every 10s per active session even when nothing changed, and `activeAt` is
+ * the sole field that moves. No component reads `activeAt` - the list shows
+ * `updatedAt` and sorts on active/pendingRequestsCount/updatedAt - so storing
+ * it costs a new object identity and a full list re-render for nothing.
+ */
+export function isRenderIrrelevantPatch(current: SessionSummary, next: SessionSummary): boolean {
+    return current.active === next.active
+        && current.thinking === next.thinking
+        && current.updatedAt === next.updatedAt
+        && current.backgroundTaskCount === next.backgroundTaskCount
+        && current.model === next.model
+        && current.modelReasoningEffort === next.modelReasoningEffort
+        && current.effort === next.effort
+        && current.pendingRequestsCount === next.pendingRequestsCount
 }
 
 function getSessionPatch(value: unknown): SessionPatch | null {
@@ -142,7 +192,8 @@ export function useSSE(options: {
         sessions: boolean
         machines: boolean
         sessionIds: Set<string>
-    }>({ sessions: false, machines: false, sessionIds: new Set() })
+        scratchlistSessionIds: Set<string>
+    }>({ sessions: false, machines: false, sessionIds: new Set(), scratchlistSessionIds: new Set() })
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const reconnectAttemptRef = useRef(0)
     const lastActivityAtRef = useRef(0)
@@ -187,6 +238,7 @@ export function useSSE(options: {
             pendingInvalidationsRef.current.sessions = false
             pendingInvalidationsRef.current.machines = false
             pendingInvalidationsRef.current.sessionIds.clear()
+            pendingInvalidationsRef.current.scratchlistSessionIds.clear()
             if (reconnectTimerRef.current) {
                 clearTimeout(reconnectTimerRef.current)
                 reconnectTimerRef.current = null
@@ -245,17 +297,24 @@ export function useSSE(options: {
 
         const flushInvalidations = () => {
             const pending = pendingInvalidationsRef.current
-            if (!pending.sessions && !pending.machines && pending.sessionIds.size === 0) {
+            if (
+                !pending.sessions
+                && !pending.machines
+                && pending.sessionIds.size === 0
+                && pending.scratchlistSessionIds.size === 0
+            ) {
                 return
             }
 
             const shouldInvalidateSessions = pending.sessions
             const shouldInvalidateMachines = pending.machines
             const sessionIds = Array.from(pending.sessionIds)
+            const scratchlistSessionIds = Array.from(pending.scratchlistSessionIds)
 
             pending.sessions = false
             pending.machines = false
             pending.sessionIds.clear()
+            pending.scratchlistSessionIds.clear()
 
             const tasks: Array<Promise<unknown>> = []
             if (shouldInvalidateSessions) {
@@ -263,6 +322,9 @@ export function useSSE(options: {
             }
             for (const sessionId of sessionIds) {
                 tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.session(sessionId) }))
+            }
+            for (const sessionId of scratchlistSessionIds) {
+                tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.scratchlist(sessionId) }))
             }
             if (shouldInvalidateMachines) {
                 tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.machines }))
@@ -291,6 +353,11 @@ export function useSSE(options: {
 
         const queueSessionDetailInvalidation = (sessionId: string) => {
             pendingInvalidationsRef.current.sessionIds.add(sessionId)
+            scheduleInvalidationFlush()
+        }
+
+        const queueScratchlistInvalidation = (sessionId: string) => {
+            pendingInvalidationsRef.current.scratchlistSessionIds.add(sessionId)
             scheduleInvalidationFlush()
         }
 
@@ -358,6 +425,13 @@ export function useSSE(options: {
                 }
 
                 patched = true
+                // The keep-alive patch repeats every field every ~10s per active
+                // session, and `activeAt` is the only one that actually moves.
+                // Nothing renders `activeAt`, so writing a new object for it just
+                // hands React Query a fresh reference and re-renders the list.
+                if (isRenderIrrelevantPatch(current, nextSummary)) {
+                    return previous
+                }
                 nextSessions[index] = nextSummary
                 nextSessions.sort(sortSessionSummaries)
                 return { ...previous, sessions: nextSessions }
@@ -372,6 +446,9 @@ export function useSSE(options: {
                     return previous
                 }
                 patched = true
+                if (isRenderIrrelevantSessionPatch(previous.session, patch)) {
+                    return previous
+                }
                 return {
                     ...previous,
                     session: {
@@ -514,6 +591,13 @@ export function useSSE(options: {
                         }
                         if (!summaryPatched) {
                             queueSessionListInvalidation()
+                        }
+                        // tiann/hapi#893: piggybacked scratchlist token.
+                        // The patch itself does not carry the entries -
+                        // the timestamp is the change-detection signal,
+                        // which triggers the dedicated query refetch.
+                        if (Object.prototype.hasOwnProperty.call(patch, 'scratchlistUpdatedAt')) {
+                            queueScratchlistInvalidation(event.sessionId)
                         }
                     } else {
                         queueSessionDetailInvalidation(event.sessionId)

@@ -27,10 +27,10 @@ import type {
 } from '@/types/api'
 import type {
     AddCodexApiEndpointRequest,
-    CodexModelsResponse,
     CodexAccountLoginStartResponse,
     CodexAccountLoginStatusResponse,
     CodexAccountsResponse,
+    CodexModelsResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
     CursorChatStoreStatus,
@@ -47,6 +47,7 @@ import type {
     OpencodeReasoningEffortResponse,
     QueuedStateResponse,
     ReopenSessionResponse,
+    SqliteStorageUsageResponse,
     UploadFileResponse
 } from '@hapi/protocol/apiTypes'
 import type { AgentFlavor } from '@hapi/protocol'
@@ -190,22 +191,14 @@ export class ApiClient {
         return await res.json() as { token: string; sessionId: string }
     }
 
-    /** Owner: current share status for a session. */
     async getSessionShare(sessionId: string): Promise<{ shared: boolean; token: string | null }> {
-        return await this.request<{ shared: boolean; token: string | null }>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/share`
-        )
+        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`)
     }
 
-    /** Owner: create (or reuse) a share link for a session. */
     async createSessionShare(sessionId: string): Promise<{ shared: boolean; token: string }> {
-        return await this.request<{ shared: boolean; token: string }>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/share`,
-            { method: 'POST' }
-        )
+        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'POST' })
     }
 
-    /** Owner: revoke a session's share link(s). */
     async revokeSessionShare(sessionId: string): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'DELETE' })
     }
@@ -320,20 +313,36 @@ export class ApiClient {
         sessionId: string,
         options: {
             beforeSeq?: number | null
-            afterSeq?: number | null
             beforeAt?: number | null
+            afterSeq?: number | null
+            afterAt?: number | null
+            untilSeq?: number | null
+            untilAt?: number | null
+            epoch?: number | null
             limit?: number
         }
     ): Promise<MessagesResponse> {
         const params = new URLSearchParams()
-        if (options.afterSeq !== undefined && options.afterSeq !== null) {
-            params.set('afterSeq', `${options.afterSeq}`)
-        }
         if (options.beforeAt !== undefined && options.beforeAt !== null) {
             params.set('beforeAt', `${options.beforeAt}`)
         }
         if (options.beforeSeq !== undefined && options.beforeSeq !== null) {
             params.set('beforeSeq', `${options.beforeSeq}`)
+        }
+        if (options.afterAt !== undefined && options.afterAt !== null) {
+            params.set('afterAt', `${options.afterAt}`)
+        }
+        if (options.afterSeq !== undefined && options.afterSeq !== null) {
+            params.set('afterSeq', `${options.afterSeq}`)
+        }
+        if (options.untilAt !== undefined && options.untilAt !== null) {
+            params.set('untilAt', `${options.untilAt}`)
+        }
+        if (options.untilSeq !== undefined && options.untilSeq !== null) {
+            params.set('untilSeq', `${options.untilSeq}`)
+        }
+        if (options.epoch !== undefined && options.epoch !== null) {
+            params.set('epoch', `${options.epoch}`)
         }
         if (options.limit !== undefined && options.limit !== null) {
             params.set('limit', `${options.limit}`)
@@ -406,29 +415,24 @@ export class ApiClient {
         return await this.request<FileReadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/file?${params.toString()}`)
     }
 
+    /** Download through the authenticated Hub route; never expose a CLI-local URL to the browser. */
     async getSessionFileBlob(
         sessionId: string,
         path: string,
         attempt: number = 0,
         overrideToken?: string | null
     ): Promise<Blob> {
-        const params = new URLSearchParams()
-        params.set('path', path)
-        params.set('download', 'true')
-
+        const params = new URLSearchParams({ path, download: 'true' })
         const headers = new Headers()
         const liveToken = this.getToken ? this.getToken() : null
         const authToken = overrideToken !== undefined
             ? (overrideToken ?? (liveToken ?? this.token))
             : (liveToken ?? this.token)
-        if (authToken) {
-            headers.set('authorization', `Bearer ${authToken}`)
-        }
+        if (authToken) headers.set('authorization', `Bearer ${authToken}`)
 
         const res = await fetch(this.buildUrl(
             `/api/sessions/${encodeURIComponent(sessionId)}/file/raw?${params.toString()}`
         ), { headers })
-
         if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
             const refreshed = await this.onUnauthorized()
             if (refreshed) {
@@ -482,12 +486,11 @@ export class ApiClient {
         if (opts?.permissionMode !== undefined) body.permissionMode = opts.permissionMode
         if (opts?.resumeWithSessionId !== undefined) body.resumeWithSessionId = opts.resumeWithSessionId
         if (opts?.codexAccountId !== undefined) body.codexAccountId = opts.codexAccountId
-        const hasBody = Object.keys(body).length > 0
         const response = await this.request<{ sessionId: string }>(
             `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
             {
                 method: 'POST',
-                ...(hasBody ? { body: JSON.stringify(body) } : {})
+                ...(Object.keys(body).length > 0 ? { body: JSON.stringify(body) } : {})
             }
         )
         return response.sessionId
@@ -694,6 +697,18 @@ export class ApiClient {
         return await this.request<MachinesResponse>('/api/machines')
     }
 
+    /** Pass an empty string to clear the custom name and fall back to the hostname. */
+    async renameMachine(machineId: string, displayName: string): Promise<void> {
+        await this.request(`/api/machines/${encodeURIComponent(machineId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ displayName })
+        })
+    }
+
+    async getSqliteStorageUsage(): Promise<SqliteStorageUsageResponse> {
+        return await this.request<SqliteStorageUsageResponse>('/api/storage/sqlite')
+    }
+
     async listMachineDirectory(
         machineId: string,
         path: string
@@ -732,7 +747,9 @@ export class ApiClient {
         effort?: string,
         sandbox?: boolean,
         permissionMode?: PermissionMode,
-        codexAccountId?: string
+        codexAccountId?: string,
+        serviceTier?: 'fast' | 'standard',
+        collaborationMode?: 'default' | 'plan'
     ): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
@@ -747,19 +764,19 @@ export class ApiClient {
                 effort,
                 sandbox,
                 permissionMode,
-                codexAccountId
+                codexAccountId,
+                serviceTier,
+                collaborationMode
             })
         })
     }
 
     async getMachineCodexAccounts(machineId: string): Promise<CodexAccountsResponse> {
-        return await this.request<CodexAccountsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts`
-        )
+        return await this.request(`/api/machines/${encodeURIComponent(machineId)}/codex-accounts`)
     }
 
     async startMachineCodexAccountLogin(machineId: string): Promise<CodexAccountLoginStartResponse> {
-        return await this.request<CodexAccountLoginStartResponse>(
+        return await this.request(
             `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login`,
             { method: 'POST' }
         )
@@ -769,12 +786,9 @@ export class ApiClient {
         machineId: string,
         input: AddCodexApiEndpointRequest
     ): Promise<CodexAccountsResponse> {
-        return await this.request<CodexAccountsResponse>(
+        return await this.request(
             `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/api-endpoints`,
-            {
-                method: 'POST',
-                body: JSON.stringify(input)
-            }
+            { method: 'POST', body: JSON.stringify(input) }
         )
     }
 
@@ -782,29 +796,20 @@ export class ApiClient {
         machineId: string,
         attemptId: string
     ): Promise<CodexAccountLoginStatusResponse> {
-        return await this.request<CodexAccountLoginStatusResponse>(
+        return await this.request(
             `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login/${encodeURIComponent(attemptId)}`
         )
     }
 
-    async setMachineDefaultCodexAccount(
-        machineId: string,
-        accountId: string
-    ): Promise<CodexAccountsResponse> {
-        return await this.request<CodexAccountsResponse>(
+    async setMachineDefaultCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        return await this.request(
             `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/default`,
-            {
-                method: 'POST',
-                body: JSON.stringify({ accountId })
-            }
+            { method: 'POST', body: JSON.stringify({ accountId }) }
         )
     }
 
-    async removeMachineCodexAccount(
-        machineId: string,
-        accountId: string
-    ): Promise<CodexAccountsResponse> {
-        return await this.request<CodexAccountsResponse>(
+    async removeMachineCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        return await this.request(
             `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/${encodeURIComponent(accountId)}`,
             { method: 'DELETE' }
         )
@@ -817,9 +822,7 @@ export class ApiClient {
     }
 
     async getSessionCodexModels(sessionId: string): Promise<CodexModelsResponse> {
-        return await this.request<CodexModelsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/codex-models`
-        )
+        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/codex-models`)
     }
 
     async getSessionOpencodeModels(sessionId: string): Promise<OpencodeModelsResponse> {
@@ -904,11 +907,133 @@ export class ApiClient {
         })
     }
 
-
     async deleteSession(sessionId: string): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
             method: 'DELETE'
         })
+    }
+
+    /*
+     * Scratchlist v2 (tiann/hapi#893).
+     *
+     * The hub is the durable store; localStorage is demoted to an
+     * offline cache. Mutations return the canonical entry so optimistic
+     * updates can reconcile with the hub-stamped `updatedAt`.
+     */
+
+    async getScratchlist(sessionId: string): Promise<{
+        entries: Array<{
+            entryId: string
+            text: string
+            createdAt: number
+            updatedAt: number
+            attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }>
+    }> {
+        return await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist`
+        )
+    }
+
+    async uploadScratchlistAttachment(
+        sessionId: string,
+        filename: string,
+        content: string,
+        mimeType: string
+    ): Promise<{
+        success: boolean
+        attachment?: import('@hapi/protocol').ScratchlistAttachmentMetadata
+        error?: string
+        code?: string
+    }> {
+        return await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist/upload`,
+            {
+                method: 'POST',
+                body: JSON.stringify({ filename, content, mimeType })
+            }
+        )
+    }
+
+    async fetchScratchlistAttachmentBlob(sessionId: string, attachmentId: string): Promise<Blob> {
+        const headers = new Headers()
+        const liveToken = this.getToken ? this.getToken() : null
+        const authToken = liveToken ?? this.token
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+        const response = await fetch(
+            this.buildUrl(
+                `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist/attachments/${encodeURIComponent(attachmentId)}`
+            ),
+            { headers }
+        )
+        if (!response.ok) {
+            throw new ApiError(`Failed to fetch scratchlist attachment (${response.status})`, response.status)
+        }
+        return await response.blob()
+    }
+
+    async deleteScratchlistAttachment(sessionId: string, attachmentId: string): Promise<void> {
+        await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist/attachments/${encodeURIComponent(attachmentId)}`,
+            { method: 'DELETE' }
+        )
+    }
+
+    async createScratchlistEntry(
+        sessionId: string,
+        body: {
+            text: string
+            entryId?: string
+            createdAt?: number
+            attachments?: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    ): Promise<{
+        entry: {
+            entryId: string
+            text: string
+            createdAt: number
+            updatedAt: number
+            attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    }> {
+        return await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist`,
+            {
+                method: 'POST',
+                body: JSON.stringify(body)
+            }
+        )
+    }
+
+    async updateScratchlistEntry(
+        sessionId: string,
+        entryId: string,
+        text: string
+    ): Promise<{
+        entry: {
+            entryId: string
+            text: string
+            createdAt: number
+            updatedAt: number
+            attachments: import('@hapi/protocol').ScratchlistAttachmentMetadata[]
+        }
+    }> {
+        return await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist/${encodeURIComponent(entryId)}`,
+            {
+                method: 'PUT',
+                body: JSON.stringify({ text })
+            }
+        )
+    }
+
+    async deleteScratchlistEntry(sessionId: string, entryId: string): Promise<void> {
+        await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/scratchlist/${encodeURIComponent(entryId)}`,
+            { method: 'DELETE' }
+        )
     }
 
     async fetchVoiceToken(options?: { customAgentId?: string; customApiKey?: string; voiceId?: string }): Promise<{

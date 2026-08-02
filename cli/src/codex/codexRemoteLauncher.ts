@@ -17,12 +17,13 @@ import { AppServerEventConverter } from './utils/appServerEventConverter';
 import { detectImageMimeType, registerGeneratedImage } from '@/modules/common/generatedImages';
 import { registerAppServerPermissionHandlers } from './utils/appServerPermissionAdapter';
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
-import type { ThreadGoal, ThreadGoalStatus } from './appServerTypes';
+import type { SkillMetadata, ThreadGoal, ThreadGoalStatus } from './appServerTypes';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
 import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
 import type { AgentAccountStatus } from '@hapi/protocol/types';
 import { extractErrorInfo } from '@/utils/errorUtils';
+import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import {
     RemoteLauncherBase,
     type RemoteLauncherDisplayContext,
@@ -685,6 +686,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 || toolName === 'resume_agent'
                 || toolName === 'wait_agent'
                 || toolName === 'close_agent';
+        };
+
+        const isLegacyCodexAgentToolCall = (toolName: string | null, input: unknown): boolean => {
+            if (!isCodexAgentToolName(toolName)) return false;
+
+            const inputRecord = asRecord(input);
+            if (toolName === 'spawn_agent') {
+                return !asString(inputRecord?.task_name ?? inputRecord?.taskName);
+            }
+            if (toolName === 'wait_agent') {
+                return Array.isArray(inputRecord?.targets);
+            }
+
+            return true;
         };
 
         const isTerminalAgentRunStatus = (status: string | null | undefined): boolean => {
@@ -1710,7 +1725,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const callId = asString(msg.call_id ?? msg.callId);
                 const name = asString(msg.name);
                 if (callId && name) {
-                    if (isCodexAgentToolName(name)) {
+                    if (isLegacyCodexAgentToolCall(name, msg.input)) {
                         const error = 'Nested agent calls are disabled for child agents.';
                         runtime.blockedNestedAgent = true;
                         emitAgentRunTraceMessage(agentId, {
@@ -3031,20 +3046,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const callId = asString(msg.call_id ?? msg.callId);
                 const name = asString(msg.name);
                 if (callId && name) {
-                    if (isCodexAgentToolName(name)) {
-                            const input = msg.input ?? {};
-                            pendingAgentToolInputByCallId.set(callId, { name, input });
-                            if (name === 'spawn_agent') {
-                                emitAgentRunStart(callId, input);
-                            } else {
-                                for (const agentId of extractAgentTargets(input)) {
-                                    if (!agentCardByAgentId.has(agentId)) {
-                                        continue;
-                                    }
-                                    const activity = name === 'wait_agent'
-                                        ? 'Waiting for agent'
-                                        : name === 'send_input'
-                                            ? 'Sending input'
+                    if (isLegacyCodexAgentToolCall(name, msg.input)) {
+                        const input = msg.input ?? {};
+                        pendingAgentToolInputByCallId.set(callId, { name, input });
+                        if (name === 'spawn_agent') {
+                            emitAgentRunStart(callId, input);
+                        } else {
+                            for (const agentId of extractAgentTargets(input)) {
+                                if (!agentCardByAgentId.has(agentId)) {
+                                    continue;
+                                }
+                                const activity = name === 'wait_agent'
+                                    ? 'Waiting for agent'
+                                    : name === 'send_input'
+                                        ? 'Sending input'
                                         : name === 'resume_agent'
                                             ? 'Resuming agent'
                                             : name === 'close_agent'
@@ -3073,7 +3088,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const callId = asString(msg.call_id ?? msg.callId);
                 const name = asString(msg.name) ?? pendingAgentToolInputByCallId.get(callId ?? '')?.name ?? null;
                 if (callId) {
-                    if (name && isCodexAgentToolName(name)) {
+                    if (name && pendingAgentToolInputByCallId.has(callId)) {
                         handleAgentToolEnd(callId, name, msg.output, Boolean(msg.is_error ?? msg.isError));
                         return;
                     }
@@ -3115,7 +3130,38 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
         });
 
+        let nativeSkills: SkillMetadata[] = [];
+        let nativeSkillsAvailable = false;
+        const refreshNativeSkills = async (forceReload: boolean): Promise<void> => {
+            const response = await appServerClient.listSkills({
+                cwds: [session.path],
+                forceReload
+            });
+            const inventory = response.data?.find(entry => entry.cwd === session.path)
+                ?? response.data?.[0];
+            if (!inventory || (inventory.skills.length === 0 && (inventory.errors?.length ?? 0) > 0)) {
+                throw new Error('skills/list returned no usable inventory');
+            }
+            nativeSkills = inventory.skills.filter(skill => skill.enabled);
+            if (!nativeSkillsAvailable) {
+                nativeSkillsAvailable = true;
+                session.client.rpcHandlerManager.registerHandler(RPC_METHODS.ListSkills, async () => ({
+                    success: true,
+                    skills: nativeSkills.map(skill => ({
+                        name: skill.name,
+                        description: skill.description
+                    }))
+                }));
+            }
+        };
+
         appServerClient.setNotificationHandler((method, params) => {
+            if (method === 'skills/changed') {
+                void refreshNativeSkills(true).catch((error) => {
+                    logger.debug(`[Codex] failed to refresh skills: ${errorMessage(error)}`);
+                });
+                return;
+            }
             const events = appServerEventConverter.handleNotification(method, params);
             for (const event of events) {
                 const eventRecord = asRecord(event) ?? { type: undefined };
@@ -3194,6 +3240,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 experimentalApi: true
             }
         });
+
+        try {
+            await refreshNativeSkills(false);
+        } catch (error) {
+            logger.debug(`[Codex] skills/list failed: ${errorMessage(error)}; keeping filesystem fallback`);
+        }
+
         let supportsTurnCollaborationMode = true;
         let supportsGoals = true;
         try {
@@ -3739,6 +3792,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     cwd: session.path,
                     mode,
                     cliOverrides: session.codexCliOverrides,
+                    skills: nativeSkills,
                     overrides: suppressCollaborationMode
                         ? { suppressCollaborationMode: true }
                         : undefined

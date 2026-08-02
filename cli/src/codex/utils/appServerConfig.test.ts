@@ -3,6 +3,7 @@ import type { EnhancedMode } from '../loop';
 import {
     buildThreadStartParams,
     buildTurnStartParams,
+    buildUserInputFromMessage,
     codexCollaborationSpawnAgentInstructions,
     supportsReasoningSummary
 } from './appServerConfig';
@@ -240,6 +241,41 @@ describe('appServerConfig', () => {
         expect('serviceTier' in nullParams).toBe(false);
     });
 
+    it('forwards personality only when explicitly set on the mode', () => {
+        const omitted = buildTurnStartParams({
+            threadId: 'thread-1',
+            message: 'hello',
+            cwd: '/workspace/project',
+            mode: { permissionMode: 'default', model: 'gpt-5.5', collaborationMode: 'default' }
+        });
+        expect('personality' in omitted).toBe(false);
+
+        const set = buildTurnStartParams({
+            threadId: 'thread-1',
+            message: 'hello',
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: 'gpt-5.5',
+                collaborationMode: 'default',
+                personality: 'pragmatic'
+            }
+        });
+        expect(set.personality).toBe('pragmatic');
+
+        const thread = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: 'gpt-5.5',
+                collaborationMode: 'default',
+                personality: 'friendly'
+            },
+            mcpServers
+        });
+        expect(thread.personality).toBe('friendly');
+    });
+
     it('builds turn params with mode defaults', () => {
         const params = buildTurnStartParams({
             threadId: 'thread-1',
@@ -400,10 +436,10 @@ describe('appServerConfig', () => {
             mode: 'plan',
             settings: {
                 model: 'o3',
-                reasoning_effort: null,
                 developer_instructions: withCollaborationInstructions(`${codexSystemPrompt}\n\nOnly respond in Chinese.`)
             }
         });
+        expect(params.collaborationMode?.settings).not.toHaveProperty('reasoning_effort');
     });
 
     it('injects spawn_agent argument rules into collaboration mode instructions', () => {
@@ -419,6 +455,23 @@ describe('appServerConfig', () => {
         expect(instructions).toContain('do not set agent_type, model, or reasoning_effort');
         expect(instructions).toContain('set fork_context: false');
         expect(instructions).toContain('Do not rely on parent turn reasoning settings for spawned agents');
+    });
+
+    it('injects proactive multi-agent instructions when /agent mode is enabled', () => {
+        const params = buildTurnStartParams({
+            threadId: 'thread-1',
+            message: 'work',
+            cwd: '/repo',
+            mode: {
+                permissionMode: 'default',
+                model: 'o3',
+                collaborationMode: 'default',
+                proactiveMultiAgent: true
+            }
+        });
+
+        expect(params.collaborationMode?.settings.developer_instructions)
+            .toContain('Proactive multi-agent delegation is active.');
     });
 
     it('rejects collaboration mode payloads without a resolved model', () => {
@@ -445,7 +498,6 @@ describe('appServerConfig', () => {
             mode: 'default',
             settings: {
                 model: 'o3',
-                reasoning_effort: null,
                 developer_instructions: withCollaborationInstructions(codexSystemPrompt)
             }
         });
@@ -466,7 +518,6 @@ describe('appServerConfig', () => {
             mode: 'default',
             settings: {
                 model: 'o3',
-                reasoning_effort: null,
                 developer_instructions: withCollaborationInstructions(codexSystemPrompt)
             }
         });
@@ -486,7 +537,6 @@ describe('appServerConfig', () => {
             mode: 'default',
             settings: {
                 model: 'gpt-5',
-                reasoning_effort: null,
                 developer_instructions: withCollaborationInstructions(codexSystemPrompt)
             }
         });
@@ -504,5 +554,66 @@ describe('appServerConfig', () => {
 
         expect(params.collaborationMode).toBeUndefined();
         expect(params.model).toBe('o3');
+    });
+
+    it('builds mention inputs from quoted @file tokens', () => {
+        expect(buildUserInputFromMessage('please inspect @"src/index.ts" now')).toEqual([
+            { type: 'text', text: 'please inspect ' },
+            { type: 'mention', name: 'index.ts', path: 'src/index.ts' },
+            { type: 'text', text: ' now' }
+        ]);
+    });
+
+    it('builds a structured leading skill input from the native catalog', () => {
+        expect(buildUserInputFromMessage('$hapi inspect @"README.md"', [{
+            name: 'hapi',
+            path: '/home/user/.agents/skills/hapi/SKILL.md',
+            description: 'Manage HAPI',
+            scope: 'user',
+            enabled: true
+        }])).toEqual([
+            { type: 'skill', name: 'hapi', path: '/home/user/.agents/skills/hapi/SKILL.md' },
+            { type: 'text', text: ' inspect ' },
+            { type: 'mention', name: 'README.md', path: 'README.md' }
+        ]);
+    });
+
+    it('keeps unknown and disabled skill references as text', () => {
+        const skills = [{
+            name: 'disabled-skill',
+            path: '/skills/disabled/SKILL.md',
+            description: 'Disabled',
+            scope: 'user' as const,
+            enabled: false
+        }];
+
+        expect(buildUserInputFromMessage('$unknown run', skills)).toEqual([
+            { type: 'text', text: '$unknown run' }
+        ]);
+        expect(buildUserInputFromMessage('$disabled-skill run', skills)).toEqual([
+            { type: 'text', text: '$disabled-skill run' }
+        ]);
+    });
+
+    it('builds mention inputs from quoted @file tokens with spaces', () => {
+        expect(buildUserInputFromMessage('please inspect @"docs/My File.md" now')).toEqual([
+            { type: 'text', text: 'please inspect ' },
+            { type: 'mention', name: 'My File.md', path: 'docs/My File.md' },
+            { type: 'text', text: ' now' }
+        ]);
+    });
+
+    it('builds mention inputs from quoted root-level @file tokens', () => {
+        expect(buildUserInputFromMessage('please inspect @"package.json" now')).toEqual([
+            { type: 'text', text: 'please inspect ' },
+            { type: 'mention', name: 'package.json', path: 'package.json' },
+            { type: 'text', text: ' now' }
+        ]);
+    });
+
+    it('keeps literal at-mentions as text', () => {
+        expect(buildUserInputFromMessage('please ask @alice to upgrade @types/node.')).toEqual([
+            { type: 'text', text: 'please ask @alice to upgrade @types/node.' }
+        ]);
     });
 });

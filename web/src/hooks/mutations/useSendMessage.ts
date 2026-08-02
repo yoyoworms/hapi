@@ -5,7 +5,7 @@ import type { AttachmentMetadata, DecryptedMessage } from '@/types/api'
 import { makeClientSideId } from '@/lib/messages'
 import {
     appendOptimisticMessage,
-    fetchLatestMessages,
+    syncTailMessages,
     getMessageWindowState,
     removeOptimisticMessage,
     updateMessageStatus,
@@ -104,9 +104,6 @@ function findMessageByLocalId(
 ): DecryptedMessage | null {
     const state = getMessageWindowState(sessionId)
     for (const message of state.messages) {
-        if (message.localId === localId) return message
-    }
-    for (const message of state.pending) {
         if (message.localId === localId) return message
     }
     return null
@@ -226,7 +223,7 @@ export function useSendMessage(
             haptic.notification('success')
             options?.onSuccess?.(input.sessionId)
             if (api) {
-                const doFetch = () => fetchLatestMessages(api, input.sessionId, { incremental: true }).catch(() => {})
+                const doFetch = () => syncTailMessages(api, input.sessionId, { ensureAfterCurrent: true }).catch(() => {})
                 doFetch()
                 setTimeout(doFetch, 1000)
                 setTimeout(doFetch, 3000)
@@ -323,7 +320,7 @@ export function useSendMessage(
                 setIsResolving(false)
             }
         }
-        await fetchLatestMessages(targetApi, targetSessionId, { incremental: true }).catch(() => {})
+        await syncTailMessages(targetApi, targetSessionId, { ensureAfterCurrent: true }).catch(() => {})
 
         // Update optimistic message status from queued to sending
         updateMessageStatus(targetSessionId, localId, 'sending')
