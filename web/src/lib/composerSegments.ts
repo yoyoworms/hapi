@@ -285,20 +285,40 @@ export function insertSegmentsInComposerSegments(
     }
 }
 
+function parseExplicitBoolean(value: string | null | undefined): boolean | null {
+    if (value == null) return null
+    const normalized = value.trim().toLowerCase()
+    if (normalized === '1' || normalized === 'true') return true
+    if (normalized === '0' || normalized === 'false') return false
+    return null
+}
+
 /**
- * Rich segmented composer is the product default (same as v1 @ autocomplete:
- * no user opt-in). Emergency kill-switch only:
- *   localStorage `hapi.composer.richMentions=0` or `?richMentions=0`
- *   or build `VITE_RICH_COMPOSER_MENTIONS=false`
+ * Rich segmented composer is opt-in while it is being brought to feature
+ * parity with the textarea. It can be enabled explicitly with either:
+ *   localStorage `hapi.composer.richMentions=1|true`
+ *   query `?richMentions=1|true`
+ *   build `VITE_RICH_COMPOSER_MENTIONS=1|true`
+ *
+ * An explicit `0|false` from any source remains an emergency kill switch and
+ * wins over an enable flag from another source.
  */
 export function isRichComposerMentionsEnabled(): boolean {
-    if (typeof window === 'undefined') return true
+    const configuredValues: Array<boolean | null> = [
+        parseExplicitBoolean(import.meta.env.VITE_RICH_COMPOSER_MENTIONS),
+    ]
+
     try {
-        if (window.localStorage.getItem('hapi.composer.richMentions') === '0') return false
-        if (new URLSearchParams(window.location.search).get('richMentions') === '0') return false
+        if (typeof window !== 'undefined') {
+            configuredValues.push(
+                parseExplicitBoolean(window.localStorage.getItem('hapi.composer.richMentions')),
+                parseExplicitBoolean(new URLSearchParams(window.location.search).get('richMentions')),
+            )
+        }
     } catch {
         // ignore storage / URL access failures
     }
-    if (import.meta.env.VITE_RICH_COMPOSER_MENTIONS === 'false') return false
-    return true
+
+    if (configuredValues.includes(false)) return false
+    return configuredValues.includes(true)
 }

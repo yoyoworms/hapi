@@ -1,6 +1,9 @@
 import type { AttachmentAdapter, Attachment, CompleteAttachment, PendingAttachment } from '@assistant-ui/react'
 import type { ScratchlistAttachmentMetadata } from '@hapi/protocol'
-import { parseHubScratchlistAttachmentPath } from '@hapi/protocol'
+import {
+    parseHubScratchlistAttachmentPath,
+    SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE,
+} from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
 import { getRestoredUploadMetadata } from '@/lib/composer-attachment-drafts'
 import { isImageMimeType } from '@/lib/fileAttachments'
@@ -44,12 +47,15 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
     const cancelledAttachmentIds = new Set<string>()
 
     return {
-        accept: '*/*',
+        // assistant-ui 0.14 reserves `*` for the universal matcher. `*/*`
+        // is parsed as a MIME wildcard with the literal top-level type `*`
+        // and therefore rejects every real file.
+        accept: '*',
 
         async *add({ file }): AsyncGenerator<PendingAttachment> {
             const contentType = file.type || 'application/octet-stream'
             const restored = getRestoredUploadMetadata(file)
-            if (restored) {
+            if (restored?.sourceSessionId === sessionId) {
                 const hubAttachment = hubAttachmentFromRestoredDraft(restored.path, file, contentType)
                 if (hubAttachment) {
                     yield {
@@ -68,6 +74,21 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
             }
 
             const id = randomId()
+
+            // Reject before publishing a running attachment. The composer draft
+            // controller persists resumable uploads, and must never receive an
+            // oversized File that the Hub will reject.
+            if (file.size > SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE) {
+                yield {
+                    id,
+                    type: 'file',
+                    name: `${file.name} (file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+                    contentType,
+                    file,
+                    status: { type: 'incomplete', reason: 'error' }
+                }
+                return
+            }
 
             yield {
                 id,
@@ -124,7 +145,24 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
 
                 let previewUrl: string | undefined
                 if (isImageMimeType(contentType) && file.size <= MAX_PREVIEW_BYTES) {
-                    previewUrl = await fileToDataUrl(file)
+                    try {
+                        previewUrl = await fileToDataUrl(file)
+                    } catch {
+                        // Preview is optional; the Hub attachment is already
+                        // durable and remains usable without an inline image.
+                        previewUrl = undefined
+                    }
+                }
+
+                // remove() can race the optional FileReader above. Re-check
+                // after its await so a cancelled attachment is cleaned up
+                // instead of being yielded as ready and reappearing in UI.
+                if (cancelledAttachmentIds.has(id)) {
+                    await api.deleteScratchlistAttachment(
+                        sessionId,
+                        result.attachment.id
+                    ).catch(() => {})
+                    return
                 }
 
                 yield {

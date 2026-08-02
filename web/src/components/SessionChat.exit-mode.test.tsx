@@ -4,9 +4,11 @@ import { I18nProvider } from '@/lib/i18n-context'
 import type { ScratchlistEntry } from '@/lib/scratchlist'
 import type { ApiClient } from '@/api/client'
 
+const fetchScratchlistAttachmentBlob = vi.fn()
+const uploadFile = vi.fn()
 const mockApi = {
-    fetchScratchlistAttachmentBlob: vi.fn(),
-    uploadFile: vi.fn(),
+    fetchScratchlistAttachmentBlob,
+    uploadFile,
 } as unknown as ApiClient
 const mockSessionId = 'sess-test'
 
@@ -30,26 +32,54 @@ const mockSessionId = 'sess-test'
  */
 
 const setText = vi.fn()
+const addAttachment = vi.fn()
+let mockComposerText = ''
 vi.mock('@assistant-ui/react', () => ({
     useAui: () => ({
-        composer: () => ({ setText }),
+        composer: () => ({
+            setText,
+            addAttachment,
+            getState: () => ({ text: mockComposerText }),
+        }),
+    }),
+    useAuiState: (selector: (state: { composer: { text: string } }) => unknown) => selector({
+        composer: { text: mockComposerText },
     }),
 }))
 
+import { canPromoteScratchlistEntryAttachments } from './AssistantChat/ScratchlistPanel'
 import { ScratchlistDrawerHost } from './SessionChat'
 
 function makeEntry(overrides: Partial<ScratchlistEntry> & { id: string }): ScratchlistEntry {
     return { text: 'note', createdAt: 1000, ...overrides }
 }
 
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    const promise = new Promise<T>((res) => { resolve = res })
+    return { promise, resolve }
+}
+
+const storedAttachment = {
+    id: 'a1b2c3d4-e5f6-4789-a012-3456789abcde',
+    filename: 'evidence.pdf',
+    mimeType: 'application/pdf',
+    size: 4,
+    path: 'hapi-hub:scratchlist/default/sess-test/a1b2c3d4-e5f6-4789-a012-3456789abcde-evidence.pdf',
+}
+
 afterEach(() => {
     cleanup()
     setText.mockReset()
+    addAttachment.mockReset()
+    fetchScratchlistAttachmentBlob.mockReset()
+    uploadFile.mockReset()
+    mockComposerText = ''
 })
 
 describe('ScratchlistDrawerHost.onPromoteToComposer', () => {
-    it('exits scratchlist mode AND sets composer text when an entry is promoted to composer', () => {
-        const onExitScratchlistMode = vi.fn()
+    it('lets an inactive session promote a text-only entry to the composer', () => {
+        const onExitScratchlistMode = vi.fn(() => true)
         const onSend = vi.fn(async () => true)
         const onMove = vi.fn()
         const onDelete = vi.fn()
@@ -64,6 +94,7 @@ describe('ScratchlistDrawerHost.onPromoteToComposer', () => {
                     onDelete={onDelete}
                     onSend={onSend}
                     onExitScratchlistMode={onExitScratchlistMode}
+                    attachmentsSupported={false}
                 />
             </I18nProvider>,
         )
@@ -80,8 +111,68 @@ describe('ScratchlistDrawerHost.onPromoteToComposer', () => {
         expect(onSend).not.toHaveBeenCalled()
     })
 
-    it('exits scratchlist mode when an entry is promoted to queue and the send is accepted', async () => {
-        const onExitScratchlistMode = vi.fn()
+    it('does not replace a composer draft when existing attachments lock its destination', () => {
+        const onExitScratchlistMode = vi.fn(() => false)
+        const onSend = vi.fn(async () => true)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawerHost
+                    sessionId={mockSessionId}
+                    api={mockApi}
+                    entries={[makeEntry({ id: 'e1', text: 'would overwrite draft' })]}
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onSend={onSend}
+                    onExitScratchlistMode={onExitScratchlistMode}
+                    composerDestinationLocked
+                />
+            </I18nProvider>,
+        )
+
+        const promoteButton = screen.getByRole('button', {
+            name: /Remove attachments before switching destination/,
+        })
+        expect(promoteButton).toBeDisabled()
+        fireEvent.click(promoteButton)
+
+        expect(onExitScratchlistMode).not.toHaveBeenCalled()
+        expect(setText).not.toHaveBeenCalled()
+        expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('does not overwrite existing unsent composer text', () => {
+        mockComposerText = 'draft that must survive'
+        const onExitScratchlistMode = vi.fn(() => true)
+        const onSend = vi.fn(async () => true)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawerHost
+                    sessionId={mockSessionId}
+                    api={mockApi}
+                    entries={[makeEntry({ id: 'e1', text: 'would overwrite draft' })]}
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onSend={onSend}
+                    onExitScratchlistMode={onExitScratchlistMode}
+                />
+            </I18nProvider>,
+        )
+
+        const promoteButton = screen.getByRole('button', {
+            name: /Clear the current draft before copying an entry/,
+        })
+        expect(promoteButton).toBeDisabled()
+        fireEvent.click(promoteButton)
+
+        expect(onExitScratchlistMode).not.toHaveBeenCalled()
+        expect(setText).not.toHaveBeenCalled()
+        expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('lets an inactive session promote a text-only entry to queue', async () => {
+        const onExitScratchlistMode = vi.fn(() => true)
         const onSend = vi.fn(async () => true)
         const onMove = vi.fn()
         const onDelete = vi.fn()
@@ -96,6 +187,7 @@ describe('ScratchlistDrawerHost.onPromoteToComposer', () => {
                     onDelete={onDelete}
                     onSend={onSend}
                     onExitScratchlistMode={onExitScratchlistMode}
+                    attachmentsSupported={false}
                 />
             </I18nProvider>,
         )
@@ -109,8 +201,120 @@ describe('ScratchlistDrawerHost.onPromoteToComposer', () => {
         expect(setText).not.toHaveBeenCalled()
     })
 
+    it('keeps the source entry until the queue send is confirmed', async () => {
+        const delivery = deferred<boolean>()
+        const onExitScratchlistMode = vi.fn(() => true)
+        const onSend = vi.fn(() => delivery.promise)
+        const onDelete = vi.fn()
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawerHost
+                    sessionId={mockSessionId}
+                    api={mockApi}
+                    entries={[makeEntry({ id: 'e1', text: 'durable until delivered' })]}
+                    onMove={vi.fn()}
+                    onDelete={onDelete}
+                    onSend={onSend}
+                    onExitScratchlistMode={onExitScratchlistMode}
+                />
+            </I18nProvider>,
+        )
+
+        fireEvent.click(screen.getAllByRole('button', { name: /queue|send/i })[0]!)
+        await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(onExitScratchlistMode).not.toHaveBeenCalled()
+
+        delivery.resolve(true)
+        await waitFor(() => expect(onDelete).toHaveBeenCalledWith('e1'))
+        expect(onExitScratchlistMode).toHaveBeenCalledTimes(1)
+    })
+
+    it('blocks both attachment promotion paths while inactive', () => {
+        const onExitScratchlistMode = vi.fn(() => true)
+        const onSend = vi.fn(async () => true)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawerHost
+                    sessionId={mockSessionId}
+                    api={mockApi}
+                    entries={[makeEntry({
+                        id: 'e1',
+                        text: 'send with evidence',
+                        attachments: [storedAttachment],
+                    })]}
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onSend={onSend}
+                    onExitScratchlistMode={onExitScratchlistMode}
+                    attachmentsSupported={false}
+                />
+            </I18nProvider>,
+        )
+
+        const composerButton = screen.getByRole('button', {
+            name: 'Copy into composer: Attachments require an active session',
+        })
+        const queueButton = screen.getByRole('button', {
+            name: 'Send to queue: Attachments require an active session',
+        })
+        expect(composerButton).toBeDisabled()
+        expect(queueButton).toBeDisabled()
+
+        // The same policy is called again by both host handlers, rather than
+        // trusting only the disabled DOM affordance.
+        expect(canPromoteScratchlistEntryAttachments(
+            makeEntry({ id: 'guarded', attachments: [storedAttachment] }),
+            false,
+        )).toBe(false)
+        expect(onExitScratchlistMode).not.toHaveBeenCalled()
+        expect(onSend).not.toHaveBeenCalled()
+        expect(setText).not.toHaveBeenCalled()
+        expect(fetchScratchlistAttachmentBlob).not.toHaveBeenCalled()
+        expect(uploadFile).not.toHaveBeenCalled()
+    })
+
+    it('keeps attachment promotion enabled for an active session', async () => {
+        const onExitScratchlistMode = vi.fn(() => true)
+        const onSend = vi.fn(async () => true)
+        fetchScratchlistAttachmentBlob.mockResolvedValue(new Blob(['data'], {
+            type: storedAttachment.mimeType,
+        }))
+        addAttachment.mockResolvedValue(undefined)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawerHost
+                    sessionId={mockSessionId}
+                    api={mockApi}
+                    entries={[makeEntry({
+                        id: 'e1',
+                        text: 'edit with evidence',
+                        attachments: [storedAttachment],
+                    })]}
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onSend={onSend}
+                    onExitScratchlistMode={onExitScratchlistMode}
+                    attachmentsSupported
+                />
+            </I18nProvider>,
+        )
+
+        const composerButton = screen.getByRole('button', { name: 'Copy into composer' })
+        expect(composerButton).not.toBeDisabled()
+        fireEvent.click(composerButton)
+
+        expect(onExitScratchlistMode).toHaveBeenCalledTimes(1)
+        expect(setText).toHaveBeenCalledWith('edit with evidence')
+        await waitFor(() => expect(addAttachment).toHaveBeenCalledTimes(1))
+        expect(onSend).not.toHaveBeenCalled()
+    })
+
     it('does NOT exit scratchlist mode when promote-to-queue send is rejected', async () => {
-        const onExitScratchlistMode = vi.fn()
+        const onExitScratchlistMode = vi.fn(() => true)
         const onSend = vi.fn(async () => false)
         const onMove = vi.fn()
         const onDelete = vi.fn()
@@ -148,7 +352,7 @@ describe('ScratchlistDrawer copy-to-clipboard action', () => {
             configurable: true,
         })
 
-        const onExitScratchlistMode = vi.fn()
+        const onExitScratchlistMode = vi.fn(() => true)
         const onSend = vi.fn(async () => true)
         const onMove = vi.fn()
         const onDelete = vi.fn()

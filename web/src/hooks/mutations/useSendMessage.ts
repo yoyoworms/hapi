@@ -15,11 +15,18 @@ import { usePlatform } from '@/hooks/usePlatform'
 
 type SendMessageInput = {
     sessionId: string
+    /**
+     * Session whose composer owns the persisted File snapshot. `null` means
+     * this send originated outside the composer (for example scratchlist move)
+     * and therefore must not clear or restore the operator's current draft.
+     */
+    draftSessionId: string | null
     text: string
     localId: string
     createdAt: number
     attachments?: AttachmentMetadata[]
     scheduledAt?: number | null
+    sourceCodexSessionId?: string | null
 }
 
 type BlockedReason = 'no-api' | 'no-session' | 'pending'
@@ -48,28 +55,35 @@ type BlockedReason = 'no-api' | 'no-session' | 'pending'
  *   pendingSchedule the moment the mutation is accepted, so without
  *   this the schedule is gone by the time onError fires.
  *
- * Only fired for text-only sends.  Sends with attachments fall back to
- * the legacy failed-bubble UX (the optimistic row stays as `failed` and
- * the user retries via the in-thread retry button); the composer-restore
- * path can't reinstate uploaded attachment metadata, so doing the swap
- * for attachment sends would silently drop the attachments.
+ * Attachment sends use the same single retry surface. Their File objects
+ * are retained by useComposerDraft and rehydrated from `draftSessionId`.
  */
 export type SendErrorInfo = {
     sessionId: string
+    draftSessionId: string
     text: string
+    attachments?: AttachmentMetadata[]
     error: unknown
     scheduledAt: number | null
+}
+
+export type SendSuccessInfo = {
+    sessionId: string
+    draftSessionId: string | null
+    sourceCodexSessionId: string | null
 }
 
 type UseSendMessageOptions = {
     resolveSessionId?: (sessionId: string) => Promise<string>
     onSessionResolved?: (sessionId: string) => void
     onBlocked?: (reason: BlockedReason) => void
-    onSuccess?: (sessionId: string) => void
+    onSuccess?: (info: SendSuccessInfo) => void
     // Fork uses `thinking`; upstream renamed to `isSessionThinking`. Accept both.
     thinking?: boolean
     onError?: (info: SendErrorInfo) => void
     isSessionThinking?: boolean
+    /** Captured into each mutation so a later route change cannot clear another session's import marker. */
+    sourceCodexSessionId?: string | null
 }
 
 /** Create an optimistic message for display. Extracted as an extension point
@@ -145,6 +159,13 @@ export function useSendMessage(
     // caller clear UI state (e.g. pendingSchedule) before knowing whether
     // resume succeeded — see SessionChat.handleSend.
     sendMessage: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
+    /**
+     * Resolves only after the Hub has accepted the message. Unlike
+     * `sendMessage`, a locally queued item does not resolve early. This is for
+     * move semantics such as scratchlist -> queue, where deleting the source
+     * before the POST succeeds would lose the only durable copy on failure.
+     */
+    sendMessageConfirmed: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
     retryMessage: (localId: string) => void
     isSending: boolean
     queuedCount: number
@@ -162,6 +183,18 @@ export function useSendMessage(
     const thinkingFlag = Boolean(options?.thinking ?? options?.isSessionThinking)
     const thinkingRef = useRef(thinkingFlag)
     const mutationPendingRef = useRef(false)
+    const deliveryWaitersRef = useRef(new Map<string, {
+        sessionId: string
+        phase: 'queued' | 'dispatching'
+        resolve: (delivered: boolean) => void
+    }>())
+
+    const settleDeliveryWaiter = useCallback((localId: string, delivered: boolean) => {
+        const waiter = deliveryWaitersRef.current.get(localId)
+        if (!waiter) return
+        deliveryWaitersRef.current.delete(localId)
+        waiter.resolve(delivered)
+    }, [])
 
     // Subscribe to queue changes — getState returns a stable reference when empty
     const queueState = useSyncExternalStore(
@@ -204,6 +237,35 @@ export function useSendMessage(
         clearTurnReleaseTimer()
     }, [clearTurnReleaseTimer])
 
+    const cancelQueuedDeliveryWaiters = useCallback((
+        shouldCancel: (waiter: { sessionId: string }) => boolean,
+    ) => {
+        for (const [localId, waiter] of deliveryWaitersRef.current) {
+            if (waiter.phase !== 'queued') continue
+            if (!shouldCancel(waiter)) continue
+            queue.cancel(waiter.sessionId, localId)
+            removeOptimisticMessage(waiter.sessionId, localId)
+            deliveryWaitersRef.current.delete(localId)
+            waiter.resolve(false)
+        }
+    }, [])
+
+    useEffect(() => () => {
+        // Undispatched local items are safe to cancel, so their callers can
+        // clean temporary staging files. A dispatching request is different:
+        // resolving it false here could delete an upload after the Hub has
+        // accepted its message. Keep it alive until mutation success/error.
+        cancelQueuedDeliveryWaiters(() => true)
+    }, [cancelQueuedDeliveryWaiters])
+
+    // A still-local confirmation belongs to the route that initiated it. If the
+    // operator navigates away before dispatch, cancel it and keep the durable
+    // scratchlist source. Dispatching confirmations intentionally survive the
+    // route change and settle from the Hub result.
+    useEffect(() => {
+        cancelQueuedDeliveryWaiters((waiter) => waiter.sessionId !== sessionId)
+    }, [cancelQueuedDeliveryWaiters, sessionId])
+
     const mutation = useMutation({
         mutationFn: async (input: SendMessageInput) => {
             if (!api) {
@@ -221,7 +283,21 @@ export function useSendMessage(
                 scheduleTurnLockRelease(input.sessionId, input.localId)
             }
             haptic.notification('success')
-            options?.onSuccess?.(input.sessionId)
+            // Settle the move before invoking optional UI bookkeeping. A
+            // consumer callback must never be able to strand the confirmation.
+            settleDeliveryWaiter(input.localId, true)
+            try {
+                options?.onSuccess?.({
+                    sessionId: input.sessionId,
+                    draftSessionId: input.draftSessionId,
+                    sourceCodexSessionId: input.sourceCodexSessionId ?? null,
+                })
+            } catch (error) {
+                // Delivery is already authoritative. UI/storage bookkeeping
+                // must not make TanStack reinterpret a successful POST as a
+                // mutation failure and restore/delete the wrong source.
+                console.error('Post-send bookkeeping failed:', error)
+            }
             if (api) {
                 const doFetch = () => syncTailMessages(api, input.sessionId, { ensureAfterCurrent: true }).catch(() => {})
                 doFetch()
@@ -234,33 +310,34 @@ export function useSendMessage(
             // fire against a session that just failed to accept this one.
             clearTurnLock(input.sessionId)
             queue.pauseQueue(input.sessionId)
-            // Attachment sends keep the legacy failed-bubble UX: the
-            // composer-restore path can only re-seat text + scheduledAt,
-            // not the uploaded attachment metadata.  Removing the row
-            // would destroy the attachment preview AND leave the operator
-            // with no retry surface for it.  Keep the row as `failed` so
-            // the in-thread retry button can re-fire the send (with
-            // attachments) via retryMessage.
-            if (input.attachments && input.attachments.length > 0) {
-                updateMessageStatus(input.sessionId, input.localId, 'failed')
-                haptic.notification('error')
-                return
-            }
-            // Text-only sends use the composer-restore path: drop the
-            // optimistic row from the thread (otherwise the failed bubble
-            // would visually duplicate the same text the composer is
-            // about to restore, and the operator could stack a stale
-            // failed turn next to a fresh send) and hand the text +
-            // scheduledAt + sessionId back so the route can put both
-            // back into the composer keyed to the right session.
+            // A move waiting behind this failed request would otherwise sit in
+            // a paused local queue forever (there is no durable waiter after a
+            // reload). Reject it while its scratchlist source is still intact.
+            cancelQueuedDeliveryWaiters((waiter) => waiter.sessionId === input.sessionId)
+            // The composer is the sole retry surface for every failed send.
+            // Keeping a failed optimistic row as well would duplicate both
+            // content and retry actions. Attachment File objects are retained
+            // separately by the composer draft controller.
             removeOptimisticMessage(input.sessionId, input.localId)
             haptic.notification('error')
-            options?.onError?.({
-                sessionId: input.sessionId,
-                text: input.text,
-                error,
-                scheduledAt: input.scheduledAt ?? null
-            })
+            settleDeliveryWaiter(input.localId, false)
+            // External move-style sends retain their own durable source. Do not
+            // route their failure through the composer restore channel: doing
+            // so can overwrite an unrelated draft that the operator is typing.
+            if (input.draftSessionId !== null) {
+                try {
+                    options?.onError?.({
+                        sessionId: input.sessionId,
+                        draftSessionId: input.draftSessionId,
+                        text: input.text,
+                        attachments: input.attachments,
+                        error,
+                        scheduledAt: input.scheduledAt ?? null
+                    })
+                } catch (callbackError) {
+                    console.error('Failed to report send error:', callbackError)
+                }
+            }
         },
     })
 
@@ -278,7 +355,9 @@ export function useSendMessage(
         localId: string,
         createdAt: number,
         attachments?: AttachmentMetadata[],
-        scheduledAt?: number | null
+        scheduledAt?: number | null,
+        draftSessionId: string | null = sid,
+        sourceCodexSessionId: string | null = null,
     ): Promise<boolean> => {
         let targetSessionId = sid
         if (options?.resolveSessionId) {
@@ -290,6 +369,9 @@ export function useSendMessage(
                     options.onSessionResolved?.(resolved)
                     queue.moveSession(sid, resolved)
                     targetSessionId = resolved
+                    for (const waiter of deliveryWaitersRef.current.values()) {
+                        if (waiter.sessionId === sid) waiter.sessionId = resolved
+                    }
                 }
             } catch (error) {
                 haptic.notification('error')
@@ -298,22 +380,33 @@ export function useSendMessage(
                 // against a session that just failed to resolve.
                 clearTurnLock(sid)
                 queue.pauseQueue(sid)
+                cancelQueuedDeliveryWaiters((waiter) => waiter.sessionId === sid)
+                removeOptimisticMessage(sid, localId)
                 // #918: surface the failure via onError so the route can render
                 // an inline affordance instead of silently swallowing the
                 // typed text.  This covers the "no resume target" branch
                 // (inactiveSessionCanResume === false) and also any failure
-                // from api.resumeSession itself.  The mutation never started
-                // (no optimistic row to clean up); onError is the only
-                // visibility hook the consumer has for this pre-mutation
-                // path.  Key by the ORIGINAL sessionId because navigation
+                // from api.resumeSession itself. The mutation never started,
+                // but sendMessage already inserted its optimistic row before
+                // awaiting resolution, so remove it before restoring the
+                // composer. Key by the ORIGINAL sessionId because navigation
                 // hasn't happened yet -- the operator is still on the
                 // archived session's route.
-                options?.onError?.({
-                    sessionId: sid,
-                    text,
-                    error,
-                    scheduledAt: scheduledAt ?? null
-                })
+                settleDeliveryWaiter(localId, false)
+                if (draftSessionId !== null) {
+                    try {
+                        options?.onError?.({
+                            sessionId: sid,
+                            draftSessionId,
+                            text,
+                            attachments,
+                            error,
+                            scheduledAt: scheduledAt ?? null
+                        })
+                    } catch (callbackError) {
+                        console.error('Failed to report send error:', callbackError)
+                    }
+                }
                 return false
             } finally {
                 resolveGuardRef.current = false
@@ -327,14 +420,16 @@ export function useSendMessage(
 
         mutation.mutate({
             sessionId: targetSessionId,
+            draftSessionId,
             text,
             localId,
             createdAt,
             attachments,
             scheduledAt: scheduledAt ?? null,
+            sourceCodexSessionId,
         })
         return true
-    }, [clearTurnLock, mutation, options, haptic])
+    }, [cancelQueuedDeliveryWaiters, clearTurnLock, mutation, options, haptic, settleDeliveryWaiter])
 
     // Try to drain the queue — called when Claude finishes or dispatch completes
     const drainQueue = useCallback(() => {
@@ -348,8 +443,23 @@ export function useSendMessage(
         drainingRef.current = true
         const item = queue.dequeue(sessionId)!
         queue.setInFlight(sessionId, item.localId)
+        const waiter = deliveryWaitersRef.current.get(item.localId)
+        if (waiter) {
+            waiter.phase = 'dispatching'
+            waiter.sessionId = sessionId
+        }
 
-        void dispatchMessage(api, sessionId, item.text, item.localId, item.createdAt, item.attachments)
+        void dispatchMessage(
+            api,
+            sessionId,
+            item.text,
+            item.localId,
+            item.createdAt,
+            item.attachments,
+            item.scheduledAt,
+            item.draftSessionId === undefined ? sessionId : item.draftSessionId,
+            item.sourceCodexSessionId ?? null,
+        )
             .finally(() => { drainingRef.current = false })
     }, [api, sessionId, mutation.isPending, thinkingFlag, queueState.inFlightLocalId, dispatchMessage])
 
@@ -385,6 +495,8 @@ export function useSendMessage(
                     content: { type: 'text', text: item.text, attachments: item.attachments }
                 },
                 createdAt: item.createdAt,
+                invokedAt: null,
+                scheduledAt: item.scheduledAt ?? null,
                 status: 'queued',
                 originalText: item.text,
             })
@@ -398,7 +510,12 @@ export function useSendMessage(
         }
     }, [queuedCount, queueState.inFlightLocalId, mutation.isPending, thinkingFlag, drainQueue])
 
-    const sendMessage = useCallback(async (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<boolean> => {
+    const sendMessageInternal = useCallback(async (
+        text: string,
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null,
+        awaitDelivery = false,
+    ): Promise<boolean> => {
         if (!api) {
             options?.onBlocked?.('no-api')
             haptic.notification('error')
@@ -412,14 +529,34 @@ export function useSendMessage(
 
         const localId = makeClientSideId('local')
         const createdAt = Date.now()
-
+        const sourceCodexSessionId = options?.sourceCodexSessionId ?? null
         const busy = mutation.isPending || resolveGuardRef.current
+        let deliveryPromise: Promise<boolean> | null = null
+        if (awaitDelivery) {
+            deliveryPromise = new Promise<boolean>((resolve) => {
+                deliveryWaitersRef.current.set(localId, {
+                    sessionId,
+                    phase: busy ? 'queued' : 'dispatching',
+                    resolve,
+                })
+            })
+        }
+        const draftSessionId = awaitDelivery ? null : sessionId
 
         if (busy) {
             // Enqueue and show optimistic bubble with 'queued' status
-            queue.enqueue(sessionId, { localId, text, attachments, createdAt })
+            queue.enqueue(sessionId, {
+                localId,
+                text,
+                attachments,
+                createdAt,
+                scheduledAt: scheduledAt ?? null,
+                draftSessionId,
+                sourceCodexSessionId,
+            })
             appendOptimisticMessage(sessionId, createOptimisticMessage({
                 sessionId,
+                draftSessionId,
                 text,
                 localId,
                 createdAt,
@@ -431,6 +568,7 @@ export function useSendMessage(
             // Dispatch immediately
             appendOptimisticMessage(sessionId, createOptimisticMessage({
                 sessionId,
+                draftSessionId,
                 text,
                 localId,
                 createdAt,
@@ -441,10 +579,37 @@ export function useSendMessage(
             // Await dispatchMessage so the caller learns whether the async
             // resolveSessionId step succeeded — needed to clear pendingSchedule
             // only on actual send. dispatchMessage returns false when resolve threw.
-            return await dispatchMessage(api, sessionId, text, localId, createdAt, attachments, scheduledAt)
+            const accepted = await dispatchMessage(
+                api,
+                sessionId,
+                text,
+                localId,
+                createdAt,
+                attachments,
+                scheduledAt,
+                draftSessionId,
+                sourceCodexSessionId,
+            )
+            if (!accepted) {
+                settleDeliveryWaiter(localId, false)
+                return false
+            }
         }
+        if (deliveryPromise) return await deliveryPromise
         return true
-    }, [api, sessionId, mutation.isPending, thinkingFlag, options, queueState.inFlightLocalId, haptic, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, options, haptic, dispatchMessage, settleDeliveryWaiter])
+
+    const sendMessage = useCallback((
+        text: string,
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null,
+    ) => sendMessageInternal(text, attachments, scheduledAt), [sendMessageInternal])
+
+    const sendMessageConfirmed = useCallback((
+        text: string,
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null,
+    ) => sendMessageInternal(text, attachments, scheduledAt, true), [sendMessageInternal])
 
     const retryMessage = useCallback((localId: string) => {
         if (!api || !sessionId) return
@@ -464,22 +629,26 @@ export function useSendMessage(
             message.createdAt,
             getMessageAttachments(message),
             message.scheduledAt ?? null,
+            sessionId,
+            options?.sourceCodexSessionId ?? null,
         )
-    }, [api, sessionId, mutation.isPending, queueState.inFlightLocalId, dispatchMessage])
+    }, [api, sessionId, mutation.isPending, queueState.inFlightLocalId, dispatchMessage, options?.sourceCodexSessionId])
 
     const cancelQueued = useCallback((localId: string) => {
         if (!sessionId) return
         queue.cancel(sessionId, localId)
         removeOptimisticMessage(sessionId, localId)
-    }, [sessionId])
+        settleDeliveryWaiter(localId, false)
+    }, [sessionId, settleDeliveryWaiter])
 
     const clearQueueFn = useCallback(() => {
         if (!sessionId) return
         const removed = queue.clearAll(sessionId)
         for (const item of removed) {
             removeOptimisticMessage(sessionId, item.localId)
+            settleDeliveryWaiter(item.localId, false)
         }
-    }, [sessionId])
+    }, [sessionId, settleDeliveryWaiter])
 
     const resumeQueueFn = useCallback(() => {
         if (!sessionId) return
@@ -489,6 +658,7 @@ export function useSendMessage(
 
     return {
         sendMessage,
+        sendMessageConfirmed,
         retryMessage,
         isSending: mutation.isPending || isResolving,
         queuedCount,

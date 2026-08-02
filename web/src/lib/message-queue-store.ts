@@ -5,6 +5,10 @@ export interface QueuedMessage {
     text: string
     attachments?: AttachmentMetadata[]
     createdAt: number
+    scheduledAt?: number | null
+    /** null for a move-style send that must not mutate composer drafts. */
+    draftSessionId?: string | null
+    sourceCodexSessionId?: string | null
     phase: 'queued' | 'paused'
 }
 
@@ -28,8 +32,9 @@ function loadFromStorage(): void {
         if (!raw) return
         const data = JSON.parse(raw) as Record<string, { items: QueuedMessage[] }>
         for (const [sessionId, state] of Object.entries(data)) {
-            if (state.items && state.items.length > 0) {
-                queues.set(sessionId, { items: state.items, inFlightLocalId: null })
+            const items = state.items?.filter((item) => item.draftSessionId !== null) ?? []
+            if (items.length > 0) {
+                queues.set(sessionId, { items, inFlightLocalId: null })
             }
         }
     } catch {
@@ -41,9 +46,15 @@ function saveToStorage(): void {
     try {
         const data: Record<string, { items: QueuedMessage[] }> = {}
         for (const [sessionId, state] of queues) {
-            if (state.items.length > 0) {
+            // Move-style items retain their scratchlist entry as the durable
+            // source and may contain ephemeral staged upload paths. Persisting
+            // them would lose the waiter/source-delete transaction on reload
+            // and later drain a duplicate (or a text-only copy). Keep them only
+            // in memory; ordinary composer queue entries remain restart-safe.
+            const persistentItems = state.items.filter((item) => item.draftSessionId !== null)
+            if (persistentItems.length > 0) {
                 // Strip attachments from persisted messages (paths are ephemeral)
-                const items = state.items.map(m => ({
+                const items = persistentItems.map(m => ({
                     ...m,
                     attachments: undefined
                 }))

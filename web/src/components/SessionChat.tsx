@@ -34,7 +34,10 @@ import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePic
 import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { HappyThread } from '@/components/AssistantChat/HappyThread'
 import { QueuedMessagesBar } from '@/components/AssistantChat/QueuedMessagesBar'
-import { ScratchlistDrawer } from '@/components/AssistantChat/ScratchlistPanel'
+import {
+    canPromoteScratchlistEntryAttachments,
+    ScratchlistDrawer,
+} from '@/components/AssistantChat/ScratchlistPanel'
 import { useHubScratchlist } from '@/lib/use-hub-scratchlist'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { getSessionTitle } from '@/lib/sessionTitle'
@@ -43,7 +46,11 @@ import { classifySessionAttention, getSessionAttentionLabelKey } from '@/lib/ses
 import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
 import { formatRelativeTime } from '@/lib/relativeTime'
 import { ScratchlistMigrationBanner } from '@/components/AssistantChat/ScratchlistMigrationBanner'
-import { useHappyRuntime } from '@/lib/assistant-runtime'
+import {
+    useHappyRuntime,
+    type ComposerDraftActionEvent,
+    type ComposerSendOutcome,
+} from '@/lib/assistant-runtime'
 import type { OlderLoadOutcome } from '@/lib/message-window-store'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
 import { createScratchlistAttachmentAdapter } from '@/lib/scratchlistAttachmentAdapter'
@@ -87,6 +94,7 @@ import { useOpencodeReasoningEffortOptions } from '@/hooks/queries/useOpencodeRe
 import { useVoiceOptional } from '@/lib/voice-context'
 import { VoiceBackendSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
+import { installComposerWheelBridge } from '@/lib/composerWheel'
 
 type SessionModelSelection = { provider: string; modelId: string } | string | null
 
@@ -148,8 +156,9 @@ export function shouldAutoClearPendingSchedule(pending: PendingSchedule | null):
  * (Ctrl/Cmd + Shift + S, no Alt). Pure / exported for unit tests.
  *
  * Convention: matches the v1 always-visible panel's shortcut so muscle
- * memory carries over. Sibling globals follow the same modifier shape
- * (Ctrl/Cmd-m cycles agent model in HappyComposer).
+ * memory carries over. Browsers commonly reserve this chord for Save Page
+ * As, so every recognized, non-dialog invocation must be preventDefault'ed
+ * even when attachments lock the actual mode change.
  */
 export function isScratchlistToggleHotkey(e: {
     metaKey: boolean
@@ -195,6 +204,16 @@ export function isScratchlistHotkeyBlockedTarget(target: EventTarget | null): bo
     // jsdom doesn't implement it; the attribute fallback covers both.
     if (target.isContentEditable === true) return true
     return target.getAttribute('contenteditable') === 'true'
+}
+
+export function getScratchlistToggleHotkeyAction(
+    event: Parameters<typeof isScratchlistToggleHotkey>[0],
+    target: EventTarget | null,
+    composerHasAttachments: boolean,
+): 'ignore' | 'consume' | 'toggle' {
+    if (!isScratchlistToggleHotkey(event)) return 'ignore'
+    if (isScratchlistHotkeyBlockedTarget(target)) return 'ignore'
+    return composerHasAttachments ? 'consume' : 'toggle'
 }
 
 /**
@@ -331,16 +350,38 @@ export function ScratchlistDrawerHost(props: {
     onMove: ReturnType<typeof useHubScratchlist>['move']
     onDelete: ReturnType<typeof useHubScratchlist>['remove']
     onSend: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
-    onExitScratchlistMode: () => void
+    onExitScratchlistMode: () => boolean
+    composerDestinationLocked?: boolean
+    attachmentsSupported?: boolean
 }) {
     const assistantApi = useAui()
+    const composerText = useAuiState((state) => state.composer.text)
+    const { t } = useTranslation()
+    const composerHasDraftText = composerText.length > 0
+    const composerDestinationLocked = Boolean(
+        props.composerDestinationLocked || composerHasDraftText
+    )
     const handlePromoteToComposer = useCallback(async (entry: ScratchlistEntry) => {
-        assistantApi.composer().setText(entry.text)
+        // Inactive sessions cannot accept composer attachments. Keep the entry
+        // intact instead of exiting scratchlist mode and losing its payload.
+        if (!canPromoteScratchlistEntryAttachments(entry, props.attachmentsSupported)) return
+        // The disabled button is only an affordance; re-check the imperative
+        // composer state at click time so a just-typed draft cannot be replaced
+        // between render and handler dispatch.
+        if (
+            props.composerDestinationLocked
+            || assistantApi.composer().getState().text.length > 0
+        ) return
         // Exit scratchlist mode before rehydrating attachments so addAttachment
         // uses the normal chat upload adapter (not the scratchlist hub adapter).
+        let exited = false
         flushSync(() => {
-            props.onExitScratchlistMode()
+            exited = props.onExitScratchlistMode()
         })
+        // Existing composer attachments lock their owning adapter/destination.
+        // Do not silently mix them with a promoted scratchlist entry.
+        if (!exited) return
+        assistantApi.composer().setText(entry.text)
         if (entry.attachments && entry.attachments.length > 0) {
             await rehydrateScratchlistAttachmentsToComposer(
                 props.api,
@@ -349,8 +390,11 @@ export function ScratchlistDrawerHost(props: {
                 assistantApi.composer()
             )
         }
-    }, [assistantApi, props.api, props.onExitScratchlistMode, props.sessionId])
+    }, [assistantApi, props.api, props.attachmentsSupported, props.composerDestinationLocked, props.onExitScratchlistMode, props.sessionId])
     const handlePromoteToQueue = useCallback(async (entry: ScratchlistEntry) => {
+        // Queue promotion stages scratchlist blobs through the active CLI upload
+        // path, so it must obey the same inactive-session attachment guard.
+        if (!canPromoteScratchlistEntryAttachments(entry, props.attachmentsSupported)) return false
         let attachments: AttachmentMetadata[] | undefined
         if (entry.attachments && entry.attachments.length > 0) {
             attachments = await stageScratchlistAttachmentsForComposeSend(
@@ -359,12 +403,26 @@ export function ScratchlistDrawerHost(props: {
                 entry.attachments
             )
         }
-        const accepted = await props.onSend(entry.text, attachments)
-        if (accepted) {
-            props.onExitScratchlistMode()
+        let accepted = false
+        try {
+            accepted = await props.onSend(entry.text, attachments)
+            if (accepted) {
+                props.onExitScratchlistMode()
+            }
+            return accepted
+        } finally {
+            // The original scratchlist blobs remain durable on failure. Remove
+            // only the temporary CLI-side staging copies so repeated retries do
+            // not accumulate orphaned uploads.
+            if (!accepted && attachments) {
+                await Promise.allSettled(
+                    attachments.map((attachment) => (
+                        props.api.deleteUploadFile(props.sessionId, attachment.path)
+                    ))
+                )
+            }
         }
-        return accepted
-    }, [props.api, props.onSend, props.onExitScratchlistMode, props.sessionId])
+    }, [props.api, props.attachmentsSupported, props.onSend, props.onExitScratchlistMode, props.sessionId])
     return (
         <ScratchlistDrawer
             entries={props.entries}
@@ -374,6 +432,16 @@ export function ScratchlistDrawerHost(props: {
             onDelete={props.onDelete}
             onPromoteToComposer={handlePromoteToComposer}
             onPromoteToQueue={handlePromoteToQueue}
+            promoteToComposerDisabled={composerDestinationLocked}
+            promoteToComposerDisabledReason={composerDestinationLocked
+                ? props.composerDestinationLocked
+                    ? t('scratchlist.modeLockedByAttachments')
+                    : t('scratchlist.modeLockedByDraft')
+                : undefined}
+            attachmentsSupported={props.attachmentsSupported}
+            attachmentsUnsupportedReason={props.attachmentsSupported === false
+                ? t('composer.attachUnavailableInactive')
+                : undefined}
         />
     )
 }
@@ -424,6 +492,9 @@ type SessionChatProps = {
     // inactive-session resume failed. Composer state that should only be cleared on
     // actual send (pendingSchedule) must await this — see handleSend below.
     onSend: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
+    // Move-style actions (scratchlist -> queue) must wait for Hub acceptance
+    // before deleting their durable source entry.
+    onSendConfirmed: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
     onViewModeChange: (mode: 'tail' | 'history') => void
     onRetryMessage?: (localId: string) => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
@@ -521,14 +592,23 @@ function SessionChatInner(props: SessionChatProps) {
         }
     }, [allSessions, t])
     const [scratchlistMode, setScratchlistMode] = useState(false)
+    const [composerHasAttachments, setComposerHasAttachments] = useState(false)
+    const [scratchlistSubmitting, setScratchlistSubmitting] = useState(false)
+    const [composerDraftAction, setComposerDraftAction] = useState<ComposerDraftActionEvent | null>(null)
     // Mode resets across sessions implicitly: SessionChat is keyed by
     // session.id at the public-export boundary, so a session switch
     // remounts SessionChatInner from scratch and `scratchlistMode`
     // initializes to false again. (Previous effect-based reset was
     // racy on first paint - see public-export comment for context.)
     const handleScratchlistToggle = useCallback(() => {
+        if (composerHasAttachments) return
         setScratchlistMode((m) => !m)
-    }, [])
+    }, [composerHasAttachments])
+    const handleExitScratchlistMode = useCallback((): boolean => {
+        if (composerHasAttachments) return false
+        setScratchlistMode(false)
+        return true
+    }, [composerHasAttachments])
     /**
      * Global keyboard shortcut: Ctrl/Cmd + Shift + S toggles scratchlist
      * mode (open/close drawer + flip composer routing).
@@ -536,12 +616,11 @@ function SessionChatInner(props: SessionChatProps) {
      * Convention matches the v1 always-visible panel's shortcut so muscle
      * memory carries over. Other composer-adjacent globals in the app use
      * the same modifier shape: Ctrl/Cmd-m cycles agent model in
-     * HappyComposer. Ctrl/Cmd-Shift-S is unreserved by Chrome / Firefox /
-     * Safari at the app level (browser Save As is Ctrl-S / Cmd-S, no
-     * Shift), so requiring Shift keeps the user's save-page muscle memory
-     * working. Bound at SessionChat scope (not the drawer) because the
-     * drawer is unmounted while mode is off — a drawer-scoped listener
-     * couldn't reopen it.
+     * HappyComposer. Some browsers reserve Ctrl/Cmd-Shift-S for Save As,
+     * so every recognized app shortcut is consumed even when attachment
+     * ownership temporarily prevents the mode toggle. Bound at SessionChat
+     * scope (not the drawer) because the drawer is unmounted while mode is
+     * off — a drawer-scoped listener couldn't reopen it.
      *
      * Skipped when focus is inside an open dialog or single-line input
      * (see isScratchlistHotkeyBlockedTarget). Otherwise fires for any
@@ -553,14 +632,15 @@ function SessionChatInner(props: SessionChatProps) {
      */
     useEffect(() => {
         const onKeyDown = (e: globalThis.KeyboardEvent) => {
-            if (!isScratchlistToggleHotkey(e)) return
-            if (isScratchlistHotkeyBlockedTarget(e.target)) return
+            const action = getScratchlistToggleHotkeyAction(e, e.target, composerHasAttachments)
+            if (action === 'ignore') return
             e.preventDefault()
+            if (action === 'consume') return
             setScratchlistMode((m) => !m)
         }
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
-    }, [])
+    }, [composerHasAttachments])
     /**
      * onSend wrapper: when scratchlist mode is on AND the submission is
      * not scheduled, route to scratchlist (text and/or hub attachments).
@@ -1209,6 +1289,16 @@ function SessionChatInner(props: SessionChatProps) {
         setOutlineOpen((open) => !open)
     }, [])
 
+    const composerAreaRef = useRef<HTMLDivElement>(null)
+    useEffect(() => {
+        const boundary = composerAreaRef.current
+        if (!boundary) return
+        return installComposerWheelBridge(boundary, () => {
+            const sessionRoot = boundary.closest<HTMLElement>('[data-session-chat-root]')
+            return sessionRoot?.querySelector<HTMLElement>('.chat-scroll-y') ?? null
+        })
+    }, [])
+
     const handleViewTerminal = useCallback(() => {
         navigate({
             to: '/sessions/$sessionId/terminal',
@@ -1244,7 +1334,11 @@ function SessionChatInner(props: SessionChatProps) {
         return () => clearTimeout(timer)
     }, [pendingSchedule])
 
-    const handleSend = useCallback(async (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => {
+    const handleSend = useCallback(async (
+        text: string,
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null,
+    ): Promise<ComposerSendOutcome> => {
         // Route through the scratchlist-aware wrapper. When scratchlistMode
         // is on AND the payload is pure text, this turns into
         // addScratchlistEntry; otherwise it goes to props.onSend (the chat
@@ -1257,8 +1351,14 @@ function SessionChatInner(props: SessionChatProps) {
         // upstream review on PR #798: [Major] "Clear accepted scheduled
         // chat sends after scratchlist fallback".)
         const routedToScratchlist = shouldRouteToScratchlist(scratchlistMode, attachments, scheduledAt)
-        const accepted = await onSendForComposer(text, attachments, scheduledAt)
-        if (!accepted) return
+        if (routedToScratchlist) setScratchlistSubmitting(true)
+        let accepted: boolean
+        try {
+            accepted = await onSendForComposer(text, attachments, scheduledAt)
+        } finally {
+            if (routedToScratchlist) setScratchlistSubmitting(false)
+        }
+        if (!accepted) return { accepted: false }
         if (!routedToScratchlist) {
             // Clear pendingSchedule only after the mutation is actually
             // accepted - covers both pre-mutation guards AND async
@@ -1269,6 +1369,12 @@ function SessionChatInner(props: SessionChatProps) {
             // schedule and shouldn't move the chat viewport.
             setPendingSchedule(null)
             setForceScrollToken((token) => token + 1)
+        }
+        return {
+            accepted: true,
+            // Chat mutations clear only in router.onSuccess; scratchlist.add
+            // has already durably completed when its promise resolves.
+            clearDraftOnSuccess: routedToScratchlist,
         }
     }, [onSendForComposer, scratchlistMode])
 
@@ -1286,9 +1392,10 @@ function SessionChatInner(props: SessionChatProps) {
         blocks: visibleBlocks,
         messagesVersion: props.messagesVersion,
         historyVersion: props.historyVersion,
-        isSending: props.isSending,
+        isSending: props.isSending || scratchlistSubmitting,
         isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
+        onComposerDraftAction: setComposerDraftAction,
         onAbort: handleAbort,
         attachmentAdapter,
         allowSendWhenInactive: true,
@@ -1296,7 +1403,7 @@ function SessionChatInner(props: SessionChatProps) {
     })
 
     return (
-        <div className="flex h-full min-h-0 min-w-0 w-full overflow-clip flex-col">
+        <div data-session-chat-root className="flex h-full min-h-0 min-w-0 w-full overflow-clip flex-col">
             <SessionHeader
                 session={props.session}
                 serviceTier={effectiveCodexServiceTier}
@@ -1369,7 +1476,10 @@ function SessionChatInner(props: SessionChatProps) {
                         onOutlineOpenChange={setOutlineOpen}
                     />
 
-                    <div className={outlineOpen ? 'max-sm:hidden' : undefined}>
+                    <div
+                        ref={composerAreaRef}
+                        className={outlineOpen ? 'max-sm:hidden' : undefined}
+                    >
                         {codexCollaborationModeSupported && codexModelsState.error ? (
                             <div className="px-3 pb-2">
                                 <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-red-600">
@@ -1406,8 +1516,10 @@ function SessionChatInner(props: SessionChatProps) {
                                     entries={scratchlist.entries}
                                     onMove={scratchlist.move}
                                     onDelete={scratchlist.remove}
-                                    onSend={props.onSend}
-                                    onExitScratchlistMode={() => setScratchlistMode(false)}
+                                    onSend={props.onSendConfirmed}
+                                    onExitScratchlistMode={handleExitScratchlistMode}
+                                    composerDestinationLocked={composerHasAttachments}
+                                    attachmentsSupported={props.session.active}
                                 />
                             ) : null}
                             <QueuedMessagesBar
@@ -1576,9 +1688,13 @@ function SessionChatInner(props: SessionChatProps) {
                         scratchlistMode={scratchlistMode}
                         scratchlistCount={scratchlist.entries.length}
                         onScratchlistToggle={handleScratchlistToggle}
+                        scratchlistToggleDisabled={composerHasAttachments}
+                        attachmentsSupported={props.session.active}
+                        onAttachmentsChange={setComposerHasAttachments}
                         sendError={props.sendError ?? null}
                         onClearSendError={props.onClearSendError}
-                        />
+                        composerDraftAction={composerDraftAction}
+                    />
                     </div>
                 </DragDropZone>
             </AssistantRuntimeProvider>

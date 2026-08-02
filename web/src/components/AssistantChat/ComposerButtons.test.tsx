@@ -81,4 +81,21 @@ describe('UnifiedButton — routesToScratchlist visual state', () => {
         const btn = getButton('Send')
         expect(btn.className).not.toContain('bg-amber-500')
     })
+
+    it('keeps a blocked non-empty draft as disabled send instead of turning into voice', () => {
+        renderInProviders(
+            <UnifiedButton
+                canSend={false}
+                hasContent
+                voiceStatus="disconnected"
+                voiceEnabled
+                controlsDisabled={false}
+                onSend={noop}
+                onVoiceToggle={noop}
+            />,
+        )
+        const btn = getButton('Send')
+        expect(btn).toBeDisabled()
+        expect(screen.queryByRole('button', { name: 'Voice assistant' })).not.toBeInTheDocument()
+    })
 })

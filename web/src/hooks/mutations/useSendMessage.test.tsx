@@ -15,7 +15,7 @@ vi.mock('@/lib/message-window-store', () => ({
 
 vi.mock('@/hooks/usePlatform', () => ({
     usePlatform: () => ({
-        haptic: { notification: vi.fn() },
+        haptic: { notification: vi.fn(), impact: vi.fn() },
     }),
 }))
 
@@ -38,10 +38,12 @@ function createMockApi(sendMessage: (...args: unknown[]) => Promise<void> = asyn
 
 function deferred<T>() {
     let resolve!: (value: T | PromiseLike<T>) => void
-    const promise = new Promise<T>((res) => {
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
         resolve = res
+        reject = rej
     })
-    return { promise, resolve }
+    return { promise, resolve, reject }
 }
 
 describe('useSendMessage', () => {
@@ -63,7 +65,11 @@ describe('useSendMessage', () => {
         })
 
         await waitFor(() => {
-            expect(onSuccess).toHaveBeenCalledWith('session-A')
+            expect(onSuccess).toHaveBeenCalledWith({
+                sessionId: 'session-A',
+                draftSessionId: 'session-A',
+                sourceCodexSessionId: null,
+            })
         })
     })
 
@@ -104,6 +110,38 @@ describe('useSendMessage', () => {
         })
     })
 
+    it('retains scheduledAt when a second send enters the local queue', async () => {
+        const firstRequest = deferred<void>()
+        const api = createMockApi(() => firstRequest.promise)
+        const scheduledAt = Date.now() + 10 * 60_000
+        const queuedSessionId = 'scheduled-local-queue-session'
+        const messageQueue = await import('@/lib/message-queue-store')
+        messageQueue.clearAll(queuedSessionId)
+        messageQueue.setInFlight(queuedSessionId, null)
+
+        const { result } = renderHook(
+            () => useSendMessage(api, queuedSessionId),
+            { wrapper: createWrapper() },
+        )
+        act(() => {
+            void result.current.sendMessage('first')
+        })
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+
+        await act(async () => {
+            await expect(result.current.sendMessage('later', undefined, scheduledAt)).resolves.toBe(true)
+        })
+        expect(messageQueue.getState(queuedSessionId).items).toEqual([
+            expect.objectContaining({ text: 'later', scheduledAt }),
+        ])
+
+        act(() => result.current.clearQueue())
+        await act(async () => {
+            firstRequest.resolve()
+            await firstRequest.promise
+        })
+    })
+
     it('calls onSuccess with resolved session ID, not the original', async () => {
         const onSuccess = vi.fn()
         const api = createMockApi()
@@ -122,7 +160,46 @@ describe('useSendMessage', () => {
         })
 
         await waitFor(() => {
-            expect(onSuccess).toHaveBeenCalledWith('session-resolved')
+            expect(onSuccess).toHaveBeenCalledWith({
+                sessionId: 'session-resolved',
+                draftSessionId: 'session-original',
+                sourceCodexSessionId: null,
+            })
+        })
+    })
+
+    it('keeps the originating draft/import context when the route changes before success', async () => {
+        const request = deferred<void>()
+        const api = createMockApi(() => request.promise)
+        const onSuccess = vi.fn()
+        const { result, rerender } = renderHook(
+            ({ sid, codexId }: { sid: string; codexId: string }) => useSendMessage(api, sid, {
+                sourceCodexSessionId: codexId,
+                onSuccess,
+            }),
+            {
+                initialProps: { sid: 'session-A', codexId: 'codex-A' },
+                wrapper: createWrapper(),
+            },
+        )
+
+        act(() => {
+            void result.current.sendMessage('sent from A')
+        })
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+
+        rerender({ sid: 'session-B', codexId: 'codex-B' })
+        await act(async () => {
+            request.resolve()
+            await request.promise
+        })
+
+        await waitFor(() => {
+            expect(onSuccess).toHaveBeenCalledWith({
+                sessionId: 'session-A',
+                draftSessionId: 'session-A',
+                sourceCodexSessionId: 'codex-A',
+            })
         })
     })
 
@@ -244,7 +321,11 @@ describe('useSendMessage', () => {
             })
 
             await waitFor(() => {
-                expect(onSuccess).toHaveBeenCalledWith('session-A')
+                expect(onSuccess).toHaveBeenCalledWith({
+                    sessionId: 'session-A',
+                    draftSessionId: 'session-A',
+                    sourceCodexSessionId: null,
+                })
             })
             expect(onError).not.toHaveBeenCalled()
         })
@@ -390,11 +471,7 @@ describe('useSendMessage', () => {
             expect(info.text).toBe('hi from resumed')
         })
 
-        it('attachment send: keeps the failed row in the thread and skips composer-restore', async () => {
-            // The composer-restore path can't reinstate uploaded attachment
-            // metadata, so for sends with attachments we fall back to the
-            // legacy failed-bubble UX (operator retries via the in-thread
-            // retry button, which re-fires the send WITH attachments).
+        it('attachment send: removes the failed row and restores through the composer once', async () => {
             const onError = vi.fn()
             const api = createMockApi(async () => {
                 throw new Error('HTTP 503')
@@ -403,6 +480,9 @@ describe('useSendMessage', () => {
             const { removeOptimisticMessage, updateMessageStatus } = await import('@/lib/message-window-store')
             const removeMock = vi.mocked(removeOptimisticMessage)
             const updateMock = vi.mocked(updateMessageStatus)
+            const attachments = [
+                { id: 'att-1', filename: 'x.png', mimeType: 'image/png', size: 1, path: '/x.png' }
+            ]
 
             const { result } = renderHook(
                 () => useSendMessage(api, 'session-A', { onError }),
@@ -410,18 +490,20 @@ describe('useSendMessage', () => {
             )
 
             act(() => {
-                result.current.sendMessage('see this image', [
-                    { id: 'att-1', filename: 'x.png', mimeType: 'image/png', size: 1, path: '/x.png' }
-                ])
+                result.current.sendMessage('see this image', attachments)
             })
 
             await waitFor(() => {
-                expect(updateMock).toHaveBeenCalledWith('session-A', 'local-id-1', 'failed')
+                expect(onError).toHaveBeenCalledTimes(1)
             })
-            // No composer-restore: onError is NOT fired and the optimistic
-            // row is NOT removed -- both would destroy the attachment UX.
-            expect(onError).not.toHaveBeenCalled()
-            expect(removeMock).not.toHaveBeenCalled()
+            expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+                sessionId: 'session-A',
+                draftSessionId: 'session-A',
+                text: 'see this image',
+                attachments,
+            }))
+            expect(removeMock).toHaveBeenCalledWith('session-A', 'local-id-1')
+            expect(updateMock.mock.calls.some((call) => call[2] === 'failed')).toBe(false)
         })
 
         it('retryMessage: passes attachments through so failed-bubble retry of an attachment send keeps its files', async () => {
@@ -508,6 +590,140 @@ describe('useSendMessage', () => {
         await expect(acceptedPromise!).resolves.toBe(true)
     })
 
+    it('keeps a confirmed send pending until the Hub accepts it', async () => {
+        const request = deferred<void>()
+        const api = createMockApi(() => request.promise)
+        const onSuccess = vi.fn()
+        const { result } = renderHook(
+            () => useSendMessage(api, 'session-A', { onSuccess }),
+            { wrapper: createWrapper() },
+        )
+
+        let settled = false
+        let confirmedPromise!: Promise<boolean>
+        act(() => {
+            confirmedPromise = result.current.sendMessageConfirmed('move durable entry')
+            void confirmedPromise.then(() => { settled = true })
+        })
+
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+        expect(settled).toBe(false)
+
+        await act(async () => {
+            request.resolve()
+            await request.promise
+        })
+        await expect(confirmedPromise).resolves.toBe(true)
+        expect(onSuccess).toHaveBeenCalledWith({
+            sessionId: 'session-A',
+            draftSessionId: null,
+            sourceCodexSessionId: null,
+        })
+    })
+
+    it('resolves a confirmed send false when the Hub rejects it', async () => {
+        const onError = vi.fn()
+        const api = createMockApi(async () => {
+            throw new Error('HTTP 503')
+        })
+        const { result } = renderHook(
+            () => useSendMessage(api, 'session-A', { onError }),
+            { wrapper: createWrapper() },
+        )
+
+        let confirmedPromise!: Promise<boolean>
+        act(() => {
+            confirmedPromise = result.current.sendMessageConfirmed('keep source entry')
+        })
+        await expect(confirmedPromise).resolves.toBe(false)
+        // This failure belongs to the retained scratchlist source, not to the
+        // unrelated composer draft/inline-error channel.
+        expect(onError).not.toHaveBeenCalled()
+    })
+
+    it('keeps a dispatching confirmation alive across unmount', async () => {
+        const request = deferred<void>()
+        const api = createMockApi(() => request.promise)
+        const { result, unmount } = renderHook(
+            () => useSendMessage(api, 'session-A'),
+            { wrapper: createWrapper() },
+        )
+        let confirmedPromise!: Promise<boolean>
+        let settled = false
+        act(() => {
+            confirmedPromise = result.current.sendMessageConfirmed('move in flight')
+            void confirmedPromise.then(() => { settled = true })
+        })
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+
+        unmount()
+        await Promise.resolve()
+        expect(settled).toBe(false)
+
+        request.resolve()
+        await expect(confirmedPromise).resolves.toBe(true)
+    })
+
+    it('cancels an undispatched confirmed item on unmount', async () => {
+        const request = deferred<void>()
+        const api = createMockApi(() => request.promise)
+        const messages = await import('@/lib/messages')
+        vi.mocked(messages.makeClientSideId)
+            .mockReturnValueOnce('local-in-flight')
+            .mockReturnValueOnce('local-confirmed')
+        const queueStore = await import('@/lib/message-queue-store')
+        queueStore.clearAll('session-A')
+        queueStore.setInFlight('session-A', null)
+        const { result, unmount } = renderHook(
+            () => useSendMessage(api, 'session-A'),
+            { wrapper: createWrapper() },
+        )
+        act(() => { void result.current.sendMessage('first') })
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+        let confirmedPromise!: Promise<boolean>
+        act(() => {
+            confirmedPromise = result.current.sendMessageConfirmed('still local')
+        })
+        expect(queueStore.getState('session-A').items).toEqual([
+            expect.objectContaining({ localId: 'local-confirmed' }),
+        ])
+        expect(window.localStorage.getItem('hapi-message-queue') ?? '').not.toContain('local-confirmed')
+
+        unmount()
+        await expect(confirmedPromise).resolves.toBe(false)
+        expect(queueStore.getState('session-A').items).toEqual([])
+
+        request.resolve()
+        await request.promise
+    })
+
+    it('rejects a confirmed item left behind a failed send instead of pausing forever', async () => {
+        const request = deferred<void>()
+        const api = createMockApi(() => request.promise)
+        const messages = await import('@/lib/messages')
+        vi.mocked(messages.makeClientSideId)
+            .mockReturnValueOnce('local-failing')
+            .mockReturnValueOnce('local-confirmed')
+        const queueStore = await import('@/lib/message-queue-store')
+        queueStore.clearAll('session-A')
+        queueStore.setInFlight('session-A', null)
+        const { result } = renderHook(
+            () => useSendMessage(api, 'session-A'),
+            { wrapper: createWrapper() },
+        )
+        act(() => { void result.current.sendMessage('first') })
+        await waitFor(() => expect(result.current.isSending).toBe(true))
+        let confirmedPromise!: Promise<boolean>
+        act(() => {
+            confirmedPromise = result.current.sendMessageConfirmed('durable source stays')
+        })
+
+        request.reject(new Error('HTTP 503'))
+
+        await expect(confirmedPromise).resolves.toBe(false)
+        expect(queueStore.getState('session-A').items).toEqual([])
+    })
+
     it('resolves false when blocked (no api) so the caller can preserve schedule state', async () => {
         const onBlocked = vi.fn()
         const { result } = renderHook(
@@ -538,6 +754,7 @@ describe('useSendMessage', () => {
     it('resolves false when resolveSessionId throws (inactive-session resume failure)', async () => {
         const api = createMockApi()
         const resumeError = new Error('resume failed')
+        const { removeOptimisticMessage } = await import('@/lib/message-window-store')
         const { result } = renderHook(
             () => useSendMessage(api, 'session-A', {
                 resolveSessionId: async () => { throw resumeError },
@@ -550,6 +767,7 @@ describe('useSendMessage', () => {
             acceptedPromise = result.current.sendMessage('hello')
         })
         await expect(acceptedPromise!).resolves.toBe(false)
+        expect(vi.mocked(removeOptimisticMessage)).toHaveBeenCalledWith('session-A', 'local-id-1')
     })
 
     it('resolves true after async resolveSessionId succeeds and mutation starts', async () => {

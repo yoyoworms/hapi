@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { findActiveWord } from '@/utils/findActiveWord'
 import {
     COMPOSER_MENTION_MIRROR_CHAR,
@@ -190,24 +190,40 @@ describe('isRichComposerMentionsEnabled', () => {
     afterEach(() => {
         window.localStorage.removeItem('hapi.composer.richMentions')
         window.history.replaceState({}, '', `${window.location.pathname}${originalSearch}`)
+        vi.unstubAllEnvs()
     })
 
-    it('defaults to ON', () => {
+    it('defaults to OFF', () => {
         window.localStorage.removeItem('hapi.composer.richMentions')
         window.history.replaceState({}, '', window.location.pathname)
-        expect(isRichComposerMentionsEnabled()).toBe(true)
-    })
-
-    it('kills via localStorage=0', () => {
-        window.localStorage.setItem('hapi.composer.richMentions', '0')
         expect(isRichComposerMentionsEnabled()).toBe(false)
     })
 
-    it('kills via ?richMentions=0 (not =1 force-on)', () => {
+    it.each(['1', 'true', 'TRUE'])('opts in via localStorage=%s', (value) => {
+        window.localStorage.setItem('hapi.composer.richMentions', value)
+        expect(isRichComposerMentionsEnabled()).toBe(true)
+    })
+
+    it.each(['1', 'true'])('opts in via ?richMentions=%s', (value) => {
+        window.history.replaceState({}, '', `${window.location.pathname}?richMentions=${value}`)
+        expect(isRichComposerMentionsEnabled()).toBe(true)
+    })
+
+    it('opts in via the build flag', () => {
+        vi.stubEnv('VITE_RICH_COMPOSER_MENTIONS', 'true')
+        expect(isRichComposerMentionsEnabled()).toBe(true)
+    })
+
+    it('keeps an explicit zero as a kill switch', () => {
+        window.localStorage.setItem('hapi.composer.richMentions', '1')
         window.history.replaceState({}, '', `${window.location.pathname}?richMentions=0`)
         expect(isRichComposerMentionsEnabled()).toBe(false)
-        window.history.replaceState({}, '', `${window.location.pathname}?richMentions=1`)
-        expect(isRichComposerMentionsEnabled()).toBe(true)
+    })
+
+    it('does not enable for unrecognized values', () => {
+        window.localStorage.setItem('hapi.composer.richMentions', 'yes')
+        window.history.replaceState({}, '', `${window.location.pathname}?richMentions=on`)
+        expect(isRichComposerMentionsEnabled()).toBe(false)
     })
 })
 

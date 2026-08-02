@@ -36,17 +36,21 @@ export function AttachmentItem() {
     const isError = status.type === 'incomplete'
 
     return (
-        <AttachmentPrimitive.Root className="flex items-center gap-2 rounded-lg bg-[var(--app-subtle-bg)] px-3 py-2 text-base text-[var(--app-fg)]">
+        <AttachmentPrimitive.Root className="flex min-w-0 max-w-full items-center gap-2 rounded-lg bg-[var(--app-subtle-bg)] px-3 py-2 text-base text-[var(--app-fg)]">
             {isUploading ? <Spinner size="sm" label={null} className="text-[var(--app-hint)]" /> : null}
             {isError ? (
-                <span className="text-red-500">
+                <span className="shrink-0 text-red-500" aria-label="Upload failed" title="Upload failed">
                     <ErrorIcon />
                 </span>
             ) : null}
-            <span className={`max-w-[150px] truncate ${isError ? 'text-red-500 line-through' : ''}`}>{name}</span>
-            {isError ? <span className="text-xs text-red-500 whitespace-nowrap">Upload failed</span> : null}
+            <span className={`min-w-0 max-w-[150px] flex-1 truncate ${isError ? 'text-red-500 line-through' : ''}`}>{name}</span>
+            {isError ? (
+                <span aria-hidden="true" className="hidden shrink-0 whitespace-nowrap text-xs text-red-500 sm:inline">
+                    Upload failed
+                </span>
+            ) : null}
             <AttachmentPrimitive.Remove
-                className="ml-auto flex h-5 w-5 items-center justify-center rounded text-[var(--app-hint)] transition-colors hover:text-[var(--app-fg)]"
+                className="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--app-hint)] transition-colors hover:text-[var(--app-fg)]"
                 aria-label="Remove attachment"
                 title="Remove attachment"
             >

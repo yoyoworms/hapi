@@ -77,6 +77,20 @@ describe('composer-attachment-drafts', () => {
             id: 'attachment-ready',
             path: '/uploads/ready.png',
             previewUrl: 'data:image/png;base64,aW1hZ2U=',
+            sourceSessionId: 'session-1',
         })
+    })
+
+    it('keeps oversized multi-file drafts out of persistent IndexedDB storage', async () => {
+        const mod = await import('./composer-attachment-drafts')
+
+        expect(mod.canPersistAttachmentDraft([
+            { size: 32 * 1024 * 1024 },
+            { size: 32 * 1024 * 1024 },
+        ])).toBe(true)
+        expect(mod.canPersistAttachmentDraft([
+            { size: 40 * 1024 * 1024 },
+            { size: 30 * 1024 * 1024 },
+        ])).toBe(false)
     })
 })

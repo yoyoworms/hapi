@@ -8,6 +8,7 @@ import {
     type SyntheticEvent as ReactSyntheticEvent,
     useCallback,
     useEffect,
+    useLayoutEffect,
     useMemo,
     useRef,
     useState
@@ -18,7 +19,14 @@ import {
     RichComposerInput,
     type RichComposerInputHandle,
 } from '@/components/AssistantChat/RichComposerInput'
-import type { AgentState, CodexCollaborationMode, PermissionMode, PiModelSummary, ThreadGoal } from '@/types/api'
+import type {
+    AgentState,
+    AttachmentMetadata,
+    CodexCollaborationMode,
+    PermissionMode,
+    PiModelSummary,
+    ThreadGoal,
+} from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import type { ConversationStatus } from '@/realtime/types'
 import { useActiveWord } from '@/hooks/useActiveWord'
@@ -45,6 +53,7 @@ import { getDisplayedCodexServiceTier } from './codexFastMode'
 import { getPiThinkingLevelOptions, getHighestThinkingLevel, isThinkingLevelSupported } from './piThinkingLevelOptions'
 import type { PlanProgress } from '@/chat/planProgress'
 import type { LatestUsage } from '@/chat/reducer'
+import type { ComposerDraftActionEvent } from '@/lib/assistant-runtime'
 import { getClipboardImageFiles } from '@/lib/clipboardAttachments'
 import { groupModelsByProvider } from './piModelGroups'
 import { PiModelPanel } from './PiModelPanel'
@@ -66,6 +75,8 @@ export interface TextInputState {
  *   or null for an immediate send.  When non-null, the composer also
  *   restores the schedule via `onSchedule` so the operator can edit and
  *   retry without silently downgrading a scheduled send to immediate.
+ * - `attachments` signals that persisted File objects must be rehydrated;
+ *   `attachmentDraftSessionId` identifies the pre-resume draft owner.
  * - `action` is an optional recovery affordance rendered as a button next
  *   to the message.  Used by the inactive-session branch (#918) to expose
  *   a one-click Reopen.  Other failure modes (5xx, network, generic 4xx)
@@ -82,6 +93,9 @@ export type ComposerSendError = {
     text: string
     message: string
     scheduledAt: number | null
+    attachments?: AttachmentMetadata[]
+    /** Draft files can live under the pre-resume route session. */
+    attachmentDraftSessionId?: string
     action?: {
         label: string
         onClick: () => void
@@ -90,6 +104,140 @@ export type ComposerSendError = {
 }
 
 const defaultSuggestionHandler = async (): Promise<Suggestion[]> => []
+
+const INPUT_HISTORY_STORAGE_KEY = 'hapi:composer-input-history:v2'
+const MAX_INPUT_HISTORY_ENTRIES = 100
+const MAX_INPUT_HISTORY_SESSIONS = 20
+const MAX_INPUT_HISTORY_ENTRY_CHARS = 20_000
+// localStorage is commonly capped around a few MiB and is shared with more
+// important HAPI preferences/caches. Keep this convenience feature well below
+// that ceiling (JSON length is a conservative-enough proxy for stored bytes).
+const MAX_INPUT_HISTORY_SERIALIZED_CHARS = 500_000
+
+type InputHistoryStore = Record<string, string[]>
+
+/**
+ * Keep newest sessions and newest entries first in the retention decision,
+ * while preserving their original oldest -> newest iteration order in the
+ * returned object/arrays. Object insertion order acts as the small LRU: every
+ * successful add deletes + reinserts its session key below.
+ */
+function pruneInputHistoryStore(store: InputHistoryStore): InputHistoryStore {
+    const sessions = Object.entries(store).slice(-MAX_INPUT_HISTORY_SESSIONS)
+    const keptNewestFirst: Array<[string, string[]]> = []
+    // Account for the outer `{}` up front. Per-property and per-entry costs use
+    // JSON.stringify so quotes/escapes cannot bypass the budget.
+    let remaining = MAX_INPUT_HISTORY_SERIALIZED_CHARS - 2
+
+    for (let sessionIndex = sessions.length - 1; sessionIndex >= 0; sessionIndex -= 1) {
+        const [sessionId, rawHistory] = sessions[sessionIndex]!
+        const propertyCost = JSON.stringify(sessionId).length
+            + 3 // colon + array brackets
+            + (keptNewestFirst.length > 0 ? 1 : 0) // property comma
+        if (propertyCost >= remaining) break
+
+        const history = rawHistory
+            .filter((item): item is string => (
+                typeof item === 'string'
+                && item.trim().length > 0
+                && item.length <= MAX_INPUT_HISTORY_ENTRY_CHARS
+            ))
+            .slice(-MAX_INPUT_HISTORY_ENTRIES)
+        if (history.length === 0) continue
+        const keptEntriesNewestFirst: string[] = []
+        let sessionRemaining = remaining - propertyCost
+
+        for (let entryIndex = history.length - 1; entryIndex >= 0; entryIndex -= 1) {
+            const entry = history[entryIndex]!
+            const entryCost = JSON.stringify(entry).length
+                + (keptEntriesNewestFirst.length > 0 ? 1 : 0)
+            if (entryCost > sessionRemaining) break
+            keptEntriesNewestFirst.push(entry)
+            sessionRemaining -= entryCost
+        }
+
+        // If the newest valid entry of this session does not fit, no older
+        // session should displace it merely because its strings are shorter.
+        if (keptEntriesNewestFirst.length === 0) break
+        keptNewestFirst.push([sessionId, keptEntriesNewestFirst.reverse()])
+        remaining = sessionRemaining
+    }
+
+    return Object.fromEntries(keptNewestFirst.reverse())
+}
+
+function readInputHistoryStore(): InputHistoryStore {
+    if (typeof window === 'undefined') return {}
+    try {
+        const raw = window.localStorage.getItem(INPUT_HISTORY_STORAGE_KEY)
+        const parsed: unknown = raw ? JSON.parse(raw) : {}
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+        const result: InputHistoryStore = {}
+        for (const [sessionId, value] of Object.entries(parsed)) {
+            if (!Array.isArray(value)) continue
+            const history = value
+                .filter((item): item is string => (
+                    typeof item === 'string'
+                    && item.trim().length > 0
+                    && item.length <= MAX_INPUT_HISTORY_ENTRY_CHARS
+                ))
+                .slice(-MAX_INPUT_HISTORY_ENTRIES)
+            if (history.length > 0) result[sessionId] = history
+        }
+        return pruneInputHistoryStore(result)
+    } catch {
+        return {}
+    }
+}
+
+function writeInputHistoryStore(store: InputHistoryStore): void {
+    if (typeof window === 'undefined') return
+    try {
+        window.localStorage.setItem(
+            INPUT_HISTORY_STORAGE_KEY,
+            JSON.stringify(pruneInputHistoryStore(store))
+        )
+    } catch {
+        // History is a convenience. If the origin is already near quota, free
+        // this feature's allocation rather than pinning a stale large value and
+        // starving settings/scratchlist writes.
+        try {
+            window.localStorage.removeItem(INPUT_HISTORY_STORAGE_KEY)
+        } catch {
+            // Storage can be entirely unavailable (private/locked-down mode).
+        }
+    }
+}
+
+export function getComposerInputHistory(sessionId: string | undefined): string[] {
+    if (!sessionId) return []
+    return readInputHistoryStore()[sessionId] ?? []
+}
+
+export function addComposerInputHistory(sessionId: string | undefined, text: string): void {
+    if (!sessionId) return
+    const entry = text.trim()
+    if (!entry || entry.length > MAX_INPUT_HISTORY_ENTRY_CHARS) return
+
+    const store = readInputHistoryStore()
+    const history = store[sessionId] ?? []
+    if (history[history.length - 1] === entry) return
+
+    history.push(entry)
+    // Refresh the session's insertion order so pruning behaves like an LRU.
+    delete store[sessionId]
+    store[sessionId] = history.slice(-MAX_INPUT_HISTORY_ENTRIES)
+    writeInputHistoryStore(store)
+}
+
+function isCaretOnFirstLine(el: HTMLTextAreaElement): boolean {
+    return el.value.lastIndexOf('\n', Math.max(0, el.selectionStart - 1)) === -1
+}
+
+function isCaretOnLastLine(el: HTMLTextAreaElement): boolean {
+    return el.value.indexOf('\n', el.selectionEnd) === -1
+}
 
 export function ModelEffortSettingsSection(props: {
     agentFlavor?: string | null
@@ -212,11 +360,18 @@ export function HappyComposer(props: {
     scratchlistMode?: boolean
     scratchlistCount?: number
     onScratchlistToggle?: () => void
+    /** Destination cannot change while attachments owned by its adapter exist. */
+    scratchlistToggleDisabled?: boolean
+    /** Inactive sessions can accept text after resume, but cannot upload files. */
+    attachmentsSupported?: boolean
+    onAttachmentsChange?: (hasAttachments: boolean) => void
     // Set when the most recent send failed (4xx/5xx/network).  The composer
     // restores the original text once per `sendError.id` and renders an
     // inline error affordance until the user dismisses or starts editing.
     sendError?: ComposerSendError | null
     onClearSendError?: () => void
+    /** Async result of a non-chat destination after assistant-ui cleared. */
+    composerDraftAction?: ComposerDraftActionEvent | null
     /** Chip hover / aria-label resolver (SessionChat → useSessions). */
     resolveSessionMentionTooltip?: (id: string, title: string) => SessionMentionResolveResult
 }) {
@@ -272,7 +427,10 @@ export function HappyComposer(props: {
         onClearSchedule: onClearScheduleProp,
         sendError = null,
         onClearSendError,
+        composerDraftAction = null,
         resolveSessionMentionTooltip,
+        attachmentsSupported = true,
+        onAttachmentsChange,
     } = props
 
     // Use ?? so missing values fall back to default (destructuring defaults only handle undefined)
@@ -305,8 +463,6 @@ export function HappyComposer(props: {
         const path = (attachment as { path?: string }).path
         return typeof path === 'string' && path.length > 0
     })
-    const canSend = (hasText || hasAttachments) && attachmentsReady && !controlsDisabled
-
     const [inputState, setInputState] = useState<TextInputState>({
         text: '',
         selection: { start: 0, end: 0 }
@@ -315,23 +471,59 @@ export function HappyComposer(props: {
     const [showPiModelPanel, setShowPiModelPanel] = useState(false)
     const [showPiThinkingPanel, setShowPiThinkingPanel] = useState(false)
     const [isAborting, setIsAborting] = useState(false)
+    const [abortError, setAbortError] = useState<string | null>(null)
     const [isSwitching, setIsSwitching] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
+    const [attachmentError, setAttachmentError] = useState<string | null>(null)
     // pendingSchedule is controlled externally when onSchedule prop is provided; otherwise local state
     const [pendingScheduleLocal, setPendingScheduleLocal] = useState<PendingSchedule | null>(null)
     const isControlled = onScheduleProp !== undefined
     const pendingSchedule = isControlled ? (pendingScheduleProp ?? null) : pendingScheduleLocal
     const setPendingSchedule = isControlled ? onScheduleProp : setPendingScheduleLocal
+    const hasInvalidScheduledAttachments = pendingSchedule != null && hasAttachments
+    const canSend = (hasText || hasAttachments)
+        && attachmentsReady
+        && !hasInvalidScheduledAttachments
+        && (!hasAttachments || attachmentsSupported)
+        && !controlsDisabled
+    const visibleAttachmentError = hasAttachments && !attachmentsSupported
+        ? t('composer.attachUnavailableInactive')
+        : attachmentError
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const richInputRef = useRef<RichComposerInputHandle>(null)
-    // Kill-switch only (?richMentions=0 / localStorage=0 / VITE=false). Mount-time
-    // read — hard reload required, so no per-keystroke localStorage/URL parse.
+    // Opt-in only while rich input reaches textarea parity. Mount-time read —
+    // hard reload required, so no per-keystroke localStorage/URL parse.
     const [richMentionsEnabled] = useState(() => isRichComposerMentionsEnabled())
+    const composerTextRef = useRef(composerText)
+    composerTextRef.current = composerText
+    const historyIndexRef = useRef<number | null>(null)
+    const historyDraftRef = useRef('')
+    const onAttachmentsChangeRef = useRef(onAttachmentsChange)
+    onAttachmentsChangeRef.current = onAttachmentsChange
     const prevControlledByUser = useRef(controlledByUser)
 
-    const attachmentDrafts = attachments.flatMap((attachment) => {
-        if (!attachment.file) return []
+    useEffect(() => {
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
+    }, [sessionId])
+
+    // Destination ownership must lock before the browser can paint a newly
+    // added attachment; a normal effect leaves one interactive frame where
+    // the scratchlist toggle can swap adapters mid-upload.
+    useLayoutEffect(() => {
+        onAttachmentsChange?.(hasAttachments)
+    }, [hasAttachments, onAttachmentsChange])
+
+    useEffect(() => () => {
+        onAttachmentsChangeRef.current?.(false)
+    }, [])
+
+    const attachmentDrafts = useMemo(() => attachments.flatMap((attachment) => {
+        // Failed/oversized uploads are actionable error chips, not resumable
+        // drafts. Persisting their File would write potentially huge rejected
+        // blobs to IndexedDB and restore the same permanent failure on reload.
+        if (!attachment.file || attachment.status.type === 'incomplete') return []
         const upload = attachment as typeof attachment & { path?: string; previewUrl?: string }
         return [{
             id: attachment.id,
@@ -339,8 +531,8 @@ export function HappyComposer(props: {
             path: upload.path,
             previewUrl: upload.previewUrl,
         }]
-    })
-    useComposerDraft(
+    }), [attachments])
+    const composerDraft = useComposerDraft(
         sessionId,
         composerText,
         attachmentDrafts,
@@ -349,13 +541,30 @@ export function HappyComposer(props: {
         (file) => api.composer().addAttachment(file),
     )
 
-    // assistant-ui clears `composer.text` synchronously the moment a send is
-    // invoked AND `SessionChat.handleSend` clears `pendingSchedule` the
-    // moment the mutation is accepted, so by the time the mutation's
-    // onError fires both the typed text and the schedule are gone.  When
-    // the route hands us a `sendError`, splice both back in -- once per
-    // `sendError.id` so a second failure with the same text still triggers
-    // a fresh restore.
+    const restoreSubmission = useCallback((submission: {
+        text: string
+        attachments?: AttachmentMetadata[]
+        scheduledAt: number | null
+        attachmentDraftSessionId?: string
+    }) => {
+        const composer = api.composer()
+        // Query the runtime synchronously instead of using render-time text;
+        // route and local rejection events can arrive in the same batch.
+        if (composer.getState().text.length === 0 && submission.text.length > 0) {
+            composer.setText(submission.text)
+        }
+        if (submission.attachments && submission.attachments.length > 0) {
+            void composerDraft.restoreAttachments(
+                submission.attachmentDraftSessionId ?? sessionId
+            )
+        }
+        if (submission.scheduledAt !== null && onScheduleProp) {
+            onScheduleProp({ type: 'absolute', ms: submission.scheduledAt })
+        }
+    }, [api, composerDraft, onScheduleProp, sessionId])
+
+    // Mutation failures arrive from the route after assistant-ui has already
+    // cleared. Restore every field once per failure id.
     const restoredErrorIdRef = useRef<number | null>(null)
     useEffect(() => {
         if (!sendError) {
@@ -365,23 +574,25 @@ export function HappyComposer(props: {
             return
         }
         restoredErrorIdRef.current = sendError.id
-        // Only restore when the composer is empty.  If the user has already
-        // typed something new (rare -- composer is `disabled` during send,
-        // but possible if isSending toggles before this effect runs), we
-        // would otherwise stomp on their fresh input.
-        if (composerText.length === 0 && sendError.text.length > 0) {
-            api.composer().setText(sendError.text)
+        restoreSubmission(sendError)
+    }, [sendError, restoreSubmission])
+
+    // Scratchlist add() and other pre-mutation rejections settle inside the
+    // runtime rather than the route. Clear only after a durable scratchlist
+    // success; otherwise restore the snapshot. Duplicate route/local restore
+    // events are safe because runtime text is checked and attachment restores
+    // are serialized by useComposerDraft.
+    const handledDraftActionIdRef = useRef<number | null>(null)
+    useEffect(() => {
+        if (!composerDraftAction) return
+        if (handledDraftActionIdRef.current === composerDraftAction.id) return
+        handledDraftActionIdRef.current = composerDraftAction.id
+        if (composerDraftAction.action === 'clear') {
+            composerDraft.completeSubmission()
+        } else {
+            restoreSubmission(composerDraftAction)
         }
-        // Restore the pending schedule too.  `scheduledAt` was already
-        // resolved to an absolute epoch-ms before the failed send (presets
-        // are computed at send time -- see `resolvePendingSchedule`), so
-        // we feed it back as an 'absolute' PendingSchedule.  The existing
-        // shouldAutoClearPendingSchedule effect in SessionChat handles the
-        // case where the absolute time has passed by the time we restore.
-        if (sendError.scheduledAt !== null && onScheduleProp) {
-            onScheduleProp({ type: 'absolute', ms: sendError.scheduledAt })
-        }
-    }, [sendError, api, composerText, onScheduleProp])
+    }, [composerDraft, composerDraftAction, restoreSubmission])
 
     useEffect(() => {
         if (richMentionsEnabled) {
@@ -494,9 +705,9 @@ export function HappyComposer(props: {
     const terminalLabel = terminalUnsupported ? t('terminal.unsupportedWindows') : t('composer.terminal')
 
     useEffect(() => {
-        if (!isAborting) return
         if (threadIsRunning) return
-        setIsAborting(false)
+        if (isAborting) setIsAborting(false)
+        setAbortError(null)
     }, [isAborting, threadIsRunning])
 
     useEffect(() => {
@@ -509,8 +720,16 @@ export function HappyComposer(props: {
         if (abortDisabled) return
         haptic('error')
         setIsAborting(true)
-        api.thread().cancelRun()
-    }, [abortDisabled, api, haptic])
+        setAbortError(null)
+        void Promise.resolve()
+            .then(() => api.thread().cancelRun())
+            .catch((error: unknown) => {
+                console.error('Failed to stop the active task:', error)
+                setIsAborting(false)
+                setAbortError(t('composer.abortFailed'))
+                haptic('error')
+            })
+    }, [abortDisabled, api, haptic, t])
 
     const handleSwitch = useCallback(async () => {
         if (switchDisabled || !onSwitchToRemote) return
@@ -595,11 +814,24 @@ export function HappyComposer(props: {
 
     /** Flush rich chips → `[title](/sessions/<id>)` into composer.text, then send. */
     const flushAndSend = useCallback(() => {
+        // Defense in depth for races between the schedule picker and attachment
+        // updates. The hub intentionally rejects this combination.
+        if (!canSend || hasInvalidScheduledAttachments) return
+
+        let textToRecord = composerTextRef.current
         if (richMentionsEnabled && richInputRef.current) {
-            richInputRef.current.flushSerializedText()
+            textToRecord = richInputRef.current.flushSerializedText()
         }
+        addComposerInputHistory(sessionId, textToRecord)
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
+        setAttachmentError(null)
+        // assistant-ui clears the runtime before its async onNew callback.
+        // Persist a synchronous snapshot and mark that empty transition as
+        // transient so a rejection can put every field back.
+        composerDraft.prepareForSubmit(textToRecord)
         api.composer().send()
-    }, [api, richMentionsEnabled])
+    }, [api, canSend, composerDraft, hasInvalidScheduledAttachments, richMentionsEnabled, sessionId])
 
     const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
         const key = e.key
@@ -622,8 +854,9 @@ export function HappyComposer(props: {
             return
         }
 
-        // Only plain Enter (no modifiers) sends; other modifier combos are ignored
-        if (key === 'Enter') {
+        // Touch keyboards use Enter for a newline and the dedicated button for
+        // sending. Desktop keeps the configured Enter/Ctrl+Enter behavior.
+        if (key === 'Enter' && !isTouch) {
             if (composerEnterBehavior === 'newline') {
                 if ((e.ctrlKey || e.metaKey) && !e.altKey && canSend) {
                     e.preventDefault()
@@ -664,6 +897,57 @@ export function HappyComposer(props: {
             }
         }
 
+        // Shell-style per-session history for the textarea. Rich input has a
+        // different selection model and stays out of this path until parity.
+        const inputHistory = getComposerInputHistory(sessionId)
+        if (!richMentionsEnabled && (key === 'ArrowUp' || key === 'ArrowDown') && inputHistory.length > 0) {
+            const el = textareaRef.current
+            if (!el) return
+
+            const canNavigateUp = key === 'ArrowUp'
+                && el.selectionStart === el.selectionEnd
+                && isCaretOnFirstLine(el)
+            const canNavigateDown = key === 'ArrowDown'
+                && el.selectionStart === el.selectionEnd
+                && historyIndexRef.current !== null
+                && isCaretOnLastLine(el)
+
+            if (canNavigateUp || canNavigateDown) {
+                e.preventDefault()
+
+                if (key === 'ArrowUp') {
+                    if (historyIndexRef.current === null) {
+                        historyDraftRef.current = composerTextRef.current
+                        historyIndexRef.current = inputHistory.length - 1
+                    } else {
+                        historyIndexRef.current = Math.max(0, historyIndexRef.current - 1)
+                    }
+                } else if (historyIndexRef.current !== null) {
+                    if (historyIndexRef.current >= inputHistory.length - 1) {
+                        historyIndexRef.current = null
+                    } else {
+                        historyIndexRef.current += 1
+                    }
+                }
+
+                const nextText = historyIndexRef.current === null
+                    ? historyDraftRef.current
+                    : inputHistory[historyIndexRef.current] ?? ''
+                const cursorPosition = nextText.length
+                api.composer().setText(nextText)
+                setInputState({
+                    text: nextText,
+                    selection: { start: cursorPosition, end: cursorPosition }
+                })
+                setTimeout(() => {
+                    const input = textareaRef.current
+                    if (!input) return
+                    input.setSelectionRange(cursorPosition, cursorPosition)
+                }, 0)
+                return
+            }
+        }
+
         if (key === 'Escape' && threadIsRunning) {
             e.preventDefault()
             handleAbort()
@@ -694,8 +978,10 @@ export function HappyComposer(props: {
         api,
         haptic,
         composerEnterBehavior,
+        isTouch,
         richMentionsEnabled,
         flushAndSend,
+        sessionId,
     ])
 
     useEffect(() => {
@@ -721,6 +1007,9 @@ export function HappyComposer(props: {
             start: e.target.selectionStart,
             end: e.target.selectionEnd
         }
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
+        setAttachmentError(null)
         setInputState({ text: e.target.value, selection })
         // Editing the restored text is the operator's "I'm handling it"
         // signal -- drop the inline error so the affordance doesn't shout
@@ -743,26 +1032,51 @@ export function HappyComposer(props: {
 
         if (imageFiles.length === 0) return
 
+        // A clipboard payload can contain both an image and text (common when
+        // copying from browsers/design tools). Keep the native/plain-text path
+        // alive for that text while we consume the image as an attachment. For
+        // image-only payloads, prevent the browser from inserting a broken
+        // contenteditable image or doing nothing silently in the textarea.
+        const pastedText = typeof e.clipboardData.getData === 'function'
+            ? e.clipboardData.getData('text/plain')
+            : ''
+        if (pastedText.length === 0) e.preventDefault()
+
+        if (!attachmentsSupported) {
+            setAttachmentError(t('composer.attachUnavailableInactive'))
+            return
+        }
+
+        if (controlsDisabled) {
+            setAttachmentError(t('composer.attachmentAddFailed'))
+            return
+        }
+
         // The backend rejects scheduledAt + attachments (per-CLI upload dir is
         // torn down before a mature emit could read the files). The button-based
         // attachment flow is disabled by ComposerButtons.hasAttachments, but the
         // paste path bypasses that — guard here so a pasted image while a
         // schedule is active cannot produce a submission the hub will reject.
         if (pendingSchedule != null) {
-            e.preventDefault()
+            setAttachmentError(t('composer.attachBlockedBySchedule'))
             return
         }
 
-        e.preventDefault()
-
-        try {
-            for (const file of imageFiles) {
+        setAttachmentError(null)
+        let failed = false
+        // Each adapter may hold a base64 string in addition to the File/Blob.
+        // Starting several large mobile photos together can spike memory by
+        // hundreds of MB, so process sequentially while still isolating errors.
+        for (const file of imageFiles) {
+            try {
                 await api.composer().addAttachment(file)
+            } catch (error) {
+                failed = true
+                console.error('Error adding pasted image:', error)
             }
-        } catch (error) {
-            console.error('Error adding pasted image:', error)
         }
-    }, [api, pendingSchedule])
+        if (failed) setAttachmentError(t('composer.attachmentAddFailed'))
+    }, [api, attachmentsSupported, controlsDisabled, pendingSchedule, t])
 
     const handleSettingsToggle = useCallback(() => {
         haptic('light')
@@ -1376,9 +1690,29 @@ export function HappyComposer(props: {
                         </div>
                     ) : null}
 
+                    {visibleAttachmentError ? (
+                        <div
+                            role="alert"
+                            data-testid="composer-attachment-error"
+                            className="mb-2 rounded-md bg-[var(--app-subtle-bg)] px-3 py-2 text-sm text-red-600"
+                        >
+                            {visibleAttachmentError}
+                        </div>
+                    ) : null}
+
+                    {abortError ? (
+                        <div
+                            role="alert"
+                            data-testid="composer-abort-error"
+                            className="mb-2 rounded-md bg-[var(--app-subtle-bg)] px-3 py-2 text-sm text-red-600"
+                        >
+                            {abortError}
+                        </div>
+                    ) : null}
+
                     <div
                         className={`overflow-clip rounded-[20px] bg-[var(--app-secondary-bg)] ${
-                            sendError ? 'ring-1 ring-red-500' : ''
+                            sendError || visibleAttachmentError || abortError ? 'ring-1 ring-red-500' : ''
                         }`}
                     >
                         {attachments.length > 0 ? (
@@ -1401,6 +1735,7 @@ export function HappyComposer(props: {
                                     onPaste={handlePaste}
                                     resolveSessionMentionTooltip={resolveSessionMentionTooltip}
                                     onEdit={() => {
+                                        setAttachmentError(null)
                                         if (sendError && onClearSendError) onClearSendError()
                                     }}
                                     className="max-h-[7.5rem] min-h-[1.5rem] flex-1 overflow-y-auto whitespace-pre-wrap break-words bg-transparent text-base leading-snug text-[var(--app-fg)] focus:outline-none"
@@ -1425,6 +1760,7 @@ export function HappyComposer(props: {
 
                         <ComposerButtons
                             canSend={canSend}
+                            hasContent={hasText || hasAttachments}
                             controlsDisabled={controlsDisabled}
                             showSettingsButton={showSettingsButton}
                             onSettingsToggle={handleSettingsToggle}
@@ -1450,6 +1786,7 @@ export function HappyComposer(props: {
                             onSchedule={setPendingSchedule}
                             onClearSchedule={isControlled ? onClearScheduleProp : () => setPendingScheduleLocal(null)}
                             hasAttachments={hasAttachments}
+                            attachmentsSupported={attachmentsSupported}
                             piModelLabel={piModelLabel}
                             piModelDisabled={controlsDisabled || !piHasModels}
                             piModelOpen={showPiModelPanel}
@@ -1461,6 +1798,7 @@ export function HappyComposer(props: {
                             scratchlistMode={props.scratchlistMode}
                             scratchlistCount={props.scratchlistCount}
                             onScratchlistToggle={props.onScratchlistToggle}
+                            scratchlistToggleDisabled={props.scratchlistToggleDisabled || hasAttachments}
                         />
                     </div>
                 </ComposerPrimitive.Root>

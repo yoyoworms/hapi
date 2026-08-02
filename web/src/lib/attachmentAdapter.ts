@@ -1,4 +1,5 @@
 import type { AttachmentAdapter, PendingAttachment, CompleteAttachment, Attachment } from '@assistant-ui/react'
+import { isHubScratchlistAttachmentPath } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
 import type { AttachmentMetadata } from '@/types/api'
 import { isImageMimeType } from '@/lib/fileAttachments'
@@ -21,11 +22,6 @@ type PendingUploadAttachment = PendingAttachment & {
     previewUrl?: string
 }
 
-// Shared map of uploaded attachment paths, keyed by attachment ID.
-// Used by directSend (thinking mode) to retrieve paths that may not
-// survive assistant-ui's internal state serialization.
-export const uploadedAttachmentPaths = new Map<string, { path: string; previewUrl?: string }>()
-
 export function createAttachmentAdapter(api: ApiClient, sessionId: string): AttachmentAdapter {
     const cancelledAttachmentIds = new Set<string>()
 
@@ -45,7 +41,15 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
 
         async *add({ file }): AsyncGenerator<PendingAttachment> {
             const restored = getRestoredUploadMetadata(file)
-            if (restored) {
+            // Scratchlist drafts point at hub-owned blobs, not files in the
+            // active CLI upload directory. Re-upload their persisted local File
+            // through the normal adapter before a chat send. Ordinary CLI paths
+            // are already usable and can be restored without another upload.
+            if (
+                restored
+                && restored.sourceSessionId === sessionId
+                && !isHubScratchlistAttachmentPath(restored.path)
+            ) {
                 yield {
                     id: restored.id,
                     type: 'file',
@@ -62,6 +66,21 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
             const id = randomId()
             const contentType = file.type || 'application/octet-stream'
 
+            // Reject before publishing a running attachment. HappyComposer
+            // persists resumable running uploads, so yielding first would let an
+            // arbitrarily large rejected File reach IndexedDB before this guard.
+            if (file.size > MAX_UPLOAD_BYTES) {
+                yield {
+                    id,
+                    type: 'file',
+                    name: `${file.name} (file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+                    contentType,
+                    file,
+                    status: { type: 'incomplete', reason: 'error' }
+                }
+                return
+            }
+
             yield {
                 id,
                 type: 'file',
@@ -73,18 +92,6 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
 
             try {
                 if (cancelledAttachmentIds.has(id)) {
-                    return
-                }
-
-                if (file.size > MAX_UPLOAD_BYTES) {
-                    yield {
-                        id,
-                        type: 'file',
-                        name: `${file.name} (file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB)`,
-                        contentType,
-                        file,
-                        status: { type: 'incomplete', reason: 'error' }
-                    }
                     return
                 }
 
@@ -130,14 +137,31 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     try {
                         previewUrl = await fileToThumbnailDataUrl(file)
                     } catch {
-                        previewUrl = file.size <= MAX_INLINE_PREVIEW_BYTES
-                            ? await fileToDataUrl(file)
-                            : undefined
+                        if (file.size <= MAX_INLINE_PREVIEW_BYTES) {
+                            try {
+                                previewUrl = await fileToDataUrl(file)
+                            } catch {
+                                // Preview generation is optional. The server
+                                // upload is already usable without one.
+                                previewUrl = undefined
+                            }
+                        }
                     }
                 }
 
-                // Save path for directSend access
-                uploadedAttachmentPaths.set(id, { path: result.path!, previewUrl })
+                // remove() can run while the optional preview is awaiting
+                // decode/FileReader. Do not resurrect the attachment after
+                // that await; delete the newly uploaded server copy instead.
+                if (cancelledAttachmentIds.has(id)) {
+                    await deleteUpload(result.path)
+                    return
+                }
+
+                // A scratchlist promotion to the composer is explicitly a copy:
+                // its original entry remains visible and still references the
+                // Hub-owned blob. Re-upload for the normal CLI path, but never
+                // delete that source blob here; only deleting the scratchlist
+                // entry itself may release it.
 
                 yield {
                     id,

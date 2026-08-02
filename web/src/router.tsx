@@ -36,6 +36,7 @@ import { buildSessionReferenceText, matchSessionsForMention } from '@/lib/sessio
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import { useSendMessage, type SendErrorInfo } from '@/hooks/mutations/useSendMessage'
 import type { ComposerSendError } from '@/components/AssistantChat/HappyComposer'
+import type { AttachmentMetadata } from '@/types/api'
 import { ApiError } from '@/api/client'
 import { queryKeys } from '@/lib/query-keys'
 import { useToast } from '@/lib/toast-context'
@@ -382,6 +383,8 @@ function SessionPage() {
         message: string
         code: string | null
         scheduledAt: number | null
+        attachments?: AttachmentMetadata[]
+        attachmentDraftSessionId: string
     }
     const [sendErrors, setSendErrors] = useState<Record<string, RawSendError>>({})
     const [reopeningSessionId, setReopeningSessionId] = useState<string | null>(null)
@@ -456,6 +459,8 @@ function SessionPage() {
             text: rawSendError.text,
             message: rawSendError.message,
             scheduledAt: rawSendError.scheduledAt,
+            attachments: rawSendError.attachments,
+            attachmentDraftSessionId: rawSendError.attachmentDraftSessionId,
             action: rawSendError.code === 'session_inactive' && canOfferInactiveReopen
                 ? {
                     label: t('chat.sendError.sessionInactive.action'),
@@ -468,22 +473,27 @@ function SessionPage() {
 
     const {
         sendMessage,
+        sendMessageConfirmed,
         retryMessage,
         isSending,
     } = useSendMessage(api, sessionId, {
         isSessionThinking: session?.thinking ?? false,
-        onSuccess: (sentSessionId) => {
-            clearDraftsAfterSend(sentSessionId, sessionId)
+        sourceCodexSessionId: session?.metadata?.codexSessionId ?? null,
+        onSuccess: (info) => {
+            if (info.draftSessionId !== null) {
+                clearDraftsAfterSend(info.sessionId, info.draftSessionId)
+                // A successful composer retry supersedes the error that was
+                // rendered for that composer. Move-style sends (scratchlist →
+                // queue) are unrelated and must not dismiss its recovery UI.
+                setSendErrors((prev) => {
+                    if (!(info.sessionId in prev)) return prev
+                    const next = { ...prev }
+                    delete next[info.sessionId]
+                    return next
+                })
+            }
             // 中文注释：一旦用户已经在 Hapi 内继续这个 Codex 会话，就清除"刚从 Codex 导入"的标记。
-            clearCodexImportedSession(session?.metadata?.codexSessionId)
-            // A successful send supersedes any previously-rendered error
-            // for that session.  Other sessions' errors stay put.
-            setSendErrors((prev) => {
-                if (!(sentSessionId in prev)) return prev
-                const next = { ...prev }
-                delete next[sentSessionId]
-                return next
-            })
+            clearCodexImportedSession(info.sourceCodexSessionId)
         },
         onError: (info: SendErrorInfo) => {
             sendErrorIdRef.current += 1
@@ -495,7 +505,9 @@ function SessionPage() {
                     text: info.text,
                     message,
                     code,
-                    scheduledAt: info.scheduledAt
+                    scheduledAt: info.scheduledAt,
+                    attachments: info.attachments,
+                    attachmentDraftSessionId: info.draftSessionId,
                 }
             }))
         },
@@ -728,6 +740,7 @@ function SessionPage() {
             onLoadMore={loadMoreMessages}
             onCancelLoadMore={cancelLoadMoreMessages}
             onSend={sendMessage}
+            onSendConfirmed={sendMessageConfirmed}
             onViewModeChange={setViewMode}
             onRetryMessage={retryMessage}
             autocompleteSuggestions={getAutocompleteSuggestions}

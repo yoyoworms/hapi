@@ -27,6 +27,14 @@ import { formatAbsoluteDateTime, formatRelativeTime } from '@/lib/relativeTime'
 
 const STORAGE_KEY_PREFIX = 'hapi.scratchlist-collapsed.v1.'
 
+/** Shared policy for both disabled affordances and imperative promotion handlers. */
+export function canPromoteScratchlistEntryAttachments(
+    entry: Pick<ScratchlistEntry, 'attachments'>,
+    attachmentsSupported: boolean | undefined,
+): boolean {
+    return attachmentsSupported !== false || !entry.attachments?.length
+}
+
 function readCollapsedPref(sessionId: string): boolean {
     if (typeof window === 'undefined') return true
     try {
@@ -313,6 +321,10 @@ function ScratchlistInventory({
     onMove,
     sessionId,
     api,
+    promoteToComposerDisabled,
+    promoteToComposerDisabledReason,
+    attachmentsSupported,
+    attachmentsUnsupportedReason,
 }: {
     entries: ScratchlistEntry[]
     busyEntryId: string | null
@@ -322,6 +334,10 @@ function ScratchlistInventory({
     onMove: (entry: ScratchlistEntry, direction: 'up' | 'down') => void
     sessionId?: string
     api?: ApiClient
+    promoteToComposerDisabled?: boolean
+    promoteToComposerDisabledReason?: string
+    attachmentsSupported?: boolean
+    attachmentsUnsupportedReason?: string
 }) {
     const { t } = useTranslation()
     const { copiedEntryId, signalCopied } = useCopiedFeedback()
@@ -351,6 +367,18 @@ function ScratchlistInventory({
                 const isFirst = index === 0
                 const isLast = index === entries.length - 1
                 const isBusy = busyEntryId === entry.id
+                const attachmentPromotionDisabled = !canPromoteScratchlistEntryAttachments(
+                    entry,
+                    attachmentsSupported,
+                )
+                const composerDisabledReason = attachmentPromotionDisabled
+                    ? attachmentsUnsupportedReason
+                    : promoteToComposerDisabled
+                        ? promoteToComposerDisabledReason
+                        : undefined
+                const queueDisabledReason = attachmentPromotionDisabled
+                    ? attachmentsUnsupportedReason
+                    : undefined
                 return (
                     <li
                         key={entry.id}
@@ -400,20 +428,24 @@ function ScratchlistInventory({
                             </button>
                             <button
                                 type="button"
-                                aria-label={t('scratchlist.action.promoteToComposer')}
-                                title={t('scratchlist.action.promoteToComposer')}
+                                aria-label={composerDisabledReason
+                                    ? `${t('scratchlist.action.promoteToComposer')}: ${composerDisabledReason}`
+                                    : t('scratchlist.action.promoteToComposer')}
+                                title={composerDisabledReason ?? t('scratchlist.action.promoteToComposer')}
                                 onClick={() => onPromoteToComposer(entry)}
-                                disabled={isBusy}
+                                disabled={isBusy || promoteToComposerDisabled || attachmentPromotionDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <PencilIcon />
                             </button>
                             <button
                                 type="button"
-                                aria-label={t('scratchlist.action.promoteToQueue')}
-                                title={t('scratchlist.action.promoteToQueue')}
+                                aria-label={queueDisabledReason
+                                    ? `${t('scratchlist.action.promoteToQueue')}: ${queueDisabledReason}`
+                                    : t('scratchlist.action.promoteToQueue')}
+                                title={queueDisabledReason ?? t('scratchlist.action.promoteToQueue')}
                                 onClick={() => onPromoteToQueue(entry)}
-                                disabled={isBusy}
+                                disabled={isBusy || attachmentPromotionDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <SendIcon />
@@ -471,6 +503,10 @@ export function ScratchlistDrawer({
     onPromoteToQueue,
     sessionId,
     api,
+    promoteToComposerDisabled,
+    promoteToComposerDisabledReason,
+    attachmentsSupported,
+    attachmentsUnsupportedReason,
 }: {
     entries: ScratchlistEntry[]
     onMove: (id: string, direction: 'up' | 'down') => void
@@ -479,6 +515,10 @@ export function ScratchlistDrawer({
     onPromoteToQueue: (entry: ScratchlistEntry) => Promise<boolean>
     sessionId: string
     api: ApiClient
+    promoteToComposerDisabled?: boolean
+    promoteToComposerDisabledReason?: string
+    attachmentsSupported?: boolean
+    attachmentsUnsupportedReason?: string
 }) {
     const { t } = useTranslation()
     const [busyEntryId, setBusyEntryId] = useState<string | null>(null)
@@ -504,19 +544,29 @@ export function ScratchlistDrawer({
     }, [onMove])
 
     const handlePromoteToComposer = useCallback((entry: ScratchlistEntry) => {
-        void onPromoteToComposer(entry)
-    }, [onPromoteToComposer])
+        if (!canPromoteScratchlistEntryAttachments(entry, attachmentsSupported)) return
+        void Promise.resolve(onPromoteToComposer(entry)).catch((error: unknown) => {
+            // The source entry is copy-style and remains durable. Avoid an
+            // unhandled click-handler rejection when attachment hydration fails.
+            console.error('Failed to copy scratchlist entry to composer:', error)
+        })
+    }, [attachmentsSupported, onPromoteToComposer])
 
     const handlePromoteToQueue = useCallback(async (entry: ScratchlistEntry) => {
         if (busyEntryId) return
+        if (!canPromoteScratchlistEntryAttachments(entry, attachmentsSupported)) return
         setBusyEntryId(entry.id)
         try {
             const accepted = await onPromoteToQueue(entry)
             if (accepted) onDelete(entry.id)
+        } catch (error) {
+            // Keep the source entry. The host already cleans any partially
+            // staged CLI uploads before rethrowing.
+            console.error('Failed to send scratchlist entry to queue:', error)
         } finally {
             setBusyEntryId(null)
         }
-    }, [busyEntryId, onDelete, onPromoteToQueue])
+    }, [attachmentsSupported, busyEntryId, onDelete, onPromoteToQueue])
 
     return (
         <div className="mx-auto w-full max-w-content mb-1">
@@ -553,6 +603,10 @@ export function ScratchlistDrawer({
                         onPromoteToQueue={handlePromoteToQueue}
                         onDelete={handleDelete}
                         onMove={handleMove}
+                        promoteToComposerDisabled={promoteToComposerDisabled}
+                        promoteToComposerDisabledReason={promoteToComposerDisabledReason}
+                        attachmentsSupported={attachmentsSupported}
+                        attachmentsUnsupportedReason={attachmentsUnsupportedReason}
                     />
                 </div>
             </div>

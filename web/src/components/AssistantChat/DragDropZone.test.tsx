@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, fireEvent } from '@testing-library/react'
+import { render, fireEvent, waitFor } from '@testing-library/react'
 
 const addAttachment = vi.fn()
 
@@ -75,5 +75,31 @@ describe('DragDropZone drop handling', () => {
 
         expect(event.defaultPrevented).toBe(true)
         expect(addAttachment).not.toHaveBeenCalled()
+    })
+
+    it('processes every dropped file sequentially even when one attachment rejects', async () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        addAttachment
+            .mockRejectedValueOnce(new Error('first failed'))
+            .mockResolvedValueOnce(undefined)
+        const { container } = render(
+            <DragDropZone>
+                <div />
+            </DragDropZone>
+        )
+        const zone = container.firstChild as HTMLElement
+        const first = new File(['a'], 'a.txt', { type: 'text/plain' })
+        const second = new File(['b'], 'b.txt', { type: 'text/plain' })
+
+        fireEvent(zone, createDropEvent(['Files'], [first, second]))
+
+        await waitFor(() => expect(addAttachment).toHaveBeenCalledTimes(2))
+        expect(addAttachment).toHaveBeenNthCalledWith(1, first)
+        expect(addAttachment).toHaveBeenNthCalledWith(2, second)
+        await waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+            'Error adding dragged file:',
+            expect.any(Error),
+        ))
+        errorSpy.mockRestore()
     })
 })

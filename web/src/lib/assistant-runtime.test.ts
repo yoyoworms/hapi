@@ -1,11 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
     type BlockWithThreadMessageId,
     aggregateResponseGroups,
     assignThreadMessageIds,
     assignThreadMessageIdsWithStableWrappers,
     getBlockPresentationTimestamp,
-    getResponseGroupTimestamps
+    getResponseGroupTimestamps,
+    resolveComposerDraftSettlement,
 } from './assistant-runtime'
 import type { AgentEventBlock, AgentTextBlock, CliOutputBlock, ToolCallBlock, UserTextBlock } from '@/chat/types'
 import type { ToolGroupBlock, VisibleChatBlock } from '@/chat/toolGroups'
@@ -107,6 +108,36 @@ function toolGroup(id: string, tools: ToolCallBlock[], overrides: Partial<ToolGr
         ...overrides
     }
 }
+
+describe('composer draft settlement', () => {
+    it('waits for an async rejection result and requests restoration', async () => {
+        let resolve!: (value: { accepted: boolean }) => void
+        const pending = new Promise<{ accepted: boolean }>((done) => {
+            resolve = done
+        })
+        const send = vi.fn(() => pending)
+        const settlement = resolveComposerDraftSettlement(send)
+
+        expect(send).toHaveBeenCalledTimes(1)
+        resolve({ accepted: false })
+        await expect(settlement).resolves.toEqual({ action: 'restore' })
+    })
+
+    it('clears only destinations that are already durable and restores throws', async () => {
+        await expect(resolveComposerDraftSettlement(async () => ({
+            accepted: true,
+            clearDraftOnSuccess: true,
+        }))).resolves.toEqual({ action: 'clear' })
+        await expect(resolveComposerDraftSettlement(async () => ({
+            accepted: true,
+        }))).resolves.toEqual({ action: null })
+
+        const error = new Error('scratchlist offline')
+        await expect(resolveComposerDraftSettlement(async () => {
+            throw error
+        })).resolves.toEqual({ action: 'restore', error })
+    })
+})
 
 describe('assignThreadMessageIds', () => {
     it('suffixes duplicate kind+id pairs so assistant-ui never sees repeated thread ids', () => {

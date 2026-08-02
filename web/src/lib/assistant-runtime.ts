@@ -52,6 +52,44 @@ export type HappyRuntimeExtras = Readonly<{
     historyVersion: number
 }>
 
+/**
+ * assistant-ui empties its composer before awaiting the external `onNew`
+ * callback. The send path therefore has to report what should happen to the
+ * persisted draft after its asynchronous destination has answered.
+ */
+export type ComposerSendOutcome = Readonly<{
+    accepted: boolean
+    /** Scratchlist writes are final here; chat writes wait for mutation onSuccess. */
+    clearDraftOnSuccess?: boolean
+}>
+
+export type ComposerDraftActionEvent = Readonly<{
+    id: number
+    action: 'clear' | 'restore'
+    text: string
+    attachments?: AttachmentMetadata[]
+    scheduledAt: number | null
+}>
+
+export type ComposerDraftSettlement = Readonly<{
+    action: ComposerDraftActionEvent['action'] | null
+    error?: unknown
+}>
+
+/** Await the app destination even though assistant-ui does not await it. */
+export async function resolveComposerDraftSettlement(
+    send: () => Promise<ComposerSendOutcome>,
+): Promise<ComposerDraftSettlement> {
+    try {
+        const outcome = await send()
+        if (!outcome.accepted) return { action: 'restore' }
+        if (outcome.clearDraftOnSuccess) return { action: 'clear' }
+        return { action: null }
+    } catch (error) {
+        return { action: 'restore', error }
+    }
+}
+
 function formatCodexReviewText(review: CodexReview): string {
     const lines = ['Codex review']
     if (review.overallCorrectness) {
@@ -611,13 +649,19 @@ export function useHappyRuntime(props: {
     historyVersion: number
     isSending: boolean
     isRunning?: boolean
-    onSendMessage: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => void
+    onSendMessage: (
+        text: string,
+        attachments?: AttachmentMetadata[],
+        scheduledAt?: number | null,
+    ) => Promise<ComposerSendOutcome>
+    onComposerDraftAction?: (event: ComposerDraftActionEvent) => void
     onAbort: () => Promise<void>
     attachmentAdapter?: AttachmentAdapter
     allowSendWhenInactive?: boolean
     pendingScheduleRef?: React.RefObject<PendingSchedule | null>
 }) {
     const isRunning = props.isRunning ?? props.session.thinking
+    const draftActionIdRef = useRef(0)
 
     // Compute response-group aggregates once per block list so we can
     // inject the summed metadata onto each group's first visible block.
@@ -688,8 +732,29 @@ export function useHappyRuntime(props: {
         // moment the user clicked the preset button.
         const sendNow = Date.now()
         const scheduledAt = resolvePendingSchedule(props.pendingScheduleRef?.current ?? null, sendNow)
-        props.onSendMessage(text, attachments.length > 0 ? attachments : undefined, scheduledAt)
-    }, [props.onSendMessage, props.pendingScheduleRef])
+        const submittedAttachments = attachments.length > 0 ? attachments : undefined
+        const emitDraftAction = (action: ComposerDraftActionEvent['action']) => {
+            draftActionIdRef.current += 1
+            props.onComposerDraftAction?.({
+                id: draftActionIdRef.current,
+                action,
+                text,
+                attachments: submittedAttachments,
+                scheduledAt,
+            })
+        }
+
+        // BaseComposerRuntimeCore intentionally does not await handleSend;
+        // this continuation still runs and explicitly restores the draft
+        // when an async destination rejects the submission.
+        const settlement = await resolveComposerDraftSettlement(
+            () => props.onSendMessage(text, submittedAttachments, scheduledAt)
+        )
+        if (settlement.error !== undefined) {
+            console.error('Composer destination rejected the submission:', settlement.error)
+        }
+        if (settlement.action) emitDraftAction(settlement.action)
+    }, [props.onSendMessage, props.onComposerDraftAction, props.pendingScheduleRef])
 
     const onCancel = useCallback(async () => {
         await props.onAbort()
