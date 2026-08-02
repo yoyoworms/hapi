@@ -1337,7 +1337,7 @@ describe('session model', () => {
         }
     })
 
-    it('marks a resumed session active in hub cache before returning success without persisting runtime active state', async () => {
+    it('returns a resumed session after its heartbeat made the cache active without persisting runtime state', async () => {
         const store = new Store(':memory:')
         const events: unknown[] = []
         const engine = new SyncEngine(
@@ -1370,7 +1370,16 @@ describe('session model', () => {
             engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
 
             ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'success', sessionId: session.id })
-            ;(engine as any).waitForSessionActive = async () => true
+            ;(engine as any).waitForSessionActive = async () => {
+                engine.handleSessionAlive({
+                    sid: session.id,
+                    time: Date.now(),
+                    thinking: false,
+                    runtimeId: 'runtime-resumed',
+                    runtimeGeneration: 1
+                })
+                return true
+            }
 
             const result = await engine.resumeSession(session.id, 'default')
 
@@ -1383,6 +1392,13 @@ describe('session model', () => {
                 return record.type === 'session-updated'
                     && record.sessionId === session.id
                     && record.data?.active === true
+            })).toBe(true)
+            expect(engine.handleSessionEnd({
+                sid: session.id,
+                time: Date.now(),
+                reason: 'completed',
+                runtimeId: 'runtime-resumed',
+                runtimeGeneration: 1
             })).toBe(true)
         } finally {
             engine.stop()
@@ -4050,6 +4066,34 @@ describe('session model', () => {
             expect(meta?.archivedBy).toBe('cli')
             expect(meta?.archiveReason).toBe('User terminated')
             expect(meta?.lifecycleStateSince).toBe(initialSince)
+        })
+
+        it('does not archive a newer running lifecycle generation', () => {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+            const newerGenerationAt = Date.now()
+            const session = cache.getOrCreateSession(
+                'session-newer-running-generation',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    flavor: 'codex',
+                    lifecycleState: 'running',
+                    lifecycleStateSince: newerGenerationAt
+                },
+                null,
+                'default'
+            )
+
+            cache.markSessionArchivedFromHub(session.id, 'stale end', {
+                onlyRunningSinceAtOrBefore: newerGenerationAt - 1
+            })
+
+            expect(cache.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+                lifecycleState: 'running',
+                lifecycleStateSince: newerGenerationAt
+            }))
         })
 
         it('self-heals on version-mismatch via refresh-and-retry', () => {

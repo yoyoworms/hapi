@@ -1,4 +1,5 @@
 import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
+import type { SessionEndReason } from '@hapi/protocol'
 import type { Store, StoredMachine, StoredSession } from '../../../store'
 import type { RpcRegistry } from '../../rpcRegistry'
 import type { SyncEvent } from '../../../sync/syncEngine'
@@ -20,11 +21,16 @@ type SessionAlivePayload = {
     modelReasoningEffort?: string | null
     effort?: string | null
     collaborationMode?: CodexCollaborationMode
+    runtimeId?: string
+    runtimeGeneration?: number
 }
 
 type SessionEndPayload = {
     sid: string
     time: number
+    reason?: SessionEndReason
+    runtimeId?: string
+    runtimeGeneration?: number
 }
 
 type SessionReadyPayload = {
@@ -44,10 +50,17 @@ export type CliHandlersDeps = {
     terminalRegistry: TerminalRegistry
     onSessionAlive?: (payload: SessionAlivePayload) => void
     onSessionReady?: (payload: SessionReadyPayload) => void
-    onSessionEnd?: (payload: SessionEndPayload) => void
+    onSessionEnd?: (payload: SessionEndPayload) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
-    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
+    onSessionMetadataUpdated?: (payload: {
+        sid: string
+        namespace: string
+        metadata: unknown
+        runtimeId?: string
+        runtimeGeneration?: number
+    }) => void
+    onSessionMetadataUpdateAllowed?: (payload: { sid: string; metadata: unknown; runtimeId: string; runtimeGeneration: number }) => boolean
     onMachineAlive?: (payload: MachineAlivePayload) => void
     onWebappEvent?: (event: SyncEvent) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
@@ -57,7 +70,7 @@ export type CliHandlersDeps = {
 }
 
 export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlersDeps): void {
-    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onMachineAlive, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onSessionMetadataUpdateAllowed, onMachineAlive, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
     const terminalNamespace = io.of('/terminal')
     const namespace = typeof socket.data.namespace === 'string' ? socket.data.namespace : null
 
@@ -120,6 +133,7 @@ export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlers
         onSessionUsage,
         onSessionAccountStatus,
         onSessionMetadataUpdated,
+        onSessionMetadataUpdateAllowed,
         onWebappEvent,
         onBackgroundTaskDelta,
         onSessionActivity,

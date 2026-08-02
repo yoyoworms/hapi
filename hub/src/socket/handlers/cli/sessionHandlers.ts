@@ -26,6 +26,13 @@ type SessionAlivePayload = {
     collaborationMode?: CodexCollaborationMode
 }
 
+type SessionRuntimeSource = {
+    runtimeId?: string
+    runtimeGeneration?: number
+}
+
+type AuthoritativeSessionRuntimeSource = Required<SessionRuntimeSource>
+
 type SessionEndPayload = {
     sid: string
     time: number
@@ -97,16 +104,61 @@ function getAgentEventType(content: unknown): string | null {
     return null
 }
 
+function getAuthoritativeRuntimeSource(socket: CliSocketWithData): AuthoritativeSessionRuntimeSource | null {
+    if (
+        typeof socket.data.runtimeId !== 'string'
+        || !Number.isSafeInteger(socket.data.runtimeGeneration)
+    ) {
+        return null
+    }
+    return {
+        runtimeId: socket.data.runtimeId,
+        runtimeGeneration: socket.data.runtimeGeneration as number
+    }
+}
+
+function attachRuntimeOwnershipMetadata(
+    metadata: unknown,
+    runtimeSource: AuthoritativeSessionRuntimeSource | null
+): unknown {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+        return metadata
+    }
+    const record = metadata as Record<string, unknown>
+    if (runtimeSource) {
+        return { ...record, runtimeId: runtimeSource.runtimeId }
+    }
+    if (record.lifecycleState === 'running') {
+        // A legacy CLI cannot prove ownership after Hub restart. Explicitly
+        // clear a carried-forward id when it reopens so future events stay on
+        // the legacy timestamp/lifecycle ordering path.
+        return { ...record, runtimeId: null }
+    }
+    return metadata
+}
+
 export type SessionHandlersDeps = {
     store: Store
     resolveSessionAccess: ResolveSessionAccess
     emitAccessError: EmitAccessError
-    onSessionAlive?: (payload: SessionAlivePayload) => void
+    onSessionAlive?: (payload: SessionAlivePayload & SessionRuntimeSource) => void
     onSessionReady?: (payload: SessionReadyPayload) => void
-    onSessionEnd?: (payload: SessionEndPayload) => void
+    onSessionEnd?: (payload: SessionEndPayload & SessionRuntimeSource) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
-    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
+    onSessionMetadataUpdated?: (payload: {
+        sid: string
+        namespace: string
+        metadata: unknown
+        runtimeId?: string
+        runtimeGeneration?: number
+    }) => void
+    onSessionMetadataUpdateAllowed?: (payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+    }) => boolean
     onWebappEvent?: (event: SyncEvent) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
     onSessionActivity?: (sessionId: string, updatedAt: number) => void
@@ -118,7 +170,7 @@ export type SessionHandlersDeps = {
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onSessionMetadataUpdateAllowed, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
 
     // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
     const recentContentUuids = new Set<string>()
@@ -312,9 +364,31 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
 
+        const runtimeSource = getAuthoritativeRuntimeSource(socket)
+        const metadataWithRuntime = attachRuntimeOwnershipMetadata(metadata, runtimeSource)
+        if (runtimeSource && onSessionMetadataUpdateAllowed && !onSessionMetadataUpdateAllowed({
+            sid,
+            metadata: metadataWithRuntime,
+            ...runtimeSource
+        })) {
+            const current = store.sessions.getSessionByNamespace(sid, sessionAccess.value.namespace)
+            if (!current) {
+                cb({ result: 'error' })
+                return
+            }
+            // Acknowledge with the durable value so the ended/stale client
+            // converges without retrying a write that can no longer be valid.
+            cb({
+                result: 'success',
+                version: current.metadataVersion,
+                metadata: current.metadata
+            })
+            return
+        }
+
         const result = store.sessions.updateSessionMetadata(
             sid,
-            metadata,
+            metadataWithRuntime,
             expectedVersion,
             sessionAccess.value.namespace
         )
@@ -327,7 +401,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         if (result.result === 'success') {
-            onSessionMetadataUpdated?.({ sid, namespace: sessionAccess.value.namespace, metadata: result.value })
+            onSessionMetadataUpdated?.({
+                sid,
+                namespace: sessionAccess.value.namespace,
+                metadata: result.value,
+                ...(runtimeSource ?? {})
+            })
             const update = {
                 id: randomUUID(),
                 seq: Date.now(),
@@ -408,7 +487,8 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             emitAccessError('session', data.sid, sessionAccess.reason)
             return
         }
-        onSessionAlive?.(data)
+        const runtimeSource = getAuthoritativeRuntimeSource(socket)
+        onSessionAlive?.({ ...data, ...(runtimeSource ?? {}) })
     })
 
     socket.on('session-ready', (data: SessionReadyPayload) => {
@@ -486,6 +566,18 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
 
+        let accepted = true
+        try {
+            const runtimeSource = getAuthoritativeRuntimeSource(socket)
+            accepted = onSessionEnd?.({ ...data, ...(runtimeSource ?? {}) }) ?? true
+        } catch (err) {
+            console.error('session-end reconciliation failed', err)
+            accepted = false
+        }
+        if (!accepted) {
+            return
+        }
+
         // Force-invoke only immediate-queued messages (scheduled_at IS NULL) at
         // session end.  *All* scheduled rows — mature or future — are deliberately
         // preserved in DB so the mature-scan path (releaseMatureScheduledMessages)
@@ -503,7 +595,5 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         } catch (err) {
             console.error('session-end sweep failed', err)
         }
-
-        onSessionEnd?.(data)
     })
 }

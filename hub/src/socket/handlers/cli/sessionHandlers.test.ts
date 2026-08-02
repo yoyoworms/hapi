@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'bun:test'
 import { Store, type StoredSession } from '../../../store'
+import { MetadataSchema } from '@hapi/protocol/schemas'
 import type { SyncEvent } from '../../../sync/syncEngine'
 import type { CliSocketWithData } from '../../socketTypes'
 import { registerSessionHandlers } from './sessionHandlers'
 
 class FakeSocket {
-    readonly data: Record<string, unknown> = {}
+    readonly id = 'socket-test'
+    readonly data: Record<string, unknown> = {
+        runtimeId: 'runtime-test',
+        runtimeGeneration: 1
+    }
     readonly roomEvents: Array<{ room: string; event: string; data: unknown }> = []
     private readonly handlers = new Map<string, (data: unknown, ack?: (response: unknown) => void) => void>()
 
@@ -39,6 +44,171 @@ function redundantGoalStatusContent(message: string): unknown {
 }
 
 describe('cli session handlers', () => {
+    it('keeps legacy CLI events on the non-authoritative timestamp path', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'legacy-runtime-reopen',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                lifecycleState: 'archived',
+                lifecycleStateSince: Date.now() - 1_000,
+                runtimeId: 'runtime-from-newer-cli'
+            },
+            null,
+            'default'
+        )
+        const socket = new FakeSocket()
+        delete socket.data.runtimeId
+        delete socket.data.runtimeGeneration
+        const alivePayloads: unknown[] = []
+        const endPayloads: unknown[] = []
+        let metadataGateCalls = 0
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onSessionAlive: (payload) => alivePayloads.push(payload),
+            onSessionEnd: (payload) => {
+                endPayloads.push(payload)
+                return false
+            },
+            onSessionMetadataUpdateAllowed: () => {
+                metadataGateCalls += 1
+                return false
+            }
+        })
+
+        let metadataAck: unknown = null
+        const runningSince = Date.now()
+        socket.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: {
+                path: '/tmp/project',
+                host: 'localhost',
+                lifecycleState: 'running',
+                lifecycleStateSince: runningSince
+            }
+        }, (response) => {
+            metadataAck = response
+        })
+        socket.trigger('session-alive', {
+            sid: session.id,
+            time: runningSince,
+            thinking: false
+        })
+        socket.trigger('session-end', {
+            sid: session.id,
+            time: runningSince + 1,
+            reason: 'completed'
+        })
+
+        expect(metadataGateCalls).toBe(0)
+        expect(metadataAck).toEqual(expect.objectContaining({ result: 'success' }))
+        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+            lifecycleState: 'running',
+            lifecycleStateSince: runningSince
+        }))
+        expect((store.sessions.getSession(session.id)?.metadata as Record<string, unknown>).runtimeId).toBeUndefined()
+        expect(MetadataSchema.safeParse(store.sessions.getSession(session.id)?.metadata).success).toBe(true)
+        expect(alivePayloads).toEqual([{
+            sid: session.id,
+            time: runningSince,
+            thinking: false
+        }])
+        expect(endPayloads).toEqual([{
+            sid: session.id,
+            time: runningSince + 1,
+            reason: 'completed'
+        }])
+    })
+
+    it('does not sweep queued prompts when a stale session end is rejected', () => {
+        const socket = new FakeSocket()
+        const endPayloads: unknown[] = []
+        let sweepCalls = 0
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store: {} as Store,
+            resolveSessionAccess: () => ({
+                ok: true,
+                value: { namespace: 'default' } as StoredSession
+            }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onSessionEnd: (payload) => {
+                endPayloads.push(payload)
+                return false
+            },
+            onSweepImmediateQueued: () => {
+                sweepCalls += 1
+            }
+        })
+
+        socket.trigger('session-end', {
+            sid: 'session-1',
+            time: Date.now(),
+            reason: 'completed'
+        })
+
+        expect(endPayloads).toEqual([expect.objectContaining({
+            sid: 'session-1',
+            runtimeId: 'runtime-test',
+            runtimeGeneration: 1
+        })])
+        expect(sweepCalls).toBe(0)
+    })
+
+    it('acknowledges but does not persist metadata rejected by runtime ownership', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'ended-runtime-metadata',
+            {
+                lifecycleState: 'archived',
+                archivedBy: 'hub',
+                archiveReason: 'Session completed'
+            },
+            null,
+            'default'
+        )
+        const socket = new FakeSocket()
+        let ackResponse: unknown = null
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onSessionMetadataUpdateAllowed: () => false
+        })
+
+        socket.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: {
+                lifecycleState: 'running',
+                lifecycleStateSince: Date.now()
+            }
+        }, (response) => {
+            ackResponse = response
+        })
+
+        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+            lifecycleState: 'archived',
+            archiveReason: 'Session completed'
+        }))
+        expect(ackResponse).toEqual(expect.objectContaining({
+            result: 'success',
+            metadata: expect.objectContaining({ lifecycleState: 'archived' })
+        }))
+    })
+
     it('emits ready events to the webapp notification pipeline without storing them', () => {
         const socket = new FakeSocket()
         const events: SyncEvent[] = []
@@ -226,13 +396,15 @@ describe('cli session handlers', () => {
             'default'
         )
         const socket = new FakeSocket()
+        const acceptedMetadata: unknown[] = []
 
         registerSessionHandlers(socket as unknown as CliSocketWithData, {
             store,
             resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
             emitAccessError: () => {
                 throw new Error('unexpected access error')
-            }
+            },
+            onSessionMetadataUpdated: (payload) => acceptedMetadata.push(payload)
         })
 
         let ackResponse: unknown = null
@@ -259,6 +431,13 @@ describe('cli session handlers', () => {
         const ackMetadata = ack.metadata as Record<string, unknown>
         expect(ackMetadata.cursorSessionId).toBe('broadcast-survives')
         expect(ackMetadata.path).toBe('/tmp/project')
+        expect(ackMetadata.runtimeId).toBe('runtime-test')
+        expect(acceptedMetadata).toEqual([expect.objectContaining({
+            sid: session.id,
+            runtimeId: 'runtime-test',
+            runtimeGeneration: 1,
+            metadata: expect.objectContaining({ runtimeId: 'runtime-test' })
+        })])
 
         // Broadcast: the room event must carry the same merged value.
         const broadcast = socket.roomEvents.find((event) => event.event === 'update')
@@ -267,5 +446,6 @@ describe('cli session handlers', () => {
         expect(broadcastBody.metadata.value.cursorSessionId).toBe('broadcast-survives')
         expect(broadcastBody.metadata.value.path).toBe('/tmp/project')
         expect(broadcastBody.metadata.value.lifecycleState).toBe('archived')
+        expect(broadcastBody.metadata.value.runtimeId).toBe('runtime-test')
     })
 })

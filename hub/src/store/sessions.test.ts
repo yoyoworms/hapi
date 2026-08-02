@@ -712,6 +712,70 @@ describe('updateSessionMetadata: protocol resume token preservation', () => {
         }
     })
 
+    it('carries runtime ownership through sparse writes and supports explicit legacy clear', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'runtime-owner-carry-forward',
+            {
+                path: '/tmp/project',
+                host: 'example',
+                lifecycleState: 'running',
+                runtimeId: 'runtime-current'
+            },
+            null,
+            'default'
+        )
+
+        const archived = store.sessions.updateSessionMetadata(
+            session.id,
+            { lifecycleState: 'archived', archivedBy: 'cli' },
+            session.metadataVersion,
+            'default'
+        )
+        expect(archived.result).toBe('success')
+        expect(getMetadata(store, session.id)?.runtimeId).toBe('runtime-current')
+
+        const current = store.sessions.getSession(session.id)!
+        const legacyReopen = store.sessions.updateSessionMetadata(
+            session.id,
+            { lifecycleState: 'running', runtimeId: null },
+            current.metadataVersion,
+            'default'
+        )
+        expect(legacyReopen.result).toBe('success')
+        expect(getMetadata(store, session.id)?.runtimeId).toBeUndefined()
+    })
+
+    it('never persists an explicit-clear null when the prior metadata is malformed', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'runtime-owner-clear-malformed-prior',
+            null,
+            null,
+            'default'
+        )
+        const result = store.sessions.updateSessionMetadata(
+            session.id,
+            {
+                path: '/tmp/project',
+                host: 'example',
+                lifecycleState: 'running',
+                runtimeId: null
+            },
+            session.metadataVersion,
+            'default'
+        )
+
+        expect(result.result).toBe('success')
+        const metadata = getMetadata(store, session.id)
+        expect(metadata?.runtimeId).toBeUndefined()
+        expect(metadata).toEqual(expect.objectContaining({
+            path: '/tmp/project',
+            host: 'example',
+            lifecycleState: 'running'
+        }))
+    })
+
     // Upstream cold-review (Major): preserve-on-omit must not block
     // intentional clears. `cli/src/codex/session.ts resetCodexThread()`
     // is the existing site that needs to drop `codexSessionId` (called

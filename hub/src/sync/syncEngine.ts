@@ -7,10 +7,9 @@
  * - No E2E encryption; data is stored as JSON in SQLite
  */
 
-import { isKnownFlavor, type LocalResumeTarget, type ResumableSession } from '@hapi/protocol'
+import { isKnownFlavor, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
 import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessagesResponse, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { AgentAccountStatus, AgentFlavor, CodexCollaborationMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
-import { MetadataSchema } from '@hapi/protocol/schemas'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
 import type { Server } from 'socket.io'
 import type { Store, CancelQueuedMessageResult } from '../store'
@@ -462,9 +461,14 @@ export class SyncEngine {
         effort?: string | null
         serviceTier?: string | null
         collaborationMode?: CodexCollaborationMode
-    }): void {
-        this.sessionCache.handleSessionAlive(payload)
+        runtimeId?: string
+        runtimeGeneration?: number
+    }): boolean {
+        if (!this.sessionCache.handleSessionAlive(payload)) {
+            return false
+        }
         this.triggerDedupIfNeeded(payload.sid)
+        return true
     }
 
     handleSessionReady(payload: { sid: string; time: number }): void {
@@ -476,13 +480,60 @@ export class SyncEngine {
         this.sessionCache.clearQueuedThinkingGrace(sessionId)
     }
 
-    handleSessionEnd(payload: { sid: string; time: number; reason?: 'completed' | 'terminated' | 'error' }): void {
+    handleSessionEnd(payload: {
+        sid: string
+        time: number
+        reason?: SessionEndReason
+        runtimeId?: string
+        runtimeGeneration?: number
+    }): boolean {
         const before = this.sessionCache.getSession(payload.sid)
         const isCursorAcp = before?.metadata?.flavor === 'cursor'
             && before.metadata.cursorSessionProtocol === 'acp'
         const shouldRetryDedup = !isCursorAcp || this.sessionReadyIds.has(payload.sid)
 
-        this.sessionCache.handleSessionEnd(payload)
+        const acceptedEndAt = this.sessionCache.handleSessionEnd(payload)
+        if (acceptedEndAt === null) {
+            return false
+        }
+
+        // RunnerLifecycle normally persists archive metadata immediately before
+        // emitting session-end. An old client or a dropped metadata ACK can
+        // leave the durable row split-brained (inactive but lifecycle=running).
+        // The explicit end event is authoritative; socket disconnect and the
+        // generic 30s liveness expiry intentionally do not use this fallback.
+        const latest = this.sessionCache.getSession(payload.sid)
+        const runtimeAuthoritative = typeof payload.runtimeId === 'string'
+            && Number.isSafeInteger(payload.runtimeGeneration)
+        if (
+            latest
+            && latest.metadata?.lifecycleState !== 'archived'
+            && (runtimeAuthoritative || latest.metadata?.lifecycleState === 'running')
+        ) {
+            const archiveReason = payload.reason === 'completed'
+                ? 'Session completed'
+                : payload.reason === 'terminated'
+                    ? 'Session terminated'
+                    : payload.reason === 'error'
+                        ? 'Session ended with error'
+                        : payload.reason === 'handoff'
+                            ? 'Handed off to local terminal'
+                            : 'Session ended'
+            try {
+                this.sessionCache.markSessionArchivedFromHub(
+                    payload.sid,
+                    archiveReason,
+                    runtimeAuthoritative
+                        ? undefined
+                        : { onlyRunningSinceAtOrBefore: acceptedEndAt }
+                )
+            } catch (error) {
+                // There is no request/response caller for a Socket.IO end event.
+                // Keep publishing the stopped state and clearing dedup/runtime
+                // bookkeeping; a later explicit archive can retry persistence.
+                console.error('session-end lifecycle reconciliation failed', error)
+            }
+        }
         this.eventPublisher.emit({
             type: 'session-ended',
             sessionId: payload.sid,
@@ -495,6 +546,16 @@ export class SyncEngine {
             this.triggerDedupIfNeeded(payload.sid)
         }
         this.sessionReadyIds.delete(payload.sid)
+        return true
+    }
+
+    isSessionMetadataUpdateAllowed(payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+    }): boolean {
+        return this.sessionCache.isRuntimeMetadataUpdateAllowed(payload)
     }
 
     handleBackgroundTaskDelta(sessionId: string, delta: { started: number; completed: number }): void {
@@ -518,28 +579,47 @@ export class SyncEngine {
         this.sessionCache.handleSessionAccountStatus(payload)
     }
 
-    async handleSessionMetadataUpdated(payload: { sid: string; namespace: string; metadata: unknown }): Promise<void> {
-        const currentMetadata = MetadataSchema.safeParse(payload.metadata)
-        if (!currentMetadata.success) {
-            return
-        }
-
-        if (!getNativeAgentSessionId(currentMetadata.data)) {
-            return
-        }
-
+    async handleSessionMetadataUpdated(payload: {
+        sid: string
+        namespace: string
+        metadata: unknown
+        runtimeId?: string
+        runtimeGeneration?: number
+    }): Promise<void> {
         const current = this.store.sessions.getSessionByNamespace(payload.sid, payload.namespace)
         if (!current) {
             return
         }
 
-        // Metadata is persisted before this callback runs, so refresh the cache
-        // before deduplication. Never merge directly here: two live HAPI
+        // Every successful metadata write is durable before this callback.
+        // Refresh unconditionally before any native-session-id/dedup gates so a
+        // runtime takeover without a native agent id cannot leave cache owner C
+        // paired with stale cached metadata.runtimeId B and reject C's alive.
+        const refreshed = this.sessionCache.refreshSession(payload.sid)
+        if (
+            typeof payload.runtimeId === 'string'
+            && Number.isSafeInteger(payload.runtimeGeneration)
+        ) {
+            this.sessionCache.recordRuntimeMetadataUpdate({
+                sid: payload.sid,
+                metadata: payload.metadata,
+                runtimeId: payload.runtimeId,
+                runtimeGeneration: payload.runtimeGeneration as number
+            })
+        }
+        if (!refreshed?.metadata) {
+            return
+        }
+
+        if (!getNativeAgentSessionId(refreshed.metadata)) {
+            return
+        }
+
+        // Never merge directly here: two live HAPI
         // sessions can temporarily report the same native thread after a bad
         // resume/account handoff. The central dedup path deliberately preserves
         // both active records until one ends instead of deleting a live session.
-        const refreshed = this.sessionCache.refreshSession(payload.sid)
-        if (!refreshed?.metadata || !this.canRunCursorDedup(refreshed)) {
+        if (!this.canRunCursorDedup(refreshed)) {
             return
         }
 
@@ -1919,7 +1999,6 @@ async uploadScratchlistAttachment(
             }
         }
 
-        this.sessionCache.markSessionActive(spawnResult.sessionId)
         return { type: 'success', sessionId: spawnResult.sessionId }
     }
 

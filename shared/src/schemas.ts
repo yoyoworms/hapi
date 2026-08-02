@@ -65,6 +65,10 @@ export const MetadataSchema = z.object({
     happyToolsDir: z.string().optional(),
     startedFromRunner: z.boolean().optional(),
     hostPid: z.number().optional(),
+    // Stable for one CLI process across Socket.IO reconnects. The Hub persists
+    // this so a stale process cannot replay buffered lifecycle events after a
+    // Hub restart and take ownership from the current runner.
+    runtimeId: z.string().optional(),
     hapiMcpUrl: z.string().url().optional(),
     startedBy: z.enum(['runner', 'terminal']).optional(),
     lifecycleState: z.string().optional(),

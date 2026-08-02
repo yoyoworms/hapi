@@ -10,6 +10,7 @@ import { registerCliHandlers } from './handlers/cli'
 import { registerTerminalHandlers } from './handlers/terminal'
 import { RpcRegistry } from './rpcRegistry'
 import type { AgentAccountStatus } from '@hapi/protocol/types'
+import type { SessionEndReason } from '@hapi/protocol'
 import { SOCKET_MAX_HTTP_BUFFER_SIZE } from './socketLimits'
 import type { SyncEvent } from '../sync/syncEngine'
 import { TerminalRegistry } from './terminalRegistry'
@@ -38,12 +39,19 @@ export type SocketServerDeps = {
     corsOrigins?: string[]
     getSession?: (sessionId: string) => { active: boolean; namespace: string } | null
     onWebappEvent?: (event: SyncEvent) => void
-    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote' }) => void
+    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote'; runtimeId?: string; runtimeGeneration?: number }) => void
     onSessionReady?: (payload: { sid: string; time: number }) => void
-    onSessionEnd?: (payload: { sid: string; time: number }) => void
+    onSessionEnd?: (payload: { sid: string; time: number; reason?: SessionEndReason; runtimeId?: string; runtimeGeneration?: number }) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
-    onSessionMetadataUpdated?: (payload: { sid: string; namespace: string; metadata: unknown }) => void
+    onSessionMetadataUpdated?: (payload: {
+        sid: string
+        namespace: string
+        metadata: unknown
+        runtimeId?: string
+        runtimeGeneration?: number
+    }) => void
+    onSessionMetadataUpdateAllowed?: (payload: { sid: string; metadata: unknown; runtimeId: string; runtimeGeneration: number }) => boolean
     onMachineAlive?: (payload: { machineId: string; time: number; health?: unknown }) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
     onSessionActivity?: (sessionId: string, updatedAt: number) => void
@@ -110,6 +118,14 @@ export function createSocketServer(deps: SocketServerDeps): {
         }
     })
 
+    // New CLIs provide a stable runtimeId that survives Socket.IO reconnects.
+    // Do not synthesize one for legacy clients: a session-scoped fallback would
+    // also survive a process restart, so an ended owner would reject every
+    // keepalive from the reopened legacy process. Those clients intentionally
+    // stay on the timestamp/lifecycle ordering path.
+    let nextCliRuntimeGeneration = 0
+    const cliRuntimeGenerationById = new Map<string, number>()
+
     cliNs.use((socket, next) => {
         const auth = socket.handshake.auth as Record<string, unknown> | undefined
         const token = typeof auth?.token === 'string' ? auth.token : null
@@ -118,6 +134,18 @@ export function createSocketServer(deps: SocketServerDeps): {
             return next(new Error('Invalid token'))
         }
         socket.data.namespace = parsedToken.namespace
+        const requestedRuntimeId = typeof auth?.runtimeId === 'string' && auth.runtimeId.length > 0
+            ? auth.runtimeId
+            : null
+        if (requestedRuntimeId) {
+            let runtimeGeneration = cliRuntimeGenerationById.get(requestedRuntimeId)
+            if (runtimeGeneration === undefined) {
+                runtimeGeneration = ++nextCliRuntimeGeneration
+                cliRuntimeGenerationById.set(requestedRuntimeId, runtimeGeneration)
+            }
+            socket.data.runtimeId = requestedRuntimeId
+            socket.data.runtimeGeneration = runtimeGeneration
+        }
         // Calculate clock offset between CLI and Hub for timestamp normalization
         const clientTime = typeof auth?.clientTime === 'number' ? auth.clientTime : null
         if (clientTime) {
@@ -125,24 +153,27 @@ export function createSocketServer(deps: SocketServerDeps): {
         }
         next()
     })
-    cliNs.on('connection', (socket) => registerCliHandlers(socket as CliSocketWithData, {
-        io,
-        store: deps.store,
-        rpcRegistry,
-        terminalRegistry,
-        onSessionAlive: deps.onSessionAlive,
-        onSessionReady: deps.onSessionReady,
-        onSessionEnd: deps.onSessionEnd,
-        onSessionUsage: deps.onSessionUsage,
-        onSessionAccountStatus: deps.onSessionAccountStatus,
-        onSessionMetadataUpdated: deps.onSessionMetadataUpdated,
-        onMachineAlive: deps.onMachineAlive,
-        onWebappEvent: deps.onWebappEvent,
-        onBackgroundTaskDelta: deps.onBackgroundTaskDelta,
-        onSessionActivity: deps.onSessionActivity,
-        onSweepImmediateQueued: deps.onSweepImmediateQueued,
-        onMessagesConsumed: deps.onMessagesConsumed
-    }))
+    cliNs.on('connection', (socket) => {
+        registerCliHandlers(socket as CliSocketWithData, {
+            io,
+            store: deps.store,
+            rpcRegistry,
+            terminalRegistry,
+            onSessionAlive: deps.onSessionAlive,
+            onSessionReady: deps.onSessionReady,
+            onSessionEnd: deps.onSessionEnd,
+            onSessionUsage: deps.onSessionUsage,
+            onSessionAccountStatus: deps.onSessionAccountStatus,
+            onSessionMetadataUpdated: deps.onSessionMetadataUpdated,
+            onSessionMetadataUpdateAllowed: deps.onSessionMetadataUpdateAllowed,
+            onMachineAlive: deps.onMachineAlive,
+            onWebappEvent: deps.onWebappEvent,
+            onBackgroundTaskDelta: deps.onBackgroundTaskDelta,
+            onSessionActivity: deps.onSessionActivity,
+            onSweepImmediateQueued: deps.onSweepImmediateQueued,
+            onMessagesConsumed: deps.onMessagesConsumed
+        })
+    })
 
     terminalNs.use(async (socket, next) => {
         const auth = socket.handshake.auth as Record<string, unknown> | undefined

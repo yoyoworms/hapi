@@ -16,7 +16,7 @@ import { updateVersionedField } from './versionedUpdates'
 // in updateSessionMetadata wipes whatever it omits. That breaks resume
 // even though the on-disk chat data still exists.
 //
-// Three preservation tiers cover the failure modes:
+// Four preservation tiers cover the failure modes:
 //
 //   - PARSE_IDENTITY_FIELDS: required by MetadataSchema in
 //     shared/src/schemas.ts. Without these, hub session cache and CLI
@@ -31,6 +31,10 @@ import { updateVersionedField } from './versionedUpdates'
 //     Claude and the preserved token is ignored. `machineId` is the
 //     filter the CLI's resumable listing uses to scope rows to the
 //     current host; without it the row drops out of the resume picker.
+//
+//   - RUNTIME_OWNER_FIELDS: the stable CLI process id used to reject stale
+//     buffered lifecycle events after a Hub restart. New authoritative CLI
+//     writes explicitly replace it; legacy reopen explicitly clears it.
 //
 //   - SIMPLE_RESUME_TOKENS: flavor-specific resume identifiers that are
 //     write-once-keep semantics. Mirror of pickExistingSessionMetadata
@@ -52,6 +56,10 @@ import { updateVersionedField } from './versionedUpdates'
 const PARSE_IDENTITY_FIELDS = ['path', 'host'] as const
 
 const ROUTING_FIELDS = ['flavor', 'machineId'] as const
+
+// Hub-owned runner incarnation. New authoritative CLI writes explicitly
+// replace it; sparse lifecycle/identity updates must not accidentally drop it.
+const RUNTIME_OWNER_FIELDS = ['runtimeId'] as const
 
 const SIMPLE_RESUME_TOKENS = [
     'claudeSessionId',
@@ -120,14 +128,21 @@ function preserveCursorProtocolPair(
 }
 
 export function mergeSessionMetadata(prior: unknown, next: unknown): unknown {
-    if (!isPlainObject(prior) || !isPlainObject(next)) {
+    if (!isPlainObject(next)) {
         return next
     }
+    // Explicit-clear sentinels are an input protocol, never a persisted value.
+    // Normalize them even when the prior row is null/malformed so an internal
+    // `runtimeId: null` legacy clear cannot make MetadataSchema reject the row.
+    const priorRecord = isPlainObject(prior) ? prior : {}
     let merged: Record<string, unknown> | null = null
-    merged = carryForwardIfMissing(prior, next, merged, PARSE_IDENTITY_FIELDS)
-    merged = carryForwardIfMissing(prior, next, merged, ROUTING_FIELDS)
-    merged = carryForwardIfMissing(prior, next, merged, SIMPLE_RESUME_TOKENS)
-    merged = preserveCursorProtocolPair(prior, next, merged)
+    merged = carryForwardIfMissing(priorRecord, next, merged, PARSE_IDENTITY_FIELDS)
+    merged = carryForwardIfMissing(priorRecord, next, merged, ROUTING_FIELDS)
+    merged = carryForwardIfMissing(priorRecord, next, merged, RUNTIME_OWNER_FIELDS)
+    merged = carryForwardIfMissing(priorRecord, next, merged, SIMPLE_RESUME_TOKENS)
+    if (isPlainObject(prior)) {
+        merged = preserveCursorProtocolPair(prior, next, merged)
+    }
     return merged ?? next
 }
 

@@ -22,6 +22,14 @@ export class SessionCache {
     private readonly deduplicatePending: Set<string> = new Set()
     private readonly pendingThinkingUntilBySessionId: Map<string, number> = new Map()
     private readonly runtimeConfigUpdatedAtBySessionId: Map<string, Partial<Record<RuntimeConfigKey, number>>> = new Map()
+    /** Last ordered liveness timestamp (Hub clock for identified runtimes). */
+    private readonly lastAlivePayloadTimeBySessionId: Map<string, number> = new Map()
+    /** Hub-local owner prevents an older CLI connection from ending a newer run. */
+    private readonly runtimeOwnerBySessionId: Map<string, {
+        runtimeId: string
+        runtimeGeneration: number
+        ended: boolean
+    }> = new Map()
 
     constructor(
         private readonly store: Store,
@@ -97,6 +105,8 @@ export class SessionCache {
             const existed = this.sessions.delete(sessionId)
             this.pendingThinkingUntilBySessionId.delete(sessionId)
             this.runtimeConfigUpdatedAtBySessionId.delete(sessionId)
+            this.lastAlivePayloadTimeBySessionId.delete(sessionId)
+            this.runtimeOwnerBySessionId.delete(sessionId)
             if (existed) {
                 this.publisher.emit({ type: 'session-removed', sessionId })
             }
@@ -214,6 +224,40 @@ export class SessionCache {
         }
     }
 
+    /**
+     * Persist the authoritative CLI process id without touching the session's
+     * user-visible activity timestamp. This is intentionally version-retried:
+     * metadata writes (title/model/native thread id) can race the first alive
+     * packet, but a claim is not safe across Hub restart until it is durable.
+     */
+    private persistRuntimeOwnerId(sessionId: string, runtimeId: string): Session | null {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session?.metadata) {
+                return null
+            }
+            if (session.metadata.runtimeId === runtimeId) {
+                return session
+            }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...session.metadata, runtimeId },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') {
+                return null
+            }
+            if (result.result === 'success') {
+                return this.refreshSession(sessionId)
+            }
+            this.refreshSession(sessionId)
+        }
+        return null
+    }
+
     handleSessionAlive(payload: {
         sid: string
         time: number
@@ -225,12 +269,80 @@ export class SessionCache {
         effort?: string | null
         serviceTier?: string | null
         collaborationMode?: CodexCollaborationMode
-    }): void {
-        const t = clampAliveTime(payload.time)
-        if (!t) return
+        runtimeId?: string
+        runtimeGeneration?: number
+    }): boolean {
+        const hasRuntimeSource = typeof payload.runtimeId === 'string'
+            && Number.isSafeInteger(payload.runtimeGeneration)
+        // Runtime identity establishes ordering across runners; use Hub receive
+        // time for liveness/config comparisons so host clock skew cannot make a
+        // valid owner look ten minutes stale.
+        const t = hasRuntimeSource ? Date.now() : clampAliveTime(payload.time)
+        if (!t) return false
 
-        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-        if (!session) return
+        let session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+        if (!session) return false
+
+        // An explicit end persists lifecycleState=archived before (new CLIs) or
+        // during (Hub fallback) teardown. A delayed heartbeat must never turn
+        // that durable terminal state back into active=true. A genuinely new
+        // runtime first writes lifecycleState=running through the ownership-
+        // gated metadata path, then its alive event can activate the row.
+        if (session.metadata?.lifecycleState === 'archived') {
+            return false
+        }
+
+        if (hasRuntimeSource) {
+            const runtimeGeneration = payload.runtimeGeneration as number
+            const owner = this.runtimeOwnerBySessionId.get(session.id)
+            const durableRuntimeId = session.metadata?.runtimeId
+            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
+                // A different process must first persist a newer `running`
+                // transition through the metadata ownership gate. Requiring
+                // that transition closes both cold-start ambiguity and the
+                // warm-cache case where a stale, later-first-seen runtime sends
+                // alive after the current owner's heartbeat expires.
+                return false
+            }
+            if (owner) {
+                const sameRuntime = payload.runtimeId === owner.runtimeId
+                if (sameRuntime) {
+                    if (owner.ended || runtimeGeneration !== owner.runtimeGeneration) {
+                        return false
+                    }
+                } else {
+                    // Within one Hub lifetime, generation is the first-seen
+                    // ordering authority. Once a newer runtime has owned this
+                    // session, an older runtime must not reclaim it merely
+                    // because the newer owner ended or its heartbeat expired.
+                    if (runtimeGeneration <= owner.runtimeGeneration) {
+                        return false
+                    }
+                    if (session.active && !owner.ended) {
+                        // A later first-seen runtime still cannot steal a live
+                        // owner: an older runner may have been offline when the
+                        // current runner connected, then reconnect with a higher
+                        // Hub-local generation.
+                        return false
+                    }
+                }
+            }
+            if (!owner || payload.runtimeId !== owner.runtimeId) {
+                this.lastAlivePayloadTimeBySessionId.delete(session.id)
+            }
+            this.runtimeOwnerBySessionId.set(session.id, {
+                runtimeId: payload.runtimeId as string,
+                runtimeGeneration,
+                ended: false
+            })
+            const persistedSession = this.persistRuntimeOwnerId(session.id, payload.runtimeId as string)
+            if (!persistedSession) {
+                // Keep the in-memory owner as a retry watermark, but do not
+                // advertise the row active until the claim is durable.
+                return false
+            }
+            session = persistedSession
+        }
 
         const wasActive = session.active
         const wasThinking = session.thinking
@@ -247,6 +359,10 @@ export class SessionCache {
 
         session.active = true
         session.activeAt = Math.max(session.activeAt, t)
+        this.lastAlivePayloadTimeBySessionId.set(
+            session.id,
+            Math.max(this.lastAlivePayloadTimeBySessionId.get(session.id) ?? Number.NEGATIVE_INFINITY, t)
+        )
         session.thinking = requestedThinking || preserveQueuedThinking
         session.thinkingAt = t
         if (requestedThinking || pendingThinkingUntil <= hubNow) {
@@ -323,6 +439,7 @@ export class SessionCache {
                 } satisfies SessionPatch
             })
         }
+        return true
     }
 
     /**
@@ -447,18 +564,105 @@ export class SessionCache {
         })
     }
 
-    handleSessionEnd(payload: { sid: string; time: number }): void {
-        const t = clampAliveTime(payload.time) ?? Date.now()
+    handleSessionEnd(payload: {
+        sid: string
+        time: number
+        runtimeId?: string
+        runtimeGeneration?: number
+    }): number | null {
+        if (!Number.isFinite(payload.time)) {
+            return null
+        }
+        // Preserve old timestamps for generation ordering. clampAliveTime()
+        // returns null for values older than ten minutes, and substituting now
+        // here would let a replayed old session-end kill a newly reopened run.
+        const legacyEventTime = Math.min(payload.time, Date.now())
 
-        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-        if (!session) return
+        let session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+        if (!session) return null
+
+        if (
+            session.metadata?.lifecycleState === 'archived'
+            && !session.active
+            && !session.thinking
+            && (session.backgroundTaskCount ?? 0) === 0
+        ) {
+            // Durable terminal state already reconciled. Treat a cold/replayed
+            // duplicate as rejected so handlers do not emit another ended
+            // event or sweep immediate messages queued after the original end.
+            return null
+        }
+
+        const hasRuntimeSource = typeof payload.runtimeId === 'string'
+            && Number.isSafeInteger(payload.runtimeGeneration)
+        if (hasRuntimeSource) {
+            const owner = this.runtimeOwnerBySessionId.get(session.id)
+            const durableRuntimeId = session.metadata?.runtimeId
+            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
+                return null
+            }
+            if (owner) {
+                if (
+                    owner.ended
+                    || payload.runtimeGeneration !== owner.runtimeGeneration
+                    || payload.runtimeId !== owner.runtimeId
+                ) {
+                    return null
+                }
+            } else {
+                // A reconnect can flush buffered events before the client's
+                // connect handler sends its first keepalive. Claim the cold
+                // cache now so the following same-runtime alive cannot revive
+                // a runner that already ended.
+                this.runtimeOwnerBySessionId.set(session.id, {
+                    runtimeId: payload.runtimeId as string,
+                    runtimeGeneration: payload.runtimeGeneration as number,
+                    ended: false
+                })
+            }
+            const persistedSession = this.persistRuntimeOwnerId(session.id, payload.runtimeId as string)
+            if (!persistedSession) {
+                return null
+            }
+            session = persistedSession
+        }
+        const t = hasRuntimeSource ? Date.now() : legacyEventTime
+
+        // Timestamp ordering is only meaningful inside one runtime. New clients
+        // additionally carry a Hub-owned runtime generation, which is the
+        // cross-run authority and is checked above.
+        const lastAlivePayloadTime = this.lastAlivePayloadTimeBySessionId.get(session.id)
+        if (!hasRuntimeSource && lastAlivePayloadTime !== undefined && t < lastAlivePayloadTime) {
+            return null
+        }
+        const lifecycleStateSince = typeof session.metadata?.lifecycleStateSince === 'number'
+            ? session.metadata.lifecycleStateSince
+            : 0
+        if (
+            !hasRuntimeSource
+            &&
+            session.metadata?.lifecycleState === 'running'
+            && lifecycleStateSince > t
+        ) {
+            return null
+        }
+
+        if (hasRuntimeSource) {
+            const owner = this.runtimeOwnerBySessionId.get(session.id)
+            if (owner) {
+                owner.ended = true
+            }
+        }
 
         if (
             !session.active
             && !session.thinking
             && (session.backgroundTaskCount ?? 0) === 0
         ) {
-            return
+            // A valid explicit end can arrive after the 30s liveness expiry.
+            // Report it as accepted so SyncEngine can still reconcile stale
+            // lifecycleState=running metadata without changing live state.
+            return t
         }
 
         session.active = false
@@ -467,11 +671,127 @@ export class SessionCache {
         session.thinkingAt = t
         session.backgroundTaskCount = 0
         this.pendingThinkingUntilBySessionId.delete(session.id)
+        this.lastAlivePayloadTimeBySessionId.delete(session.id)
 
         this.publisher.emit({
             type: 'session-updated',
             sessionId: session.id,
             data: { active: false, thinking: false, backgroundTaskCount: 0 } satisfies SessionPatch
+        })
+        return t
+    }
+
+    isRuntimeMetadataUpdateAllowed(payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+    }): boolean {
+        const owner = this.runtimeOwnerBySessionId.get(payload.sid)
+        if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
+            return false
+        }
+        const lifecycleState = (payload.metadata as Record<string, unknown>).lifecycleState
+        if (!owner) {
+            const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+            const durableRuntimeId = session?.metadata?.runtimeId
+            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
+                if (lifecycleState !== 'running') {
+                    return false
+                }
+                // Cold Hub cache cannot order random runtime ids. Accept a
+                // replacement only when its process-start lifecycle timestamp
+                // is strictly newer than the durable owner's last running OR
+                // archived transition. This also prevents an old buffered
+                // `running` write from reviving an explicitly archived row.
+                // Both values are authored by CLI lifecycle code; comparison
+                // is limited to different-runtime takeover. Same-runtime
+                // liveness/config ordering remains entirely in Hub time.
+                if (!session || !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata)) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        const sameRuntime = payload.runtimeId === owner.runtimeId
+            && payload.runtimeGeneration === owner.runtimeGeneration
+        if (sameRuntime) {
+            return owner.ended ? lifecycleState === 'archived' : true
+        }
+
+        // An ended or expired newer owner remains the ordering watermark for
+        // this Hub lifetime. Without this check, a delayed `running` write from
+        // an older runtime can reclaim the session after B(gen=2) ended merely
+        // because the row is now inactive.
+        if (payload.runtimeGeneration <= owner.runtimeGeneration) {
+            return false
+        }
+
+        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+        if (lifecycleState === 'running' && (!session?.active || owner.ended)) {
+            const durableRuntimeId = session?.metadata?.runtimeId
+            if (
+                durableRuntimeId
+                && durableRuntimeId !== payload.runtimeId
+                && !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata)
+            ) {
+                return false
+            }
+            // bootstrapExistingSession queues running metadata before Socket.IO
+            // invokes the client's connect handler/keepalive. The successful
+            // write callback (recordRuntimeMetadataUpdate) establishes owner;
+            // a version-mismatch must not let a stale writer steal it.
+            return true
+        }
+        return false
+    }
+
+    private isStrictlyNewerRuntimeLifecycle(session: Session, metadata: unknown): boolean {
+        if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+            return false
+        }
+        const incomingSince = (metadata as Record<string, unknown>).lifecycleStateSince
+        const durableSince = session.metadata?.lifecycleStateSince
+        return typeof incomingSince === 'number'
+            && Number.isFinite(incomingSince)
+            && typeof durableSince === 'number'
+            && Number.isFinite(durableSince)
+            && incomingSince > durableSince
+    }
+
+    /** Commit ownership only after update-metadata actually persisted. */
+    recordRuntimeMetadataUpdate(payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+    }): void {
+        if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
+            return
+        }
+        const metadataRecord = payload.metadata as Record<string, unknown>
+        const lifecycleState = metadataRecord.lifecycleState
+        if (lifecycleState !== 'running' || metadataRecord.runtimeId !== payload.runtimeId) {
+            return
+        }
+
+        const owner = this.runtimeOwnerBySessionId.get(payload.sid)
+        const sameRuntime = owner
+            && owner.runtimeId === payload.runtimeId
+            && owner.runtimeGeneration === payload.runtimeGeneration
+        if (sameRuntime && !owner.ended) {
+            return
+        }
+        if (owner && payload.runtimeGeneration <= owner.runtimeGeneration) {
+            return
+        }
+
+        this.lastAlivePayloadTimeBySessionId.delete(payload.sid)
+        this.runtimeOwnerBySessionId.set(payload.sid, {
+            runtimeId: payload.runtimeId,
+            runtimeGeneration: payload.runtimeGeneration,
+            ended: false
         })
     }
 
@@ -526,6 +846,7 @@ export class SessionCache {
             session.thinkingAt = now
             session.backgroundTaskCount = 0
             this.pendingThinkingUntilBySessionId.delete(session.id)
+            this.lastAlivePayloadTimeBySessionId.delete(session.id)
             expired.push(session.id)
             this.publisher.emit({
                 type: 'session-updated',
@@ -664,7 +985,11 @@ export class SessionCache {
      * `archiveSession` flow still marks the session inactive in cache via
      * `handleSessionEnd`, just without flipping the persisted lifecycle.
      */
-    markSessionArchivedFromHub(sessionId: string, reason: string): void {
+    markSessionArchivedFromHub(
+        sessionId: string,
+        reason: string,
+        options?: { onlyRunningSinceAtOrBefore?: number }
+    ): void {
         for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
             const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
             if (!session) return
@@ -672,6 +997,17 @@ export class SessionCache {
             if (!current) return
             if (current.lifecycleState === 'archived') {
                 return
+            }
+            if (options?.onlyRunningSinceAtOrBefore !== undefined) {
+                if (current.lifecycleState !== 'running') {
+                    return
+                }
+                const lifecycleStateSince = typeof current.lifecycleStateSince === 'number'
+                    ? current.lifecycleStateSince
+                    : 0
+                if (lifecycleStateSince > options.onlyRunningSinceAtOrBefore) {
+                    return
+                }
             }
 
             const next: Record<string, unknown> = {
