@@ -218,8 +218,33 @@ export function ToolGroupCard(props: {
         }, t)
     }, [selectedTool, props.metadata, t])
 
+    const activeTool = useMemo(() => {
+        for (let index = props.block.tools.length - 1; index >= 0; index -= 1) {
+            const tool = props.block.tools[index]
+            if (tool.tool.state === 'running' || tool.tool.state === 'pending') {
+                return tool
+            }
+        }
+        return null
+    }, [props.block.tools])
+    const activePresentation = useMemo(() => {
+        if (!activeTool) return null
+        return getToolPresentation({
+            toolName: activeTool.tool.name,
+            input: activeTool.tool.input,
+            result: activeTool.tool.result,
+            childrenCount: activeTool.children.length,
+            description: activeTool.tool.description,
+            metadata: props.metadata
+        }, t)
+    }, [activeTool, props.metadata, t])
+
     const primaryTitle = formatGroupedHeaderTitle(props.block, t)
-    const subtitle = formatGroupedHeaderSubtitle(props.block, t) ?? formatActionSummary(props.block, t)
+    // While a group is live, show what Codex is doing now rather than only
+    // aggregate counters. Completed groups fall back to the compact summary.
+    const subtitle = activePresentation
+        ? activePresentation.subtitle ?? activePresentation.title
+        : formatGroupedHeaderSubtitle(props.block, t) ?? formatActionSummary(props.block, t)
     const fileCount = props.block.summary.fileTargets.length
 
     return (

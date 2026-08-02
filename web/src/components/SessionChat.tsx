@@ -20,6 +20,7 @@ import { reduceChatBlocks } from '@/chat/reducer'
 import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
 import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
+import { getLatestPlanProgress, getPersistedPlanProgress } from '@/chat/planProgress'
 import { isQueuedForInvocation, mergeMessages } from '@/lib/messages'
 import { inactiveSessionCanResume } from '@/lib/sessionResume'
 import {
@@ -966,9 +967,36 @@ function SessionChatInner(props: SessionChatProps) {
     const visibleBlocks = useMemo(
         () => buildVisibleChatBlocks(reconciled.blocks, {
             hasMoreMessages: props.hasMoreMessages,
-            previousGroups: visibleGroupsRef.current
+            previousGroups: visibleGroupsRef.current,
+            // Codex progress/commentary and update_plan cards remain hard
+            // boundaries. Inside each phase, collapse low-signal execution
+            // noise without turning the whole turn into one opaque card.
+            mode: agentFlavor === 'codex' ? 'codex' : 'contiguous'
         }),
-        [reconciled.blocks, props.hasMoreMessages]
+        [agentFlavor, reconciled.blocks, props.hasMoreMessages]
+    )
+    const latestPlanProgress = useMemo(
+        () => {
+            if (agentFlavor !== 'codex') return null
+
+            const currentTurnStartedAt = reconciled.blocks.reduce(
+                (latest, block) => block.kind === 'user-text'
+                    ? Math.max(latest, block.createdAt)
+                    : latest,
+                0
+            )
+            const messageProgress = getLatestPlanProgress(
+                reconciled.blocks.filter((block) => block.createdAt >= currentTurnStartedAt)
+            )
+            if (messageProgress) return messageProgress
+
+            return getPersistedPlanProgress(props.session.todos)
+        },
+        [
+            agentFlavor,
+            props.session.todos,
+            reconciled.blocks
+        ]
     )
 
     useEffect(() => {
@@ -1349,6 +1377,7 @@ function SessionChatInner(props: SessionChatProps) {
                         permissionMode={props.session.permissionMode}
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
                         threadGoal={reduced.latestGoal}
+                        planProgress={latestPlanProgress}
                         model={props.session.model}
                         modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
                         effort={props.session.effort}

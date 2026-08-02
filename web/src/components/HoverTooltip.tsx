@@ -3,10 +3,10 @@ import { cn } from '@/lib/utils'
 
 /** Tailwind classes that reveal the bubble when a named parent row has :focus-visible. */
 export const SESSION_ROW_TOOLTIP_FOCUS_CLASS =
-    'group-focus-visible/session-row:opacity-100 group-focus-visible/session-row:visible'
+    'group-focus-visible/session-row:block group-focus-visible/session-row:opacity-100 group-focus-visible/session-row:visible'
 
 export const MACHINE_ROW_TOOLTIP_FOCUS_CLASS =
-    'group-focus-visible/machine-row:opacity-100 group-focus-visible/machine-row:visible'
+    'group-focus-visible/machine-row:block group-focus-visible/machine-row:opacity-100 group-focus-visible/machine-row:visible'
 
 /**
  * Lightweight CSS-driven tooltip used by the session list to surface "why is
@@ -77,12 +77,17 @@ export function HoverTooltip(props: {
                     'px-2 py-1 text-xs leading-snug text-[var(--app-fg)] shadow-lg',
                     side === 'top' ? 'bottom-full mb-1' : 'top-full mt-1',
                     alignClasses,
-                    'opacity-0 invisible',
+                    // `visibility: hidden` still contributes absolute tooltip
+                    // geometry to a scroll container's horizontal overflow.
+                    // On the narrow session list that created a real x-axis
+                    // scrollbar even though no tooltip was visible. Keep the
+                    // panel out of layout until hover/focus/open reveals it.
+                    'hidden opacity-0 invisible',
                     isHelpGroup
-                        ? 'group-hover/help-tooltip:opacity-100 group-hover/help-tooltip:visible'
-                        : 'group-hover/hover-tooltip:opacity-100 group-hover/hover-tooltip:visible',
+                        ? 'group-hover/help-tooltip:block group-hover/help-tooltip:opacity-100 group-hover/help-tooltip:visible'
+                        : 'group-hover/hover-tooltip:block group-hover/hover-tooltip:opacity-100 group-hover/hover-tooltip:visible',
                     props.revealOnParentFocusClass,
-                    props.open && 'opacity-100 visible',
+                    props.open && 'block opacity-100 visible',
                     props.tooltipClassName,
                     'transition-opacity duration-100'
                 )}

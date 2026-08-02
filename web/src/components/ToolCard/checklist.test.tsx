@@ -160,6 +160,23 @@ describe('UpdatePlanView', () => {
         expect(pending.className).toContain('text-[var(--app-hint)]')
     })
 
+    it('renders the plan explanation above the checklist', () => {
+        render(
+            <UpdatePlanView
+                block={makeUpdatePlanBlock({
+                    explanation: 'I will preserve progress while collapsing command noise.',
+                    plan: [
+                        { step: 'Implement grouping', status: 'in_progress' }
+                    ]
+                })}
+                metadata={null}
+            />
+        )
+
+        expect(screen.getByText('I will preserve progress while collapsing command noise.')).toBeInTheDocument()
+        expect(screen.getByText(/Implement grouping/)).toBeInTheDocument()
+    })
+
     it('is registered as the compact tool view', () => {
         expect(getToolViewComponent('update_plan')).toBe(UpdatePlanView)
     })

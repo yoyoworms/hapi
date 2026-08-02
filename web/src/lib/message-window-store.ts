@@ -21,8 +21,11 @@ export type MessageWindowState = {
 export const VISIBLE_WINDOW_SIZE = 150
 export const PENDING_WINDOW_SIZE = 200
 const AGENT_RUN_WINDOW_SIZE = 300
-const OLDER_LOAD_WINDOW_SIZE = VISIBLE_WINDOW_SIZE * 2
 const PAGE_SIZE = 50
+const OLDER_PAGE_SIZE = 200
+const MAX_OLDER_HISTORY_PAGES = 5
+const OLDER_LOAD_WINDOW_SIZE = VISIBLE_WINDOW_SIZE + (OLDER_PAGE_SIZE * MAX_OLDER_HISTORY_PAGES)
+const INCREMENTAL_PAGE_SIZE = 200
 const MIN_INITIAL_VISIBLE_MESSAGES = 8
 const MAX_INITIAL_HISTORY_PAGES = 4
 const COLD_LOAD_BACKFILL_PAGE_SIZE = 200
@@ -491,6 +494,10 @@ function countRegularMessages(messages: DecryptedMessage[]): number {
     return count
 }
 
+function hasConversationAnchor(messages: DecryptedMessage[]): boolean {
+    return messages.some((message) => isUserMessage(message) && !isQueuedForInvocation(message))
+}
+
 function sameCursor(a: MessagesResponse, b: MessagesResponse): boolean {
     return a.page.nextBeforeAt === b.page.nextBeforeAt
         && a.page.nextBeforeSeq === b.page.nextBeforeSeq
@@ -504,13 +511,17 @@ async function backfillColdLoadMessages(
 ): Promise<MessagesResponse> {
     let combined = first
     let regularCount = countRegularMessages(combined.messages)
+    let conversationAnchored = hasConversationAnchor(combined.messages)
 
-    // On a cold reload the hub's latest page can be filled entirely by Codex
-    // child-agent trace updates. The live path protects regular/root messages
-    // with a separate client budget, but that cannot help if those messages were
-    // never fetched. Walk older pages until the initial window has a small root
-    // conversation floor, or until history is exhausted.
-    while (combined.page.hasMore && regularCount < COLD_LOAD_REGULAR_TARGET) {
+    // A Codex turn can emit hundreds of tool/token events. Counting those as
+    // "regular" made a 50-row latest page look complete even when it contained
+    // only the tail of a turn (answer present, user prompt on the older page).
+    // Keep the existing root-message floor, but also require an invoked user
+    // message so a cold/recovery load starts from a meaningful turn boundary.
+    while (
+        combined.page.hasMore
+        && (regularCount < COLD_LOAD_REGULAR_TARGET || !conversationAnchored)
+    ) {
         if (isCurrent && !isCurrent()) {
             return combined
         }
@@ -544,9 +555,68 @@ async function backfillColdLoadMessages(
             page: older.page
         }
         regularCount = countRegularMessages(combined.messages)
+        conversationAnchored = hasConversationAnchor(combined.messages)
     }
 
     return combined
+}
+
+async function fetchIncrementalMessages(
+    api: ApiClient,
+    sessionId: string,
+    afterSeq: number,
+    isCurrent?: () => boolean
+): Promise<MessagesResponse> {
+    let cursor = afterSeq
+    let combined: DecryptedMessage[] = []
+    let latest: MessagesResponse | null = null
+
+    // `afterSeq` is an ascending recovery stream. One Codex turn regularly
+    // exceeds the Hub's 200-row cap, so a single request can stop in the middle
+    // of tool activity and never reach the final reply. Drain every page while
+    // guarding against a malformed/non-advancing response.
+    while (true) {
+        if (isCurrent && !isCurrent()) {
+            break
+        }
+
+        const response = await api.getMessages(sessionId, {
+            afterSeq: cursor,
+            limit: INCREMENTAL_PAGE_SIZE
+        })
+        latest = response
+        combined = mergeMessages(combined, response.messages)
+
+        if (isCurrent && !isCurrent()) {
+            break
+        }
+        if (!response.page.hasMore) {
+            break
+        }
+
+        const nextCursor = deriveSeqBounds(response.messages).newestSeq
+        if (nextCursor === null || nextCursor <= cursor) {
+            latest = {
+                messages: response.messages,
+                page: {
+                    ...response.page,
+                    hasMore: false
+                }
+            }
+            break
+        }
+        cursor = nextCursor
+    }
+
+    return {
+        messages: combined,
+        page: latest?.page ?? {
+            limit: INCREMENTAL_PAGE_SIZE,
+            nextBeforeSeq: null,
+            nextBeforeAt: null,
+            hasMore: false
+        }
+    }
 }
 
 function sliceForTrim<T>(items: T[], limit: number, mode: 'append' | 'prepend'): { kept: T[]; dropped: T[] } {
@@ -619,12 +689,37 @@ function buildState(
     }
 }
 
-/** Trim `messages` down to `limit` while preserving every queued user message.
- *  Queued rows must survive trimming on both windows: the `messages-consumed`
- *  SSE only carries localIds, so a dropped queued row cannot be restored or
- *  repositioned without a full refetch.  Returns the kept slice plus the list
- *  of regular (non-queued) rows that were dropped, so the pending-overflow
- *  warning counter can be advanced symmetrically. */
+function getLatestConversationAnchor(messages: DecryptedMessage[]): DecryptedMessage | null {
+    let latest: DecryptedMessage | null = null
+    for (const message of messages) {
+        if (!isUserMessage(message) || isQueuedForInvocation(message)) {
+            continue
+        }
+        if (!latest) {
+            latest = message
+            continue
+        }
+        const messageAt = getMessagePositionAt(message)
+        const latestAt = getMessagePositionAt(latest)
+        const messageSeq = typeof message.seq === 'number' ? message.seq : Number.NEGATIVE_INFINITY
+        const latestSeq = typeof latest.seq === 'number' ? latest.seq : Number.NEGATIVE_INFINITY
+        if (messageAt > latestAt || (messageAt === latestAt && messageSeq > latestSeq)) {
+            latest = message
+        }
+    }
+    return latest
+}
+
+/** Trim `messages` down to `limit` while preserving queued user messages and,
+ *  on the live/latest edge, the newest invoked user prompt.
+ *
+ *  Queued rows must survive trimming because `messages-consumed` only carries
+ *  localIds. The latest prompt is also a structural anchor: without it, a
+ *  tool-heavy Codex turn can leave an answer and its folded execution trace in
+ *  the window while evicting the question that initiated the turn.
+ *
+ *  Returns the kept slice plus regular rows that were dropped so callers can
+ *  retain a pageable cursor and pending-overflow accounting. */
 function trimPreservingQueued(
     messages: DecryptedMessage[],
     limit: number,
@@ -634,15 +729,19 @@ function trimPreservingQueued(
         return { kept: messages, dropped: [] }
     }
     const queued = messages.filter(isQueuedForInvocation)
-    const queuedIds = new Set(queued.map((message) => message.id))
-    const nonQueued = messages.filter((message) => !queuedIds.has(message.id))
-    const agentRun = nonQueued.filter(isCodexAgentRunMessage)
-    const regular = nonQueued.filter((message) => !isCodexAgentRunMessage(message))
-    const budget = Math.max(0, limit - queued.length)
+    const latestAnchor = mode === 'append' ? getLatestConversationAnchor(messages) : null
+    const protectedMessages = latestAnchor
+        ? mergeMessages(queued, [latestAnchor])
+        : queued
+    const protectedIds = new Set(protectedMessages.map((message) => message.id))
+    const unprotected = messages.filter((message) => !protectedIds.has(message.id))
+    const agentRun = unprotected.filter(isCodexAgentRunMessage)
+    const regular = unprotected.filter((message) => !isCodexAgentRunMessage(message))
+    const budget = Math.max(0, limit - protectedMessages.length)
     const regularTrim = sliceForTrim(regular, budget, mode)
     const agentRunTrim = sliceForTrim(agentRun, AGENT_RUN_WINDOW_SIZE, mode)
     return {
-        kept: mergeMessages([...regularTrim.kept, ...agentRunTrim.kept], queued),
+        kept: mergeMessages([...regularTrim.kept, ...agentRunTrim.kept], protectedMessages),
         dropped: [...regularTrim.dropped, ...agentRunTrim.dropped]
     }
 }
@@ -669,7 +768,30 @@ function cursorUpdatesAfterAppendTrim(
     if (dropped.length === 0) {
         return {}
     }
-    const oldest = deriveOldestPosition(kept)
+
+    // Protected user/queued rows can sit before a trimmed gap. Using the
+    // absolute oldest kept row as the cursor would jump over that gap forever.
+    // Anchor pagination at the first kept row after the newest dropped row so
+    // the next older request can recover every omitted record.
+    const newestDropped = dropped.reduce<DecryptedMessage | null>((newest, message) => {
+        if (typeof message.seq !== 'number') return newest
+        if (!newest) return message
+        const messageAt = getMessagePositionAt(message)
+        const newestAt = getMessagePositionAt(newest)
+        return messageAt > newestAt || (messageAt === newestAt && message.seq > newest.seq!)
+            ? message
+            : newest
+    }, null)
+    const contiguousKept = newestDropped
+        ? kept.filter((message) => {
+            if (typeof message.seq !== 'number') return false
+            const messageAt = getMessagePositionAt(message)
+            const droppedAt = getMessagePositionAt(newestDropped)
+            return messageAt > droppedAt
+                || (messageAt === droppedAt && message.seq > newestDropped.seq!)
+        })
+        : kept
+    const oldest = deriveOldestPosition(contiguousKept.length > 0 ? contiguousKept : kept)
     return {
         hasMore: true,
         ...(oldest ? {
@@ -686,9 +808,9 @@ function trimPending(
     if (messages.length <= PENDING_WINDOW_SIZE) {
         return { pending: messages, dropped: 0, droppedVisible: 0 }
     }
-    // Symmetric with trimVisible: agents that overflow the pending window
-    // (200) must not evict queued user messages — the floating bar holds the
-    // only client-visible reference to them until the CLI ack arrives.
+    // Keep the newest coherent live tail while a reader is browsing history.
+    // trimPreservingQueued also pins the latest invoked user prompt, so a
+    // tool-heavy cross-device turn cannot leave only its answer in pending.
     const { kept, dropped } = trimPreservingQueued(messages, PENDING_WINDOW_SIZE, 'append')
     const droppedVisible = countVisiblePendingMessages(sessionId, dropped)
     return { pending: kept, dropped: dropped.length, droppedVisible }
@@ -804,7 +926,13 @@ function mergeIntoPending(
     const pendingOverflowCount = prev.pendingOverflowCount + dropped
     const pendingOverflowVisibleCount = prev.pendingOverflowVisibleCount + droppedVisible
     const warning = droppedVisible > 0 && !prev.warning ? PENDING_OVERFLOW_WARNING : prev.warning
-    return { pending, pendingVisibleCount, pendingOverflowCount, pendingOverflowVisibleCount, warning }
+    return {
+        pending,
+        pendingVisibleCount,
+        pendingOverflowCount,
+        pendingOverflowVisibleCount,
+        warning
+    }
 }
 
 export function getMessageWindowState(sessionId: string): MessageWindowState {
@@ -952,12 +1080,20 @@ async function fetchLatestMessagesOnce(
         const useIncremental = options?.incremental && initial.newestSeq !== null && initial.newestSeq > 0
         let response
         if (useIncremental) {
-            response = await api.getMessages(sessionId, { afterSeq: initial.newestSeq!, limit: PAGE_SIZE })
+            response = await fetchIncrementalMessages(
+                api,
+                sessionId,
+                initial.newestSeq!,
+                () => isCurrentGeneration(sessionId, 'latest', generation)
+            )
         } else {
             const firstResponse = await api.getMessages(sessionId, { limit: PAGE_SIZE })
-            response = initial.atBottom
-                ? await backfillColdLoadMessages(api, sessionId, firstResponse, () => isCurrentGeneration(sessionId, 'latest', generation))
-                : firstResponse
+            response = await backfillColdLoadMessages(
+                api,
+                sessionId,
+                firstResponse,
+                () => isCurrentGeneration(sessionId, 'latest', generation)
+            )
         }
         if (!isCurrentGeneration(sessionId, 'latest', generation)) {
             return
@@ -969,40 +1105,60 @@ async function fetchLatestMessagesOnce(
         const nextBeforeSeq = response.page.nextBeforeSeq
 
         updateStateForGeneration(sessionId, 'latest', generation, (prev) => {
-            if (prev.atBottom) {
-                const merged = mergeMessages(prev.messages, [...prev.pending, ...response.messages])
-                // Reconcile against the authoritative latest page before trimming:
-                // trimVisible preserves every queued row, so a ghost (queued locally
-                // but already invoked server-side, missed messages-consumed while
-                // offline) would otherwise be pinned forever.
-                const reconciled = reconcileQueuedAgainstLatest(merged, response.messages, reconcileCandidateIds)
-                const trimmed = trimVisible(reconciled, 'append')
+            if (!prev.atBottom && prev.messages.length > 0) {
+                // A latest/recovery fetch can finish while the reader is paging
+                // through old history. Do not splice that live tail into the
+                // historical window: append-trimming would discard the pages
+                // they just loaded and move the older cursor forward again.
+                // Keep the complete cross-device tail (user + agent) together
+                // in pending; returning to the bottom flushes it atomically.
+                const pendingResult = mergeIntoPending(prev, response.messages)
                 return buildState(prev, {
-                    messages: trimmed,
-                    pending: [],
-                    pendingOverflowCount: 0,
-                    pendingVisibleCount: 0,
-                    pendingOverflowVisibleCount: 0,
-                    hasMore: useIncremental ? prev.hasMore : response.page.hasMore,
-                    oldestPositionAt: useIncremental ? prev.oldestPositionAt : nextBeforeAt,
-                    oldestPositionSeq: useIncremental ? prev.oldestPositionSeq : nextBeforeSeq,
+                    pending: pendingResult.pending,
+                    pendingVisibleCount: pendingResult.pendingVisibleCount,
+                    pendingOverflowCount: pendingResult.pendingOverflowCount,
+                    pendingOverflowVisibleCount: pendingResult.pendingOverflowVisibleCount,
                     isLoading: false,
-                    warning: null,
+                    warning: pendingResult.warning,
                 })
             }
-            const pendingResult = mergeIntoPending(prev, response.messages)
-            return buildState(prev, {
-                pending: pendingResult.pending,
-                pendingVisibleCount: pendingResult.pendingVisibleCount,
-                pendingOverflowCount: pendingResult.pendingOverflowCount,
-                pendingOverflowVisibleCount: pendingResult.pendingOverflowVisibleCount,
-                // Persist the cursor pair on the non-at-bottom path too. Without this
-                // a refresh while scrolled up drops the composite cursor and prevents
-                // the next older-page load.
+
+            const merged = mergeMessages(prev.messages, [...prev.pending, ...response.messages])
+            // Only a full latest-page response is authoritative for queued-row
+            // reconciliation. An afterSeq slice legitimately omits older queued
+            // rows and must never delete them merely because they are absent.
+            const reconciled = useIncremental
+                ? merged
+                : reconcileQueuedAgainstLatest(merged, response.messages, reconcileCandidateIds)
+            const { kept, dropped } = trimVisibleWithDropped(reconciled, 'append')
+            const trimCursor = cursorUpdatesAfterAppendTrim(kept, dropped)
+            const fullPageCursor = {
+                hasMore: response.page.hasMore,
                 oldestPositionAt: nextBeforeAt,
                 oldestPositionSeq: nextBeforeSeq,
+            }
+            const incrementalCursor = {
+                hasMore: trimCursor.hasMore ?? prev.hasMore,
+                oldestPositionAt: trimCursor.oldestPositionAt ?? prev.oldestPositionAt,
+                oldestPositionSeq: trimCursor.oldestPositionSeq ?? prev.oldestPositionSeq,
+            }
+            const latestCursor = dropped.length > 0
+                ? {
+                    hasMore: true,
+                    oldestPositionAt: trimCursor.oldestPositionAt ?? nextBeforeAt,
+                    oldestPositionSeq: trimCursor.oldestPositionSeq ?? nextBeforeSeq,
+                }
+                : fullPageCursor
+
+            return buildState(prev, {
+                messages: kept,
+                pending: [],
+                pendingOverflowCount: 0,
+                pendingVisibleCount: 0,
+                pendingOverflowVisibleCount: 0,
+                ...(useIncremental ? incrementalCursor : latestCursor),
                 isLoading: false,
-                warning: pendingResult.warning,
+                warning: null,
             })
         })
     } catch (error) {
@@ -1050,6 +1206,112 @@ async function fetchLatestMessagesWithVisibleHistory(api: ApiClient, sessionId: 
     }
 }
 
+function getConversationAnchorIds(messages: DecryptedMessage[]): Set<string> {
+    return new Set(
+        messages
+            .filter((message) => isUserMessage(message) && !isQueuedForInvocation(message))
+            .map((message) => message.id)
+    )
+}
+
+async function fetchOlderConversationBatch(
+    api: ApiClient,
+    sessionId: string,
+    cursor: { at: number; seq: number },
+    existingAnchorIds: Set<string>,
+    isCurrent: () => boolean
+): Promise<MessagesResponse> {
+    let beforeAt = cursor.at
+    let beforeSeq = cursor.seq
+    let combined: DecryptedMessage[] = []
+    let latest: MessagesResponse | null = null
+
+    // A Codex turn commonly contains hundreds of raw tool/token events while
+    // rendering as one folded conversation. Loading one 50-row raw page made
+    // the top appear to change at random and required many gestures to reach
+    // the preceding question. Read larger pages until one new user anchor is
+    // present, with a bounded raw-row budget for very large turns.
+    for (let pageIndex = 0; pageIndex < MAX_OLDER_HISTORY_PAGES; pageIndex += 1) {
+        if (!isCurrent()) break
+
+        const response = await api.getMessages(sessionId, {
+            beforeAt,
+            beforeSeq,
+            limit: OLDER_PAGE_SIZE
+        })
+        latest = response
+
+        if (!isCurrent()) break
+
+        let anchorIndex = -1
+        for (let index = response.messages.length - 1; index >= 0; index -= 1) {
+            const message = response.messages[index]
+            if (
+                typeof message.seq === 'number'
+                && isUserMessage(message)
+                && !isQueuedForInvocation(message)
+                && !existingAnchorIds.has(message.id)
+            ) {
+                anchorIndex = index
+                break
+            }
+        }
+        if (anchorIndex >= 0) {
+            // Stop exactly at the nearest preceding user turn instead of at an
+            // arbitrary raw-page boundary. Rows before this prompt belong to
+            // the prior turn and are intentionally deferred to the next load.
+            // This keeps the top DOM anchor stable and makes each gesture reveal
+            // one coherent conversation.
+            const anchor = response.messages[anchorIndex]
+            combined = mergeMessages(combined, response.messages.slice(anchorIndex))
+            latest = {
+                messages: response.messages,
+                page: {
+                    ...response.page,
+                    nextBeforeAt: getMessagePositionAt(anchor),
+                    nextBeforeSeq: anchor.seq,
+                    hasMore: response.page.hasMore || anchorIndex > 0
+                }
+            }
+            break
+        }
+
+        combined = mergeMessages(combined, response.messages)
+        if (!response.page.hasMore) {
+            break
+        }
+
+        const nextAt = response.page.nextBeforeAt
+        const nextSeq = response.page.nextBeforeSeq
+        if (
+            nextAt === null
+            || nextSeq === null
+            || (nextAt === beforeAt && nextSeq === beforeSeq)
+        ) {
+            latest = {
+                messages: response.messages,
+                page: {
+                    ...response.page,
+                    hasMore: false
+                }
+            }
+            break
+        }
+        beforeAt = nextAt
+        beforeSeq = nextSeq
+    }
+
+    return {
+        messages: combined,
+        page: latest?.page ?? {
+            limit: OLDER_PAGE_SIZE,
+            nextBeforeSeq: cursor.seq,
+            nextBeforeAt: cursor.at,
+            hasMore: true
+        }
+    }
+}
+
 export async function fetchOlderMessages(api: ApiClient, sessionId: string): Promise<void> {
     const initial = getState(sessionId)
     if (initial.isLoadingMore || !initial.hasMore) {
@@ -1061,11 +1323,19 @@ export async function fetchOlderMessages(api: ApiClient, sessionId: string): Pro
     const generation = beginAsyncGeneration(sessionId, 'older', { isLoadingMore: true })
 
     try {
-        const response = await api.getMessages(sessionId, {
-            beforeAt: initial.oldestPositionAt,
-            beforeSeq: initial.oldestPositionSeq,
-            limit: PAGE_SIZE
-        })
+        const response = await fetchOlderConversationBatch(
+            api,
+            sessionId,
+            {
+                at: initial.oldestPositionAt,
+                seq: initial.oldestPositionSeq
+            },
+            getConversationAnchorIds([...initial.messages, ...initial.pending]),
+            () => isCurrentGeneration(sessionId, 'older', generation)
+        )
+        if (!isCurrentGeneration(sessionId, 'older', generation)) {
+            return
+        }
 
         const nextBeforeAt = response.page.nextBeforeAt
         const nextBeforeSeq = response.page.nextBeforeSeq
@@ -1095,35 +1365,13 @@ export function ingestIncomingMessages(sessionId: string, incoming: DecryptedMes
         return
     }
     updateState(sessionId, (prev) => {
-        if (prev.atBottom) {
-            const merged = mergeMessages(prev.messages, incoming)
-            const { kept, dropped } = trimVisibleWithDropped(merged, 'append')
-            const pending = filterPendingAgainstVisible(prev.pending, kept)
+        if (!prev.atBottom && prev.messages.length > 0) {
+            // Freeze the historical window while it is being read. Queue both
+            // roles together: splitting user into pending while appending agent
+            // rows caused answer-without-question timelines; appending both and
+            // trimming caused live Codex events to erase older-page progress.
+            const pendingResult = mergeIntoPending(prev, incoming)
             return buildState(prev, {
-                messages: kept,
-                pending,
-                ...cursorUpdatesAfterAppendTrim(kept, dropped)
-            })
-        }
-        // 不在底部时：agent 消息立即显示，user 消息才放入 pending
-        // 原因：用户必须看到 AI 回复才能继续交互，pending 机制会导致回复滞后
-        const agentMessages = incoming.filter(msg => !isUserMessage(msg))
-        const userMessages = incoming.filter(msg => isUserMessage(msg))
-
-        let state = prev
-        if (agentMessages.length > 0) {
-            const merged = mergeMessages(state.messages, agentMessages)
-            const { kept, dropped } = trimVisibleWithDropped(merged, 'append')
-            const pending = filterPendingAgainstVisible(state.pending, kept)
-            state = buildState(state, {
-                messages: kept,
-                pending,
-                ...cursorUpdatesAfterAppendTrim(kept, dropped)
-            })
-        }
-        if (userMessages.length > 0) {
-            const pendingResult = mergeIntoPending(state, userMessages)
-            state = buildState(state, {
                 pending: pendingResult.pending,
                 pendingVisibleCount: pendingResult.pendingVisibleCount,
                 pendingOverflowCount: pendingResult.pendingOverflowCount,
@@ -1131,7 +1379,15 @@ export function ingestIncomingMessages(sessionId: string, incoming: DecryptedMes
                 warning: pendingResult.warning,
             })
         }
-        return state
+
+        const merged = mergeMessages(prev.messages, incoming)
+        const { kept, dropped } = trimVisibleWithDropped(merged, 'append')
+        const pending = filterPendingAgainstVisible(prev.pending, kept)
+        return buildState(prev, {
+            messages: kept,
+            pending,
+            ...cursorUpdatesAfterAppendTrim(kept, dropped)
+        })
     })
 }
 
@@ -1281,14 +1537,24 @@ export function markMessagesConsumed(sessionId: string, localIds: string[], invo
                 return { ...message, ...update }
             })
         }
-        // Migrate just-acked pending entries into the visible thread. Without
-        // this step, an at-bottom=false user that is stuck in pending never
-        // sees their own message at the invocation slot — it stays in the
-        // pending bucket until they scroll, even though the floating bar
-        // already cleared.  Identifying the migrated rows by (localId,
-        // invokedAt = invokedAt) ensures we only move rows whose
-        // ack just arrived, not unrelated pending entries.
+        const updatedMessages = updateList(prev.messages)
         const updatedPending = updateList(prev.pending)
+        if (!changed) {
+            return prev
+        }
+
+        if (!prev.atBottom && prev.messages.length > 0) {
+            // Invocation acks must not punch a just-consumed phone prompt into a
+            // historical window and trigger append trimming. Keep the updated
+            // row in the same pending live tail until the reader returns.
+            return buildState(prev, {
+                messages: mergeMessages([], updatedMessages),
+                pending: mergeMessages([], updatedPending)
+            })
+        }
+
+        // At the live edge, migrate just-acked pending entries into the thread
+        // at their authoritative invocation position.
         const consumedFromPending: DecryptedMessage[] = []
         const remainingPending = updatedPending.filter((message) => {
             if (
@@ -1304,12 +1570,9 @@ export function markMessagesConsumed(sessionId: string, localIds: string[], invo
         // After update, re-merge to re-sort by the position key (`invokedAt ?? createdAt`):
         // a queued message that just received `invokedAt` should move to its invocation
         // position, not stay at its original send-time slot until the next fetch.
-        const mergedMessages = mergeMessages(updateList(prev.messages), consumedFromPending)
+        const mergedMessages = mergeMessages(updatedMessages, consumedFromPending)
         const { kept, dropped } = trimVisibleWithDropped(mergedMessages, 'append')
         const pending = mergeMessages([], remainingPending)
-        if (!changed) {
-            return prev
-        }
         return buildState(prev, {
             messages: kept,
             pending,

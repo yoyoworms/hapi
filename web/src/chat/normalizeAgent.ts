@@ -828,6 +828,8 @@ export function normalizeAgentRecord(
             const plan = normalizePlanEntries(data.plan ?? data.update ?? data.items ?? data.steps ?? data)
             if (plan.length === 0) return null
             const uuid = asString(data.id) ?? messageId
+            const update = isObject(data.update) ? data.update : null
+            const explanation = asString(data.explanation ?? update?.explanation)
             return {
                 id: messageId,
                 localId,
@@ -841,6 +843,7 @@ export function normalizeAgentRecord(
                         name: 'update_plan',
                         input: {
                             plan,
+                            ...(explanation ? { explanation } : {}),
                             source: 'codex'
                         },
                         description: null,
@@ -852,6 +855,7 @@ export function normalizeAgentRecord(
                         tool_use_id: 'codex-plan-state',
                         content: {
                             plan,
+                            ...(explanation ? { explanation } : {}),
                             source: 'codex',
                             status: 'updated'
                         },

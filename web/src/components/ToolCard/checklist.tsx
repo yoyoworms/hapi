@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { isObject } from '@hapi/protocol'
+import { extractPlanSnapshot } from '@/chat/planProgress'
 
 export type ChecklistStatus = 'pending' | 'in_progress' | 'completed'
 
@@ -62,19 +63,15 @@ export function extractTodoChecklist(input: unknown, result: unknown): Checklist
 }
 
 export function extractUpdatePlanChecklist(input: unknown, result: unknown): ChecklistItem[] {
-    if (isObject(input) && Object.prototype.hasOwnProperty.call(input, 'plan')) {
-        return parseChecklistEntries(input.plan, {
-            textKey: 'step'
-        })
-    }
+    return extractPlanSnapshot(input, result).steps.map((item) => ({
+        id: undefined,
+        text: item.step,
+        status: item.status
+    }))
+}
 
-    if (isObject(result)) {
-        return parseChecklistEntries(result.plan, {
-            textKey: 'step'
-        })
-    }
-
-    return []
+export function extractUpdatePlanExplanation(input: unknown, result: unknown): string | null {
+    return extractPlanSnapshot(input, result).explanation
 }
 
 function checklistTone(item: ChecklistItem): string {

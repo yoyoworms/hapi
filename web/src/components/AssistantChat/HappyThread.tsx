@@ -19,17 +19,20 @@ type ScrollAnchor = {
     topOffset: number
 }
 
-type PendingScrollRestore = {
+export type ScrollRestoreSnapshot = {
     anchor: ScrollAnchor | null
     scrollTop: number
     scrollHeight: number
 }
+
+type PendingScrollRestore = ScrollRestoreSnapshot
 
 const MESSAGE_ANCHOR_SELECTOR = '.happy-thread-messages > [id]'
 const AUTO_SCROLL_RESUME_THRESHOLD_PX = 120
 const MANUAL_SCROLL_EPSILON_PX = 1
 const INITIAL_SCROLL_SETTLE_MS = 1800
 const INITIAL_SCROLL_SETTLE_DELAYS_MS = [0, 16, 50, 120, 250, 500, 900, 1400, 1800] as const
+const PREPEND_SCROLL_RESTORE_DELAYS_MS = [0, 16, 50, 120, 250, 500, 900, 1400] as const
 
 type ScrollIntent = {
     distanceFromBottom: number
@@ -87,6 +90,39 @@ export function restoreScrollAnchor(viewport: HTMLElement, anchor: ScrollAnchor)
     const viewportRect = viewport.getBoundingClientRect()
     const targetRect = target.getBoundingClientRect()
     viewport.scrollTop += targetRect.top - viewportRect.top - anchor.topOffset
+    return true
+}
+
+export function restoreScrollAfterPrepend(
+    viewport: HTMLElement,
+    snapshot: ScrollRestoreSnapshot,
+    force: boolean = false
+): boolean {
+    const heightChanged = viewport.scrollHeight !== snapshot.scrollHeight
+
+    if (snapshot.anchor) {
+        const target = document.getElementById(snapshot.anchor.id)
+        if (target && viewport.contains(target)) {
+            const viewportRect = viewport.getBoundingClientRect()
+            const targetRect = target.getBoundingClientRect()
+            const offsetDelta = targetRect.top - viewportRect.top - snapshot.anchor.topOffset
+            const anchorMoved = Math.abs(offsetDelta) > 0.5
+            if (!heightChanged && !anchorMoved && !force) {
+                // assistant-ui updates its external runtime after the raw store
+                // version changes. An immediate layout effect can still see the
+                // old DOM; keep the snapshot until ResizeObserver/rAF observes
+                // the actual prepend.
+                return false
+            }
+            viewport.scrollTop += offsetDelta
+            return true
+        }
+    }
+
+    if (!heightChanged && !force) {
+        return false
+    }
+    viewport.scrollTop = snapshot.scrollTop + (viewport.scrollHeight - snapshot.scrollHeight)
     return true
 }
 
@@ -291,6 +327,7 @@ export function HappyThread(props: {
     const initialScrollSessionRef = useRef<string | null>(null)
     const initialScrollDeadlineRef = useRef(0)
     const initialScrollTimersRef = useRef<number[]>([])
+    const prependRestoreTimersRef = useRef<number[]>([])
 
     // Smart scroll state: enabled only while the user is intentionally at the bottom.
     const autoScrollEnabledRef = useRef(true)
@@ -328,6 +365,13 @@ export function HappyThread(props: {
         initialScrollTimersRef.current = []
     }, [])
 
+    const clearPrependRestoreTimers = useCallback(() => {
+        for (const timer of prependRestoreTimersRef.current) {
+            window.clearTimeout(timer)
+        }
+        prependRestoreTimersRef.current = []
+    }, [])
+
     const settlePendingLoad = useCallback((result: boolean) => {
         const resolve = pendingLoadResolveRef.current
         const baseline = pendingLoadBaselineRef.current
@@ -346,6 +390,43 @@ export function HappyThread(props: {
             || hasMoreMessagesRef.current !== baseline.hasMoreMessages
         )
     }, [])
+
+    const finishPendingScrollRestore = useCallback((force: boolean = false): boolean => {
+        const pending = pendingScrollRef.current
+        const viewport = viewportRef.current
+        if (!pending || !viewport || isLoadingMoreRef.current) {
+            return false
+        }
+        if (!restoreScrollAfterPrepend(viewport, pending, force)) {
+            return false
+        }
+
+        lastScrollTopRef.current = viewport.scrollTop
+        if (!force) {
+            // Tool groups and markdown resize over several React commits after
+            // the raw page lands. Keep applying the same anchor until the final
+            // settling attempt instead of consuming it on the first resize.
+            return true
+        }
+        pendingScrollRef.current = null
+        loadLockRef.current = false
+        clearPrependRestoreTimers()
+        settlePendingLoad(true)
+        return true
+    }, [clearPrependRestoreTimers, settlePendingLoad])
+
+    const schedulePendingScrollRestore = useCallback(() => {
+        if (!pendingScrollRef.current) {
+            return
+        }
+        clearPrependRestoreTimers()
+        prependRestoreTimersRef.current = PREPEND_SCROLL_RESTORE_DELAYS_MS.map((delay, index) => (
+            window.setTimeout(() => {
+                const force = index === PREPEND_SCROLL_RESTORE_DELAYS_MS.length - 1
+                finishPendingScrollRestore(force)
+            }, delay)
+        ))
+    }, [clearPrependRestoreTimers, finishPendingScrollRestore])
 
     // Track scroll position to toggle autoScroll (stable listener using refs)
     useEffect(() => {
@@ -447,8 +528,9 @@ export function HappyThread(props: {
         initialScrollSessionRef.current = null
         initialScrollDeadlineRef.current = 0
         clearInitialScrollTimers()
+        clearPrependRestoreTimers()
         settlePendingLoad(false)
-    }, [props.sessionId, clearInitialScrollTimers, settlePendingLoad])
+    }, [props.sessionId, clearInitialScrollTimers, clearPrependRestoreTimers, settlePendingLoad])
 
     useLayoutEffect(() => {
         if (
@@ -490,9 +572,10 @@ export function HappyThread(props: {
     useEffect(() => {
         return () => {
             clearInitialScrollTimers()
+            clearPrependRestoreTimers()
             settlePendingLoad(false)
         }
-    }, [clearInitialScrollTimers, settlePendingLoad])
+    }, [clearInitialScrollTimers, clearPrependRestoreTimers, settlePendingLoad])
 
     useEffect(() => {
         if (forceScrollTokenRef.current === props.forceScrollToken) {
@@ -524,6 +607,7 @@ export function HappyThread(props: {
             scrollTop: viewport.scrollTop,
             scrollHeight: viewport.scrollHeight
         }
+        clearPrependRestoreTimers()
         autoScrollEnabledRef.current = false
         loadLockRef.current = true
         loadStartedRef.current = false
@@ -537,27 +621,30 @@ export function HappyThread(props: {
         pendingLoadPromiseRef.current = loadPromise
         try {
             void onLoadMoreRef.current().catch((error) => {
+                clearPrependRestoreTimers()
                 pendingScrollRef.current = null
                 loadLockRef.current = false
                 settlePendingLoad(false)
                 console.error('Failed to load older messages:', error)
             }).finally(() => {
                 if (!loadStartedRef.current && !isLoadingMoreRef.current) {
-                    if (pendingScrollRef.current) {
-                        pendingScrollRef.current = null
-                        loadLockRef.current = false
-                    }
-                    settlePendingLoad(true)
+                    schedulePendingScrollRestore()
                 }
             })
         } catch (error) {
+            clearPrependRestoreTimers()
             pendingScrollRef.current = null
             loadLockRef.current = false
             settlePendingLoad(false)
             console.error('Failed to load older messages:', error)
         }
         return loadPromise
-    }, [isInitialScrollSettling, settlePendingLoad])
+    }, [
+        isInitialScrollSettling,
+        clearPrependRestoreTimers,
+        schedulePendingScrollRestore,
+        settlePendingLoad
+    ])
 
     const handleOutlineSelect = useCallback(async (item: ConversationOutlineItem) => {
         const target = await locateOutlineTargetMessage({
@@ -618,6 +705,9 @@ export function HappyThread(props: {
         }
 
         const observer = new ResizeObserver(() => {
+            if (pendingScrollRef.current && finishPendingScrollRestore()) {
+                return
+            }
             // Message DOM can grow after messagesVersion commits (assistant-ui
             // updates its external runtime in an effect, then markdown/tool
             // content may resize). Keep following while the user is at bottom.
@@ -631,7 +721,7 @@ export function HappyThread(props: {
         })
         observer.observe(content)
         return () => observer.disconnect()
-    }, [scrollToBottomInstant])
+    }, [finishPendingScrollRestore, scrollToBottomInstant])
 
     useLayoutEffect(() => {
         const pending = pendingScrollRef.current
@@ -640,21 +730,13 @@ export function HappyThread(props: {
             return
         }
         if (pending) {
-            const restoredByAnchor = pending.anchor ? restoreScrollAnchor(viewport, pending.anchor) : false
-            if (!restoredByAnchor) {
-                const delta = viewport.scrollHeight - pending.scrollHeight
-                viewport.scrollTop = pending.scrollTop + delta
-            }
-            lastScrollTopRef.current = viewport.scrollTop
-            pendingScrollRef.current = null
-            loadLockRef.current = false
-            settlePendingLoad(true)
+            schedulePendingScrollRestore()
             return
         }
         if (atBottomRef.current && autoScrollEnabledRef.current) {
             scrollToBottomInstant()
         }
-    }, [props.messagesVersion, scrollToBottomInstant, settlePendingLoad])
+    }, [props.messagesVersion, schedulePendingScrollRestore, scrollToBottomInstant])
 
     useEffect(() => {
         isLoadingMoreRef.current = props.isLoadingMoreMessages
@@ -662,14 +744,10 @@ export function HappyThread(props: {
             loadStartedRef.current = true
         }
         if (prevLoadingMoreRef.current && !props.isLoadingMoreMessages) {
-            if (pendingScrollRef.current) {
-                pendingScrollRef.current = null
-                loadLockRef.current = false
-            }
-            settlePendingLoad(true)
+            schedulePendingScrollRestore()
         }
         prevLoadingMoreRef.current = props.isLoadingMoreMessages
-    }, [props.isLoadingMoreMessages, settlePendingLoad])
+    }, [props.isLoadingMoreMessages, schedulePendingScrollRestore])
 
     const showSkeleton = props.isLoadingMessages && props.rawMessagesCount === 0 && props.pendingCount === 0
 

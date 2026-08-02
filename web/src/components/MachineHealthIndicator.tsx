@@ -120,11 +120,11 @@ function MachineHealthHint() {
             id={tooltipId}
             target={target}
             side="bottom"
-            align="start"
+            align="row"
             open={clickOpen}
             containerRef={containerRef}
             hoverGroup="help"
-            tooltipClassName="pointer-events-auto w-56"
+            tooltipClassName="pointer-events-auto min-w-0"
         >
             {t('machine.health.tooltip.hint')}
         </HoverTooltip>
@@ -255,9 +255,12 @@ export function MachineHealthIndicator(props: {
             id={tooltipId}
             target={chip}
             side="bottom"
-            align="end"
+            align={compact ? 'row' : 'end'}
             className="shrink-0"
-            tooltipClassName="pointer-events-auto before:absolute before:inset-x-0 before:-top-1 before:h-1 before:content-[''] px-3 py-2 min-w-[16rem]"
+            tooltipClassName={cn(
+                "pointer-events-auto before:absolute before:inset-x-0 before:-top-1 before:h-1 before:content-[''] px-3 py-2",
+                compact ? 'min-w-0' : 'min-w-[16rem]'
+            )}
             revealOnParentFocusClass={props.revealOnParentFocusClass}
             open={clickOpen}
             containerRef={containerRef}

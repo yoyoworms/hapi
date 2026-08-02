@@ -15,6 +15,7 @@ import type {
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { CodexAppServerClient } from './codexAppServerClient';
+import { sanitizeCodexSessionEnvironment } from './codexProcessEnvironment';
 import type { GetAccountRateLimitsResponse, GetAccountResponse } from './appServerTypes';
 
 export const SYSTEM_CODEX_ACCOUNT_ID = 'system';
@@ -92,7 +93,7 @@ function expandHome(path: string): string {
 }
 
 function getSystemCodexHome(): string {
-    const configured = process.env.CODEX_HOME?.trim();
+    const configured = sanitizeCodexSessionEnvironment(process.env).CODEX_HOME?.trim();
     return configured ? expandHome(configured) : join(homedir(), '.codex');
 }
 
@@ -487,6 +488,63 @@ export class CodexAccountManager {
         };
     }
 
+    /**
+     * Resolve the account that actually owns an existing Codex rollout.
+     *
+     * Older runners could inherit a managed CODEX_HOME while recording the
+     * session as "system". Prefer the recorded account when it contains the
+     * rollout; otherwise recover only when exactly one other local account
+     * contains the requested thread.
+     */
+    async resolveAccountForResume(
+        accountId: string | undefined,
+        sessionId: string
+    ): Promise<ResolvedCodexAccount> {
+        const requested = await this.resolveAccount(accountId);
+        const requestedPath = await findTranscriptPath(
+            join(requested.homeDir, 'sessions'),
+            sessionId
+        );
+        if (requestedPath) return requested;
+
+        const registry = await this.readRegistry();
+        const candidateIds = [
+            SYSTEM_CODEX_ACCOUNT_ID,
+            ...registry.accounts.map((account) => account.id)
+        ].filter((candidateId) => candidateId !== requested.id);
+        const matches: ResolvedCodexAccount[] = [];
+
+        for (const candidateId of candidateIds) {
+            let candidate: ResolvedCodexAccount;
+            try {
+                candidate = await this.resolveAccount(candidateId);
+            } catch {
+                continue;
+            }
+            const transcriptPath = await findTranscriptPath(
+                join(candidate.homeDir, 'sessions'),
+                sessionId
+            );
+            if (transcriptPath) matches.push(candidate);
+        }
+
+        if (matches.length === 1) {
+            const recovered = matches[0]!;
+            logger.debug('[CodexAccountManager] Recovered mismatched resume account metadata', {
+                sessionId,
+                recordedAccountId: requested.id,
+                actualAccountId: recovered.id
+            });
+            return recovered;
+        }
+        if (matches.length > 1) {
+            throw new Error(
+                `Codex conversation ${sessionId} exists in multiple local accounts; select the account explicitly`
+            );
+        }
+        return requested;
+    }
+
     async prepareSessionSwitch(
         sourceAccountId: string,
         targetAccountId: string,
@@ -499,6 +557,13 @@ export class CodexAccountManager {
         ]);
         const sourcePath = await findTranscriptPath(join(source.homeDir, 'sessions'), sessionId);
         if (!sourcePath) {
+            // Legacy metadata may name the wrong source even though the exact
+            // conversation already belongs to the explicitly selected target.
+            const existingTargetPath = await findTranscriptPath(
+                join(target.homeDir, 'sessions'),
+                sessionId
+            );
+            if (existingTargetPath) return existingTargetPath;
             throw new Error(`Codex conversation ${sessionId} was not found in account ${source.label}`);
         }
 

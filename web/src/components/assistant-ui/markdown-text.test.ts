@@ -11,6 +11,7 @@ import {
     MARKDOWN_PLUGINS_WITH_BREAKS,
     MARKDOWN_REHYPE_PLUGINS,
 } from '@/components/assistant-ui/markdown-text'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 describe('MARKDOWN_PLUGINS integration', () => {
     it('includes remarkNonHttpsAutolink', () => {
@@ -36,7 +37,7 @@ function render(markdown: string): string {
         .use(MARKDOWN_PLUGINS)
         .use(remarkRehype)
         .use(MARKDOWN_REHYPE_PLUGINS)
-    const tree = processor.runSync(processor.parse(markdown))
+    const tree = processor.runSync(processor.parse(normalizeLatexDelimiters(markdown)))
     return toHtml(tree as never)
 }
 
@@ -71,5 +72,29 @@ describe('MARKDOWN_PLUGINS — currency prose vs KaTeX', () => {
         const md = "Before\n\n$$\nE = mc^2\n$$\n\nAfter"
         const html = render(md)
         expect(html).toContain('class="katex"')
+    })
+
+    it('renders Codex LaTeX delimiters as KaTeX without losing symbols', () => {
+        const md = [
+            '\\[',
+            '企业价值=\\sum_{t=1}^{n} \\frac{FCF_t}{(1+r)^t}',
+            '\\]',
+            '',
+            '- \\(FCF_t\\)：未来第t年的自由现金流',
+            '- \\(r\\)：折现率',
+            '',
+            '\\[ SPCX：-5\\%\\sim-12\\% \\]'
+        ].join('\n')
+        const html = render(md)
+
+        expect(html.match(/class="katex"/g)).toHaveLength(4)
+        expect(html).toContain('∑')
+        expect(html).toContain('FCF')
+        expect(html).toContain('SPCX')
+        expect(html).toContain('∼')
+        expect(html).not.toContain('\\[')
+        expect(html).not.toContain('\\]')
+        expect(html).not.toContain('\\(')
+        expect(html).not.toContain('\\)')
     })
 })

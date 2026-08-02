@@ -20,6 +20,8 @@ const harness = vi.hoisted(() => ({
     startTurnThreadIds: [] as string[],
     startTurnParams: [] as Array<Record<string, unknown>>,
     startTurnErrors: [] as Error[],
+    steerTurnParams: [] as Array<Record<string, unknown>>,
+    steerTurnErrors: [] as Error[],
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
     interruptErrors: [] as Error[],
     rollbackCalls: [] as Array<{ threadId: string; numTurns: number }>,
@@ -868,6 +870,19 @@ vi.mock('./codexAppServerClient', () => {
             return { turn: { id: turnId } };
         }
 
+        async steerTurn(params?: {
+            threadId?: string;
+            expectedTurnId?: string;
+            input?: Array<{ text?: string }>;
+        }): Promise<{ turnId: string }> {
+            harness.steerTurnParams.push((params ?? {}) as Record<string, unknown>);
+            const nextError = harness.steerTurnErrors.shift();
+            if (nextError) {
+                throw nextError;
+            }
+            return { turnId: params?.expectedTurnId ?? 'turn-unknown' };
+        }
+
         async interruptTurn(params?: { threadId?: string; turnId?: string }): Promise<Record<string, never>> {
             const threadId = params?.threadId ?? 'thread-unknown';
             const turnId = params?.turnId ?? 'turn-unknown';
@@ -1081,6 +1096,8 @@ describe('codexRemoteLauncher', () => {
         harness.startTurnThreadIds = [];
         harness.startTurnParams = [];
         harness.startTurnErrors = [];
+        harness.steerTurnParams = [];
+        harness.steerTurnErrors = [];
         harness.interruptedTurns = [];
         harness.interruptErrors = [];
         harness.rollbackCalls = [];
@@ -1455,6 +1472,35 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents).not.toContainEqual({
             type: 'ready'
         });
+    });
+
+    it('steers a follow-up into the active turn without replacing its terminal turn id', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session, thinkingChanges } = createSessionStub([
+            'first message',
+            'follow-up while running'
+        ]);
+
+        const running = codexRemoteLauncher(session as never);
+
+        await vi.waitFor(() => {
+            expect(harness.steerTurnParams).toEqual([{
+                threadId: 'thread-1',
+                expectedTurnId: 'turn-1',
+                input: [{ type: 'text', text: 'follow-up while running' }]
+            }]);
+        });
+        expect(harness.startTurnMessages).toEqual(['first message']);
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            turn: { id: 'turn-1', status: 'completed' }
+        });
+
+        await expect(running).resolves.toBe('exit');
+        expect(session.thinking).toBe(false);
+        expect(thinkingChanges).toEqual(expect.arrayContaining([true, false]));
     });
 
     it('switches collaboration mode to default after approving exit_plan_mode', async () => {

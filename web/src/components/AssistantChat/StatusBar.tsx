@@ -12,6 +12,7 @@ import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { getClaudeModelLabel } from '@hapi/protocol'
 import { formatCodexReasoningLabel, shouldShowCodexReasoningLabel } from '@/lib/codexStatusLabels'
+import type { PlanProgress } from '@/chat/planProgress'
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useAppContext } from '@/lib/app-context'
@@ -145,6 +146,15 @@ function isCodexFastMode(model?: string | null, effort?: string | null): boolean
 /** Cursor native ACP does not emit usage_update; hide the bar to avoid empty/misleading UI. */
 export function shouldShowComposerStatusBar(agentFlavor: string | null | undefined): boolean {
     return agentFlavor !== 'cursor'
+}
+
+export function getVisibleCodexPlanProgress(
+    agentFlavor: string | null | undefined,
+    progress: PlanProgress | null | undefined,
+    thinking: boolean
+): PlanProgress | null {
+    if (agentFlavor !== 'codex' || !progress || !thinking) return null
+    return progress
 }
 
 function formatCost(cost: number): string {
@@ -332,6 +342,7 @@ export function StatusBar(props: {
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     threadGoal?: ThreadGoal | null
+    planProgress?: PlanProgress | null
     agentFlavor?: string | null
     voiceStatus?: ConversationStatus
     onModelChange?: (model: string | null) => void
@@ -417,10 +428,15 @@ export function StatusBar(props: {
             ? 'goal'
             : `goal ${props.threadGoal.status === 'budgetLimited' ? 'limited' : props.threadGoal.status}`
         : null
+    const planProgress = getVisibleCodexPlanProgress(
+        props.agentFlavor,
+        props.planProgress,
+        props.thinking
+    )
 
     return (
         <div className="flex min-w-0 items-center justify-between gap-2 px-2 pb-1">
-            <div className="flex min-w-0 items-baseline gap-2 sm:gap-3">
+            <div className="flex min-w-0 flex-1 items-baseline gap-2 sm:gap-3">
                 <div className="flex shrink-0 items-center gap-1.5">
                     <span
                         className={`h-2 w-2 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
@@ -429,8 +445,23 @@ export function StatusBar(props: {
                         {connectionStatus.text}
                     </span>
                 </div>
+                {planProgress ? (
+                    <span
+                        data-testid="codex-plan-progress"
+                        className="min-w-0 flex-1 truncate text-[10px] text-[var(--app-link)] sm:max-w-[48vw] sm:flex-none"
+                        title={planProgress.explanation ?? planProgress.currentStep ?? undefined}
+                    >
+                        {t('status.planProgress', {
+                            completed: planProgress.completed,
+                            total: planProgress.total
+                        })}
+                        {planProgress.currentStep ? (
+                            <span> · {planProgress.currentStep}</span>
+                        ) : null}
+                    </span>
+                ) : null}
                 {contextUsageLabel ? (
-                    <span className={`min-w-0 whitespace-nowrap text-[10px] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}>
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} min-w-0 whitespace-nowrap text-[10px] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}>
                         <span className="sm:hidden">
                             {compactContextUsageLabel}
                         </span>
@@ -448,27 +479,27 @@ export function StatusBar(props: {
 
             <div className="flex min-w-0 items-center justify-end gap-2">
                 {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
-                    <span className="min-w-0 max-w-[46vw] truncate text-[10px] font-medium text-[var(--app-fg)]" title={accountTitle}>
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} min-w-0 max-w-[46vw] truncate text-[10px] font-medium text-[var(--app-fg)]`} title={accountTitle}>
                         {accountStatus.accountLabel ? `${accountStatus.accountLabel} ` : ''}{accountLimitText}
                     </span>
                 ) : null}
                 {usageText ? (
-                    <span className="shrink-0 text-[10px] text-[var(--app-hint)]" title={usageText.title}>
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} shrink-0 text-[10px] text-[var(--app-hint)]`} title={usageText.title}>
                         {usageText.text}
                     </span>
                 ) : null}
                 {codexReasoningLabel ? (
-                    <span className="whitespace-nowrap text-xs text-[var(--app-hint)]">
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-hint)]`}>
                         {codexReasoningLabel}
                     </span>
                 ) : null}
                 {codexFastMode ? (
-                    <span className="whitespace-nowrap text-xs text-[#34C759]">
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[#34C759]`}>
                         fast
                     </span>
                 ) : null}
                 {goalLabel ? (
-                    <span className="whitespace-nowrap text-xs text-[var(--app-link)]">
+                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-link)]`}>
                         {goalLabel}
                     </span>
                 ) : null}

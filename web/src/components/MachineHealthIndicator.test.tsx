@@ -67,4 +67,32 @@ describe('MachineHealthIndicator', () => {
 
         expect(screen.getByLabelText(/CPU 34 percent; RAM 56 percent/i)).toBeTruthy()
     })
+
+    it('anchors the compact tooltip to the containing machine row', () => {
+        render(
+            <div className="relative">
+                <I18nProvider>
+                    <MachineHealthIndicator
+                        compact
+                        presentation={{
+                            metrics: [
+                                { id: 'cpu', shortLabel: 'CPU', percent: 34, tone: 'ok' },
+                                { id: 'ram', shortLabel: 'RAM', percent: 56, tone: 'warn' }
+                            ],
+                            overallTone: 'warn',
+                            status: 'elevated',
+                        }}
+                    />
+                </I18nProvider>
+            </div>
+        )
+
+        const healthButton = screen.getByRole('button', { name: /CPU 34 percent; RAM 56 percent/i })
+        const tooltipId = healthButton.getAttribute('aria-describedby')
+        const tooltip = tooltipId ? document.getElementById(tooltipId) : null
+        expect(tooltip?.className).toContain('left-1')
+        expect(tooltip?.className).toContain('right-1')
+        expect(tooltip?.className).toContain('min-w-0')
+        expect(tooltip?.className).not.toContain('min-w-[16rem]')
+    })
 })

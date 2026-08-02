@@ -3,8 +3,9 @@
  * 
  * Tests the full flow of runner startup, session tracking, and shutdown
  * 
- * IMPORTANT: These tests MUST be run with the integration test environment:
- * yarn test:integration-test-env
+ * IMPORTANT: These tests MUST be run with the integration test environment
+ * and HAPI_RUNNER_INTEGRATION_TESTS=1:
+ * HAPI_RUNNER_INTEGRATION_TESTS=1 bunx vitest run src/runner/runner.integration.test.ts
  * 
  * DO NOT run with regular 'npm test' or 'yarn test' - it will use the wrong environment
  * and the runner will not work properly!
@@ -78,7 +79,12 @@ async function isServerHealthy(): Promise<boolean> {
   }
 }
 
-describe.skipIf(!await isServerHealthy())('Runner Integration Tests', { timeout: 20_000 }, () => {
+const runnerIntegrationTestsEnabled = process.env.HAPI_RUNNER_INTEGRATION_TESTS === '1';
+const runnerIntegrationServerHealthy = runnerIntegrationTestsEnabled
+  ? await isServerHealthy()
+  : false;
+
+describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { timeout: 20_000 }, () => {
   let runnerPid: number;
 
   beforeEach(async () => {

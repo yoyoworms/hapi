@@ -439,6 +439,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         const invokedAt = Date.now()
         try {
             store.messages.markMessagesInvoked(data.sid, localIds, invokedAt)
+            const todosCleared = store.sessions.setSessionTodos(
+                data.sid,
+                [],
+                invokedAt,
+                sessionAccess.value.namespace
+            )
             onSessionActivity?.(data.sid, invokedAt)
             // Only drop the queued-thinking grace when the CLI explicitly opts in
             // (synchronous handlers like slash commands that will never send
@@ -447,6 +453,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             // shift and `backend.prompt` start.
             if (data.clearQueuedThinkingGrace === true) {
                 onMessagesConsumed?.(data.sid)
+            }
+            if (todosCleared) {
+                onWebappEvent?.({ type: 'session-updated', sessionId: data.sid })
             }
             // Emit only after the DB write succeeds. Otherwise a transient SQLite
             // failure would broadcast an `invokedAt` that was never persisted —

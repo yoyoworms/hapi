@@ -35,9 +35,12 @@ export type ToolGroupBlock = {
 
 export type VisibleChatBlock = ChatBlock | ToolGroupBlock
 
+export type ToolGroupingMode = 'contiguous' | 'codex' | 'none'
+
 type ToolGroupingOptions = {
     hasMoreMessages: boolean
     previousGroups?: ToolGroupBlock[]
+    mode?: ToolGroupingMode
 }
 
 const PLAN_TOOL_NAMES = new Set([
@@ -67,6 +70,14 @@ const INTERACTIVE_TOOL_NAMES = new Set([
     'CodexPermission'
 ])
 
+type CodexActivityBucket = 'explore' | 'change' | 'verify' | 'execute' | 'research' | `other:${string}`
+
+// Codex's own TUI only coalesces parsed read/list/search commands into its
+// "Exploring" cell. The web UI also batches adjacent edits and verification
+// commands, but keeps those as separate phases so a long turn never becomes
+// one opaque, mixed-purpose card.
+const CODEX_EXPLORATION_COMMAND_RE = /\b(?:rg|grep|findstr|select-string|fd|find|ls|dir|tree|cat|type|sed|head|tail|pwd|wc|git\s+(?:status|diff|show|log))\b/i
+const CODEX_VERIFICATION_COMMAND_RE = /(?:^|&&|\|\||;)\s*(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:test|typecheck|lint|build|check)\b|(?:bunx|npx)\s+(?:vitest|jest|eslint|biome|tsc)\b|(?:python(?:3)?\s+-m\s+)?(?:vitest|jest|pytest|ruff|mypy|eslint|biome|tsc)\b|cargo\s+(?:test|check|clippy)\b|go\s+test\b)/i
 function pushUnique(target: string[], value: string | null): void {
     if (!value) return
     if (target.includes(value)) return
@@ -204,16 +215,43 @@ export function isEligibleForToolGrouping(block: ToolCallBlock): boolean {
     return true
 }
 
+function getCodexActivityBucket(block: ToolCallBlock): CodexActivityBucket {
+    const kind = getToolGroupActionKind(block)
+    if (kind === 'read' || kind === 'search') return 'explore'
+    if (kind === 'mutation') return 'change'
+    if (kind === 'web') return 'research'
+    if (kind === 'command') {
+        const command = normalizeCommandInput(block.tool.input) ?? ''
+        if (CODEX_VERIFICATION_COMMAND_RE.test(command)) return 'verify'
+        if (CODEX_EXPLORATION_COMMAND_RE.test(command)) return 'explore'
+        return 'execute'
+    }
+    return `other:${block.tool.name}`
+}
+
+function codexGroupLimit(bucket: CodexActivityBucket): number {
+    if (bucket === 'explore') return 12
+    if (bucket === 'change') return 8
+    if (bucket === 'verify') return 6
+    if (bucket === 'research') return 8
+    return 4
+}
+
 function createToolGroupId(
     tools: ToolCallBlock[],
     needsOlderHistory: boolean,
-    previousGroups: ToolGroupBlock[]
+    previousGroups: ToolGroupBlock[],
+    claimedPreviousGroupIds: Set<string>
 ): string {
     const firstToolId = tools[0]?.id ?? 'unknown'
     const lastToolId = tools[tools.length - 1]?.id ?? firstToolId
 
-    const previous = previousGroups.find((group) => group.firstToolId === firstToolId || group.lastToolId === lastToolId)
+    const previous = previousGroups.find((group) => (
+        !claimedPreviousGroupIds.has(group.id)
+        && (group.firstToolId === firstToolId || group.lastToolId === lastToolId)
+    ))
     if (previous) {
+        claimedPreviousGroupIds.add(previous.id)
         return previous.id
     }
 
@@ -230,8 +268,14 @@ export function buildVisibleChatBlocks(
     blocks: ChatBlock[],
     options: ToolGroupingOptions
 ): VisibleChatBlock[] {
+    const mode = options.mode ?? 'contiguous'
+    if (mode === 'none') {
+        return blocks
+    }
+
     const visibleBlocks: VisibleChatBlock[] = []
     const previousGroups = options.previousGroups ?? []
+    const claimedPreviousGroupIds = new Set<string>()
 
     for (let index = 0; index < blocks.length; index += 1) {
         const block = blocks[index]
@@ -241,10 +285,21 @@ export function buildVisibleChatBlocks(
         }
 
         const tools: ToolCallBlock[] = [block]
+        const codexBucket = mode === 'codex' ? getCodexActivityBucket(block) : null
+        const groupLimit = codexBucket ? codexGroupLimit(codexBucket) : Number.POSITIVE_INFINITY
         let cursor = index + 1
         while (cursor < blocks.length) {
             const candidate = blocks[cursor]
             if (candidate.kind !== 'tool-call' || !isEligibleForToolGrouping(candidate)) {
+                break
+            }
+            if (
+                codexBucket
+                && (
+                    tools.length >= groupLimit
+                    || getCodexActivityBucket(candidate) !== codexBucket
+                )
+            ) {
                 break
             }
             tools.push(candidate)
@@ -260,7 +315,7 @@ export function buildVisibleChatBlocks(
         const needsOlderHistory = options.hasMoreMessages && startsAtOldestVisibleBoundary
         visibleBlocks.push({
             kind: 'tool-group',
-            id: createToolGroupId(tools, needsOlderHistory, previousGroups),
+            id: createToolGroupId(tools, needsOlderHistory, previousGroups, claimedPreviousGroupIds),
             createdAt: tools[0].createdAt,
             invokedAt: tools[0].invokedAt,
             firstToolId: tools[0].id,

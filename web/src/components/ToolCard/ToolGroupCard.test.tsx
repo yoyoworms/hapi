@@ -109,6 +109,42 @@ describe('ToolGroupCard', () => {
         expect(view.container.innerHTML).toContain('bg-[var(--app-tool-group-bg)]')
     })
 
+    it('shows the current action in a collapsed running group', () => {
+        const tools = [
+            makeToolBlock('read-1', 'Read', { file_path: 'repo/src/a.ts' }),
+            makeToolBlock('bash-1', 'CodexBash', { command: 'bun run test:web' })
+        ]
+        tools[1].tool.state = 'running'
+        tools[1].tool.completedAt = null
+
+        renderCard(makeGroup({
+            tools,
+            summary: {
+                totalTools: 2,
+                countsByKind: {
+                    read: 1,
+                    search: 0,
+                    command: 1,
+                    mutation: 0,
+                    web: 0,
+                    other: 0,
+                },
+                fileTargets: ['repo/src/a.ts'],
+                commandTargets: ['bun run test:web'],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 1,
+                pendingCount: 0,
+            }
+        }))
+
+        expect(screen.getByText('bun run test:web')).toBeInTheDocument()
+        expect(screen.getByText('1 running')).toBeInTheDocument()
+        expect(screen.queryByText('Run 1 · Read 1')).not.toBeInTheDocument()
+    })
+
     it('expands to show compact rows and opens a detail dialog per row', async () => {
         const view = renderCard(makeGroup())
         const groupToggle = within(view.container).getByRole('button', { name: /inspect project files/i })

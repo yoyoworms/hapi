@@ -42,13 +42,36 @@ function extractTodosFromCodexMessage(content: Record<string, unknown>): TodoIte
     if (!data || data.type !== 'tool-call') return null
 
     const name = typeof data.name === 'string' ? data.name : null
-    if (name !== 'TodoWrite') return null
-
     const input = 'input' in data ? (data as Record<string, unknown>).input : null
     if (!isObject(input)) return null
 
-    const todosCandidate = input.todos
-    const parsed = TodosSchema.safeParse(todosCandidate)
+    if (name === 'TodoWrite') {
+        const parsed = TodosSchema.safeParse(input.todos)
+        return parsed.success ? parsed.data : null
+    }
+
+    if (name !== 'update_plan' || !Array.isArray(input.plan)) return null
+
+    const todos: TodoItem[] = []
+    input.plan.forEach((entry, index) => {
+        if (!isObject(entry) || typeof entry.step !== 'string') return
+        if (
+            entry.status !== 'pending'
+            && entry.status !== 'in_progress'
+            && entry.status !== 'completed'
+        ) {
+            return
+        }
+
+        todos.push({
+            id: `codex-plan-${index + 1}`,
+            content: entry.step,
+            priority: 'medium',
+            status: entry.status
+        })
+    })
+
+    const parsed = TodosSchema.safeParse(todos)
     return parsed.success ? parsed.data : null
 }
 

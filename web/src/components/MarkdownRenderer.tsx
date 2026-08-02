@@ -16,6 +16,7 @@ import {
 import { SyntaxHighlighter } from '@/components/assistant-ui/shiki-highlighter'
 import type { CodeHeaderProps, SyntaxHighlighterProps } from '@assistant-ui/react-markdown'
 import { cn } from '@/lib/utils'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 interface MarkdownRendererProps {
     content: string
@@ -84,7 +85,7 @@ function StandaloneMarkdownContent(props: MarkdownRendererProps) {
                     components={components}
                     urlTransform={denyOnlyTransform}
                 >
-                    {props.content}
+                    {normalizeLatexDelimiters(props.content)}
                 </ReactMarkdown>
             </div>
         </UriConfirmProvider>
@@ -100,6 +101,7 @@ function MarkdownContent(props: MarkdownRendererProps) {
         <UriConfirmProvider>
             <TextMessagePartProvider text={props.content}>
                 <MarkdownTextPrimitive
+                    preprocess={normalizeLatexDelimiters}
                     remarkPlugins={props.preserveSingleLineBreaks ? MARKDOWN_PLUGINS_WITH_BREAKS : MARKDOWN_PLUGINS}
                     rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
                     components={mergedComponents}

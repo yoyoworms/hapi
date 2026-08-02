@@ -63,7 +63,7 @@ export default {
   'sessions.group.showMore': 'Show {n} more',
   'sessions.group.showLess': 'Show less',
   'sessions.group.new': 'New session in this directory',
-  'sessions.recent.title': 'Recent (last 12h)',
+  'sessions.recent.title': 'Recent (last 24h)',
   'codexSync.tooltip': 'Import sessions from Codex into Hapi',
   'codexSync.newSessionAction': 'Import Codex history',
   'codexSync.confirm.title': 'Import Codex sessions',
@@ -527,6 +527,7 @@ export default {
   'toolGroup.rowStatus.running': 'Running',
   'toolGroup.rowStatus.pending': 'Pending',
   'toolGroup.rowStatus.error': 'Error',
+  'status.planProgress': 'Tasks {completed}/{total}',
 
   // Composer buttons
   'composer.settings': 'Settings',

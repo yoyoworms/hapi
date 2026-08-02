@@ -6,6 +6,7 @@ import {
     clearMessageWindow,
     fetchLatestMessages,
     fetchOlderMessages,
+    flushPendingMessages,
     getQueuedReconcileCandidateLocalIds,
     getMessageWindowState,
     ingestIncomingMessages,
@@ -315,6 +316,11 @@ describe('message-window-store async generations', () => {
             count: 50,
             startCreatedAt: 1_700_000_400_000,
         })
+        latestPage[0] = makeUserMessage({
+            id: 'latest-user',
+            seq: 101,
+            createdAt: 1_700_000_400_000,
+        })
         const olderPage = makeAgentMessagePage({
             idPrefix: 'older',
             startSeq: 51,
@@ -391,9 +397,9 @@ describe('message-window-store async generations', () => {
         expect(finalState.isLoadingMore).toBe(false)
         expect(callLog).toEqual([
             { limit: 50 },
-            { beforeAt: 1_700_000_400_000, beforeSeq: 101, limit: 50 },
+            { beforeAt: 1_700_000_400_000, beforeSeq: 101, limit: 200 },
             { limit: 50 },
-            { beforeAt: 1_700_000_300_000, beforeSeq: 51, limit: 50 },
+            { beforeAt: 1_700_000_300_000, beforeSeq: 51, limit: 200 },
         ])
     })
 
@@ -403,6 +409,11 @@ describe('message-window-store async generations', () => {
             startSeq: 11,
             count: 50,
             startCreatedAt: 1_700_000_500_000,
+        })
+        latestPage[0] = makeUserMessage({
+            id: 'latest-user',
+            seq: 11,
+            createdAt: 1_700_000_500_000,
         })
         const calls: Array<{ beforeAt?: number | null; beforeSeq?: number | null; limit?: number }> = []
         const api = {
@@ -438,8 +449,243 @@ describe('message-window-store async generations', () => {
         expect(calls[1]).toEqual({
             beforeAt: 1_700_000_500_000,
             beforeSeq: 11,
-            limit: 50,
+            limit: 200,
         })
+    })
+
+    it('loads through raw Codex activity until the preceding user turn is present', async () => {
+        const latestTime = 1_700_000_600_000
+        const latest = [
+            makeUserMessage({
+                id: 'current-user',
+                seq: 401,
+                createdAt: latestTime,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'current-tail',
+                startSeq: 402,
+                count: 49,
+                startCreatedAt: latestTime + 1,
+            }),
+        ]
+        const firstRawPage = makeAgentMessagePage({
+            idPrefix: 'raw-only',
+            startSeq: 201,
+            count: 200,
+            startCreatedAt: latestTime - 400,
+        })
+        const oldestTurn = [
+            makeUserMessage({
+                id: 'oldest-user',
+                seq: 1,
+                createdAt: latestTime - 800,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'oldest-tail',
+                startSeq: 2,
+                count: 49,
+                startCreatedAt: latestTime - 799,
+            }),
+        ]
+        const precedingTurn = [
+            ...oldestTurn,
+            makeUserMessage({
+                id: 'preceding-user',
+                seq: 51,
+                createdAt: latestTime - 600,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'preceding-tail',
+                startSeq: 52,
+                count: 149,
+                startCreatedAt: latestTime - 599,
+            }),
+        ]
+        const calls: Array<{ beforeAt?: number | null; beforeSeq?: number | null; limit?: number }> = []
+        const api = {
+            getMessages: vi.fn(async (_sessionId: string, options: { beforeAt?: number | null; beforeSeq?: number | null; limit?: number } = {}) => {
+                calls.push(options)
+                if (calls.length === 1) {
+                    return {
+                        messages: latest,
+                        page: {
+                            limit: 50,
+                            nextBeforeSeq: 401,
+                            nextBeforeAt: latestTime,
+                            hasMore: true,
+                        }
+                    }
+                }
+                if (calls.length === 2) {
+                    return {
+                        messages: firstRawPage,
+                        page: {
+                            limit: 200,
+                            nextBeforeSeq: 201,
+                            nextBeforeAt: latestTime - 400,
+                            hasMore: true,
+                        }
+                    }
+                }
+                if (calls.length === 3) {
+                    return {
+                        messages: precedingTurn,
+                        page: {
+                            limit: 200,
+                            nextBeforeSeq: 1,
+                            nextBeforeAt: latestTime - 800,
+                            hasMore: true,
+                        }
+                    }
+                }
+                return {
+                    messages: oldestTurn,
+                    page: {
+                        limit: 200,
+                        nextBeforeSeq: 1,
+                        nextBeforeAt: latestTime - 800,
+                        hasMore: false,
+                    }
+                }
+            })
+        } as Pick<ApiClient, 'getMessages'> & {
+            getMessages: ReturnType<typeof vi.fn>
+        }
+
+        await fetchLatestMessages(api as unknown as ApiClient, SESSION_ID)
+        setAtBottom(SESSION_ID, false)
+        await fetchOlderMessages(api as unknown as ApiClient, SESSION_ID)
+
+        expect(calls.slice(1)).toEqual([
+            { beforeAt: latestTime, beforeSeq: 401, limit: 200 },
+            { beforeAt: latestTime - 400, beforeSeq: 201, limit: 200 },
+        ])
+        expect(getMessageWindowState(SESSION_ID).messages.some((message) => (
+            message.id === 'preceding-user'
+        ))).toBe(true)
+        expect(getMessageWindowState(SESSION_ID).messages.some((message) => (
+            message.id === 'oldest-user'
+        ))).toBe(false)
+
+        await fetchOlderMessages(api as unknown as ApiClient, SESSION_ID)
+
+        expect(calls[3]).toEqual({
+            beforeAt: latestTime - 600,
+            beforeSeq: 51,
+            limit: 200,
+        })
+        expect(getMessageWindowState(SESSION_ID).messages.some((message) => (
+            message.id === 'oldest-user'
+        ))).toBe(true)
+    })
+
+    it('does not let live messages reset older-page progress while history is open', async () => {
+        const latestTime = 1_700_000_700_000
+        const latest = [
+            makeUserMessage({
+                id: 'latest-user',
+                seq: 101,
+                createdAt: latestTime,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'latest-tail',
+                startSeq: 102,
+                count: 49,
+                startCreatedAt: latestTime + 1,
+            }),
+        ]
+        const older = [
+            makeUserMessage({
+                id: 'older-user',
+                seq: 51,
+                createdAt: latestTime - 100,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'older-tail',
+                startSeq: 52,
+                count: 49,
+                startCreatedAt: latestTime - 99,
+            }),
+        ]
+        const oldest = [
+            makeUserMessage({
+                id: 'oldest-user',
+                seq: 1,
+                createdAt: latestTime - 200,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'oldest-tail',
+                startSeq: 2,
+                count: 49,
+                startCreatedAt: latestTime - 199,
+            }),
+        ]
+        const calls: Array<{ beforeAt?: number | null; beforeSeq?: number | null; limit?: number }> = []
+        const api = {
+            getMessages: vi.fn(async (_sessionId: string, options: { beforeAt?: number | null; beforeSeq?: number | null; limit?: number } = {}) => {
+                calls.push(options)
+                if (calls.length === 1) {
+                    return {
+                        messages: latest,
+                        page: {
+                            limit: 50,
+                            nextBeforeSeq: 101,
+                            nextBeforeAt: latestTime,
+                            hasMore: true,
+                        }
+                    }
+                }
+                if (calls.length === 2) {
+                    return {
+                        messages: older,
+                        page: {
+                            limit: 200,
+                            nextBeforeSeq: 51,
+                            nextBeforeAt: latestTime - 100,
+                            hasMore: true,
+                        }
+                    }
+                }
+                return {
+                    messages: oldest,
+                    page: {
+                        limit: 200,
+                        nextBeforeSeq: 1,
+                        nextBeforeAt: latestTime - 200,
+                        hasMore: false,
+                    }
+                }
+            })
+        } as Pick<ApiClient, 'getMessages'> & {
+            getMessages: ReturnType<typeof vi.fn>
+        }
+
+        await fetchLatestMessages(api as unknown as ApiClient, SESSION_ID)
+        setAtBottom(SESSION_ID, false)
+        await fetchOlderMessages(api as unknown as ApiClient, SESSION_ID)
+
+        ingestIncomingMessages(SESSION_ID, [
+            makeAgentMessage({
+                id: 'live-event',
+                seq: 151,
+                createdAt: latestTime + 100,
+            })
+        ])
+        const afterLive = getMessageWindowState(SESSION_ID)
+        expect(afterLive.messages.some((message) => message.id === 'older-user')).toBe(true)
+        expect(afterLive.messages.some((message) => message.id === 'live-event')).toBe(false)
+        expect(afterLive.pending.some((message) => message.id === 'live-event')).toBe(true)
+
+        await fetchOlderMessages(api as unknown as ApiClient, SESSION_ID)
+
+        expect(calls[2]).toEqual({
+            beforeAt: latestTime - 100,
+            beforeSeq: 51,
+            limit: 200,
+        })
+        expect(getMessageWindowState(SESSION_ID).messages.some((message) => (
+            message.id === 'oldest-user'
+        ))).toBe(true)
     })
 })
 
@@ -639,6 +885,189 @@ describe('message-window-store visible trimming', () => {
         expect(state.messages.some((message) => message.id === 'agent-message-0')).toBe(false)
         expect(state.hasMore).toBe(true)
         expect(state.oldestSeq).toBe(2)
+    })
+
+    it('keeps the latest user prompt when a tool-heavy turn exceeds the visible budget', () => {
+        const baseTime = 1_700_000_150_000
+        const messages: DecryptedMessage[] = [
+            makeUserMessage({
+                id: 'latest-turn-user',
+                seq: 1,
+                text: 'question from another terminal',
+                createdAt: baseTime,
+            }),
+            ...makeAgentMessagePage({
+                idPrefix: 'tool-heavy-turn',
+                startSeq: 2,
+                count: VISIBLE_WINDOW_SIZE + 1,
+                startCreatedAt: baseTime + 1,
+            }),
+        ]
+
+        ingestIncomingMessages(SESSION_ID, messages)
+
+        const state = getMessageWindowState(SESSION_ID)
+        expect(state.messages.some((message) => message.id === 'latest-turn-user')).toBe(true)
+        expect(state.messages.some((message) => message.id === `tool-heavy-turn-${VISIBLE_WINDOW_SIZE}`)).toBe(true)
+        expect(state.hasMore).toBe(true)
+    })
+
+    it('queues cross-device user and agent rows together while browsing history', () => {
+        const baseTime = 1_700_000_175_000
+        const historicalMessage = makeAgentMessage({
+            id: 'historical-message',
+            seq: 1,
+            text: 'history being read',
+            createdAt: baseTime - 1,
+        })
+        ingestIncomingMessages(SESSION_ID, [historicalMessage])
+        setAtBottom(SESSION_ID, false)
+
+        ingestIncomingMessages(SESSION_ID, [
+            makeUserMessage({
+                id: 'phone-question',
+                seq: 2,
+                text: 'sent from phone',
+                createdAt: baseTime,
+            }),
+            makeAgentMessage({
+                id: 'desktop-answer',
+                seq: 3,
+                text: 'reply visible on desktop',
+                createdAt: baseTime + 1,
+            }),
+        ])
+
+        let state = getMessageWindowState(SESSION_ID)
+        expect(state.messages.map((message) => message.id)).toEqual(['historical-message'])
+        expect(state.pending.map((message) => message.id)).toEqual([
+            'phone-question',
+            'desktop-answer',
+        ])
+        expect(state.pendingCount).toBe(2)
+        expect(state.atBottom).toBe(false)
+
+        flushPendingMessages(SESSION_ID)
+        state = getMessageWindowState(SESSION_ID)
+        expect(state.messages.map((message) => message.id)).toEqual([
+            'historical-message',
+            'phone-question',
+            'desktop-answer',
+        ])
+        expect(state.pending).toHaveLength(0)
+    })
+
+    it('backfills cold latest load until it finds the user prompt for the current turn', async () => {
+        const baseTime = 1_700_000_190_000
+        const latestActivity = makeAgentMessagePage({
+            idPrefix: 'latest-codex-activity',
+            startSeq: 2,
+            count: 50,
+            startCreatedAt: baseTime + 1,
+        })
+        const prompt = makeUserMessage({
+            id: 'prompt-before-codex-activity',
+            seq: 1,
+            text: 'question before 50 tool events',
+            createdAt: baseTime,
+        })
+        const calls: Array<{ beforeAt?: number | null; beforeSeq?: number | null; limit?: number }> = []
+        const api = {
+            getMessages: vi.fn(async (_sessionId: string, options: { beforeAt?: number | null; beforeSeq?: number | null; limit?: number }) => {
+                calls.push(options)
+                return calls.length === 1
+                    ? {
+                        messages: latestActivity,
+                        page: {
+                            limit: options.limit ?? 50,
+                            nextBeforeSeq: 2,
+                            nextBeforeAt: baseTime + 1,
+                            hasMore: true,
+                        }
+                    }
+                    : {
+                        messages: [prompt],
+                        page: {
+                            limit: options.limit ?? 200,
+                            nextBeforeSeq: 1,
+                            nextBeforeAt: baseTime,
+                            hasMore: false,
+                        }
+                    }
+            })
+        } as Pick<ApiClient, 'getMessages'>
+
+        setAtBottom(SESSION_ID, false)
+        await fetchLatestMessages(api as ApiClient, SESSION_ID)
+
+        expect(calls).toHaveLength(2)
+        expect(calls[1]).toEqual({
+            beforeAt: baseTime + 1,
+            beforeSeq: 2,
+            limit: 200,
+        })
+        const state = getMessageWindowState(SESSION_ID)
+        expect(state.messages.some((message) => message.id === prompt.id)).toBe(true)
+        expect(state.pending).toHaveLength(0)
+        expect(state.atBottom).toBe(false)
+    })
+
+    it('drains every incremental page after an SSE gap', async () => {
+        const baseTime = 1_700_000_195_000
+        const prompt = makeUserMessage({
+            id: 'pre-gap-user',
+            seq: 1,
+            createdAt: baseTime,
+        })
+        ingestIncomingMessages(SESSION_ID, [prompt])
+
+        const firstIncrementalPage = makeAgentMessagePage({
+            idPrefix: 'gap-activity',
+            startSeq: 2,
+            count: 200,
+            startCreatedAt: baseTime + 1,
+        })
+        const finalReply = makeAgentMessage({
+            id: 'gap-final-reply',
+            seq: 202,
+            createdAt: baseTime + 201,
+            text: 'final reply after more than one page',
+        })
+        const calls: Array<{ afterSeq?: number | null; limit?: number }> = []
+        const api = {
+            getMessages: vi.fn(async (_sessionId: string, options: { afterSeq?: number | null; limit?: number }) => {
+                calls.push(options)
+                return calls.length === 1
+                    ? {
+                        messages: firstIncrementalPage,
+                        page: {
+                            limit: options.limit ?? 200,
+                            nextBeforeSeq: null,
+                            nextBeforeAt: null,
+                            hasMore: true,
+                        }
+                    }
+                    : {
+                        messages: [finalReply],
+                        page: {
+                            limit: options.limit ?? 200,
+                            nextBeforeSeq: null,
+                            nextBeforeAt: null,
+                            hasMore: false,
+                        }
+                    }
+            })
+        } as Pick<ApiClient, 'getMessages'>
+
+        await fetchLatestMessages(api as ApiClient, SESSION_ID, { incremental: true })
+
+        expect(calls).toEqual([
+            { afterSeq: 1, limit: 200 },
+            { afterSeq: 201, limit: 200 },
+        ])
+        const state = getMessageWindowState(SESSION_ID)
+        expect(state.messages.some((message) => message.id === prompt.id)).toBe(true)
+        expect(state.messages.some((message) => message.id === finalReply.id)).toBe(true)
     })
 
     it('backfills cold latest load when the newest page is filled by Codex subagent events', async () => {

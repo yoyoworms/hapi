@@ -308,10 +308,16 @@ function extractPlanEntries(value: unknown): Array<{ step: string; status: 'pend
 }
 
 function extractPlanUpdate(params: Record<string, unknown>): ConvertedEvent[] {
+    const update = asRecord(params.update);
     const plan = extractPlanEntries(
         params.plan ?? params.update ?? params.items ?? params.steps ?? params
     );
-    return plan.length > 0 ? [{ type: 'plan_update', plan }] : [];
+    const explanation = asString(params.explanation ?? update?.explanation);
+    return plan.length > 0 ? [{
+        type: 'plan_update',
+        plan,
+        ...(explanation ? { explanation } : {})
+    }] : [];
 }
 
 function extractEventScope(params: Record<string, unknown>): Record<string, unknown> {

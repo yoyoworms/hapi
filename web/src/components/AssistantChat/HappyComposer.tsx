@@ -37,6 +37,7 @@ import { useTranslation } from '@/lib/use-translation'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
 import type { LatestUsage } from '@/chat/reducer'
+import type { PlanProgress } from '@/chat/planProgress'
 import { getCodexComposerReasoningEffortOptions } from './codexReasoningEffortOptions'
 import { getDisplayedCodexServiceTier } from './codexFastMode'
 import { getPiThinkingLevelOptions, getHighestThinkingLevel, isThinkingLevelSupported } from './piThinkingLevelOptions'
@@ -201,6 +202,7 @@ export function HappyComposer(props: {
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     threadGoal?: ThreadGoal | null
+    planProgress?: PlanProgress | null
     model?: string | null
     modelReasoningEffort?: string | null
     effort?: string | null
@@ -280,6 +282,7 @@ export function HappyComposer(props: {
         permissionMode: rawPermissionMode,
         collaborationMode: rawCollaborationMode,
         threadGoal,
+        planProgress,
         model: rawModel,
         modelReasoningEffort: rawModelReasoningEffort,
         effort: rawEffort,
@@ -1467,6 +1470,7 @@ export function HappyComposer(props: {
                             permissionMode={permissionMode}
                             collaborationMode={collaborationMode}
                             threadGoal={threadGoal}
+                            planProgress={planProgress}
                             agentFlavor={agentFlavor}
                             voiceStatus={voiceStatus}
                             latestUsage={props.latestUsage}

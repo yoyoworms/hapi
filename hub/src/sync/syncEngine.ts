@@ -521,8 +521,7 @@ export class SyncEngine {
             return
         }
 
-        const nativeSessionId = getNativeAgentSessionId(currentMetadata.data)
-        if (!nativeSessionId) {
+        if (!getNativeAgentSessionId(currentMetadata.data)) {
             return
         }
 
@@ -531,26 +530,19 @@ export class SyncEngine {
             return
         }
 
-        const duplicates = this.store.sessions.getSessionsByNamespace(payload.namespace)
-            .filter((session) => {
-                if (session.id === payload.sid) {
-                    return false
-                }
-                const metadata = MetadataSchema.safeParse(session.metadata)
-                if (!metadata.success) {
-                    return false
-                }
-                return getNativeAgentSessionId(metadata.data) === nativeSessionId
-            })
-            .sort((left, right) => left.updatedAt - right.updatedAt)
-
-        for (const duplicate of duplicates) {
-            try {
-                await this.sessionCache.mergeSessions(duplicate.id, current.id, payload.namespace)
-            } catch (error) {
-                console.warn('[SyncEngine] Failed to merge duplicate native agent session', error)
-            }
+        // Metadata is persisted before this callback runs, so refresh the cache
+        // before deduplication. Never merge directly here: two live HAPI
+        // sessions can temporarily report the same native thread after a bad
+        // resume/account handoff. The central dedup path deliberately preserves
+        // both active records until one ends instead of deleting a live session.
+        const refreshed = this.sessionCache.refreshSession(payload.sid)
+        if (!refreshed?.metadata || !this.canRunCursorDedup(refreshed)) {
+            return
         }
+
+        await this.sessionCache.deduplicateByAgentSessionId(payload.sid).catch(() => {
+            // Best-effort: web-side safety net hides remaining duplicates.
+        })
     }
 
     handleMachineAlive(payload: { machineId: string; time: number; health?: unknown }): void {

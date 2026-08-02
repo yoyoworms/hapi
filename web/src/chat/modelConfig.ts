@@ -14,8 +14,8 @@ const CONTEXT_HEADROOM_TOKENS = 10_000
 const DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000
 const LARGE_CLAUDE_CONTEXT_WINDOW_TOKENS = 1_000_000
 // Fallback for Codex sessions when the server has not reported an explicit modelContextWindow.
-// The value matches the context window currently reported by Codex App Server token-count events.
-const DEFAULT_CODEX_CONTEXT_WINDOW_TOKENS = 258_400
+// HAPI configures a 350K raw window; Codex reports 95% as the effective input window.
+const DEFAULT_CODEX_CONTEXT_WINDOW_TOKENS = 332_500
 // Pi supports multiple providers with varying context windows. 200K is a
 // conservative default (most Claude/GPT-4 class models). When the server
 // reports an explicit modelContextWindow via usage events, that takes

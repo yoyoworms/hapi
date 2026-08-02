@@ -251,4 +251,32 @@ describe('spawnHappyCLI windowsHide behavior', () => {
     const options = getSpawnOptionsOrThrow();
     expect(options.env?.HAPI_INVOKED_CWD).toBe(inheritedInvokedCwd);
   });
+
+  it('does not carry a Codex session identity into a spawned runner', async () => {
+    const { spawnHappyCLI } = await import('./spawnHappyCLI');
+
+    spawnHappyCLI(['runner', 'start-sync'], {
+      env: {
+        CODEX_HOME: '/tmp/hapi-managed-account',
+        HAPI_CODEX_ACCOUNT_ID: 'managed-account',
+        HAPI_CODEX_ACCOUNT_LABEL: 'managed@example.com',
+        HAPI_CODEX_ACCOUNT_KIND: 'managed',
+        HAPI_CODEX_API_KEY: 'secret',
+        HAPI_CODEX_RESUME_PATH: '/tmp/migrated-thread.jsonl',
+        HAPI_CODEX_APP_SERVER_BIN: '/opt/codex',
+        KEEP_ME: 'yes'
+      },
+      stdio: 'ignore'
+    });
+
+    const options = getSpawnOptionsOrThrow();
+    expect(options.env?.CODEX_HOME).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_ACCOUNT_ID).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_ACCOUNT_LABEL).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_ACCOUNT_KIND).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_API_KEY).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_RESUME_PATH).toBeUndefined();
+    expect(options.env?.HAPI_CODEX_APP_SERVER_BIN).toBe('/opt/codex');
+    expect(options.env?.KEEP_ME).toBe('yes');
+  });
 });

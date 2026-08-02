@@ -409,6 +409,7 @@ describe('AppServerEventConverter', () => {
         const converter = new AppServerEventConverter();
 
         const events = converter.handleNotification('turn/plan/updated', {
+            explanation: 'Keep the live task state visible.',
             plan: [
                 { step: 'Inspect Codex events', status: 'completed' },
                 { content: 'Render plan state', status: 'in_progress' },
@@ -418,6 +419,7 @@ describe('AppServerEventConverter', () => {
 
         expect(events).toEqual([{
             type: 'plan_update',
+            explanation: 'Keep the live task state visible.',
             plan: [
                 { step: 'Inspect Codex events', status: 'completed' },
                 { step: 'Render plan state', status: 'in_progress' },
@@ -433,6 +435,7 @@ describe('AppServerEventConverter', () => {
             msg: {
                 type: 'plan_update',
                 update: {
+                    explanation: 'Wrapped progress note.',
                     items: [
                         { text: 'Plan from wrapped event', status: 'completed' }
                     ]
@@ -442,6 +445,7 @@ describe('AppServerEventConverter', () => {
 
         expect(events).toEqual([{
             type: 'plan_update',
+            explanation: 'Wrapped progress note.',
             plan: [
                 { step: 'Plan from wrapped event', status: 'completed' }
             ]

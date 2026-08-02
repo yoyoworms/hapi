@@ -63,7 +63,7 @@ export default {
   'sessions.group.showMore': '再显示 {n} 个',
   'sessions.group.showLess': '收起',
   'sessions.group.new': '在此目录新建会话',
-  'sessions.recent.title': '最近（12 小时内）',
+  'sessions.recent.title': '最近（24 小时内）',
   'codexSync.tooltip': '从 Codex 导入会话到 Hapi',
   'codexSync.newSessionAction': '导入 Codex 历史',
   'codexSync.confirm.title': '导入 Codex 会话',
@@ -531,6 +531,7 @@ export default {
   'toolGroup.rowStatus.running': '运行中',
   'toolGroup.rowStatus.pending': '等待中',
   'toolGroup.rowStatus.error': '错误',
+  'status.planProgress': '任务 {completed}/{total}',
 
   // Composer buttons
   'composer.settings': '设置',

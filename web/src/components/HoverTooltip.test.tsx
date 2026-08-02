@@ -22,8 +22,27 @@ describe('HoverTooltip keyboard wiring', () => {
 
         const tooltip = screen.getByRole('tooltip', { hidden: true })
         expect(tooltip.id).toBe('sched-tooltip')
+        expect(tooltip.classList.contains('hidden')).toBe(true)
+        expect(tooltip.className).toContain('group-hover/hover-tooltip:block')
+        expect(tooltip.className).toContain('group-focus-visible/session-row:block')
         expect(tooltip.className).toContain('group-focus-visible/session-row:visible')
         expect(tooltip.className).not.toContain('group-focus-within')
+    })
+
+    it('removes display-none when explicitly opened', () => {
+        render(
+            <HoverTooltip
+                id="open-tooltip"
+                target={<span>icon</span>}
+                open
+            >
+                Open copy
+            </HoverTooltip>
+        )
+
+        const tooltip = screen.getByRole('tooltip')
+        expect(tooltip.classList.contains('block')).toBe(true)
+        expect(tooltip.classList.contains('hidden')).toBe(false)
     })
 })
 

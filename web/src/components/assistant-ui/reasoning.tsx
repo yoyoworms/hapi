@@ -11,6 +11,7 @@ import {
     denyOnlyTransform,
     UriConfirmProvider,
 } from '@/components/assistant-ui/markdown-text'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 function ChevronIcon(props: { className?: string; open?: boolean }) {
     return (
@@ -45,6 +46,7 @@ export const Reasoning: FC = () => {
     return (
         <UriConfirmProvider>
             <MarkdownTextPrimitive
+                preprocess={normalizeLatexDelimiters}
                 remarkPlugins={MARKDOWN_PLUGINS}
                 rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
                 components={defaultComponents}

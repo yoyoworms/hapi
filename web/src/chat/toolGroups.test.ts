@@ -142,6 +142,82 @@ describe('isEligibleForToolGrouping', () => {
 })
 
 describe('buildVisibleChatBlocks', () => {
+    it('keeps individual tool cards when grouping mode is none', () => {
+        const blocks: ChatBlock[] = [
+            makeToolBlock('read-1', 'Read', { file_path: 'src/a.ts' }),
+            makeToolBlock('bash-1', 'Bash', { command: 'bun test' }),
+            makeToolBlock('edit-1', 'Edit', { file_path: 'src/a.ts' }),
+        ]
+        const visible = buildVisibleChatBlocks(blocks, {
+            hasMoreMessages: false,
+            mode: 'none'
+        })
+
+        expect(visible).toEqual(blocks)
+        expect(visible.every((block) => !isToolGroupBlock(block))).toBe(true)
+    })
+
+    it('keeps Codex exploration, edits, and verification in separate collapsed phases', () => {
+        const visible = buildVisibleChatBlocks([
+            makeToolBlock('read-1', 'Read', { file_path: 'src/a.ts' }),
+            makeToolBlock('search-1', 'CodexBash', { command: 'rg "test" web/src' }),
+            makeToolBlock('patch-1', 'CodexPatch', { file_path: 'src/a.ts' }),
+            makeToolBlock('edit-1', 'Edit', { file_path: 'src/b.ts' }),
+            makeToolBlock('test-1', 'CodexBash', { command: 'bun run test' }),
+            makeToolBlock('typecheck-1', 'CodexBash', { command: 'bun typecheck' }),
+        ], {
+            hasMoreMessages: false,
+            mode: 'codex'
+        })
+
+        expect(visible).toHaveLength(3)
+        expect(visible.every(isToolGroupBlock)).toBe(true)
+        if (!visible.every(isToolGroupBlock)) {
+            throw new Error('expected Codex phase groups')
+        }
+        expect(visible.map((group) => group.tools.map((tool) => tool.id))).toEqual([
+            ['read-1', 'search-1'],
+            ['patch-1', 'edit-1'],
+            ['test-1', 'typecheck-1'],
+        ])
+    })
+
+    it('bounds long Codex exploration phases', () => {
+        const tools = Array.from({ length: 14 }, (_, index) => (
+            makeToolBlock(`read-${index + 1}`, 'Read', { file_path: `src/${index + 1}.ts` })
+        ))
+        const visible = buildVisibleChatBlocks(tools, {
+            hasMoreMessages: false,
+            mode: 'codex'
+        })
+
+        expect(visible).toHaveLength(2)
+        expect(isToolGroupBlock(visible[0]) && visible[0].tools).toHaveLength(12)
+        expect(isToolGroupBlock(visible[1]) && visible[1].tools).toHaveLength(2)
+    })
+
+    it('does not reuse one previous id for two Codex groups after a phase split', () => {
+        const tools = [
+            makeToolBlock('read-1', 'Read', { file_path: 'src/a.ts' }),
+            makeToolBlock('read-2', 'Read', { file_path: 'src/b.ts' }),
+            makeToolBlock('test-1', 'CodexBash', { command: 'bun test' }),
+            makeToolBlock('test-2', 'CodexBash', { command: 'bun test --runInBand' }),
+        ]
+        const previous = buildVisibleChatBlocks(tools, { hasMoreMessages: false })
+        const next = buildVisibleChatBlocks(tools, {
+            hasMoreMessages: false,
+            mode: 'codex',
+            previousGroups: previous.filter(isToolGroupBlock)
+        })
+
+        expect(next).toHaveLength(2)
+        expect(next.every(isToolGroupBlock)).toBe(true)
+        if (!next.every(isToolGroupBlock)) {
+            throw new Error('expected Codex phase groups')
+        }
+        expect(new Set(next.map((group) => group.id)).size).toBe(2)
+    })
+
     it('groups contiguous eligible root tool cards', () => {
         const visible = buildVisibleChatBlocks([
             makeToolBlock('read-1', 'Read', { file_path: 'src/a.ts' }),

@@ -28,6 +28,7 @@ import { UriConfirmDialog } from '@/components/UriConfirmDialog'
 import { downloadBlobFile } from '@/lib/file-download'
 import { useToast } from '@/lib/toast-context'
 import { useTranslation } from '@/lib/use-translation'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 
@@ -769,6 +770,7 @@ export function MarkdownText() {
     return (
         <UriConfirmProvider>
             <MarkdownTextPrimitive
+                preprocess={normalizeLatexDelimiters}
                 remarkPlugins={MARKDOWN_PLUGINS}
                 rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
                 components={defaultComponents}

@@ -8,6 +8,7 @@ import {
     getScrollIntent,
     locateOutlineTargetMessage,
     restoreScrollAnchor,
+    restoreScrollAfterPrepend,
     shouldCancelInitialScrollSettling,
 } from '@/components/AssistantChat/HappyThread'
 import type { ConversationOutlineItem } from '@/chat/outline'
@@ -180,6 +181,41 @@ describe('scroll anchor helpers', () => {
 
         expect(restoreScrollAnchor(viewport, { id: 'anchored-message', topOffset: 30 })).toBe(true)
         expect(viewport.scrollTop).toBe(250)
+
+        viewport.remove()
+    })
+
+    it('waits for the prepended DOM before consuming a scroll snapshot', () => {
+        const viewport = document.createElement('div')
+        const message = document.createElement('div')
+        message.id = 'delayed-anchor'
+        viewport.append(message)
+        document.body.append(viewport)
+        viewport.scrollTop = 100
+
+        let scrollHeight = 500
+        let messageTop = 120
+        Object.defineProperty(viewport, 'scrollHeight', {
+            configurable: true,
+            get: () => scrollHeight
+        })
+        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
+        vi.spyOn(message, 'getBoundingClientRect').mockImplementation(() => (
+            rect({ top: messageTop, bottom: messageTop + 60 })
+        ))
+        const snapshot = {
+            anchor: { id: message.id, topOffset: 20 },
+            scrollTop: 100,
+            scrollHeight: 500
+        }
+
+        expect(restoreScrollAfterPrepend(viewport, snapshot)).toBe(false)
+        expect(viewport.scrollTop).toBe(100)
+
+        scrollHeight = 800
+        messageTop = 420
+        expect(restoreScrollAfterPrepend(viewport, snapshot)).toBe(true)
+        expect(viewport.scrollTop).toBe(400)
 
         viewport.remove()
     })

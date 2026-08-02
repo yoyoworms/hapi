@@ -542,7 +542,7 @@ function AppInner() {
                     reason={sseDisconnectReason}
                 />
                 <OfflineBanner />
-                <div className="h-full min-h-0 flex flex-col">
+                <div className="h-full min-h-0 overflow-hidden flex flex-col">
                     <Outlet />
                 </div>
                 <ToastContainer />

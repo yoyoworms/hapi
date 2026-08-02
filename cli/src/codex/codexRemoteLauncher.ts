@@ -2903,22 +2903,24 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 });
             }
             if (msgType === 'plan_update') {
+                const explanation = asString(msg.explanation);
+                const planSnapshot = {
+                    plan: Array.isArray(msg.plan) ? msg.plan : [],
+                    ...(explanation ? { explanation } : {}),
+                    source: 'codex'
+                };
                 session.sendAgentMessage({
                     type: 'tool-call',
                     name: 'update_plan',
                     callId: 'codex-plan-state',
-                    input: {
-                        plan: Array.isArray(msg.plan) ? msg.plan : [],
-                        source: 'codex'
-                    },
+                    input: planSnapshot,
                     id: randomUUID()
                 });
                 session.sendAgentMessage({
                     type: 'tool-call-result',
                     callId: 'codex-plan-state',
                     output: {
-                        plan: Array.isArray(msg.plan) ? msg.plan : [],
-                        source: 'codex',
+                        ...planSnapshot,
                         status: 'updated'
                     },
                     id: randomUUID()
@@ -3725,8 +3727,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     }
                 }
 
-                turnInFlight = true;
-                allowAnonymousTerminalEvent = false;
                 const mode = {
                     ...message.mode,
                     model: session.getModel() ?? message.mode.model
@@ -3743,6 +3743,61 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         ? { suppressCollaborationMode: true }
                         : undefined
                 });
+
+                // Messages that arrive while Codex is already working are
+                // steering input for the active turn, not a second turn. Using
+                // `turn/start` here makes app-server inject the text into the
+                // running turn but return a new provisional turn id. HAPI then
+                // replaces `currentTurnId` with that id and rejects the real
+                // terminal event, leaving the session permanently "thinking".
+                //
+                // `turn/steer` keeps the original turn id authoritative and
+                // adds an expected-turn precondition so a completion race
+                // cannot steer the wrong turn.
+                if (turnInFlight) {
+                    const expectedTurnId = this.currentTurnId;
+                    if (!expectedTurnId) {
+                        pending = message;
+                        await waitForTurnOrRecovery(this.abortController.signal);
+                        continue;
+                    }
+
+                    const steerParams = buildParams(true);
+                    try {
+                        const steerResponse = await appServerClient.steerTurn({
+                            threadId: this.currentThreadId,
+                            expectedTurnId,
+                            input: steerParams.input
+                        }, {
+                            signal: this.abortController.signal
+                        });
+                        if (steerResponse.turnId !== expectedTurnId) {
+                            logger.debug(
+                                `[Codex] turn/steer returned a different turn id; ` +
+                                `expected=${expectedTurnId}, returned=${steerResponse.turnId}`
+                            );
+                        }
+                    } catch (error) {
+                        if (error instanceof Error && error.name === 'AbortError') {
+                            throw error;
+                        }
+                        // The active turn may have completed between queue
+                        // collection and the expected-turn check. Preserve the
+                        // message and send it as a normal turn once idle.
+                        logger.debug(
+                            `[Codex] Could not steer active turn ${expectedTurnId}; ` +
+                            `queueing the message for the next turn: ${errorMessage(error)}`
+                        );
+                        pending = message;
+                        if (turnInFlight) {
+                            await waitForTurnOrRecovery(this.abortController.signal);
+                        }
+                    }
+                    continue;
+                }
+
+                turnInFlight = true;
+                allowAnonymousTerminalEvent = false;
                 if (
                     mode.collaborationMode === 'plan'
                     && !supportsTurnCollaborationMode

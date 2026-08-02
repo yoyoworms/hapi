@@ -694,6 +694,7 @@ describe('normalizeDecryptedMessage', () => {
                 type: 'codex',
                 data: {
                     type: 'plan_update',
+                    explanation: 'Surface the current task while commands stay folded.',
                     plan: [
                         { step: 'Inspect event stream', status: 'completed' },
                         { step: 'Render plan card', status: 'in_progress' }
@@ -713,6 +714,7 @@ describe('normalizeDecryptedMessage', () => {
                     id: 'codex-plan-state',
                     name: 'update_plan',
                     input: {
+                        explanation: 'Surface the current task while commands stay folded.',
                         plan: [
                             { step: 'Inspect event stream', status: 'completed' },
                             { step: 'Render plan card', status: 'in_progress' }
@@ -724,6 +726,7 @@ describe('normalizeDecryptedMessage', () => {
                     type: 'tool-result',
                     tool_use_id: 'codex-plan-state',
                     content: {
+                        explanation: 'Surface the current task while commands stay folded.',
                         plan: [
                             { step: 'Inspect event stream', status: 'completed' },
                             { step: 'Render plan card', status: 'in_progress' }

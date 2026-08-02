@@ -189,7 +189,7 @@ export function deduplicateSessionsByAgentId(sessions: SessionSummary[], selecte
 }
 
 
-export const RECENT_SESSIONS_WINDOW_MS = 12 * 60 * 60 * 1000
+export const RECENT_SESSIONS_WINDOW_MS = 24 * 60 * 60 * 1000
 
 export function getRecentSessions(
     sessions: SessionSummary[],
@@ -198,7 +198,7 @@ export function getRecentSessions(
     selectedSessionId?: string | null
 ): SessionSummary[] {
     const cutoff = nowMs - RECENT_SESSIONS_WINDOW_MS
-    // Pinned sessions always show, even if outside the 12h window.
+    // Pinned sessions always show, even if outside the 24h window.
     const eligible = sessions.filter(s => pinned.has(s.id) || s.updatedAt > cutoff)
     const deduped = deduplicateSessionsByAgentId(eligible, selectedSessionId)
     return deduped.sort((a, b) => {

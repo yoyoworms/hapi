@@ -191,10 +191,10 @@ describe('getRecentSessions', () => {
     const now = 1_000_000_000_000
     const oneHour = 60 * 60 * 1000
 
-    it('keeps sessions updated within the 12h window', () => {
+    it('keeps sessions updated within the 24h window', () => {
         const sessions = [
-            makeSession({ id: 'within', updatedAt: now - 6 * oneHour }),
-            makeSession({ id: 'outside', updatedAt: now - 13 * oneHour })
+            makeSession({ id: 'within', updatedAt: now - 23 * oneHour }),
+            makeSession({ id: 'outside', updatedAt: now - 25 * oneHour })
         ]
         const result = getRecentSessions(sessions, now)
         expect(result.map(s => s.id)).toEqual(['within'])
@@ -210,8 +210,8 @@ describe('getRecentSessions', () => {
         expect(result.map(s => s.id)).toEqual(['pending', 'active-old', 'idle-fresh'])
     })
 
-    it('exposes RECENT_SESSIONS_WINDOW_MS as 12 hours', () => {
-        expect(RECENT_SESSIONS_WINDOW_MS).toBe(12 * 60 * 60 * 1000)
+    it('exposes RECENT_SESSIONS_WINDOW_MS as 24 hours', () => {
+        expect(RECENT_SESSIONS_WINDOW_MS).toBe(24 * 60 * 60 * 1000)
     })
 
     it('dedupes by agentSessionId before sorting', () => {
@@ -224,7 +224,7 @@ describe('getRecentSessions', () => {
         expect(result[0].id).toBe('a')
     })
 
-    it('keeps pinned sessions even outside the 12h window', () => {
+    it('keeps pinned sessions even outside the 24h window', () => {
         const sessions = [
             makeSession({ id: 'pinned-old', updatedAt: now - 48 * oneHour }),
             makeSession({ id: 'fresh', updatedAt: now - 1 * oneHour }),

@@ -165,6 +165,54 @@ describe('cli session handlers', () => {
         expect(webEvents).toHaveLength(0)
     })
 
+    it('clears the previous plan snapshot when queued user messages start a new turn', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('plan-reset-session', {}, null, 'default')
+        const socket = new FakeSocket()
+        const webEvents: SyncEvent[] = []
+        const planAt = Date.now() - 1_000
+        store.sessions.setSessionTodos(session.id, [
+            {
+                id: 'codex-plan-1',
+                content: 'Previous task',
+                priority: 'medium',
+                status: 'in_progress'
+            }
+        ], planAt, session.namespace)
+        store.messages.addMessage(
+            session.id,
+            { role: 'user', content: { type: 'text', text: 'Next task' } },
+            'local-next'
+        )
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onWebappEvent: (event) => {
+                webEvents.push(event)
+            }
+        })
+
+        socket.trigger('messages-consumed', {
+            sid: session.id,
+            localIds: ['local-next']
+        })
+
+        expect(store.sessions.getSession(session.id)?.todos).toEqual([])
+        expect(webEvents).toContainEqual({
+            type: 'session-updated',
+            sessionId: session.id
+        })
+        expect(webEvents).toContainEqual(expect.objectContaining({
+            type: 'messages-consumed',
+            sessionId: session.id,
+            localIds: ['local-next']
+        }))
+    })
+
     it('update-metadata broadcasts the merged value, not the pre-merge payload', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession(

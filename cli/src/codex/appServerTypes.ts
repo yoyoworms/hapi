@@ -272,6 +272,21 @@ export interface TurnStartResponse {
     [key: string]: unknown;
 }
 
+export interface TurnSteerParams {
+    threadId: string;
+    input: UserInput[];
+    /**
+     * The currently active turn. App-server rejects the steer if the turn
+     * completed or changed before the request arrived.
+     */
+    expectedTurnId: string;
+}
+
+export interface TurnSteerResponse {
+    turnId: string;
+    [key: string]: unknown;
+}
+
 export interface TurnInterruptParams {
     threadId: string;
     turnId: string;

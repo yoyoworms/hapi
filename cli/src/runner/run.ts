@@ -29,6 +29,8 @@ import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
 import { hashRunnerCliApiToken, hashRunnerExtraHeaders } from './runnerIdentity';
 import { scheduleCursorModelsPrewarm } from '@/modules/common/cursorModelsPrewarm';
 import { codexAccountManager } from '@/codex/codexAccountManager';
+import { sanitizeCodexSessionEnvironment } from '@/codex/codexProcessEnvironment';
+import { createSessionSpawnOutput } from './sessionSpawnOutput';
 
 export async function startRunner(options: { workspaceRoots?: string[] } = {}): Promise<void> {
   // We don't have cleanup function at the time of server construction
@@ -423,9 +425,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             || options.resumeSessionId
             || options.continueLatest
           );
-          const account = await codexAccountManager.resolveAccount(
-            options.codexAccountId ?? (isExistingSession ? 'system' : undefined)
-          );
+          const requestedAccountId = options.codexAccountId
+            ?? (isExistingSession ? 'system' : undefined);
+          const account = options.resumeSessionId && !options.codexSourceAccountId
+            ? await codexAccountManager.resolveAccountForResume(
+                requestedAccountId,
+                options.resumeSessionId
+              )
+            : await codexAccountManager.resolveAccount(requestedAccountId);
           if (options.sandbox && account.kind !== 'system') {
             return {
               type: 'error',
@@ -507,64 +514,62 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
         // sessionId reserved for future use
         const MAX_TAIL_CHARS = 4000;
-        let stderrTail = '';
-        const appendTail = (current: string, chunk: Buffer | string): string => {
-          const text = chunk.toString();
-          if (!text) {
-            return current;
-          }
-          const combined = current + text;
-          return combined.length > MAX_TAIL_CHARS ? combined.slice(-MAX_TAIL_CHARS) : combined;
+        const sessionOutput = createSessionSpawnOutput(configuration.logsDir);
+        const readOutputTail = (): string => {
+          const output = sessionOutput.readTail();
+          return output.length > MAX_TAIL_CHARS ? output.slice(-MAX_TAIL_CHARS) : output;
         };
         const logStderrTail = () => {
-          const trimmed = stderrTail.trim();
+          const trimmed = readOutputTail().trim();
           if (!trimmed) {
             return;
           }
-          logger.debug('[RUNNER RUN] Child stderr tail', trimmed);
+          logger.debug('[RUNNER RUN] Child output tail', trimmed);
         };
 
-        if (options.sandbox) {
-          // Sandbox mode: run inside Docker container with only the project directory mounted
-          const containerName = `hapi-sandbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          const dockerArgs = [
-            'run', '--rm',
-            '--name', containerName,
-            '-v', `${spawnDirectory}:/workspace`,
-            '-w', '/workspace',
-            '--network', 'host',
-            // Pass essential env vars
-            '-e', `HAPI_API_URL=${process.env.HAPI_API_URL || ''}`,
-            '-e', `CLI_API_TOKEN=${process.env.CLI_API_TOKEN || ''}`,
-            '-e', `HAPI_HOME=/tmp/.hapi`,
-            ...Object.entries(extraEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
-            'hapi-sandbox:latest',
-            'hapi', ...args
-          ];
-          logger.debug(`[RUNNER RUN] Spawning sandboxed session: docker ${dockerArgs.join(' ')}`);
-          happyProcess = spawn('docker', dockerArgs, {
-            detached: true,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-          // Track container name for cleanup
-          if (happyProcess.pid) {
-            (happyProcess as any).__sandboxContainer = containerName;
-          }
-        } else {
-          happyProcess = spawnHappyCLI(args, {
-            cwd: spawnDirectory,
-            detached: true,  // Sessions stay alive when runner stops
-            stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
-            env: {
-              ...process.env,
-              ...extraEnv
+        try {
+          if (options.sandbox) {
+            // Sandbox mode: run inside Docker container with only the project directory mounted
+            const containerName = `hapi-sandbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const dockerArgs = [
+              'run', '--rm',
+              '--name', containerName,
+              '-v', `${spawnDirectory}:/workspace`,
+              '-w', '/workspace',
+              '--network', 'host',
+              // Pass essential env vars
+              '-e', `HAPI_API_URL=${process.env.HAPI_API_URL || ''}`,
+              '-e', `CLI_API_TOKEN=${process.env.CLI_API_TOKEN || ''}`,
+              '-e', `HAPI_HOME=/tmp/.hapi`,
+              ...Object.entries(extraEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+              'hapi-sandbox:latest',
+              'hapi', ...args
+            ];
+            logger.debug(`[RUNNER RUN] Spawning sandboxed session: docker ${dockerArgs.join(' ')}`);
+            happyProcess = spawn('docker', dockerArgs, {
+              detached: true,
+              stdio: sessionOutput.stdio,
+            });
+            // Track container name for cleanup
+            if (happyProcess.pid) {
+              (happyProcess as any).__sandboxContainer = containerName;
             }
-          });
+          } else {
+            happyProcess = spawnHappyCLI(args, {
+              cwd: spawnDirectory,
+              detached: true,  // Sessions stay alive when runner stops
+              stdio: sessionOutput.stdio,
+              env: {
+                ...sanitizeCodexSessionEnvironment(process.env),
+                ...extraEnv
+              }
+            });
+          }
+        } finally {
+          // The child owns its inherited file description now. Keeping the
+          // runner's copy open is unnecessary and obscures ownership.
+          sessionOutput.closeParentHandle();
         }
-
-        happyProcess.stderr?.on('data', (data) => {
-          stderrTail = appendTail(stderrTail, data);
-        });
 
         let spawnErrorBeforePidCheck: Error | null = null;
         const captureSpawnErrorBeforePidCheck = (error: Error) => {
@@ -617,7 +622,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             }
           }
 
-          const trimmedTail = stderrTail.trim();
+          const trimmedTail = readOutputTail().trim();
           if (trimmedTail) {
             const compactTail = trimmedTail.replace(/\s+/g, ' ');
             const tailForMessage = compactTail.length > 800 ? compactTail.slice(-800) : compactTail;
@@ -663,6 +668,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           }
           onChildExited(pid);
         });
+        happyProcess.unref();
 
         // Wait for webhook to populate session with happySessionId
         logger.debug(`[RUNNER RUN] Waiting for session webhook for PID ${pid}`);

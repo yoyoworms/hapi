@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 import {
     CodexAccountManager,
@@ -191,6 +191,42 @@ describe('CodexAccountManager', () => {
             .rejects.toThrow('cannot be removed');
     });
 
+    it('does not treat a managed session CODEX_HOME as the system account home', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const keys = [
+            'CODEX_HOME',
+            'HAPI_CODEX_ACCOUNT_ID',
+            'HAPI_CODEX_ACCOUNT_LABEL',
+            'HAPI_CODEX_ACCOUNT_KIND',
+            'HAPI_CODEX_API_KEY',
+            'HAPI_CODEX_RESUME_PATH'
+        ] as const;
+        const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+
+        try {
+            process.env.CODEX_HOME = join(rootDir, 'managed-home');
+            process.env.HAPI_CODEX_ACCOUNT_ID = 'managed-account';
+            process.env.HAPI_CODEX_ACCOUNT_LABEL = 'managed@example.com';
+            process.env.HAPI_CODEX_ACCOUNT_KIND = 'managed';
+            process.env.HAPI_CODEX_RESUME_PATH = join(rootDir, 'managed-rollout.jsonl');
+
+            const manager = new CodexAccountManager({ rootDir });
+            const system = await manager.resolveAccount(SYSTEM_CODEX_ACCOUNT_ID);
+
+            expect(system.homeDir).toBe(join(homedir(), '.codex'));
+        } finally {
+            for (const key of keys) {
+                const value = previous[key];
+                if (value === undefined) {
+                    delete process.env[key];
+                } else {
+                    process.env[key] = value;
+                }
+            }
+        }
+    });
+
     it('stores custom API credentials only in the isolated runner home', async () => {
         const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
         cleanupPaths.push(rootDir);
@@ -257,6 +293,75 @@ describe('CodexAccountManager', () => {
         const migratedPath = await manager.prepareSessionSwitch('system', targetId, threadId);
         expect(migratedPath).toContain(join('sessions', 'hapi-migrated', threadId));
         expect(await readFile(migratedPath!, 'utf8')).toBe('{"type":"session_meta"}\n');
+    });
+
+    it('recovers a resume when legacy metadata points at the wrong account', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const systemHomeDir = join(rootDir, 'system-codex-home');
+        await mkdir(systemHomeDir);
+        const threadId = '22222222-3333-4444-5555-666666666666';
+        const manager = new CodexAccountManager({
+            rootDir,
+            systemHomeDir,
+            clientFactory: (homeDir) => new FakeAuthClient(homeDir, systemHomeDir)
+        });
+        const result = await manager.addApiEndpoint({
+            label: 'Actual owner',
+            baseUrl: 'https://api.example.com/v1',
+            apiKey: 'secret-key',
+            model: 'test-model'
+        });
+        const target = result.accounts.find((account) => account.kind === 'api')!;
+        const targetHome = (await manager.resolveAccount(target.id)).homeDir;
+        const targetDirectory = join(targetHome, 'sessions', '2026', '07', '25');
+        const targetPath = join(
+            targetDirectory,
+            `rollout-2026-07-25T00-00-00-${threadId}.jsonl`
+        );
+        await mkdir(targetDirectory, { recursive: true });
+        await writeFile(targetPath, '{"type":"session_meta"}\n');
+
+        await expect(manager.resolveAccountForResume('system', threadId))
+            .resolves.toMatchObject({
+                id: target.id,
+                label: 'Actual owner'
+            });
+        await expect(manager.prepareSessionSwitch('system', target.id, threadId))
+            .resolves.toBe(targetPath);
+    });
+
+    it('does not guess when a resume rollout exists in multiple alternate accounts', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const systemHomeDir = join(rootDir, 'system-codex-home');
+        await mkdir(systemHomeDir);
+        const threadId = '33333333-4444-5555-6666-777777777777';
+        const manager = new CodexAccountManager({
+            rootDir,
+            systemHomeDir,
+            clientFactory: (homeDir) => new FakeAuthClient(homeDir, systemHomeDir)
+        });
+
+        for (const label of ['First', 'Second']) {
+            const result = await manager.addApiEndpoint({
+                label,
+                baseUrl: 'https://api.example.com/v1',
+                apiKey: `secret-${label}`,
+                model: 'test-model'
+            });
+            const account = result.accounts.find((candidate) => candidate.label === label)!;
+            const homeDir = (await manager.resolveAccount(account.id)).homeDir;
+            const sessionDirectory = join(homeDir, 'sessions');
+            await mkdir(sessionDirectory, { recursive: true });
+            await writeFile(
+                join(sessionDirectory, `rollout-${threadId}.jsonl`),
+                '{"type":"session_meta"}\n'
+            );
+        }
+
+        await expect(manager.resolveAccountForResume('system', threadId))
+            .rejects.toThrow('multiple local accounts');
     });
 
     it('does not overwrite a corrupted account registry', async () => {

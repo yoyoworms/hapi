@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { isBunCompiled, projectPath } from '@/projectPath';
 import { logger } from '@/ui/logger';
 import { existsSync } from 'node:fs';
+import { sanitizeCodexSessionEnvironment } from '@/codex/codexProcessEnvironment';
 
 const HAPI_CLI_EXECUTABLE_ENV = 'HAPI_CLI_EXECUTABLE';
 
@@ -174,7 +175,10 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
   // On Windows, detached processes allocate a new console window by default.
   // windowsHide: true suppresses this to prevent cmd windows from accumulating.
   const finalOptions: SpawnOptions = { ...options };
-  const finalEnv = { ...process.env, ...options.env };
+  let finalEnv = { ...process.env, ...options.env };
+  if (args[0] === 'runner') {
+    finalEnv = sanitizeCodexSessionEnvironment(finalEnv);
+  }
   let shouldSetEnv = false;
   if (compiledMode) {
     finalEnv[HAPI_CLI_EXECUTABLE_ENV] = spawnCommand;

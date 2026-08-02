@@ -2633,6 +2633,70 @@ describe('session model', () => {
             expect(targetRequests['req-from-target']).toBeDefined()
         })
 
+        it('does not delete a live session when a metadata update creates a native thread collision', async () => {
+            const store = new Store(':memory:')
+            const engine = new SyncEngine(
+                store,
+                {} as never,
+                new RpcRegistry(),
+                { broadcast() {} } as never
+            )
+
+            try {
+                const first = engine.getOrCreateSession(
+                    'metadata-collision-first',
+                    { path: '/tmp/project-a', host: 'localhost', flavor: 'codex', codexSessionId: 'thread-X' },
+                    null,
+                    'default'
+                )
+                const second = engine.getOrCreateSession(
+                    'metadata-collision-second',
+                    { path: '/tmp/project-b', host: 'localhost', flavor: 'codex', codexSessionId: 'thread-Y' },
+                    null,
+                    'default'
+                )
+
+                store.messages.addMessage(first.id, { type: 'text', text: 'history from first' }, 'collision-first')
+                store.messages.addMessage(second.id, { type: 'text', text: 'history from second' }, 'collision-second')
+                engine.handleSessionAlive({ sid: first.id, time: Date.now() })
+                engine.handleSessionAlive({ sid: second.id, time: Date.now() + 1000 })
+
+                const storedSecond = store.sessions.getSessionByNamespace(second.id, 'default')!
+                const update = store.sessions.updateSessionMetadata(
+                    second.id,
+                    {
+                        ...(storedSecond.metadata as Record<string, unknown>),
+                        codexSessionId: 'thread-X'
+                    },
+                    storedSecond.metadataVersion,
+                    'default'
+                )
+                expect(update.result).toBe('success')
+                if (update.result !== 'success') {
+                    throw new Error('Expected metadata update to succeed')
+                }
+
+                await engine.handleSessionMetadataUpdated({
+                    sid: second.id,
+                    namespace: 'default',
+                    metadata: update.value
+                })
+
+                expect(engine.getSession(first.id)).toBeDefined()
+                expect(engine.getSession(second.id)).toBeDefined()
+                expect(store.sessions.getSession(first.id)).not.toBeNull()
+                expect(store.sessions.getSession(second.id)).not.toBeNull()
+                expect(store.messages.getMessages(first.id, 100).map((message) => (message.content as { text?: string }).text)).toEqual([
+                    'history from first'
+                ])
+                expect(store.messages.getMessages(second.id, 100).map((message) => (message.content as { text?: string }).text)).toEqual([
+                    'history from second'
+                ])
+            } finally {
+                engine.stop()
+            }
+        })
+
         it('invalidates both sessions for history-only merges', async () => {
             const store = new Store(':memory:')
             const events: SyncEvent[] = []
