@@ -698,12 +698,13 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
     ])
 
     const handlePaste = useCallback((e: ReactClipboardEvent<HTMLDivElement>) => {
-        const files = Array.from(e.clipboardData?.files ?? [])
-        const hasImage = files.some((file) => file.type.startsWith('image/'))
-        if (hasImage) {
-            onPaste?.(e)
-            return
-        }
+        // Give the parent attachment handler first refusal. In particular,
+        // contenteditable/Safari can expose a pasted image only through
+        // clipboardData.items rather than clipboardData.files. The parent
+        // prevents default synchronously when it consumes an attachment.
+        onPaste?.(e)
+        if (e.defaultPrevented) return
+
         // Contenteditable default paste inserts HTML; nested blocks collapse in
         // segmentsFromEditor without depth-aware breaks. Force plain text.
         e.preventDefault()

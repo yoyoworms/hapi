@@ -52,6 +52,94 @@ describe('CodexAccountSelector', () => {
         })).toBeInTheDocument()
     })
 
+    it('keeps and marks the account used by the current session instead of selecting the runner default', async () => {
+        const onChange = vi.fn()
+        const api = {
+            getMachineCodexAccounts: vi.fn().mockResolvedValue({
+                success: true,
+                defaultAccountId: 'system',
+                accounts: [
+                    {
+                        id: 'system',
+                        label: 'default@example.com',
+                        kind: 'system',
+                        isDefault: true,
+                        authenticated: true
+                    },
+                    {
+                        id: 'managed-1',
+                        label: 'current@example.com',
+                        kind: 'managed',
+                        isDefault: false,
+                        authenticated: true,
+                        primaryLimit: { usedPercent: 25, resetsAt: 123 }
+                    }
+                ]
+            })
+        } as unknown as ApiClient
+
+        render(
+            <I18nProvider>
+                <CodexAccountSelector
+                    api={api}
+                    machineId="machine-1"
+                    value="managed-1"
+                    currentAccountId="managed-1"
+                    isDisabled={false}
+                    onChange={onChange}
+                />
+            </I18nProvider>
+        )
+
+        const select = await screen.findByRole('combobox')
+        await waitFor(() => expect(select).toHaveValue('managed-1'))
+        expect(screen.getByRole('option', {
+            name: /current@example\.com · 25% · current/i
+        })).toBeInTheDocument()
+        expect(onChange).toHaveBeenLastCalledWith('managed-1')
+        expect(onChange).not.toHaveBeenCalledWith(null)
+        expect(onChange).not.toHaveBeenCalledWith('system')
+    })
+
+    it('keeps a missing current account selected instead of falling back to the runner default', async () => {
+        const onChange = vi.fn()
+        const api = {
+            getMachineCodexAccounts: vi.fn().mockResolvedValue({
+                success: true,
+                defaultAccountId: 'system',
+                accounts: [{
+                    id: 'system',
+                    label: 'default@example.com',
+                    kind: 'system',
+                    isDefault: true,
+                    authenticated: true
+                }]
+            })
+        } as unknown as ApiClient
+
+        render(
+            <I18nProvider>
+                <CodexAccountSelector
+                    api={api}
+                    machineId="machine-1"
+                    value="missing-current"
+                    currentAccountId="missing-current"
+                    currentAccountLabel="old@example.com"
+                    isDisabled={false}
+                    onChange={onChange}
+                />
+            </I18nProvider>
+        )
+
+        const select = await screen.findByRole('combobox')
+        await waitFor(() => expect(select).toHaveValue('missing-current'))
+        expect(screen.getByRole('option', {
+            name: /old@example\.com · current · signed out/i
+        })).toBeInTheDocument()
+        expect(onChange).toHaveBeenLastCalledWith('missing-current')
+        expect(onChange).not.toHaveBeenCalledWith('system')
+    })
+
     it('can make the selected account the HAPI default', async () => {
         const setDefault = vi.fn().mockResolvedValue({
             success: true,

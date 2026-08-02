@@ -10,6 +10,7 @@ import { codexSystemPrompt } from './utils/systemPrompt';
 import type { ReasoningEffort } from './appServerTypes';
 import { resolveCodexCommand } from './utils/codexExecutable';
 import type { McpServersConfig } from './utils/buildHapiMcpBridge';
+import { prepareHapiCodexContextArgs } from './codexAppServerClient';
 
 export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
     if (!sessionMatchToken) {
@@ -184,10 +185,11 @@ export async function codexLocal(opts: {
     }
 
     const codexCommand = resolveCodexCommand();
+    const contextArgs = prepareHapiCodexContextArgs(codexCommand, process.env);
 
     await spawnWithTerminalGuard({
         command: codexCommand.command,
-        args: [...codexCommand.args, ...args],
+        args: [...codexCommand.args, ...contextArgs, ...args],
         cwd: opts.path,
         env: process.env,
         signal: opts.abort,

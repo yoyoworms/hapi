@@ -165,8 +165,8 @@ function resolveCodexAppServerCommand(): string {
 }
 
 export const HAPI_CODEX_CONTEXT_DEFAULTS = {
-    contextWindow: 350_000,
-    autoCompactTokenLimit: 320_000,
+    contextWindow: 372_000,
+    autoCompactTokenLimit: 330_000,
     autoCompactTokenLimitScope: 'total'
 } as const;
 
@@ -205,7 +205,7 @@ function atLeast(value: unknown, minimum: number): number {
 /**
  * Codex clamps `model_context_window` to the selected model catalog entry's
  * `max_context_window`. The account catalog currently advertises 272K for Sol,
- * so a CLI `-c model_context_window=350000` override alone still resolves to
+ * so a CLI `-c model_context_window=372000` override alone still resolves to
  * 272K (258.4K after Codex's 95% effective-window reserve).
  *
  * Keep the complete account catalog and only raise metadata for models covered
@@ -241,12 +241,16 @@ export function applyHapiCodexContextCatalogPolicy(value: unknown): CodexModelCa
 }
 
 function loadCodexModelCatalog(
-    codexCommand: string,
-    environment: Record<string, string>,
+    codexCommand: { command: string; args?: readonly string[] },
+    environment: NodeJS.ProcessEnv,
     codexHome: string
 ): unknown {
     try {
-        const output = execFileSync(codexCommand, ['debug', 'models'], {
+        const output = execFileSync(codexCommand.command, [
+            ...(codexCommand.args ?? []),
+            'debug',
+            'models'
+        ], {
             encoding: 'utf8',
             timeout: 10_000,
             maxBuffer: 16 * 1024 * 1024,
@@ -267,8 +271,8 @@ function loadCodexModelCatalog(
 }
 
 function prepareHapiCodexModelCatalog(
-    codexCommand: string,
-    environment: Record<string, string>
+    codexCommand: { command: string; args?: readonly string[] },
+    environment: NodeJS.ProcessEnv
 ): string | null {
     const codexHome = resolve(environment.CODEX_HOME?.trim() || join(homedir(), '.codex'));
     const source = loadCodexModelCatalog(codexCommand, environment, codexHome);
@@ -297,7 +301,7 @@ function prepareHapiCodexModelCatalog(
     }
 }
 
-export function buildCodexAppServerArgs(modelCatalogPath?: string | null): string[] {
+function buildHapiCodexContextArgs(modelCatalogPath?: string | null): string[] {
     return [
         ...(modelCatalogPath
             ? [
@@ -310,7 +314,21 @@ export function buildCodexAppServerArgs(modelCatalogPath?: string | null): strin
         '-c',
         `model_auto_compact_token_limit=${HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit}`,
         '-c',
-        `model_auto_compact_token_limit_scope=${JSON.stringify(HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope)}`,
+        `model_auto_compact_token_limit_scope=${JSON.stringify(HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope)}`
+    ];
+}
+
+export function prepareHapiCodexContextArgs(
+    codexCommand: { command: string; args?: readonly string[] },
+    environment: NodeJS.ProcessEnv
+): string[] {
+    const modelCatalogPath = prepareHapiCodexModelCatalog(codexCommand, environment);
+    return buildHapiCodexContextArgs(modelCatalogPath);
+}
+
+export function buildCodexAppServerArgs(modelCatalogPath?: string | null): string[] {
+    return [
+        ...buildHapiCodexContextArgs(modelCatalogPath),
         'app-server'
     ];
 }
@@ -351,10 +369,10 @@ export class CodexAppServerClient extends JsonLineParser {
             ...inheritedEnv,
             ...this.options.env
         };
-        const modelCatalogPath = prepareHapiCodexModelCatalog(codexCommand, environment);
+        const contextArgs = prepareHapiCodexContextArgs({ command: codexCommand }, environment);
         // Runtime overrides keep every HAPI Codex identity on the same context
         // policy without modifying the user's standalone ~/.codex config.
-        this.process = spawn(codexCommand, buildCodexAppServerArgs(modelCatalogPath), {
+        this.process = spawn(codexCommand, [...contextArgs, 'app-server'], {
             env: environment,
             stdio: ['pipe', 'pipe', 'pipe'],
             shell: process.platform === 'win32',

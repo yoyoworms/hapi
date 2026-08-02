@@ -1,11 +1,39 @@
 import { describe, expect, it } from 'vitest'
 import {
+    formatAccountLimit,
     formatCompactContextUsageLabel,
     formatContextUsageLabel,
+    formatUsageText,
     getVisibleCodexPlanProgress,
     getContextUsageDetails,
     shouldShowCodexFastBadge
 } from './StatusBar'
+
+describe('account and session usage labels', () => {
+    it('formats the remaining account quota and clamps invalid percentages', () => {
+        expect(formatAccountLimit({ remainingPercent: 64 })).toBe('64%')
+        expect(formatAccountLimit({ remainingMs: 3_600_000, remainingPercent: 120 })).toBe('1h 100%')
+    })
+
+    it('prefers durable session totals and falls back to the latest transcript usage', () => {
+        expect(formatUsageText({
+            totalCostUsd: 0.25,
+            totalInputTokens: 1_000,
+            totalOutputTokens: 200
+        }, null)?.text).toBe('$0.25 · 1k tok')
+
+        expect(formatUsageText(null, {
+            inputTokens: 100,
+            outputTokens: 20,
+            cacheCreation: 0,
+            cacheRead: 2_000,
+            contextSize: 2_100,
+            contextWindow: 372_000,
+            model: 'gpt-5.4',
+            timestamp: 1
+        })?.text).toBe('ctx 2k · 2k tok')
+    })
+})
 
 describe('context usage labels', () => {
     it('keeps the desktop label compact and expresses used capacity', () => {

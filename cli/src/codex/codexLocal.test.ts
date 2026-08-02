@@ -1,9 +1,27 @@
 import { win32 } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { resolveCodexCommandMock, spawnWithTerminalGuardMock } = vi.hoisted(() => ({
+const {
+    prepareHapiCodexContextArgsMock,
+    resolveCodexCommandMock,
+    spawnWithTerminalGuardMock
+} = vi.hoisted(() => ({
+    prepareHapiCodexContextArgsMock: vi.fn(() => [
+        '-c',
+        'model_catalog_json="/tmp/hapi-context.json"',
+        '-c',
+        'model_context_window=372000',
+        '-c',
+        'model_auto_compact_token_limit=330000',
+        '-c',
+        'model_auto_compact_token_limit_scope="total"'
+    ]),
     resolveCodexCommandMock: vi.fn(() => ({ command: 'codex', args: [] as string[] })),
     spawnWithTerminalGuardMock: vi.fn(async (_options: unknown) => {})
+}));
+
+vi.mock('./codexAppServerClient', () => ({
+    prepareHapiCodexContextArgs: prepareHapiCodexContextArgsMock
 }));
 
 vi.mock('./utils/codexExecutable', () => ({
@@ -100,6 +118,7 @@ describe('appendSessionMatchToken', () => {
 
 describe('codexLocal', () => {
     beforeEach(() => {
+        prepareHapiCodexContextArgsMock.mockClear();
         resolveCodexCommandMock.mockReset();
         resolveCodexCommandMock.mockReturnValue({ command: 'codex', args: [] as string[] });
         spawnWithTerminalGuardMock.mockClear();
@@ -149,6 +168,20 @@ describe('codexLocal', () => {
 
         const args = spawnOptions.args;
         expect(args[0]).toBe(codexScriptPath);
+        expect(prepareHapiCodexContextArgsMock).toHaveBeenCalledWith({
+            command: 'node',
+            args: [codexScriptPath]
+        }, process.env);
+        expect(args.slice(1, 9)).toEqual([
+            '-c',
+            'model_catalog_json="/tmp/hapi-context.json"',
+            '-c',
+            'model_context_window=372000',
+            '-c',
+            'model_auto_compact_token_limit=330000',
+            '-c',
+            'model_auto_compact_token_limit_scope="total"'
+        ]);
         const hookArg = args.find((arg) => arg.startsWith('hooks.SessionStart='));
         expect(hookArg).toBeDefined();
         expect(hookArg).toContain('{ hooks = [{ type = "command", command = "');

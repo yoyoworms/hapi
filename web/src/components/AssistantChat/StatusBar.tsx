@@ -1,4 +1,5 @@
 import {
+    getClaudeModelLabel,
     getCodexCollaborationModeLabel,
     getPermissionModeLabel,
     getPermissionModeTone,
@@ -7,7 +8,7 @@ import {
 import type { PermissionModeTone } from '@hapi/protocol'
 import * as Popover from '@radix-ui/react-popover'
 import { useMemo } from 'react'
-import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
@@ -20,6 +21,7 @@ import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
 import type { PlanProgress } from '@/chat/planProgress'
+import type { LatestUsage } from '@/chat/reducer'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -131,6 +133,79 @@ function formatTokenCount(value: number): string {
     return String(value)
 }
 
+function formatCost(cost: number): string {
+    if (cost > 0 && cost < 0.01) return `$${cost.toFixed(3)}`
+    return `$${cost.toFixed(2)}`
+}
+
+function formatDuration(ms: number | null | undefined): string | null {
+    if (ms === null || ms === undefined || !Number.isFinite(ms)) return null
+    const hours = Math.max(0, Math.floor(ms / 3_600_000))
+    if (hours >= 24) {
+        const days = Math.floor(hours / 24)
+        const remainingHours = hours % 24
+        return remainingHours > 0 ? `${days}d${remainingHours}h` : `${days}d`
+    }
+    if (hours > 0) return `${hours}h`
+    const minutes = Math.max(0, Math.floor(ms / 60_000))
+    return `${minutes}m`
+}
+
+function formatReset(resetAt: number | null | undefined): string | null {
+    if (!resetAt) return null
+    return new Date(resetAt).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    })
+}
+
+export function formatAccountLimit(limit: AgentAccountStatus['window']): string | null {
+    if (!limit) return null
+    const duration = formatDuration(limit.remainingMs ?? (limit.resetAt ? limit.resetAt - Date.now() : null))
+    const percentage = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
+        ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
+        : null
+    return duration && percentage ? `${duration} ${percentage}` : duration ?? percentage
+}
+
+export function formatUsageText(
+    usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null | undefined,
+    latestUsage: LatestUsage | null | undefined
+): { text: string; title: string } | null {
+    if (usage) {
+        const totalTokens = usage.totalInputTokens + usage.totalOutputTokens
+        return {
+            text: `${formatCost(usage.totalCostUsd)} · ${formatTokenCount(totalTokens)} tok`,
+            title: [
+                `Cost: ${formatCost(usage.totalCostUsd)}`,
+                `Input tokens: ${usage.totalInputTokens.toLocaleString()}`,
+                `Output tokens: ${usage.totalOutputTokens.toLocaleString()}`,
+                `Total tokens: ${totalTokens.toLocaleString()}`
+            ].join('\n')
+        }
+    }
+
+    if (!latestUsage) return null
+    const inputTokens = latestUsage.inputTokens + latestUsage.cacheCreation + latestUsage.cacheRead
+    const outputTokens = latestUsage.outputTokens
+    const totalTokens = inputTokens + outputTokens
+    if (totalTokens <= 0 && latestUsage.contextSize <= 0) return null
+
+    return {
+        text: `ctx ${formatTokenCount(latestUsage.contextSize)} · ${formatTokenCount(totalTokens)} tok`,
+        title: [
+            'Latest agent usage from transcript',
+            `Context tokens: ${latestUsage.contextSize.toLocaleString()}`,
+            `Input tokens: ${latestUsage.inputTokens.toLocaleString()}`,
+            `Cache creation: ${latestUsage.cacheCreation.toLocaleString()}`,
+            `Cache read: ${latestUsage.cacheRead.toLocaleString()}`,
+            `Output tokens: ${latestUsage.outputTokens.toLocaleString()}`
+        ].join('\n')
+    }
+}
+
 function getContextPercentages(contextSize: number, maxContextSize: number): {
     usedPercentage: number
     remainingPercentage: number
@@ -204,6 +279,9 @@ export function StatusBar(props: {
     agentState: AgentState | null | undefined
     backgroundTaskCount?: number
     contextSize?: number
+    latestUsage?: LatestUsage | null
+    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
+    accountStatus?: AgentAccountStatus | null
     contextCacheRead?: number
     contextWindow?: number | null
     /**
@@ -273,6 +351,25 @@ export function StatusBar(props: {
     const collaborationModeLabel = displayCollaborationMode
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
+    const accountStatus = props.accountStatus ?? null
+    const accountWindowText = accountStatus ? formatAccountLimit(accountStatus.window) : null
+    const accountWeeklyText = accountStatus ? formatAccountLimit(accountStatus.weekly) : null
+    const accountLimitText = accountStatus
+        ? [
+            accountWindowText ? t('status.accountWindow', { value: accountWindowText }) : null,
+            accountWeeklyText ? t('status.accountWeekly', { value: accountWeeklyText }) : null
+        ]
+            .filter(Boolean)
+            .join(' · ')
+        : ''
+    const accountTitle = accountStatus
+        ? [
+            accountStatus.accountLabel ? `Account: ${accountStatus.accountLabel}` : null,
+            accountStatus.window?.resetAt ? `Window reset: ${formatReset(accountStatus.window.resetAt)}` : null,
+            accountStatus.weekly?.resetAt ? `Weekly reset: ${formatReset(accountStatus.weekly.resetAt)}` : null
+        ].filter(Boolean).join('\n')
+        : undefined
+    const usageText = formatUsageText(props.usage, props.latestUsage)
     const displaysCodexReasoning = shouldShowCodexReasoningLabel(props.agentFlavor)
     const codexReasoningLabel = displaysCodexReasoning
         ? formatCodexReasoningLabel(props.modelReasoningEffort, headerMetadata.showLabels)
@@ -379,6 +476,29 @@ export function StatusBar(props: {
             </div>
 
             <div className="flex min-w-0 shrink-0 items-baseline gap-2">
+                {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
+                    <span
+                        data-testid="account-usage-status"
+                        className={`${planProgress ? 'hidden sm:inline-flex' : 'inline-flex'} min-w-0 items-baseline text-[10px] font-medium text-[var(--app-fg)]`}
+                        title={accountTitle}
+                    >
+                        {accountStatus.accountLabel ? (
+                            <span className={`${accountLimitText ? 'hidden sm:inline' : 'inline'} max-w-[24vw] truncate`}>
+                                {accountStatus.accountLabel}{accountLimitText ? '\u00a0' : ''}
+                            </span>
+                        ) : null}
+                        {accountLimitText ? <span className="shrink-0 whitespace-nowrap">{accountLimitText}</span> : null}
+                    </span>
+                ) : null}
+                {usageText ? (
+                    <span
+                        data-testid="session-usage-status"
+                        className="hidden shrink-0 text-[10px] text-[var(--app-hint)] sm:inline"
+                        title={usageText.title}
+                    >
+                        {usageText.text}
+                    </span>
+                ) : null}
                 {codexReasoningLabel ? (
                     <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-hint)]`}>
                         <span className="sm:hidden">{compactCodexReasoningLabel}</span>
@@ -393,6 +513,11 @@ export function StatusBar(props: {
                 {goalLabel ? (
                     <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-link)]`}>
                         {goalLabel}
+                    </span>
+                ) : null}
+                {props.model ? (
+                    <span className="hidden text-[10px] text-[var(--app-hint)] md:inline">
+                        {getClaudeModelLabel(props.model) ?? props.model}
                     </span>
                 ) : null}
                 {collaborationModeLabel ? (

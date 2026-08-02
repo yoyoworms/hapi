@@ -44,6 +44,8 @@ import { getCodexComposerReasoningEffortOptions } from './codexReasoningEffortOp
 import { getDisplayedCodexServiceTier } from './codexFastMode'
 import { getPiThinkingLevelOptions, getHighestThinkingLevel, isThinkingLevelSupported } from './piThinkingLevelOptions'
 import type { PlanProgress } from '@/chat/planProgress'
+import type { LatestUsage } from '@/chat/reducer'
+import { getClipboardImageFiles } from '@/lib/clipboardAttachments'
 import { groupModelsByProvider } from './piModelGroups'
 import { PiModelPanel } from './PiModelPanel'
 import { PiThinkingLevelPanel } from './PiThinkingLevelPanel'
@@ -156,6 +158,9 @@ export function HappyComposer(props: {
     agentState?: AgentState | null
     backgroundTaskCount?: number
     contextSize?: number
+    latestUsage?: LatestUsage | null
+    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
+    accountStatus?: import('@/types/api').Session['accountStatus']
     contextCacheRead?: number
     contextWindow?: number | null
     /** Model for the context-window heuristic; see StatusBar.contextModel. */
@@ -734,8 +739,7 @@ export function HappyComposer(props: {
     }, [])
 
     const handlePaste = useCallback(async (e: ReactClipboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
-        const files = Array.from(e.clipboardData?.files || [])
-        const imageFiles = files.filter(file => file.type.startsWith('image/'))
+        const imageFiles = getClipboardImageFiles(e.clipboardData)
 
         if (imageFiles.length === 0) return
 
@@ -1334,6 +1338,9 @@ export function HappyComposer(props: {
                         agentState={agentState}
                         backgroundTaskCount={backgroundTaskCount}
                         contextSize={contextSize}
+                        latestUsage={props.latestUsage}
+                        usage={props.usage}
+                        accountStatus={props.accountStatus}
                         contextCacheRead={contextCacheRead}
                         contextWindow={contextWindow}
                         contextModel={contextModel}

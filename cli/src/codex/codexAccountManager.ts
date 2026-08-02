@@ -14,7 +14,7 @@ import type {
 
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
-import { CodexAppServerClient } from './codexAppServerClient';
+import { CodexAppServerClient, HAPI_CODEX_CONTEXT_DEFAULTS } from './codexAppServerClient';
 import { sanitizeCodexSessionEnvironment } from './codexProcessEnvironment';
 import type { GetAccountRateLimitsResponse, GetAccountResponse } from './appServerTypes';
 
@@ -188,6 +188,11 @@ function escapeTomlString(value: string): string {
     return JSON.stringify(value);
 }
 
+const MANAGED_CODEX_CONTEXT_CONFIG_LINES = [
+    `model_context_window = ${HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow}`,
+    `model_auto_compact_token_limit = ${HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit}`
+] as const;
+
 async function findTranscriptPath(root: string, sessionId: string): Promise<string | null> {
     const candidates: Array<{ path: string; mtimeMs: number }> = [];
     const visit = async (directory: string): Promise<void> => {
@@ -267,6 +272,7 @@ export class CodexAccountManager {
             [
                 '# Managed by HAPI. This account is isolated from the system Codex login.',
                 'cli_auth_credentials_store = "file"',
+                ...MANAGED_CODEX_CONTEXT_CONFIG_LINES,
                 ''
             ].join('\n'),
             { encoding: 'utf8', mode: 0o600 }
@@ -380,6 +386,7 @@ export class CodexAccountManager {
                     '# Managed by HAPI. The API key is stored only on this runner.',
                     `model = ${escapeTomlString(input.model.trim())}`,
                     'model_provider = "hapi_endpoint"',
+                    ...MANAGED_CODEX_CONTEXT_CONFIG_LINES,
                     '',
                     '[model_providers.hapi_endpoint]',
                     `name = ${escapeTomlString(input.label.trim())}`,

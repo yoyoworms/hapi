@@ -13,6 +13,14 @@ import {
 import { Button } from '@/components/ui/button'
 import { useTranslation } from '@/lib/use-translation'
 
+function nonEmptyString(value: unknown): string | null {
+    return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+export function resolveSessionCodexAccountId(session: Session): string {
+    return nonEmptyString(session.metadata?.codexAccountId) ?? 'system'
+}
+
 export function CodexAccountSwitchDialog(props: {
     isOpen: boolean
     onClose: () => void
@@ -22,7 +30,8 @@ export function CodexAccountSwitchDialog(props: {
 }) {
     const { t } = useTranslation()
     const machineId = props.session.metadata?.machineId ?? null
-    const currentAccountId = props.session.metadata?.codexAccountId ?? 'system'
+    const currentAccountId = resolveSessionCodexAccountId(props.session)
+    const currentAccountLabel = props.session.metadata?.codexAccountLabel ?? null
     const [accountId, setAccountId] = useState<string | null>(currentAccountId)
     const [isSwitching, setIsSwitching] = useState(false)
     const [error, setError] = useState<string | null>(null)
@@ -69,6 +78,8 @@ export function CodexAccountSwitchDialog(props: {
                             api={props.api}
                             machineId={machineId}
                             value={accountId}
+                            currentAccountId={currentAccountId}
+                            currentAccountLabel={currentAccountLabel}
                             isDisabled={isSwitching}
                             onChange={setAccountId}
                         />

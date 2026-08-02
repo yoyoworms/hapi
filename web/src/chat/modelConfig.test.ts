@@ -21,7 +21,7 @@ describe('getContextBudgetTokens', () => {
     })
 
     it('uses Codex app-server context window with headroom', () => {
-        expect(getContextBudgetTokens('gpt-5.4', 'codex')).toBe(322_500)
+        expect(getContextBudgetTokens('gpt-5.4', 'codex')).toBe(343_400)
     })
 
     it('parses context budget from Cursor wire ids', () => {

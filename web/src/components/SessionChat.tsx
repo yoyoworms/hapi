@@ -1479,6 +1479,9 @@ function SessionChatInner(props: SessionChatProps) {
                         agentState={props.session.agentState}
                         backgroundTaskCount={props.session.backgroundTaskCount}
                         contextSize={reduced.latestUsage?.contextSize}
+                        latestUsage={reduced.latestUsage}
+                        usage={props.session.usage}
+                        accountStatus={props.session.accountStatus}
                         contextCacheRead={reduced.latestUsage?.cacheRead}
                         contextWindow={reduced.latestUsage?.contextWindow ?? piContextWindow}
                         contextModel={reduced.latestUsage?.model ?? props.session.model}

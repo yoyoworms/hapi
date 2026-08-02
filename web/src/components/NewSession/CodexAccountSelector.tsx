@@ -45,6 +45,10 @@ export function CodexAccountSelector(props: {
     api: ApiClient
     machineId: string | null
     value: string | null
+    /** Account that owns an existing session; preferred over the runner default. */
+    currentAccountId?: string | null
+    /** Used only when the current account is no longer returned by the runner. */
+    currentAccountLabel?: string | null
     isDisabled: boolean
     onChange: (accountId: string | null) => void
 }) {
@@ -65,6 +69,7 @@ export function CodexAccountSelector(props: {
     const [error, setError] = useState<string | null>(null)
     const [runnerUpdateRequired, setRunnerUpdateRequired] = useState(false)
     const loadSequenceRef = useRef(0)
+    const currentAccountId = props.currentAccountId?.trim() || null
 
     const loadAccounts = useCallback(async () => {
         const sequence = ++loadSequenceRef.current
@@ -72,7 +77,11 @@ export function CodexAccountSelector(props: {
         setDefaultAccountId('system')
         setRunnerUpdateRequired(false)
         setError(null)
-        props.onChange(null)
+        // New-session selectors must clear another machine's selection. An
+        // existing-session switcher instead keeps its current identity until
+        // the runner list arrives, so opening the dialog cannot silently jump
+        // to the runner's saved default.
+        if (!currentAccountId) props.onChange(null)
         if (!props.machineId) {
             setIsLoading(false)
             return
@@ -90,7 +99,11 @@ export function CodexAccountSelector(props: {
                 (account) => account.id === result.defaultAccountId && account.authenticated
             ) ?? result.accounts.find((account) => account.authenticated)
                 ?? result.accounts[0]
-            if (fallback) props.onChange(fallback.id)
+            if (currentAccountId) {
+                props.onChange(currentAccountId)
+            } else if (fallback) {
+                props.onChange(fallback.id)
+            }
         } catch (loadError) {
             if (sequence !== loadSequenceRef.current) return
             setAccounts([])
@@ -103,7 +116,7 @@ export function CodexAccountSelector(props: {
         } finally {
             if (sequence === loadSequenceRef.current) setIsLoading(false)
         }
-    }, [props.api, props.machineId, props.onChange, t])
+    }, [props.api, props.machineId, props.onChange, currentAccountId, t])
 
     useEffect(() => {
         void loadAccounts()
@@ -162,6 +175,9 @@ export function CodexAccountSelector(props: {
     const selectedAccount = useMemo(
         () => accounts.find((account) => account.id === props.value) ?? null,
         [accounts, props.value]
+    )
+    const currentAccountMissing = Boolean(
+        currentAccountId && !accounts.some((account) => account.id === currentAccountId)
     )
 
     const handleStartLogin = async () => {
@@ -384,10 +400,17 @@ export function CodexAccountSelector(props: {
                     disabled={props.isDisabled || isLoading || accounts.length === 0}
                     onChange={(event) => props.onChange(event.target.value)}
                 >
+                    {currentAccountMissing && currentAccountId ? (
+                        <option value={currentAccountId} disabled>
+                            {props.currentAccountLabel?.trim() || currentAccountId}
+                            {` · ${t('newSession.codexAccount.current')} · ${t('newSession.codexAccount.signedOut')}`}
+                        </option>
+                    ) : null}
                     {accounts.map((account) => (
                         <option key={account.id} value={account.id} disabled={!account.authenticated}>
                             {accountOptionLabel(account)}
                             {account.id === defaultAccountId ? ` · ${t('newSession.codexAccount.default')}` : ''}
+                            {account.id === currentAccountId ? ` · ${t('newSession.codexAccount.current')}` : ''}
                             {!account.authenticated ? ` · ${t('newSession.codexAccount.signedOut')}` : ''}
                         </option>
                     ))}

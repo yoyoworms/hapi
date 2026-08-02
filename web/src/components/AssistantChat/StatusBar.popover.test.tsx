@@ -57,6 +57,7 @@ describe('StatusBar context details popover', () => {
                     thinking={false}
                     agentState={null}
                     agentFlavor="codex"
+                    model="gpt-5.6-sol"
                     modelReasoningEffort="xhigh"
                 />
             </I18nProvider>
@@ -66,6 +67,40 @@ describe('StatusBar context details popover', () => {
         const desktopLabel = screen.getByText('reasoning xhigh')
         expect(desktopLabel.className.split(' ')).toContain('hidden')
         expect(desktopLabel.className.split(' ')).toContain('sm:inline')
+        expect(screen.getByText('gpt-5.6-sol')).toBeInTheDocument()
+    })
+
+    it('renders the current account quota and session usage on the right side', () => {
+        render(
+            <I18nProvider>
+                <StatusBar
+                    active
+                    thinking={false}
+                    agentState={null}
+                    agentFlavor="codex"
+                    accountStatus={{
+                        provider: 'codex',
+                        accountLabel: 'current@example.com',
+                        window: { remainingPercent: 72 },
+                        weekly: { remainingPercent: 41 },
+                        updatedAt: 1
+                    }}
+                    usage={{
+                        totalCostUsd: 0.25,
+                        totalInputTokens: 1_000,
+                        totalOutputTokens: 200
+                    }}
+                />
+            </I18nProvider>
+        )
+
+        expect(screen.getByTestId('account-usage-status')).toHaveTextContent('current@example.com 5h 72% · 7d 41%')
+        expect(screen.getByText('current@example.com').className.split(' ')).toContain('hidden')
+        expect(screen.getByText('5h 72% · 7d 41%').className.split(' ')).toContain('whitespace-nowrap')
+        const sessionUsage = screen.getByTestId('session-usage-status')
+        expect(sessionUsage).toHaveTextContent('$0.25 · 1k tok')
+        expect(sessionUsage.className.split(' ')).toContain('hidden')
+        expect(sessionUsage.className.split(' ')).toContain('sm:inline')
     })
 
     it('opens from the mobile-accessible context trigger and keeps the requested detail order', async () => {
