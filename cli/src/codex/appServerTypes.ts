@@ -219,6 +219,26 @@ export interface ThreadForkResponse {
     [key: string]: unknown;
 }
 
+export interface ThreadReadParams {
+    threadId: string;
+    includeTurns?: boolean;
+}
+
+export type ThreadStatus =
+    | { type: 'notLoaded' }
+    | { type: 'idle' }
+    | { type: 'systemError' }
+    | { type: 'active'; activeFlags: string[] };
+
+export interface ThreadReadResponse {
+    thread: {
+        id: string;
+        status: ThreadStatus;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
 export type UserInput =
     | {
         type: 'text';

@@ -31,13 +31,18 @@ const harness = vi.hoisted(() => ({
     startThreadParams: [] as Array<Record<string, unknown>>,
     resumeThreadIds: [] as string[],
     resumeThreadParams: [] as Array<Record<string, unknown>>,
+    deferResumeThread: false,
+    readThreadCalls: [] as Array<{ threadId: string; includeTurns?: boolean }>,
+    threadStatusById: new Map<string, 'notLoaded' | 'idle' | 'systemError' | 'active'>(),
     startTurnThreadIds: [] as string[],
     startTurnParams: [] as Array<Record<string, unknown>>,
     startTurnErrors: [] as Error[],
+    deferStartTurn: false,
+    releaseDeferredStartTurn: null as (() => void) | null,
     steerTurnParams: [] as Array<Record<string, unknown>>,
     steerTurnErrors: [] as Error[],
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
-    interruptErrors: [] as Error[],
+    interruptErrors: [] as Array<Error | null>,
     rollbackCalls: [] as Array<{ threadId: string; numTurns: number }>,
     rollbackErrors: [] as Error[],
     compactThreadIds: [] as string[],
@@ -85,8 +90,41 @@ const harness = vi.hoisted(() => ({
     emitRunningChildTurnBeforeSuppressedParent: false,
     emitCompletedChildTurnBeforeSuppressedParent: false,
     emitTurnAbortedOnInterrupt: false,
+    deferParentInterruptAck: false,
+    releaseDeferredParentInterruptAck: null as (() => void) | null,
+    deferChildTurnAbortOnInterrupt: false,
+    emitLateChildStartOnParentInterrupt: false,
+    deferGeneratedImageRead: false,
+    releaseGeneratedImageRead: null as (() => void) | null,
     bridgeOptions: [] as unknown[]
 }));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs/promises')>();
+    const deferredImagePath = '/tmp/hapi-deferred-generated-image.png';
+    return {
+        ...actual,
+        lstat: async (...args: Parameters<typeof actual.lstat>) => {
+            if (args[0] === deferredImagePath) {
+                return {
+                    isFile: () => true,
+                    size: 8
+                } as Awaited<ReturnType<typeof actual.lstat>>;
+            }
+            return actual.lstat(...args);
+        },
+        readFile: async (...args: Parameters<typeof actual.readFile>) => {
+            if (args[0] === deferredImagePath && harness.deferGeneratedImageRead) {
+                await new Promise<void>((resolve) => {
+                    harness.releaseGeneratedImageRead = resolve;
+                });
+                harness.releaseGeneratedImageRead = null;
+                return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+            }
+            return actual.readFile(...args);
+        }
+    };
+});
 
 vi.mock('./codexAppServerClient', () => {
     class MockCodexAppServerClient {
@@ -142,14 +180,49 @@ vi.mock('./codexAppServerClient', () => {
             return { thread: { id }, model: 'gpt-5.4' };
         }
 
-        async resumeThread(params?: Record<string, unknown>): Promise<{ thread: { id: string }; model: string }> {
+        async resumeThread(
+            params?: Record<string, unknown>,
+            options?: { signal?: AbortSignal }
+        ): Promise<{ thread: { id: string }; model: string }> {
             const id = typeof params?.threadId === 'string' ? params.threadId : 'thread-resumed';
             harness.resumeThreadIds.push(id);
             harness.resumeThreadParams.push(params ?? {});
+            if (harness.deferResumeThread) {
+                await new Promise<void>((resolve, reject) => {
+                    const signal = options?.signal;
+                    const onAbort = () => {
+                        signal?.removeEventListener('abort', onAbort);
+                        reject(new DOMException('Aborted', 'AbortError'));
+                    };
+                    if (signal?.aborted) {
+                        onAbort();
+                        return;
+                    }
+                    signal?.addEventListener('abort', onAbort, { once: true });
+                    // The test releases the artificial delay by flipping the
+                    // flag and aborting the request through the real handler.
+                    void resolve;
+                });
+            }
             if (harness.failResumeThreadIds.includes(id)) {
                 throw new Error('resume failed');
             }
             return { thread: { id }, model: 'gpt-5.4' };
+        }
+
+        async readThread(params: { threadId: string; includeTurns?: boolean }): Promise<{
+            thread: { id: string; status: { type: string; activeFlags?: string[] } };
+        }> {
+            harness.readThreadCalls.push(params);
+            const type = harness.threadStatusById.get(params.threadId) ?? 'idle';
+            return {
+                thread: {
+                    id: params.threadId,
+                    status: type === 'active'
+                        ? { type, activeFlags: [] }
+                        : { type }
+                }
+            };
         }
 
         async compactThread(params?: { threadId?: string }): Promise<Record<string, never>> {
@@ -217,6 +290,12 @@ vi.mock('./codexAppServerClient', () => {
             const threadId = params?.threadId ?? 'thread-unknown';
             harness.startTurnThreadIds.push(threadId);
             harness.startTurnMessages.push(params?.input?.[0]?.text ?? params?.message ?? params?.userMessage ?? '');
+            if (harness.deferStartTurn) {
+                await new Promise<void>((resolve) => {
+                    harness.releaseDeferredStartTurn = resolve;
+                });
+                harness.releaseDeferredStartTurn = null;
+            }
             const turnId = `turn-${harness.startTurnThreadIds.length}`;
             const started = { turn: { id: turnId } };
             harness.notifications.push({ method: 'turn/started', params: started });
@@ -953,7 +1032,20 @@ vi.mock('./codexAppServerClient', () => {
             if (error) {
                 throw error;
             }
-            if (harness.emitTurnAbortedOnInterrupt) {
+            if (harness.emitLateChildStartOnParentInterrupt && threadId === 'thread-1') {
+                harness.emitLateChildStartOnParentInterrupt = false;
+                const childStarted = {
+                    threadId: 'late-child-thread',
+                    turnId: 'late-child-turn',
+                    turn: { id: 'late-child-turn' }
+                };
+                harness.notifications.push({ method: 'turn/started', params: childStarted });
+                this.notificationHandler?.('turn/started', childStarted);
+            }
+            if (
+                harness.emitTurnAbortedOnInterrupt
+                && !(harness.deferChildTurnAbortOnInterrupt && threadId === 'child-thread')
+            ) {
                 const interrupted = {
                     threadId,
                     turnId,
@@ -962,6 +1054,12 @@ vi.mock('./codexAppServerClient', () => {
                 };
                 harness.notifications.push({ method: 'turn/completed', params: interrupted });
                 this.notificationHandler?.('turn/completed', interrupted);
+            }
+            if (harness.deferParentInterruptAck && threadId === 'thread-1') {
+                await new Promise<void>((resolve) => {
+                    harness.releaseDeferredParentInterruptAck = resolve;
+                });
+                harness.releaseDeferredParentInterruptAck = null;
             }
             return {};
         }
@@ -1169,9 +1267,14 @@ describe('codexRemoteLauncher', () => {
         harness.startThreadParams = [];
         harness.resumeThreadIds = [];
         harness.resumeThreadParams = [];
+        harness.deferResumeThread = false;
+        harness.readThreadCalls = [];
+        harness.threadStatusById = new Map();
         harness.startTurnThreadIds = [];
         harness.startTurnParams = [];
         harness.startTurnErrors = [];
+        harness.deferStartTurn = false;
+        harness.releaseDeferredStartTurn = null;
         harness.steerTurnParams = [];
         harness.steerTurnErrors = [];
         harness.interruptedTurns = [];
@@ -1223,6 +1326,13 @@ describe('codexRemoteLauncher', () => {
         harness.emitRunningChildTurnBeforeSuppressedParent = false;
         harness.emitCompletedChildTurnBeforeSuppressedParent = false;
         harness.emitTurnAbortedOnInterrupt = false;
+        harness.deferParentInterruptAck = false;
+        harness.releaseDeferredParentInterruptAck = null;
+        harness.deferChildTurnAbortOnInterrupt = false;
+        harness.emitLateChildStartOnParentInterrupt = false;
+        harness.deferGeneratedImageRead = false;
+        harness.releaseGeneratedImageRead?.();
+        harness.releaseGeneratedImageRead = null;
         harness.bridgeOptions = [];
     });
 
@@ -1751,6 +1861,62 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('keeps deferred thread-status failure ordered behind queued authoritative errors', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+        const running = codexRemoteLauncher(session as never);
+
+        try {
+            await vi.waitFor(() => {
+                expect(harness.startTurnMessages).toEqual(['first message']);
+                expect(session.thinking).toBe(true);
+            });
+
+            harness.dispatchNotification?.('thread/status/changed', {
+                threadId: 'thread-1',
+                status: { type: 'systemError' }
+            });
+            await new Promise((resolve) => setTimeout(resolve, 25));
+
+            harness.deferGeneratedImageRead = true;
+            harness.dispatchNotification?.('codex/event/generated_image', {
+                msg: {
+                    type: 'generated_image',
+                    thread_id: 'thread-1',
+                    turn_id: 'turn-1',
+                    saved_path: '/tmp/hapi-deferred-generated-image.png'
+                }
+            });
+            await vi.waitFor(() => expect(harness.releaseGeneratedImageRead).not.toBeNull());
+
+            harness.dispatchNotification?.('error', {
+                threadId: 'thread-1',
+                turnId: 'turn-1',
+                error: {
+                    message: 'This content was flagged for possible cybersecurity risk.',
+                    codexErrorInfo: 'cyberPolicy'
+                },
+                willRetry: false
+            });
+
+            // Let the generic systemError grace period expire while the earlier
+            // image event owns the serialized queue. The authoritative policy
+            // error must still win once the queue resumes.
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            harness.releaseGeneratedImageRead?.();
+            await vi.waitFor(() => expect(session.thinking).toBe(false));
+            await new Promise((resolve) => setTimeout(resolve, 50));
+
+            expect(harness.startTurnMessages).toEqual(['first message']);
+        } finally {
+            harness.releaseGeneratedImageRead?.();
+            harness.deferGeneratedImageRead = false;
+            harness.emitTurnAbortedOnInterrupt = true;
+            await rpcHandlers.get('switch')?.({});
+            await running;
+        }
+    });
+
     it('does not retry an explicitly non-retryable error even when its text is retryable', async () => {
         harness.suppressTurnCompletion = true;
         const { session, sessionEvents } = createSessionStub(['first message']);
@@ -2050,7 +2216,7 @@ describe('codexRemoteLauncher', () => {
         await vi.waitFor(() => {
             expect(sessionEvents).toContainEqual({
                 type: 'message',
-                message: 'Failed to retry with a faster model: turn/interrupt failed'
+                message: 'Failed to retry with a faster model: Codex rejected the turn interrupt request'
             });
         });
 
@@ -2939,6 +3105,7 @@ describe('codexRemoteLauncher', () => {
 
     it('interrupts an in-flight turn before clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
         const { session, sessionEvents, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
         const exitReason = await codexRemoteLauncher(session as never);
@@ -2955,8 +3122,36 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('does not clear the conversation when the active turn rejects the interrupt', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.interruptErrors.push(new Error('turn is not interruptible'));
+        const { session, sessionEvents, resetThreadCalls } = createSessionStub(['first message', '/clear']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.interruptedTurns).toEqual([{ threadId: 'thread-1', turnId: 'turn-1' }]);
+        });
+
+        expect(resetThreadCalls).toEqual([]);
+        expect(session.thinking).toBe(true);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Command not applied because the active Codex turn could not be stopped'
+        });
+
+        harness.dispatchNotification?.('turn/completed', {
+            status: 'Completed',
+            turn: { id: 'turn-1' }
+        });
+        await running;
+
+        expect(resetThreadCalls).toEqual([]);
+        expect(session.thinking).toBe(false);
+    });
+
     it('interrupts active child agent turns before clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
         harness.emitRunningChildTurnBeforeSuppressedParent = true;
         const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
@@ -2994,8 +3189,515 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('does not start a new parent turn until every interrupted child is terminal', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitRunningChildTurnBeforeSuppressedParent = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.deferChildTurnAbortOnInterrupt = true;
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(session.thinking).toBe(true));
+
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
+        await vi.waitFor(() => {
+            expect(harness.interruptedTurns).toEqual([
+                { threadId: 'thread-1', turnId: 'turn-1' },
+                { threadId: 'child-thread', turnId: 'child-turn' }
+            ]);
+            expect(session.thinking).toBe(false);
+        });
+
+        session.queue.push('after parent and child stop', mode);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(harness.startTurnMessages).toEqual(['first message']);
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'child-thread',
+            turnId: 'child-turn',
+            status: 'Interrupted',
+            turn: { id: 'child-turn' }
+        });
+        await aborting;
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual([
+                'first message',
+                'after parent and child stop'
+            ]);
+        });
+
+        harness.deferChildTurnAbortOnInterrupt = false;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('interrupts a child-only task after the parent turn has already completed', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitRunningChildTurnBeforeSuppressedParent = true;
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(session.thinking).toBe(true));
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            status: 'Completed',
+            turn: { id: 'turn-1' }
+        });
+        await vi.waitFor(() => expect(session.thinking).toBe(false));
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('abort')?.({});
+        expect(harness.interruptedTurns).toEqual([
+            { threadId: 'child-thread', turnId: 'child-turn' }
+        ]);
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('tracks and interrupts a child that starts while abort is being requested', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.emitLateChildStartOnParentInterrupt = true;
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(session.thinking).toBe(true));
+
+        await rpcHandlers.get('abort')?.({});
+        expect(harness.interruptedTurns).toEqual(expect.arrayContaining([
+            { threadId: 'thread-1', turnId: 'turn-1' },
+            { threadId: 'late-child-thread', turnId: 'late-child-turn' }
+        ]));
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('keeps abort confirmation open for a child that starts before the initial interrupt RPC settles', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.deferParentInterruptAck = true;
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(session.thinking).toBe(true));
+
+        let abortSettled = false;
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({})).finally(() => {
+            abortSettled = true;
+        });
+        await vi.waitFor(() => {
+            expect(harness.releaseDeferredParentInterruptAck).not.toBeNull();
+            expect(harness.interruptedTurns).toContainEqual({
+                threadId: 'thread-1',
+                turnId: 'turn-1'
+            });
+        });
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        expect(abortSettled).toBe(false);
+
+        harness.dispatchNotification?.('turn/started', {
+            threadId: 'late-child-thread',
+            turnId: 'late-child-turn',
+            turn: { id: 'late-child-turn' }
+        });
+        await vi.waitFor(() => {
+            expect(harness.interruptedTurns).toContainEqual({
+                threadId: 'late-child-thread',
+                turnId: 'late-child-turn'
+            });
+        });
+        expect(abortSettled).toBe(false);
+
+        harness.releaseDeferredParentInterruptAck?.();
+        await aborting;
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('keeps abort confirmation open past the discovery interval while a spawn is pending', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        const { session, rpcHandlers, codexMessages } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(session.thinking).toBe(true));
+
+        // The suppressed mock turn returns before its usual synthetic item
+        // stream. Inject the unresolved spawn explicitly so this test covers
+        // the real race: parent interruption completes while a child id has
+        // not been reported yet.
+        harness.dispatchNotification?.('item/started', {
+            item: {
+                id: 'delayed-spawn',
+                type: 'collabAgentToolCall',
+                tool: 'spawnAgent',
+                prompt: 'do delayed side work',
+                senderThreadId: 'thread-1',
+                receiverThreadIds: []
+            },
+            threadId: 'thread-1',
+            turnId: 'turn-1'
+        });
+        await vi.waitFor(() => {
+            expect(codexMessages).toContainEqual(expect.objectContaining({
+                type: 'agent-run-start',
+                cardId: 'delayed-spawn',
+                status: 'starting'
+            }));
+        });
+
+        let abortSettled = false;
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({})).finally(() => {
+            abortSettled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(abortSettled).toBe(false);
+
+        harness.dispatchNotification?.('turn/started', {
+            threadId: 'delayed-child-thread',
+            turnId: 'delayed-child-turn',
+            turn: { id: 'delayed-child-turn' }
+        });
+        await vi.waitFor(() => {
+            expect(harness.interruptedTurns).toContainEqual({
+                threadId: 'delayed-child-thread',
+                turnId: 'delayed-child-turn'
+            });
+        });
+        await aborting;
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('keeps running after a rejected abort, then accepts a new turn after the real terminal event', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.interruptErrors.push(new Error('turn id is no longer active'));
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+            expect(rpcHandlers.has('abort')).toBe(true);
+        });
+
+        await expect(Promise.resolve(rpcHandlers.get('abort')?.({}))).rejects.toThrow(
+            'task is still running'
+        );
+
+        // A rejected interrupt is not an authoritative completion. Do not
+        // report a false idle state or start a second overlapping turn.
+        expect(session.thinking).toBe(true);
+        expect(harness.startTurnMessages).toEqual(['first message']);
+
+        harness.dispatchNotification?.('turn/completed', {
+            status: 'Completed',
+            turn: { id: 'turn-1' }
+        });
+        await vi.waitFor(() => expect(session.thinking).toBe(false));
+
+        session.queue.push('message after failed interrupt', mode);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual([
+                'first message',
+                'message after failed interrupt'
+            ]);
+        });
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+
+        expect(session.thinking).toBe(false);
+    });
+
+    it('keeps the turn running after an interrupt acknowledgement until its terminal event arrives', async () => {
+        harness.suppressTurnCompletion = true;
+        const mode = createMode();
+        const { session, rpcHandlers, thinkingChanges } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
+        await vi.waitFor(() => {
+            expect(harness.interruptedTurns).toEqual([{ threadId: 'thread-1', turnId: 'turn-1' }]);
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        session.queue.push('next turn after confirmed abort', mode);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(session.thinking).toBe(true);
+        expect(harness.startTurnMessages).toEqual(['first message']);
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            status: 'Interrupted',
+            turn: { id: 'turn-1' }
+        });
+        await aborting;
+        expect(thinkingChanges).toContain(false);
+
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual([
+                'first message',
+                'next turn after confirmed abort'
+            ]);
+        });
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+        expect(session.thinking).toBe(false);
+    });
+
+    it('does not automatically retry a failure that confirms an explicit abort', async () => {
+        harness.suppressTurnCompletion = true;
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
+        await vi.waitFor(() => expect(harness.interruptedTurns).toHaveLength(1));
+        harness.dispatchNotification?.('error', {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            error: { message: 'Selected model is at capacity' }
+        });
+        await aborting;
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(harness.startTurnMessages).toEqual(['first message']);
+        expect(session.thinking).toBe(false);
+
+        session.queue.push('new prompt after stopped failure', mode);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual([
+                'first message',
+                'new prompt after stopped failure'
+            ]);
+        });
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('recovers a naturally completed turn when thread idle arrives without turn/completed', async () => {
+        harness.suppressTurnCompletion = true;
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        harness.dispatchNotification?.('thread/status/changed', {
+            thread: { id: 'thread-1' },
+            status: { type: 'idle' }
+        });
+        await vi.waitFor(() => expect(session.thinking).toBe(false));
+        expect(harness.readThreadCalls).toContainEqual({
+            threadId: 'thread-1',
+            includeTurns: false
+        });
+
+        session.queue.push('next turn after recovered idle', mode);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual([
+                'first message',
+                'next turn after recovered idle'
+            ]);
+        });
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('does not let a delayed idle notification from the prior turn finish the current turn', async () => {
+        harness.suppressTurnCompletion = true;
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            turn: { id: 'turn-1', status: 'completed' }
+        });
+        session.queue.push('second message', mode);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message', 'second message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        harness.threadStatusById.set('thread-1', 'active');
+        harness.dispatchNotification?.('thread/status/changed', {
+            thread: { id: 'thread-1' },
+            status: { type: 'idle' }
+        });
+        await new Promise((resolve) => setTimeout(resolve, 350));
+
+        expect(harness.readThreadCalls.at(-1)).toEqual({
+            threadId: 'thread-1',
+            includeTurns: false
+        });
+        expect(session.thinking).toBe(true);
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('rejects abort when acknowledgement is not followed by terminal or idle confirmation', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+        });
+
+        vi.useFakeTimers();
+        try {
+            const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
+            const rejected = expect(aborting).rejects.toThrow('task is still running');
+            await Promise.resolve();
+            await Promise.resolve();
+            await vi.advanceTimersByTimeAsync(8_001);
+
+            await rejected;
+            expect(session.thinking).toBe(true);
+        } finally {
+            vi.useRealTimers();
+        }
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            status: 'Completed',
+            turn: { id: 'turn-1' }
+        });
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('cancels a turn that is still preparing its thread before dispatch', async () => {
+        harness.deferResumeThread = true;
+        const mode = createMode();
+        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
+        session.sessionId = 'thread-existing';
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.resumeThreadIds).toEqual(['thread-existing']);
+            expect(harness.startTurnMessages).toEqual([]);
+        });
+
+        await rpcHandlers.get('abort')?.({});
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(harness.startTurnMessages).toEqual([]);
+
+        harness.deferResumeThread = false;
+        session.queue.push('new prompt after preparation abort', mode);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['new prompt after preparation abort']);
+        });
+
+        harness.emitTurnAbortedOnInterrupt = true;
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('waits for a delayed turn/start id, then interrupts it without reporting ready', async () => {
+        harness.deferStartTurn = true;
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        const mode = createMode();
+        const { session, sessionEvents, rpcHandlers } = createSessionStub(
+            ['first message'],
+            mode,
+            false,
+            false
+        );
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnMessages).toEqual(['first message']);
+            expect(session.thinking).toBe(true);
+            expect(harness.releaseDeferredStartTurn).not.toBeNull();
+        });
+
+        const readyCountBeforeAbort = sessionEvents.filter((event) => event.type === 'ready').length;
+        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(harness.interruptedTurns).toEqual([]);
+        expect(sessionEvents.filter((event) => event.type === 'ready')).toHaveLength(readyCountBeforeAbort);
+
+        harness.releaseDeferredStartTurn?.();
+        await aborting;
+        expect(harness.interruptedTurns).toContainEqual({
+            threadId: 'thread-1',
+            turnId: 'turn-1'
+        });
+        expect(session.thinking).toBe(false);
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
+    it('does not report abort success when a child turn rejects interruption', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitRunningChildTurnBeforeSuppressedParent = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.interruptErrors.push(null, new Error('child is not interruptible'));
+        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(session.thinking).toBe(true);
+            expect(harness.startTurnMessages).toEqual(['first message']);
+        });
+
+        await expect(Promise.resolve(rpcHandlers.get('abort')?.({}))).rejects.toThrow(
+            'task is still running'
+        );
+        expect(harness.interruptedTurns.slice(0, 2)).toEqual([
+            { threadId: 'thread-1', turnId: 'turn-1' },
+            { threadId: 'child-thread', turnId: 'child-turn' }
+        ]);
+
+        await rpcHandlers.get('switch')?.({});
+        await running;
+    });
+
     it('does not interrupt completed child agent turns when clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
         harness.emitCompletedChildTurnBeforeSuppressedParent = true;
         const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
@@ -3069,6 +3771,7 @@ describe('codexRemoteLauncher', () => {
 
     it('interrupts an in-flight turn before compacting the current thread', async () => {
         harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
         const { session, sessionEvents } = createSessionStub(['first message', '/compact']);
 
         const exitReason = await codexRemoteLauncher(session as never);

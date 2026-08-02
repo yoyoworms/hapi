@@ -282,6 +282,17 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Drop messages that have not been collected yet without changing queue
+     * lifecycle or detaching an existing waiter. Abort uses this instead of
+     * reset(): reset() intentionally owns waiter/closed state and can orphan a
+     * run loop that installed its next wait concurrently with turn completion.
+     */
+    clearPending(): void {
+        logger.debug(`[MessageQueue2] clearPending() called. Clearing ${this.queue.length} messages`);
+        this.queue = [];
+    }
+
+    /**
      * Close the queue - no more messages can be pushed
      */
     close(): void {

@@ -250,6 +250,8 @@ export class ApiSessionClient extends EventEmitter {
     private metadataChangedDuringAttempt = false
     private agentStateChangedDuringAttempt = false
     private readonly pendingOutboundEvents: PendingOutboundEvent[] = []
+    /** Stable for this runner/client across Socket.IO reconnects. */
+    private readonly runtimeId = randomUUID()
     private didWarnPendingQueueFull = false
 
     constructor(token: string, session: Session, options: ApiSessionClientOptions = {}) {
@@ -278,6 +280,7 @@ export class ApiSessionClient extends EventEmitter {
                 token: this.token,
                 clientType: 'session-scoped' as const,
                 sessionId: this.sessionId,
+                runtimeId: this.runtimeId,
                 clientTime: Date.now()
             },
             path: '/socket.io/',

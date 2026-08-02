@@ -603,4 +603,17 @@ describe('MessageQueue2', () => {
         expect(batch3?.message).toBe('after-isolated');
         expect(batch3?.mode.type).toBe('B');
     });
+
+    it('clearPending keeps an installed waiter attached for later messages', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        const waiting = queue.waitForMessagesAndGetAsString();
+
+        await Promise.resolve();
+        queue.clearPending();
+        queue.push('after clear', 'local');
+
+        await expect(waiting).resolves.toEqual(expect.objectContaining({
+            message: 'after clear'
+        }));
+    });
 });

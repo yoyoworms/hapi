@@ -165,6 +165,18 @@ describe('AppServerEventConverter', () => {
         }]);
     });
 
+    it('maps an idle thread status to an authoritative idle event', () => {
+        const converter = new AppServerEventConverter();
+
+        expect(converter.handleNotification('thread/status/changed', {
+            thread: { id: 'thread-1' },
+            status: { type: 'idle' }
+        })).toEqual([{
+            type: 'thread_idle',
+            thread_id: 'thread-1'
+        }]);
+    });
+
     it('maps turn/started and completed statuses', () => {
         const converter = new AppServerEventConverter();
 

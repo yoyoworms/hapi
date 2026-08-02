@@ -927,6 +927,13 @@ export class AppServerEventConverter {
             const threadId = asString(thread.threadId ?? thread.thread_id ?? thread.id);
             const status = asRecord(paramsRecord.status ?? thread.status);
             const statusType = asString(status?.type ?? paramsRecord.statusType ?? paramsRecord.status_type);
+            if (statusType?.toLowerCase() === 'idle') {
+                events.push({
+                    type: 'thread_idle',
+                    ...(threadId ? { thread_id: threadId } : {})
+                });
+                return events;
+            }
             if (statusType === 'systemError') {
                 const error = asString(status?.message ?? status?.error ?? paramsRecord.message ?? paramsRecord.error)
                     ?? 'Codex thread entered systemError';
