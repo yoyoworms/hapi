@@ -93,6 +93,55 @@ function extractLimit(value: unknown): Record<string, unknown> | null {
     };
 }
 
+type NormalizedRateLimit = {
+    key: string;
+    limit: Record<string, unknown>;
+    windowMinutes: number | null;
+};
+
+const SHORT_RATE_LIMIT_MAX_MINUTES = 36 * 60;
+
+function extractWindowMinutes(value: unknown): number | null {
+    const limit = asRecord(value);
+    if (!limit) return null;
+    return asNumberLike(
+        limit.windowMinutes
+        ?? limit.window_minutes
+        ?? limit.windowDurationMinutes
+        ?? limit.window_duration_minutes
+        ?? limit.windowDurationMins
+        ?? limit.window_duration_mins
+    );
+}
+
+function classifyRateLimit(
+    entry: NormalizedRateLimit,
+    now: number
+): 'window' | 'weekly' | null {
+    if (entry.windowMinutes !== null && entry.windowMinutes > 0) {
+        return entry.windowMinutes <= SHORT_RATE_LIMIT_MAX_MINUTES ? 'window' : 'weekly';
+    }
+
+    if (['five', '5h', 'hour', 'short'].some((pattern) => entry.key.includes(pattern))) {
+        return 'window';
+    }
+    if (['week', 'seven', '7d', 'long'].some((pattern) => entry.key.includes(pattern))) {
+        return 'weekly';
+    }
+    if (entry.key.includes('secondary')) {
+        return 'weekly';
+    }
+
+    const resetAt = asNumber(entry.limit.resetAt);
+    if (resetAt !== null) {
+        return resetAt - now <= SHORT_RATE_LIMIT_MAX_MINUTES * 60_000
+            ? 'window'
+            : 'weekly';
+    }
+
+    return entry.key.includes('primary') ? 'window' : null;
+}
+
 function extractAccountStatus(params: Record<string, unknown>): Record<string, unknown> | null {
     const limitsRoot = asRecord(params.rateLimits)
         ?? asRecord(params.rate_limits)
@@ -110,24 +159,42 @@ function extractAccountStatus(params: Record<string, unknown>): Record<string, u
         }
     }
 
-    const normalized = candidates
-        .map(({ key, value }) => ({ key: key.toLowerCase(), limit: extractLimit(value) }))
-        .filter((entry): entry is { key: string; limit: Record<string, unknown> } => Boolean(entry.limit));
+    const normalized = candidates.flatMap(({ key, value }): NormalizedRateLimit[] => {
+        const limit = extractLimit(value);
+        return limit ? [{
+            key: key.toLowerCase(),
+            limit,
+            windowMinutes: extractWindowMinutes(value)
+        }] : [];
+    });
 
-    const byKey = (patterns: string[]) => normalized.find((entry) => patterns.some((pattern) => entry.key.includes(pattern)))?.limit ?? null;
-    const window = byKey(['five', '5h', 'hour', 'primary', 'short'])
-        ?? normalized.find((entry) => {
-            const resetAt = asNumber(entry.limit.resetAt);
-            return resetAt !== null && resetAt - Date.now() <= 36 * 3_600_000;
-        })?.limit
-        ?? normalized[0]?.limit
-        ?? null;
-    const weekly = byKey(['week', 'seven', '7d', 'secondary', 'long'])
-        ?? normalized.find((entry) => {
-            const resetAt = asNumber(entry.limit.resetAt);
-            return resetAt !== null && resetAt - Date.now() > 36 * 3_600_000;
-        })?.limit
-        ?? (normalized.length > 1 ? normalized[1]?.limit ?? null : null);
+    const now = Date.now();
+    const classified = normalized.map((entry) => ({
+        entry,
+        kind: classifyRateLimit(entry, now)
+    }));
+    const windowEntry = classified.find(({ kind }) => kind === 'window')?.entry ?? null;
+    const weeklyEntry = classified.find(({ entry, kind }) => (
+        kind === 'weekly' && entry !== windowEntry
+    ))?.entry ?? null;
+
+    const unclassified = classified
+        .filter(({ entry, kind }) => (
+            kind === null && entry !== windowEntry && entry !== weeklyEntry
+        ))
+        .map(({ entry }) => entry);
+    const fallbackWindow = !windowEntry
+        ? unclassified.find((entry) => entry.key.includes('primary')) ?? unclassified[0] ?? null
+        : null;
+    const usedWindowEntry = windowEntry ?? fallbackWindow;
+    const fallbackWeekly = !weeklyEntry
+        ? unclassified.find((entry) => (
+            entry !== usedWindowEntry && entry.key.includes('secondary')
+        )) ?? unclassified.find((entry) => entry !== usedWindowEntry) ?? null
+        : null;
+
+    const window = usedWindowEntry?.limit ?? null;
+    const weekly = (weeklyEntry ?? fallbackWeekly)?.limit ?? null;
 
     const accountLabel = extractAccountLabel(params);
     if (!accountLabel && !window && !weekly) return null;

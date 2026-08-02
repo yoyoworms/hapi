@@ -167,7 +167,11 @@ export function formatAccountLimit(limit: AgentAccountStatus['window']): string 
     const percentage = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
         ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
         : null
-    return duration && percentage ? `${duration} ${percentage}` : duration ?? percentage
+    // Keep the compact status focused on quota. Exact reset time remains in
+    // the title; the duration is only a fallback for providers without a
+    // percentage so mobile does not show duplicated labels such as
+    // "7d 5d20h 83%".
+    return percentage ?? duration
 }
 
 export function formatUsageText(

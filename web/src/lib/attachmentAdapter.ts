@@ -39,7 +39,9 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
     }
 
     return {
-        accept: '*/*',
+        // assistant-ui 0.14 uses `*` as its universal matcher. HTML-style
+        // `*/*` is treated as a literal MIME type and rejects every file.
+        accept: '*',
 
         async *add({ file }): AsyncGenerator<PendingAttachment> {
             const restored = getRestoredUploadMetadata(file)

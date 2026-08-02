@@ -10,6 +10,13 @@ describe('attachmentAdapter restored uploads', () => {
         vi.unstubAllGlobals()
     })
 
+    it('uses assistant-ui universal matching so pasted images are accepted', async () => {
+        const { createAttachmentAdapter } = await import('./attachmentAdapter')
+        const adapter = createAttachmentAdapter({} as never, 'session-1')
+
+        expect(adapter.accept).toBe('*')
+    })
+
     it('restores an uploaded draft without uploading it again', async () => {
         const drafts = await import('./composer-attachment-drafts')
         const { createAttachmentAdapter } = await import('./attachmentAdapter')

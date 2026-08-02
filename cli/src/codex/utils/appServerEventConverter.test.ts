@@ -3,6 +3,112 @@ import { logger } from '@/ui/logger';
 import { AppServerEventConverter } from './appServerEventConverter';
 
 describe('AppServerEventConverter', () => {
+    it('classifies a single 10080-minute primary rate limit as weekly only', () => {
+        const converter = new AppServerEventConverter();
+        const resetsAt = Math.floor((Date.now() + 5 * 24 * 60 * 60_000) / 1000);
+        const events = converter.handleNotification('account/rateLimits/updated', {
+            rate_limits: {
+                primary: {
+                    used_percent: 17,
+                    window_minutes: 10_080,
+                    resets_at: resetsAt
+                },
+                secondary: null
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'account_status',
+            accountStatus: expect.objectContaining({
+                window: null,
+                weekly: expect.objectContaining({
+                    remainingPercent: 83,
+                    resetAt: resetsAt * 1000
+                })
+            })
+        }]);
+    });
+
+    it('classifies a single 5-hour primary rate limit as window only', () => {
+        const converter = new AppServerEventConverter();
+        const resetsAt = Math.floor((Date.now() + 4 * 60 * 60_000) / 1000);
+        const events = converter.handleNotification('account/rateLimits/updated', {
+            rateLimits: {
+                primary: {
+                    usedPercent: 17,
+                    windowMinutes: 300,
+                    resetsAt
+                }
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'account_status',
+            accountStatus: expect.objectContaining({
+                window: expect.objectContaining({
+                    remainingPercent: 83,
+                    resetAt: resetsAt * 1000
+                }),
+                weekly: null
+            })
+        }]);
+    });
+
+    it('uses the reset horizon when an ambiguous primary limit has no window duration', () => {
+        const converter = new AppServerEventConverter();
+        const resetsAt = Math.floor((Date.now() + 5 * 24 * 60 * 60_000) / 1000);
+        const events = converter.handleNotification('account/rateLimits/updated', {
+            rate_limits: {
+                primary: {
+                    used_percent: 17,
+                    resets_at: resetsAt
+                }
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'account_status',
+            accountStatus: expect.objectContaining({
+                window: null,
+                weekly: expect.objectContaining({ remainingPercent: 83 })
+            })
+        }]);
+    });
+
+    it('maps primary and secondary limits to distinct window and weekly buckets', () => {
+        const converter = new AppServerEventConverter();
+        const windowResetsAt = Math.floor((Date.now() + 4 * 60 * 60_000) / 1000);
+        const weeklyResetsAt = Math.floor((Date.now() + 6 * 24 * 60 * 60_000) / 1000);
+        const events = converter.handleNotification('account/rateLimits/updated', {
+            rateLimits: {
+                primary: {
+                    usedPercent: 17,
+                    windowMinutes: 300,
+                    resetsAt: windowResetsAt
+                },
+                secondary: {
+                    usedPercent: 60,
+                    windowMinutes: 10_080,
+                    resetsAt: weeklyResetsAt
+                }
+            }
+        });
+
+        expect(events).toEqual([{
+            type: 'account_status',
+            accountStatus: expect.objectContaining({
+                window: expect.objectContaining({
+                    remainingPercent: 83,
+                    resetAt: windowResetsAt * 1000
+                }),
+                weekly: expect.objectContaining({
+                    remainingPercent: 40,
+                    resetAt: weeklyResetsAt * 1000
+                })
+            })
+        }]);
+    });
+
     it('maps thread/started', () => {
         const converter = new AppServerEventConverter();
         const events = converter.handleNotification('thread/started', { thread: { id: 'thread-1' } });

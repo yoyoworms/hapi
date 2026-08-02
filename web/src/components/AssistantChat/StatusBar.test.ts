@@ -12,7 +12,8 @@ import {
 describe('account and session usage labels', () => {
     it('formats the remaining account quota and clamps invalid percentages', () => {
         expect(formatAccountLimit({ remainingPercent: 64 })).toBe('64%')
-        expect(formatAccountLimit({ remainingMs: 3_600_000, remainingPercent: 120 })).toBe('1h 100%')
+        expect(formatAccountLimit({ remainingMs: 3_600_000, remainingPercent: 120 })).toBe('100%')
+        expect(formatAccountLimit({ remainingMs: 3_600_000 })).toBe('1h')
     })
 
     it('prefers durable session totals and falls back to the latest transcript usage', () => {
