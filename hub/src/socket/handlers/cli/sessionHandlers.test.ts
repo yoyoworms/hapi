@@ -212,6 +212,7 @@ describe('cli session handlers', () => {
     it('emits ready events to the webapp notification pipeline without storing them', () => {
         const socket = new FakeSocket()
         const events: SyncEvent[] = []
+        const activity: Array<{ sessionId: string; updatedAt: number }> = []
         let addMessageCalls = 0
         let acked = false
 
@@ -233,6 +234,9 @@ describe('cli session handlers', () => {
             },
             onWebappEvent: (event) => {
                 events.push(event)
+            },
+            onSessionActivity: (sessionId, updatedAt) => {
+                activity.push({ sessionId, updatedAt })
             }
         })
 
@@ -254,6 +258,10 @@ describe('cli session handlers', () => {
 
         expect(acked).toBe(true)
         expect(addMessageCalls).toBe(0)
+        expect(activity).toEqual([{
+            sessionId: 'session-1',
+            updatedAt: expect.any(Number)
+        }])
         expect(events).toHaveLength(1)
         expect(events[0]).toMatchObject({
             type: 'message-received',

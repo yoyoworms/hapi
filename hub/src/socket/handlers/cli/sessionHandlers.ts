@@ -241,9 +241,11 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     createdAt: now
                 }
             })
-            if (shouldRecordSessionActivity(content)) {
-                onSessionActivity?.(sid, now)
-            }
+            // Completion is the attention edge for inactive viewers. `ready`
+            // is deliberately not persisted as a chat row, so this explicit
+            // activity touch is what advances Session.updatedAt and produces
+            // the sidebar unread marker once thinking becomes false.
+            onSessionActivity?.(sid, now)
             ack?.()
             return
         }

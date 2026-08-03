@@ -731,58 +731,77 @@ describe('session model', () => {
         }
     })
 
-    it('records CLI user text activity and drops internal ready events', () => {
-        const store = new Store(':memory:')
-        const events: SyncEvent[] = []
-        const cache = new SessionCache(store, createPublisher(events))
-        const session = cache.getOrCreateSession(
-            'session-cli-message-activity',
-            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
-            null,
-            'default'
-        )
-        const handlers = new Map<string, (payload: unknown) => void>()
-        const activity: Array<{ sessionId: string; updatedAt: number }> = []
-        const roomEvents: unknown[] = []
+    it('records CLI user text and turn-ready activity while keeping ready out of chat history', () => {
+        const originalDateNow = Date.now
+        let now = 1_000
+        Date.now = () => now
+        try {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+            const session = cache.getOrCreateSession(
+                'session-cli-message-activity',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                null,
+                'default'
+            )
+            const handlers = new Map<string, (payload: unknown) => void>()
+            const activity: Array<{ sessionId: string; updatedAt: number }> = []
+            const roomEvents: unknown[] = []
 
-        registerSessionHandlers({
-            on: (event: string, handler: (payload: unknown) => void) => {
-                handlers.set(event, handler)
-            },
-            to: () => ({ emit: (_event: string, update: unknown) => roomEvents.push(update) })
-        } as never, {
-            store,
-            resolveSessionAccess: (sessionId) => {
-                const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
-                return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
-            },
-            emitAccessError: () => {},
-            onSessionActivity: (sessionId, updatedAt) => {
-                activity.push({ sessionId, updatedAt })
-            }
-        })
-
-        handlers.get('message')?.({
-            sid: session.id,
-            message: JSON.stringify({ role: 'user', content: { type: 'text', text: 'hello' } })
-        })
-        handlers.get('message')?.({
-            sid: session.id,
-            message: JSON.stringify({
-                role: 'agent',
-                content: {
-                    type: 'event',
-                    data: { type: 'ready' }
+            registerSessionHandlers({
+                on: (event: string, handler: (payload: unknown) => void) => {
+                    handlers.set(event, handler)
+                },
+                to: () => ({ emit: (_event: string, update: unknown) => roomEvents.push(update) })
+            } as never, {
+                store,
+                resolveSessionAccess: (sessionId) => {
+                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+                },
+                emitAccessError: () => {},
+                onSessionActivity: (sessionId, updatedAt) => {
+                    activity.push({ sessionId, updatedAt })
+                    cache.recordSessionActivity(sessionId, updatedAt)
                 }
             })
-        })
 
-        const messages = store.messages.getMessages(session.id)
-        expect(messages).toHaveLength(1)
-        expect(roomEvents).toHaveLength(1)
-        expect(activity).toHaveLength(1)
-        expect(activity[0].sessionId).toBe(session.id)
-        expect(activity[0].updatedAt).toBe(messages[0]?.createdAt)
+            events.length = 0
+            now = 2_000
+            handlers.get('message')?.({
+                sid: session.id,
+                message: JSON.stringify({ role: 'user', content: { type: 'text', text: 'hello' } })
+            })
+            now = 3_000
+            handlers.get('message')?.({
+                sid: session.id,
+                message: JSON.stringify({
+                    role: 'agent',
+                    content: {
+                        type: 'event',
+                        data: { type: 'ready' }
+                    }
+                })
+            })
+
+            const messages = store.messages.getMessages(session.id)
+            expect(messages).toHaveLength(1)
+            expect(roomEvents).toHaveLength(1)
+            expect(activity).toEqual([
+                { sessionId: session.id, updatedAt: 2_000 },
+                { sessionId: session.id, updatedAt: 3_000 }
+            ])
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(3_000)
+            expect(cache.getSession(session.id)?.updatedAt).toBe(3_000)
+            expect(events).toContainEqual(expect.objectContaining({
+                type: 'session-updated',
+                sessionId: session.id,
+                data: { updatedAt: 3_000 }
+            }))
+        } finally {
+            Date.now = originalDateNow
+        }
     })
 
     it('records activity only for the first messages-consumed transition while retaining duplicate acknowledgements', () => {
@@ -844,10 +863,11 @@ describe('session model', () => {
             expect(invoked?.invokedAt).toBe(2_000)
             expect(activity).toEqual([
                 { sessionId: session.id, updatedAt: 2_000 },
-                { sessionId: session.id, updatedAt: 2_000 }
+                { sessionId: session.id, updatedAt: 2_000 },
+                { sessionId: session.id, updatedAt: 4_000 }
             ])
-            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(2_000)
-            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(1)
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(4_000)
+            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(2)
             expect(webEvents.filter((event) => event.type === 'messages-consumed')).toHaveLength(2)
         } finally {
             Date.now = originalDateNow
