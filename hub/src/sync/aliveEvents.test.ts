@@ -773,6 +773,81 @@ describe('alive incremental events', () => {
         })).not.toBeNull()
     })
 
+    it('rejects legacy alive and end packets after a runtime owner is durable', () => {
+        const store = new Store(':memory:')
+        const now = Date.now()
+        const initialCache = new SessionCache(store, createPublisher([]))
+        const session = initialCache.getOrCreateSession(
+            'session-durable-owner-legacy-fence',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                lifecycleState: 'running',
+                lifecycleStateSince: now
+            },
+            null,
+            'default'
+        )
+        const owner = { runtimeId: 'runtime-current', runtimeGeneration: 1 }
+
+        expect(initialCache.handleSessionAlive({
+            sid: session.id,
+            time: now,
+            thinking: false,
+            ...owner
+        })).toBe(true)
+        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+            runtimeId: owner.runtimeId
+        }))
+
+        // Simulate a Hub restart: the in-memory owner map is empty, so the
+        // durable metadata must be sufficient to fence an orphaned old CLI.
+        const events: SyncEvent[] = []
+        const restartedCache = new SessionCache(store, createPublisher(events))
+        restartedCache.reloadAll()
+        events.length = 0
+
+        expect(restartedCache.handleSessionAlive({
+            sid: session.id,
+            time: now + 1,
+            thinking: true
+        })).toBe(false)
+        expect(restartedCache.getSession(session.id)).toEqual(expect.objectContaining({
+            active: false,
+            thinking: false,
+            metadata: expect.objectContaining({
+                lifecycleState: 'running',
+                runtimeId: owner.runtimeId
+            })
+        }))
+        expect(events).toEqual([])
+
+        // The legitimate owner may reconnect and reclaim liveness; a legacy
+        // end still cannot stop it or trigger Hub-side archival.
+        expect(restartedCache.handleSessionAlive({
+            sid: session.id,
+            time: now + 2,
+            thinking: true,
+            ...owner
+        })).toBe(true)
+        events.length = 0
+
+        expect(restartedCache.handleSessionEnd({
+            sid: session.id,
+            time: now + 3
+        })).toBeNull()
+        expect(restartedCache.getSession(session.id)).toEqual(expect.objectContaining({
+            active: true,
+            thinking: true,
+            metadata: expect.objectContaining({
+                lifecycleState: 'running',
+                runtimeId: owner.runtimeId
+            })
+        }))
+        expect(events).toEqual([])
+    })
+
     it('does not commit a metadata takeover until the versioned write succeeds', () => {
         const store = new Store(':memory:')
         const cache = new SessionCache(store, createPublisher([]))
@@ -907,6 +982,16 @@ describe('alive incremental events', () => {
             'default'
         )
 
+        expect(cache.isRuntimeMetadataUpdateAllowed({
+            sid: session.id,
+            metadata: {
+                lifecycleState: 'running',
+                lifecycleStateSince: 100,
+                runtimeId: 'runtime-archived'
+            },
+            runtimeId: 'runtime-archived',
+            runtimeGeneration: 1
+        })).toBe(false)
         expect(cache.isRuntimeMetadataUpdateAllowed({
             sid: session.id,
             metadata: {

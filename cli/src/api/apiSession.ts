@@ -171,6 +171,20 @@ type PendingOutboundEvent = {
     retention: 'lossless' | 'droppable'
 }
 
+type SessionKeepAliveRuntime = {
+    permissionMode?: SessionPermissionMode
+    model?: SessionModel
+    modelReasoningEffort?: string | null
+    effort?: string | null
+    serviceTier?: string | null
+    collaborationMode?: SessionCollaborationMode
+}
+
+type SessionKeepAliveState = SessionKeepAliveRuntime & {
+    thinking: boolean
+    mode?: 'local' | 'remote'
+}
+
 const MAX_PENDING_DROPPABLE_EVENTS = 256
 const MATERIALIZATION_RETRY_MIN_MS = 1_000
 const MATERIALIZATION_RETRY_MAX_MS = 30_000
@@ -252,6 +266,7 @@ export class ApiSessionClient extends EventEmitter {
     private readonly pendingOutboundEvents: PendingOutboundEvent[] = []
     /** Stable for this runner/client across Socket.IO reconnects. */
     private readonly runtimeId = randomUUID()
+    private latestKeepAlive: SessionKeepAliveState = { thinking: false }
     private didWarnPendingQueueFull = false
 
     constructor(token: string, session: Session, options: ApiSessionClientOptions = {}) {
@@ -311,11 +326,7 @@ export class ApiSessionClient extends EventEmitter {
             }
             void this.backfillIfNeeded()
             this.hasConnectedOnce = true
-            this.socket.emit('session-alive', {
-                sid: this.sessionId,
-                time: Date.now(),
-                thinking: false
-            })
+            this.socket.emit('session-alive', this.buildSessionAlivePayload())
         })
 
         this.socket.on('rpc-request', async (data: { method: string; params: string }, callback: (response: string) => void) => {
@@ -887,25 +898,31 @@ export class ApiSessionClient extends EventEmitter {
     keepAlive(
         thinking: boolean,
         mode: 'local' | 'remote',
-        runtime?: {
-            permissionMode?: SessionPermissionMode
-            model?: SessionModel
-            modelReasoningEffort?: string | null
-            effort?: string | null
-            serviceTier?: string | null
-            collaborationMode?: SessionCollaborationMode
-        }
+        runtime?: SessionKeepAliveRuntime
     ): void {
-        if (this.state !== 'active') {
+        if (this.state === 'closed') {
             return
         }
-        this.socket.volatile.emit('session-alive', {
-            sid: this.sessionId,
-            time: Date.now(),
+        // Volatile Socket.IO packets are intentionally dropped while offline.
+        // Keep the latest complete state locally so the next connect event can
+        // re-announce the real in-flight status instead of a synthetic idle one.
+        this.latestKeepAlive = {
             thinking,
             mode,
             ...(runtime ?? {})
-        })
+        }
+        if (this.state !== 'active') {
+            return
+        }
+        this.socket.volatile.emit('session-alive', this.buildSessionAlivePayload())
+    }
+
+    private buildSessionAlivePayload(): Parameters<ClientToServerEvents['session-alive']>[0] {
+        return {
+            sid: this.sessionId,
+            time: Date.now(),
+            ...this.latestKeepAlive
+        }
     }
 
     /** Hub waits for this before mergeSessions on Cursor ACP reopen (tiann/hapi#939). */

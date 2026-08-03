@@ -292,6 +292,14 @@ export class SessionCache {
             return false
         }
 
+        // Once a modern runtime has durably claimed the row, legacy packets
+        // without a complete runtime identity are no longer authoritative.
+        // Otherwise an orphaned older CLI can keep overwriting the current
+        // owner's active/thinking state indefinitely.
+        if (!hasRuntimeSource && session.metadata?.runtimeId) {
+            return false
+        }
+
         if (hasRuntimeSource) {
             const runtimeGeneration = payload.runtimeGeneration as number
             const owner = this.runtimeOwnerBySessionId.get(session.id)
@@ -595,6 +603,11 @@ export class SessionCache {
 
         const hasRuntimeSource = typeof payload.runtimeId === 'string'
             && Number.isSafeInteger(payload.runtimeGeneration)
+        // Mirror the alive fence: an unsourced legacy end must not stop (and
+        // subsequently archive) a session already owned by a modern runtime.
+        if (!hasRuntimeSource && session.metadata?.runtimeId) {
+            return null
+        }
         if (hasRuntimeSource) {
             const owner = this.runtimeOwnerBySessionId.get(session.id)
             const durableRuntimeId = session.metadata?.runtimeId
@@ -695,6 +708,16 @@ export class SessionCache {
         if (!owner) {
             const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
             const durableRuntimeId = session?.metadata?.runtimeId
+            if (
+                durableRuntimeId === payload.runtimeId
+                && session?.metadata?.lifecycleState === 'archived'
+                && lifecycleState === 'running'
+            ) {
+                // runtimeId survives transport reconnects, not process restarts.
+                // Once that runtime archived, it cannot reopen itself after a
+                // Hub restart; a legitimate new run has a new runtimeId.
+                return false
+            }
             if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
                 if (lifecycleState !== 'running') {
                     return false

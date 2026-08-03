@@ -46,13 +46,14 @@ function redundantGoalStatusContent(message: string): unknown {
 describe('cli session handlers', () => {
     it('keeps legacy CLI events on the non-authoritative timestamp path', () => {
         const store = new Store(':memory:')
+        const archivedSince = Date.now() - 1_000
         const session = store.sessions.getOrCreateSession(
             'legacy-runtime-reopen',
             {
                 path: '/tmp/project',
                 host: 'localhost',
                 lifecycleState: 'archived',
-                lifecycleStateSince: Date.now() - 1_000,
+                lifecycleStateSince: archivedSince,
                 runtimeId: 'runtime-from-newer-cli'
             },
             null,
@@ -67,11 +68,18 @@ describe('cli session handlers', () => {
 
         registerSessionHandlers(socket as unknown as CliSocketWithData, {
             store,
-            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            resolveSessionAccess: (sid) => {
+                const current = store.sessions.getSessionByNamespace(sid, 'default')
+                return current
+                    ? { ok: true, value: current }
+                    : { ok: false, reason: 'not-found' }
+            },
             emitAccessError: () => {
                 throw new Error('unexpected access error')
             },
-            onSessionAlive: (payload) => alivePayloads.push(payload),
+            onSessionAlive: (payload) => {
+                alivePayloads.push(payload)
+            },
             onSessionEnd: (payload) => {
                 endPayloads.push(payload)
                 return false
@@ -81,6 +89,28 @@ describe('cli session handlers', () => {
                 return false
             }
         })
+
+        let staleMetadataAck: unknown = null
+        socket.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: {
+                path: '/tmp/project',
+                host: 'localhost',
+                lifecycleState: 'running',
+                lifecycleStateSince: archivedSince
+            }
+        }, (response) => {
+            staleMetadataAck = response
+        })
+
+        expect(staleMetadataAck).toEqual(expect.objectContaining({
+            result: 'success',
+            metadata: expect.objectContaining({
+                lifecycleState: 'archived',
+                runtimeId: 'runtime-from-newer-cli'
+            })
+        }))
 
         let metadataAck: unknown = null
         const runningSince = Date.now()
@@ -106,6 +136,16 @@ describe('cli session handlers', () => {
             time: runningSince + 1,
             reason: 'completed'
         })
+        socket.trigger('message', {
+            sid: session.id,
+            message: {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: { type: 'message', message: 'legacy reopen is active' }
+                }
+            }
+        })
 
         expect(metadataGateCalls).toBe(0)
         expect(metadataAck).toEqual(expect.objectContaining({ result: 'success' }))
@@ -125,6 +165,168 @@ describe('cli session handlers', () => {
             time: runningSince + 1,
             reason: 'completed'
         }])
+        expect(store.messages.getMessages(session.id)).toHaveLength(1)
+    })
+
+    it('drops legacy output and state writes while a modern runtime owns the session', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'modern-owner-legacy-fence',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                lifecycleState: 'running',
+                lifecycleStateSince: Date.now(),
+                runtimeId: 'runtime-current'
+            },
+            null,
+            'default'
+        )
+        const queued = store.messages.addMessage(
+            session.id,
+            { role: 'user', content: { type: 'text', text: 'owner only' } },
+            'local-owner-only'
+        )
+        const socket = new FakeSocket()
+        delete socket.data.runtimeId
+        delete socket.data.runtimeGeneration
+        const webEvents: SyncEvent[] = []
+        const activity: number[] = []
+        let readyCalls = 0
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid) => {
+                const current = store.sessions.getSessionByNamespace(sid, 'default')
+                return current
+                    ? { ok: true, value: current }
+                    : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onWebappEvent: (event) => webEvents.push(event),
+            onSessionActivity: (_sid, updatedAt) => activity.push(updatedAt),
+            onSessionReady: () => {
+                readyCalls += 1
+            }
+        })
+
+        let outputAcked = false
+        socket.trigger('message', {
+            sid: session.id,
+            message: {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: { type: 'message', message: 'duplicate legacy reply' }
+                }
+            }
+        }, () => {
+            outputAcked = true
+        })
+        socket.trigger('message', {
+            sid: session.id,
+            message: {
+                role: 'agent',
+                content: { type: 'event', data: { type: 'ready' } }
+            }
+        })
+
+        let metadataAck: unknown = null
+        socket.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: {
+                lifecycleState: 'running',
+                lifecycleStateSince: Date.now(),
+                name: 'stale legacy title'
+            }
+        }, (response) => {
+            metadataAck = response
+        })
+
+        let stateAck: unknown = null
+        socket.trigger('update-state', {
+            sid: session.id,
+            expectedVersion: session.agentStateVersion,
+            agentState: { controlledByUser: true }
+        }, (response) => {
+            stateAck = response
+        })
+        socket.trigger('session-ready', { sid: session.id, time: Date.now() })
+        socket.trigger('messages-consumed', {
+            sid: session.id,
+            localIds: ['local-owner-only']
+        })
+
+        const current = store.sessions.getSession(session.id)!
+        expect(outputAcked).toBe(true)
+        expect(store.messages.getMessages(session.id)).toHaveLength(1)
+        expect(store.messages.lookupQueuedMessage(session.id, queued.id).status).toBe('queued')
+        expect(current.metadata).toEqual(expect.objectContaining({
+            runtimeId: 'runtime-current',
+            lifecycleState: 'running'
+        }))
+        expect((current.metadata as Record<string, unknown>).name).toBeUndefined()
+        expect(current.agentState).toBeNull()
+        expect(metadataAck).toEqual(expect.objectContaining({
+            result: 'success',
+            metadata: expect.objectContaining({ runtimeId: 'runtime-current' })
+        }))
+        expect(stateAck).toEqual(expect.objectContaining({
+            result: 'success',
+            agentState: null
+        }))
+        expect(readyCalls).toBe(0)
+        expect(activity).toEqual([])
+        expect(webEvents).toEqual([])
+    })
+
+    it('drops late output from the ended owner after lifecycle archival', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'ended-owner-output-fence',
+            {
+                lifecycleState: 'archived',
+                lifecycleStateSince: Date.now(),
+                runtimeId: 'runtime-test'
+            },
+            null,
+            'default'
+        )
+        const socket = new FakeSocket()
+        const webEvents: SyncEvent[] = []
+        let acked = false
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({
+                ok: true,
+                value: store.sessions.getSession(session.id)!
+            }),
+            emitAccessError: () => {
+                throw new Error('unexpected access error')
+            },
+            onWebappEvent: (event) => webEvents.push(event)
+        })
+
+        socket.trigger('message', {
+            sid: session.id,
+            message: {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: { type: 'message', message: 'late owner reply' }
+                }
+            }
+        }, () => {
+            acked = true
+        })
+
+        expect(acked).toBe(true)
+        expect(store.messages.getMessages(session.id)).toEqual([])
+        expect(webEvents).toEqual([])
     })
 
     it('does not sweep queued prompts when a stale session end is rejected', () => {

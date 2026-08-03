@@ -163,6 +163,47 @@ function triggerIncomingUserMessage(
     })
 }
 
+describe('ApiSessionClient keepalive reconnect state', () => {
+    it('replays the latest thinking, mode, and runtime config after reconnect', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+
+        socket.connected = false
+        socket.trigger('disconnect', 'transport close')
+        client.keepAlive(true, 'remote', {
+            permissionMode: 'yolo',
+            model: 'gpt-5.4',
+            modelReasoningEffort: 'high',
+            effort: 'medium',
+            serviceTier: 'priority',
+            collaborationMode: 'plan'
+        })
+
+        // The volatile keepalive above is lost on a real disconnected socket.
+        // Inspect only the authoritative packet emitted by the connect handler.
+        socket.emitted.length = 0
+        socket.triggerConnect()
+
+        const alivePackets = socket.emitted.filter((entry) => entry.event === 'session-alive')
+        expect(alivePackets).toHaveLength(1)
+        expect(alivePackets[0]?.args[0]).toEqual({
+            sid: '11111111-1111-4111-8111-111111111111',
+            time: expect.any(Number),
+            thinking: true,
+            mode: 'remote',
+            permissionMode: 'yolo',
+            model: 'gpt-5.4',
+            modelReasoningEffort: 'high',
+            effort: 'medium',
+            serviceTier: 'priority',
+            collaborationMode: 'plan'
+        })
+        client.close()
+    })
+})
+
 describe('ApiSessionClient lazy materialization', () => {
     it('does not connect or materialize without a real user message', async () => {
         socketHarness.sockets.length = 0

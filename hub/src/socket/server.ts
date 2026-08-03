@@ -39,7 +39,7 @@ export type SocketServerDeps = {
     corsOrigins?: string[]
     getSession?: (sessionId: string) => { active: boolean; namespace: string } | null
     onWebappEvent?: (event: SyncEvent) => void
-    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote'; runtimeId?: string; runtimeGeneration?: number }) => void
+    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote'; serviceTier?: string | null; runtimeId?: string; runtimeGeneration?: number }) => boolean | void
     onSessionReady?: (payload: { sid: string; time: number }) => void
     onSessionEnd?: (payload: { sid: string; time: number; reason?: SessionEndReason; runtimeId?: string; runtimeGeneration?: number }) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void

@@ -117,6 +117,92 @@ function getAuthoritativeRuntimeSource(socket: CliSocketWithData): Authoritative
     }
 }
 
+function getDurableRuntimeId(session: Pick<StoredSession, 'metadata'>): string | null {
+    if (!session.metadata || typeof session.metadata !== 'object' || Array.isArray(session.metadata)) {
+        return null
+    }
+    const runtimeId = (session.metadata as Record<string, unknown>).runtimeId
+    return typeof runtimeId === 'string' && runtimeId.length > 0 ? runtimeId : null
+}
+
+function hasLifecycleState(metadata: unknown, lifecycleState: 'running' | 'archived'): boolean {
+    return Boolean(
+        metadata
+        && typeof metadata === 'object'
+        && !Array.isArray(metadata)
+        && (metadata as Record<string, unknown>).lifecycleState === lifecycleState
+    )
+}
+
+function isCurrentRuntimeSocket(socket: CliSocketWithData, session: Pick<StoredSession, 'metadata'>): boolean {
+    const durableRuntimeId = getDurableRuntimeId(session)
+    if (durableRuntimeId === null) {
+        return true
+    }
+    if (socket.data.runtimeId !== durableRuntimeId) {
+        return false
+    }
+    const lifecycleState = session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+        ? (session.metadata as Record<string, unknown>).lifecycleState
+        : null
+    return lifecycleState !== 'archived'
+}
+
+function isLegacyReopenMetadata(current: StoredSession, metadata: unknown): boolean {
+    if (
+        !current.metadata
+        || typeof current.metadata !== 'object'
+        || Array.isArray(current.metadata)
+        || !metadata
+        || typeof metadata !== 'object'
+        || Array.isArray(metadata)
+    ) {
+        return false
+    }
+    if (current.active) {
+        return false
+    }
+    const currentLifecycle = (current.metadata as Record<string, unknown>).lifecycleState
+    const currentLifecycleSince = (current.metadata as Record<string, unknown>).lifecycleStateSince
+    const nextLifecycle = (metadata as Record<string, unknown>).lifecycleState
+    const nextLifecycleSince = (metadata as Record<string, unknown>).lifecycleStateSince
+    return currentLifecycle === 'archived'
+        && nextLifecycle === 'running'
+        && typeof currentLifecycleSince === 'number'
+        && Number.isFinite(currentLifecycleSince)
+        && typeof nextLifecycleSince === 'number'
+        && Number.isFinite(nextLifecycleSince)
+        && nextLifecycleSince > currentLifecycleSince
+}
+
+function isLegacyPendingRuntimeClaim(current: StoredSession, metadata: unknown): boolean {
+    if (getDurableRuntimeId(current)) {
+        return isLegacyReopenMetadata(current, metadata)
+    }
+    if (
+        current.active
+        || !metadata
+        || typeof metadata !== 'object'
+        || Array.isArray(metadata)
+    ) {
+        return false
+    }
+    const next = metadata as Record<string, unknown>
+    if (
+        next.lifecycleState !== 'running'
+        || typeof next.lifecycleStateSince !== 'number'
+        || !Number.isFinite(next.lifecycleStateSince)
+    ) {
+        return false
+    }
+    const currentSince = current.metadata && typeof current.metadata === 'object' && !Array.isArray(current.metadata)
+        ? (current.metadata as Record<string, unknown>).lifecycleStateSince
+        : undefined
+    return typeof currentSince !== 'number'
+        || !Number.isFinite(currentSince)
+        || next.lifecycleStateSince > currentSince
+}
+
 function attachRuntimeOwnershipMetadata(
     metadata: unknown,
     runtimeSource: AuthoritativeSessionRuntimeSource | null
@@ -141,7 +227,17 @@ export type SessionHandlersDeps = {
     store: Store
     resolveSessionAccess: ResolveSessionAccess
     emitAccessError: EmitAccessError
-    onSessionAlive?: (payload: SessionAlivePayload & SessionRuntimeSource) => void
+    /** False after Socket.IO has closed this transport. Guards already queued
+     * callbacks from an evicted overlapping connection. */
+    isSessionTransportActive?: () => boolean
+    /** True after this transport has proved durable/timestamp ownership. Unlike
+     * the publish gate, this remains true through its own archive→end flow. */
+    isSessionRuntimeOwned?: (sessionId: string) => boolean
+    /** Socket-local ownership gate. Pending/superseded session sockets may
+     * stay connected so a valid newer lifecycle can claim the row, but they
+     * must not publish output or consume queued prompts before activation. */
+    isSessionRuntimeActive?: (sessionId: string) => boolean
+    onSessionAlive?: (payload: SessionAlivePayload & SessionRuntimeSource) => boolean | void
     onSessionReady?: (payload: SessionReadyPayload) => void
     onSessionEnd?: (payload: SessionEndPayload & SessionRuntimeSource) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
@@ -170,7 +266,12 @@ export type SessionHandlersDeps = {
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onSessionMetadataUpdateAllowed, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { store, resolveSessionAccess, emitAccessError, isSessionTransportActive, isSessionRuntimeOwned, isSessionRuntimeActive, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onSessionMetadataUpdateAllowed, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+
+    const canPublishSessionRuntime = (sessionId: string, session: StoredSession): boolean => {
+        return (isSessionRuntimeActive?.(sessionId) ?? true)
+            && isCurrentRuntimeSocket(socket, session)
+    }
 
     // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
     const recentContentUuids = new Set<string>()
@@ -201,6 +302,15 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         const session = sessionAccess.value
+
+        // A session room may briefly contain a superseded socket while a new
+        // runtime claim is being reconciled. Never accept output from that
+        // socket: otherwise two runners can persist duplicate replies and a
+        // legacy orphan can emit a second `ready` edge for the same prompt.
+        if (!canPublishSessionRuntime(sid, session)) {
+            ack?.()
+            return
+        }
 
         // Extract usage data from event messages before dropping them
         const _c = content as any
@@ -365,8 +475,48 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             cb({ result: 'error', reason: sessionAccess.reason })
             return
         }
+        if (!(isSessionTransportActive?.() ?? true)) {
+            cb({ result: 'error' })
+            return
+        }
 
         const runtimeSource = getAuthoritativeRuntimeSource(socket)
+        const current = store.sessions.getSessionByNamespace(sid, sessionAccess.value.namespace)
+        const socketOwnsRuntime = isSessionRuntimeOwned?.(sid)
+            ?? (isSessionRuntimeActive?.(sid) ?? true)
+        if (
+            current
+            && !socketOwnsRuntime
+            && (runtimeSource
+                ? !hasLifecycleState(metadata, 'running')
+                : !isLegacyPendingRuntimeClaim(current, metadata))
+        ) {
+            // Pending sockets may only prove ownership with a `running`
+            // transition. In particular, a buffered end/archive from a runner
+            // that never won the room must not terminate the current owner.
+            cb({
+                result: 'success',
+                version: current.metadataVersion,
+                metadata: current.metadata
+            })
+            return
+        }
+        if (
+            current
+            && getDurableRuntimeId(current)
+            && !runtimeSource
+            && !isLegacyReopenMetadata(current, metadata)
+        ) {
+            // Legacy clients cannot mutate metadata owned by a live modern
+            // runtime. Acknowledge with the durable snapshot so an old client
+            // converges instead of retrying and clearing runtimeId.
+            cb({
+                result: 'success',
+                version: current.metadataVersion,
+                metadata: current.metadata
+            })
+            return
+        }
         const metadataWithRuntime = attachRuntimeOwnershipMetadata(metadata, runtimeSource)
         if (runtimeSource && onSessionMetadataUpdateAllowed && !onSessionMetadataUpdateAllowed({
             sid,
@@ -447,6 +597,15 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
 
+        if (!canPublishSessionRuntime(sid, sessionAccess.value)) {
+            cb({
+                result: 'success',
+                version: sessionAccess.value.agentStateVersion,
+                agentState: sessionAccess.value.agentState
+            })
+            return
+        }
+
         const result = store.sessions.updateSessionAgentState(
             sid,
             agentState,
@@ -502,6 +661,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             emitAccessError('session', data.sid, sessionAccess.reason)
             return
         }
+        if (!canPublishSessionRuntime(data.sid, sessionAccess.value)) {
+            return
+        }
         onSessionReady?.(data)
     })
 
@@ -516,6 +678,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         const sessionAccess = resolveSessionAccess(data.sid)
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
+            return
+        }
+        if (!canPublishSessionRuntime(data.sid, sessionAccess.value)) {
             return
         }
         const invokedAt = Date.now()
