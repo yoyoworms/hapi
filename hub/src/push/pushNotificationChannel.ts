@@ -3,14 +3,12 @@ import type { NotificationChannel, TaskNotification } from '../notifications/not
 import type { NotificationSendContext } from '../notifications/notificationSendContext'
 import { getAgentName, getSessionName } from '../notifications/sessionInfo'
 import type { SSEManager } from '../sse/sseManager'
-import type { VisibilityTracker } from '../visibility/visibilityTracker'
 import type { PushPayload, PushService } from './pushService'
 
 export class PushNotificationChannel implements NotificationChannel {
     constructor(
         private readonly pushService: PushService,
         private readonly sseManager: SSEManager,
-        private readonly visibilityTracker: VisibilityTracker,
         _appUrl: string
     ) {}
 
@@ -49,7 +47,7 @@ export class PushNotificationChannel implements NotificationChannel {
             }
         }
 
-        await this.deliverWebOrToast(session, payload, ctx, 'permission')
+        await this.deliverWebAndToast(session, payload, ctx, 'permission')
     }
 
     async sendReady(session: Session, ctx?: NotificationSendContext): Promise<void> {
@@ -71,7 +69,7 @@ export class PushNotificationChannel implements NotificationChannel {
             }
         }
 
-        await this.deliverWebOrToast(session, payload, ctx, 'ready')
+        await this.deliverWebAndToast(session, payload, ctx, 'ready')
     }
 
     async sendTaskNotification(session: Session, notification: TaskNotification, ctx?: NotificationSendContext): Promise<void> {
@@ -97,10 +95,10 @@ export class PushNotificationChannel implements NotificationChannel {
             }
         }
 
-        await this.deliverWebOrToast(session, payload, ctx, 'task')
+        await this.deliverWebAndToast(session, payload, ctx, 'task')
     }
 
-    private async deliverWebOrToast(
+    private async deliverWebAndToast(
         session: Session,
         payload: PushPayload,
         ctx: NotificationSendContext | undefined,
@@ -112,25 +110,26 @@ export class PushNotificationChannel implements NotificationChannel {
         }
 
         const url = payload.data?.url ?? this.buildSessionPath(session.id)
-        if (this.visibilityTracker.hasVisibleConnection(session.namespace)) {
-            const delivered = await this.sseManager.sendToast(session.namespace, {
-                type: 'toast',
-                data: {
-                    title: payload.title,
-                    body: payload.body,
-                    sessionId: session.id,
-                    url
-                }
-            })
-            if (delivered > 0) {
-                this.logBranch(method, session.namespace, 'sse-toast-delivered', `count=${delivered}`)
-                return
+        const delivered = await this.sseManager.sendToast(session.namespace, {
+            type: 'toast',
+            data: {
+                title: payload.title,
+                body: payload.body,
+                sessionId: session.id,
+                url
             }
-            this.logBranch(method, session.namespace, 'sse-toast-zero', 'visible but delivered=0')
-        } else {
-            this.logBranch(method, session.namespace, 'not-visible')
-        }
+        })
+        this.logBranch(
+            method,
+            session.namespace,
+            delivered > 0 ? 'sse-toast-delivered' : 'sse-toast-zero',
+            `count=${delivered}`
+        )
 
+        // Hub visibility is namespace-wide, so a visible desktop tab cannot
+        // tell us whether a different device's PWA is hidden. Always dispatch
+        // Web Push; the service worker performs the correct per-device check
+        // and suppresses its OS notification only when that device is visible.
         this.logBranch(method, session.namespace, 'web-push-fired')
         await this.pushService.sendToNamespace(session.namespace, payload)
     }

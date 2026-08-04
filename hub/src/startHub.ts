@@ -232,7 +232,6 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         new PushNotificationChannel(
             pushService,
             sseManager,
-            visibilityTracker,
             config.publicUrl
         )
     )

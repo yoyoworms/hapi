@@ -15,7 +15,7 @@ function createSession(overrides: Partial<Session> = {}): Session {
 }
 
 describe('PushNotificationChannel', () => {
-    it('sends task notifications via push when no web client is visible', async () => {
+    it('always sends task notifications via push (visibility optimization intentionally removed)', async () => {
         const pushed: Array<{ namespace: string; payload: PushPayload }> = []
         const channel = new PushNotificationChannel(
             {
@@ -25,9 +25,6 @@ describe('PushNotificationChannel', () => {
             } as never,
             {
                 sendToast: async () => 0
-            } as never,
-            {
-                hasVisibleConnection: () => false
             } as never,
             ''
         )
@@ -40,6 +37,31 @@ describe('PushNotificationChannel', () => {
         expect(pushed).toHaveLength(1)
     })
 
+    it('still sends web-push when a visible desktop receives the in-page toast', async () => {
+        const pushed: Array<{ namespace: string; payload: PushPayload }> = []
+        const toasts: unknown[] = []
+        const channel = new PushNotificationChannel(
+            {
+                sendToNamespace: async (namespace: string, payload: PushPayload) => {
+                    pushed.push({ namespace, payload })
+                }
+            } as never,
+            {
+                sendToast: async (_namespace: string, event: unknown) => {
+                    toasts.push(event)
+                    return 1
+                }
+            } as never,
+            ''
+        )
+
+        await channel.sendReady(createSession(), { nativeGate: { sent: false } })
+
+        expect(toasts).toHaveLength(1)
+        expect(pushed).toHaveLength(1)
+        expect(pushed[0]?.payload.data?.type).toBe('ready')
+    })
+
     it('does not reuse one replacement tag for all task notifications in a session', async () => {
         const pushed: Array<{ namespace: string; payload: PushPayload }> = []
         const channel = new PushNotificationChannel(
@@ -50,9 +72,6 @@ describe('PushNotificationChannel', () => {
             } as never,
             {
                 sendToast: async () => 0
-            } as never,
-            {
-                hasVisibleConnection: () => false
             } as never,
             ''
         )
@@ -81,9 +100,6 @@ describe('PushNotificationChannel', () => {
             } as never,
             {
                 sendToast: async () => 0
-            } as never,
-            {
-                hasVisibleConnection: () => false
             } as never,
             ''
         )
@@ -115,9 +131,6 @@ describe('PushNotificationChannel', () => {
             {
                 sendToast: async () => 0
             } as never,
-            {
-                hasVisibleConnection: () => false
-            } as never,
             ''
         )
 
@@ -136,9 +149,6 @@ describe('PushNotificationChannel', () => {
             } as never,
             {
                 sendToast: async () => 0
-            } as never,
-            {
-                hasVisibleConnection: () => false
             } as never,
             ''
         )
@@ -162,9 +172,6 @@ describe('PushNotificationChannel', () => {
                     toasts.push(event)
                     return 99
                 }
-            } as never,
-            {
-                hasVisibleConnection: () => true
             } as never,
             ''
         )
