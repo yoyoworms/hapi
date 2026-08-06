@@ -7,7 +7,7 @@ import {
 } from '@hapi/protocol'
 import type { PermissionModeTone } from '@hapi/protocol'
 import * as Popover from '@radix-ui/react-popover'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import type { ThreadGoal } from '@/types/api'
@@ -161,17 +161,29 @@ function formatReset(resetAt: number | null | undefined): string | null {
     })
 }
 
-export function formatAccountLimit(limit: AgentAccountStatus['window']): string | null {
+function useMinuteClock(enabled: boolean, version: number | undefined): number {
+    const [now, setNow] = useState(() => Date.now())
+
+    useEffect(() => {
+        if (!enabled) return
+        setNow(Date.now())
+        const timer = window.setInterval(() => setNow(Date.now()), 60_000)
+        return () => window.clearInterval(timer)
+    }, [enabled, version])
+
+    return now
+}
+
+export function formatAccountLimit(limit: AgentAccountStatus['window'], now = Date.now()): string | null {
     if (!limit) return null
-    const duration = formatDuration(limit.remainingMs ?? (limit.resetAt ? limit.resetAt - Date.now() : null))
+    const duration = formatDuration(limit.resetAt ? limit.resetAt - now : limit.remainingMs)
     const percentage = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
         ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
         : null
-    // Keep the compact status focused on quota. Exact reset time remains in
-    // the title; the duration is only a fallback for providers without a
-    // percentage so mobile does not show duplicated labels such as
-    // "7d 5d20h 83%".
-    return percentage ?? duration
+    // Keep the reset countdown visible: the exact timestamp in `title` is not
+    // accessible on touch-only PWA clients. Parentheses distinguish the
+    // quota window (5h/7d) from the time remaining until that window resets.
+    return duration && percentage ? `${percentage} (${duration})` : percentage ?? duration
 }
 
 export function formatUsageText(
@@ -356,13 +368,13 @@ export function StatusBar(props: {
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
     const accountStatus = props.accountStatus ?? null
-    const accountWindowText = accountStatus ? formatAccountLimit(accountStatus.window) : null
-    const accountWeeklyText = accountStatus ? formatAccountLimit(accountStatus.weekly) : null
+    const accountClock = useMinuteClock(Boolean(accountStatus), accountStatus?.updatedAt)
+    const accountWindowText = accountStatus ? formatAccountLimit(accountStatus.window, accountClock) : null
+    const accountWeeklyText = accountStatus ? formatAccountLimit(accountStatus.weekly, accountClock) : null
+    const accountWindowLabel = accountWindowText ? t('status.accountWindow', { value: accountWindowText }) : null
+    const accountWeeklyLabel = accountWeeklyText ? t('status.accountWeekly', { value: accountWeeklyText }) : null
     const accountLimitText = accountStatus
-        ? [
-            accountWindowText ? t('status.accountWindow', { value: accountWindowText }) : null,
-            accountWeeklyText ? t('status.accountWeekly', { value: accountWeeklyText }) : null
-        ]
+        ? [accountWindowLabel, accountWeeklyLabel]
             .filter(Boolean)
             .join(' · ')
         : ''
@@ -491,7 +503,23 @@ export function StatusBar(props: {
                                 {accountStatus.accountLabel}{accountLimitText ? '\u00a0' : ''}
                             </span>
                         ) : null}
-                        {accountLimitText ? <span className="shrink-0 whitespace-nowrap">{accountLimitText}</span> : null}
+                        {accountLimitText ? (
+                            <>
+                                <span
+                                    data-testid="account-usage-mobile"
+                                    className="flex shrink-0 flex-col items-end leading-[11px] sm:hidden"
+                                >
+                                    {accountWindowLabel ? <span className="whitespace-nowrap">{accountWindowLabel}</span> : null}
+                                    {accountWeeklyLabel ? <span className="whitespace-nowrap">{accountWeeklyLabel}</span> : null}
+                                </span>
+                                <span
+                                    data-testid="account-usage-desktop"
+                                    className="hidden shrink-0 whitespace-nowrap sm:inline"
+                                >
+                                    {accountLimitText}
+                                </span>
+                            </>
+                        ) : null}
                     </span>
                 ) : null}
                 {usageText ? (

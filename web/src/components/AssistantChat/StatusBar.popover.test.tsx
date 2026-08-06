@@ -1,11 +1,15 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { act, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '@/lib/i18n-context'
 import { StatusBar } from './StatusBar'
 
 describe('StatusBar context details popover', () => {
     beforeEach(() => {
         localStorage.clear()
+    })
+
+    afterEach(() => {
+        vi.useRealTimers()
     })
 
     it('keeps stable connection labels in English and offsets the whole left status', () => {
@@ -81,8 +85,8 @@ describe('StatusBar context details popover', () => {
                     accountStatus={{
                         provider: 'codex',
                         accountLabel: 'current@example.com',
-                        window: { remainingPercent: 72 },
-                        weekly: { remainingPercent: 41 },
+                        window: { remainingMs: 3_600_000, remainingPercent: 72 },
+                        weekly: { remainingMs: 5 * 86_400_000 + 20 * 3_600_000, remainingPercent: 41 },
                         updatedAt: 1
                     }}
                     usage={{
@@ -94,13 +98,50 @@ describe('StatusBar context details popover', () => {
             </I18nProvider>
         )
 
-        expect(screen.getByTestId('account-usage-status')).toHaveTextContent('current@example.com 5h 72% · 7d 41%')
+        expect(screen.getByTestId('account-usage-status')).toHaveTextContent('current@example.com')
         expect(screen.getByText('current@example.com').className.split(' ')).toContain('hidden')
-        expect(screen.getByText('5h 72% · 7d 41%').className.split(' ')).toContain('whitespace-nowrap')
+        const mobileAccountUsage = screen.getByTestId('account-usage-mobile')
+        expect(mobileAccountUsage).toHaveTextContent('5h 72% (1h)7d 41% (5d20h)')
+        expect(mobileAccountUsage.className.split(' ')).toContain('flex-col')
+        expect(mobileAccountUsage.className.split(' ')).toContain('sm:hidden')
+        const desktopAccountUsage = screen.getByTestId('account-usage-desktop')
+        expect(desktopAccountUsage).toHaveTextContent('5h 72% (1h) · 7d 41% (5d20h)')
+        expect(desktopAccountUsage.className.split(' ')).toContain('hidden')
+        expect(desktopAccountUsage.className.split(' ')).toContain('sm:inline')
         const sessionUsage = screen.getByTestId('session-usage-status')
         expect(sessionUsage).toHaveTextContent('$0.25 · 1k tok')
         expect(sessionUsage.className.split(' ')).toContain('hidden')
         expect(sessionUsage.className.split(' ')).toContain('sm:inline')
+    })
+
+    it('keeps the visible reset countdown moving while the session is idle', () => {
+        const now = new Date('2026-08-06T12:00:00+08:00')
+        vi.useFakeTimers()
+        vi.setSystemTime(now)
+        render(
+            <I18nProvider>
+                <StatusBar
+                    active
+                    thinking={false}
+                    agentState={null}
+                    agentFlavor="codex"
+                    accountStatus={{
+                        provider: 'codex',
+                        weekly: {
+                            remainingPercent: 100,
+                            resetAt: now.getTime() + 2 * 3_600_000
+                        },
+                        updatedAt: 1
+                    }}
+                />
+            </I18nProvider>
+        )
+
+        expect(screen.getByTestId('account-usage-mobile')).toHaveTextContent('7d 100% (2h)')
+        act(() => {
+            vi.advanceTimersByTime(61 * 60_000)
+        })
+        expect(screen.getByTestId('account-usage-mobile')).toHaveTextContent('7d 100% (59m)')
     })
 
     it('opens from the mobile-accessible context trigger and keeps the requested detail order', async () => {
