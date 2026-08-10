@@ -186,6 +186,8 @@ export default {
   'session.item.newActivity': '有新活动',
   'session.item.scheduledMessage': '有待发送的定时消息',
   'session.item.scheduledMessages': '{count} 条定时消息待发送',
+  'session.item.pinnedProject': '项目内置顶',
+  'session.item.pinnedGlobal': '全局置顶',
   'session.tooltip.permission.body': '批准:',
   'session.tooltip.input.body': '回复:',
   'session.tooltip.background.count.one': '1 个任务运行中',

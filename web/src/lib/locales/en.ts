@@ -186,6 +186,8 @@ export default {
   'session.item.newActivity': 'New activity',
   'session.item.scheduledMessage': 'Scheduled message pending',
   'session.item.scheduledMessages': '{count} scheduled messages pending',
+  'session.item.pinnedProject': 'Pinned in project',
+  'session.item.pinnedGlobal': 'Pinned globally',
   'session.tooltip.permission.body': 'Approve:',
   'session.tooltip.input.body': 'Reply to:',
   'session.tooltip.background.count.one': '1 task running',

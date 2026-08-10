@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import type { SessionSummary } from '@/types/api'
 import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
-import { ScheduleIcon } from '@/components/icons'
+import { PinIcon, ScheduleIcon } from '@/components/icons'
 import { HoverTooltip, SESSION_ROW_TOOLTIP_FOCUS_CLASS, useSessionRowTooltipIds } from '@/components/HoverTooltip'
 import { getAttentionLabel, SessionAttentionIndicator } from '@/components/SessionAttentionIndicator'
 import { classifySessionAttention } from '@/lib/sessionAttention'
@@ -158,6 +158,11 @@ export function SessionRowSummary(props: {
     const attentionId = attentionTooltipIdProp ?? ownedIds.attentionId
     const scheduleId = scheduleTooltipIdProp ?? ownedIds.scheduleId
     const timeLabel = getSessionTimeLabel(s, t)
+    const pinLabel = s.globalPinned
+        ? t('session.item.pinnedGlobal')
+        : s.pinned
+            ? t('session.item.pinnedProject')
+            : null
 
     return (
         <div className={`flex w-full min-w-0 flex-col gap-1 ${className ?? ''}`}>
@@ -170,6 +175,15 @@ export function SessionRowSummary(props: {
                     >
                         {sessionName}
                     </div>
+                    {pinLabel ? (
+                        <span
+                            className="inline-flex shrink-0 text-[var(--app-link)]"
+                            title={pinLabel}
+                            aria-label={pinLabel}
+                        >
+                            <PinIcon filled className="h-3.5 w-3.5" />
+                        </span>
+                    ) : null}
                     {s.active && s.thinking ? (
                         <LoaderIcon className="h-3.5 w-3.5 shrink-0 animate-spin-slow text-[var(--app-badge-success-text)]" />
                     ) : urgentAttention && nestedTooltips && attentionId ? (

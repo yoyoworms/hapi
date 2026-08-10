@@ -110,6 +110,25 @@ export function ScheduleIcon(props: IconProps) {
     )
 }
 
+export function PinIcon(props: IconProps & { filled?: boolean }) {
+    return (
+        <svg
+            className={props.className ?? 'h-4 w-4'}
+            viewBox="0 0 24 24"
+            fill={props.filled ? 'currentColor' : 'none'}
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M12 17v5" />
+            <path d="M5 17h14" />
+            <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
+        </svg>
+    )
+}
+
 /** Word-wrap toggle — lines with a wrap-around arrow on the last line. */
 export function WrapIcon(props: IconProps) {
     return createIcon(

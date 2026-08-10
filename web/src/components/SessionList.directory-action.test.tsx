@@ -535,6 +535,8 @@ describe('SessionList collapse behavior', () => {
         const inProgress = screen.getByTitle('In progress')
         const projectPinGroup = screen.getByTitle('/work/pinned-project')
         const otherGroup = screen.getByTitle('/work/other')
+        const globalPanel = globalSection.nextElementSibling as HTMLElement
+        const globalPinRow = within(globalPanel).getByRole('button', { name: /Global pin/ })
         const projectPinPanel = projectPinGroup.nextElementSibling as HTMLElement
         const projectPinRow = within(projectPinPanel).getByRole('button', { name: /Project pin/ })
         const projectIdleRow = within(projectPinPanel).getByRole('button', { name: /Project idle/ })
@@ -546,6 +548,8 @@ describe('SessionList collapse behavior', () => {
         expect(projectPinGroup).toAppearBefore(otherGroup)
         // Intra-group: project pin stays first inside its folder.
         expect(projectPinRow).toAppearBefore(projectIdleRow)
+        expect(within(globalPinRow).getByLabelText('Pinned globally')).toBeInTheDocument()
+        expect(within(projectPinRow).getByLabelText('Pinned in project')).toBeInTheDocument()
         expect(screen.getByRole('button', { name: /Unpinned floater/ })).toBeInTheDocument()
     })
 

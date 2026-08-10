@@ -8,17 +8,7 @@ import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { SessionExportDialog } from '@/components/SessionExportDialog'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
-import { CopyIcon, CheckIcon } from '@/components/icons'
-
-function PinnedSectionIcon(props: { className?: string }) {
-    return (
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className={props.className} aria-hidden="true">
-            <path d="M12 17v5" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" />
-            <path d="M5 17h14" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" />
-            <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
-        </svg>
-    )
-}
+import { CopyIcon, CheckIcon, PinIcon } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
 import { DEFAULT_SESSION_PREVIEW_LIMIT, useSessionPreviewLimit } from '@/hooks/useSessionPreviewLimit'
@@ -1833,7 +1823,7 @@ export function SessionList(props: {
                                 <span className="min-w-0 truncate text-sm font-medium">
                                     {t('sessions.pinnedSection')}
                                 </span>
-                                <PinnedSectionIcon className="h-3.5 w-3.5 shrink-0 -translate-y-px text-[var(--app-hint)]" />
+                                <PinIcon filled className="h-3.5 w-3.5 shrink-0 -translate-y-px text-[var(--app-hint)]" />
                             </span>
                             <span className="min-w-0 flex-1" aria-hidden="true" />
                             <span className="shrink-0 text-[11px] tabular-nums text-[var(--app-hint)]">
