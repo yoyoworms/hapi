@@ -1,14 +1,28 @@
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { z } from 'zod'
 import type { WebAppEnv } from '../middleware/auth'
 import {
+    DEEPGRAM_TRANSCRIPTION_MODEL,
+    ELEVENLABS_REALTIME_TRANSCRIPTION_MODEL,
+    ELEVENLABS_TRANSCRIPTION_MODEL,
     ELEVENLABS_API_BASE,
+    GROQ_TRANSCRIPTION_MODEL,
+    OPENAI_REALTIME_TRANSCRIPTION_MODEL,
+    OPENAI_TRANSCRIPTION_MODEL,
     VOICE_AGENT_NAME,
     buildVoiceAgentConfig,
+    listConfiguredTranscriptionProviders,
     listConfiguredVoiceBackends,
     resolveHubVoiceBackend
 } from '@hapi/protocol/voice'
-import type { VoiceBackendType } from '@hapi/protocol/voice'
+import type { TranscriptionProvider, VoiceBackendType } from '@hapi/protocol/voice'
+import {
+    getProviderEnvironment,
+    getTranscriptionCredentialStatus,
+    updateTranscriptionCredentials,
+} from '../../config/providerCredentials'
+import { getConfiguration } from '../../configuration'
 
 function buildVoiceWsUrl(base: string, pathname: string): string {
     const url = new URL(base)
@@ -33,6 +47,205 @@ const telemetryEventSchema = z.object({
     language: z.string().optional(),
     details: z.record(z.string(), z.unknown()).optional()
 })
+
+const transcriptionProviderSchema = z.enum([
+    'openai',
+    'elevenlabs',
+    'deepgram',
+    'groq',
+    'openai-compatible'
+])
+const realtimeTranscriptionProviderSchema = z.enum(['openai', 'elevenlabs', 'deepgram'])
+const transcriptionLanguageSchema = z.string()
+    .trim()
+    .max(35)
+    .regex(/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i)
+    .optional()
+
+const MAX_TRANSCRIPTION_BYTES = 25 * 1024 * 1024
+const MAX_TRANSCRIPTION_BODY_BYTES = MAX_TRANSCRIPTION_BYTES + 1024 * 1024
+const TRANSCRIPTION_TIMEOUT_MS = 120_000
+const REALTIME_TOKEN_TIMEOUT_MS = 15_000
+const MAX_REALTIME_TOKEN_BODY_BYTES = 8 * 1024
+
+function trimTrailingSlash(value: string): string {
+    return value.replace(/\/+$/, '')
+}
+
+function normalizeOpenAILanguage(language?: string): string | undefined {
+    const value = language?.toLowerCase()
+    if (!value) return undefined
+    return ['zh-cn', 'zh-tw', 'zh-hk'].includes(value) ? value : value.split('-')[0]
+}
+
+function getTranscriptionConfig(provider: TranscriptionProvider): {
+    apiKey?: string
+    baseUrl: string
+    model: string
+} | null {
+    const env = getProviderEnvironment()
+    if (!listConfiguredTranscriptionProviders(env).some((candidate) => candidate.id === provider)) return null
+    switch (provider) {
+        case 'openai':
+            return { apiKey: env.OPENAI_API_KEY!.trim(), baseUrl: 'https://api.openai.com/v1', model: OPENAI_TRANSCRIPTION_MODEL }
+        case 'elevenlabs':
+            return { apiKey: env.ELEVENLABS_API_KEY!.trim(), baseUrl: ELEVENLABS_API_BASE, model: ELEVENLABS_TRANSCRIPTION_MODEL }
+        case 'deepgram':
+            return { apiKey: env.DEEPGRAM_API_KEY!.trim(), baseUrl: 'https://api.deepgram.com/v1', model: DEEPGRAM_TRANSCRIPTION_MODEL }
+        case 'groq':
+            return { apiKey: env.GROQ_API_KEY!.trim(), baseUrl: 'https://api.groq.com/openai/v1', model: GROQ_TRANSCRIPTION_MODEL }
+        case 'openai-compatible': {
+            const baseUrl = env.TRANSCRIPTION_BASE_URL?.trim()
+            const model = env.TRANSCRIPTION_MODEL?.trim()
+            return baseUrl && model
+                ? { apiKey: env.TRANSCRIPTION_API_KEY?.trim(), baseUrl: trimTrailingSlash(baseUrl), model }
+                : null
+        }
+        case 'browser-local':
+            return null
+    }
+}
+
+async function transcribeStandard(
+    provider: TranscriptionProvider,
+    file: File,
+    language?: string
+): Promise<Response> {
+    const config = getTranscriptionConfig(provider)
+    if (!config) return Response.json({ error: `${provider} transcription is not configured` }, { status: 400 })
+
+    let url: string
+    let headers: Record<string, string>
+    let body: File | FormData
+
+    if (provider === 'deepgram') {
+        const query = new URLSearchParams({ model: config.model, smart_format: 'true' })
+        if (language) query.set('language', language)
+        url = `${config.baseUrl}/listen?${query}`
+        headers = {
+            Authorization: `Token ${config.apiKey}`,
+            'Content-Type': file.type || 'application/octet-stream'
+        }
+        body = file
+    } else {
+        const form = new FormData()
+        const baseLanguage = language?.split('-')[0]?.toLowerCase()
+        form.set('file', file, file.name || 'speech.webm')
+        form.set(provider === 'elevenlabs' ? 'model_id' : 'model', config.model)
+        if (baseLanguage) {
+            if (provider === 'elevenlabs') form.set('language_code', baseLanguage)
+            else if (provider === 'openai') form.set('languages[]', normalizeOpenAILanguage(language) ?? baseLanguage)
+            else if (provider === 'openai-compatible') form.set('language', language ?? baseLanguage)
+            else form.set('language', baseLanguage)
+        }
+        url = provider === 'elevenlabs'
+            ? `${config.baseUrl}/speech-to-text`
+            : `${trimTrailingSlash(config.baseUrl)}/audio/transcriptions`
+        headers = provider === 'elevenlabs'
+            ? { 'xi-api-key': config.apiKey ?? '' }
+            : (config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+        body = form
+    }
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers,
+            body,
+            signal: AbortSignal.timeout(TRANSCRIPTION_TIMEOUT_MS)
+        })
+        if (!response.ok) {
+            console.warn('[Voice][Transcription] Upstream request failed', { provider, status: response.status })
+            return Response.json({ error: `${provider} transcription failed (HTTP ${response.status})` }, { status: 502 })
+        }
+        const data = await response.json() as {
+            text?: string
+            language?: string
+            language_code?: string
+            results?: { channels?: Array<{ alternatives?: Array<{ transcript?: string }> }> }
+        }
+        const text = provider === 'deepgram'
+            ? data.results?.channels?.[0]?.alternatives?.[0]?.transcript
+            : data.text
+        return Response.json({ text: text ?? '', language: data.language ?? data.language_code })
+    } catch (error) {
+        console.warn('[Voice][Transcription] Upstream request error', {
+            provider,
+            error: error instanceof Error ? error.message : String(error)
+        })
+        return Response.json({ error: `${provider} transcription request failed` }, { status: 502 })
+    }
+}
+
+async function createRealtimeTranscriptionToken(
+    provider: z.infer<typeof realtimeTranscriptionProviderSchema>,
+    language?: string
+): Promise<Response> {
+    const config = getTranscriptionConfig(provider)
+    if (!config?.apiKey) return Response.json({ error: `${provider} transcription is not configured` }, { status: 400 })
+
+    let url: string
+    let headers: Record<string, string>
+    let body: string | undefined
+
+    switch (provider) {
+        case 'openai': {
+            const openAILanguage = normalizeOpenAILanguage(language)
+            const languages = openAILanguage ? [openAILanguage] : undefined
+            url = 'https://api.openai.com/v1/realtime/client_secrets'
+            headers = { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' }
+            body = JSON.stringify({
+                expires_after: { anchor: 'created_at', seconds: 60 },
+                session: {
+                    type: 'transcription',
+                    audio: {
+                        input: {
+                            transcription: {
+                                model: OPENAI_REALTIME_TRANSCRIPTION_MODEL,
+                                delay: 'low',
+                                ...(languages ? { languages } : {})
+                            },
+                            turn_detection: null
+                        }
+                    }
+                }
+            })
+            break
+        }
+        case 'elevenlabs':
+            url = `${ELEVENLABS_API_BASE}/single-use-token/realtime_scribe`
+            headers = { 'xi-api-key': config.apiKey }
+            break
+        case 'deepgram':
+            url = 'https://api.deepgram.com/v1/auth/grant'
+            headers = { Authorization: `Token ${config.apiKey}`, 'Content-Type': 'application/json' }
+            body = '{}'
+            break
+    }
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers,
+            body,
+            signal: AbortSignal.timeout(REALTIME_TOKEN_TIMEOUT_MS)
+        })
+        if (!response.ok) {
+            console.warn('[Voice][RealtimeTranscription] Token request failed', { provider, status: response.status })
+            return Response.json({ error: `${provider} realtime transcription token failed (HTTP ${response.status})` }, { status: 502 })
+        }
+        const data = await response.json() as { value?: string; token?: string; access_token?: string }
+        const token = data.value ?? data.token ?? data.access_token
+        if (!token) return Response.json({ error: `${provider} realtime transcription returned no token` }, { status: 502 })
+        return Response.json({ token })
+    } catch (error) {
+        console.warn('[Voice][RealtimeTranscription] Token request error', {
+            provider,
+            error: error instanceof Error ? error.message : String(error)
+        })
+        return Response.json({ error: `${provider} realtime transcription token request failed` }, { status: 502 })
+    }
+}
 
 // Cache for auto-created agent IDs (keyed by API key hash)
 const agentIdCache = new Map<string, string>()
@@ -244,21 +457,111 @@ async function getOrCreateAgentIdForVoice(apiKey: string, voiceId?: string): Pro
     return agentId
 }
 
-export function createVoiceRoutes(): Hono<WebAppEnv> {
+const transcriptionCredentialsUpdateSchema = z.object({
+    openai: z.string().nullable().optional(),
+    elevenlabs: z.string().nullable().optional(),
+    deepgram: z.string().nullable().optional(),
+    groq: z.string().nullable().optional(),
+    openaiCompatible: z.object({
+        baseUrl: z.string().nullable().optional(),
+        model: z.string().nullable().optional(),
+        apiKey: z.string().nullable().optional(),
+    }).optional(),
+    geminiLive: z.string().nullable().optional(),
+    qwenRealtime: z.string().nullable().optional(),
+}).strict()
+
+export function createVoiceRoutes(options: { dataDir?: string } = {}): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+    const resolveDataDir = () => options.dataDir ?? getConfiguration().dataDir
 
     // Hub default backend + all backends with credentials configured
     app.get('/voice/backend', (c) => {
-        const backends = listConfiguredVoiceBackends(process.env)
-        const backend = resolveHubVoiceBackend(process.env)
+        const env = getProviderEnvironment()
+        const backends = listConfiguredVoiceBackends(env)
+        const backend = resolveHubVoiceBackend(env)
         return c.json({ backend, backends })
+    })
+
+    app.get('/voice/transcription/providers', (c) => {
+        return c.json({ providers: listConfiguredTranscriptionProviders(getProviderEnvironment()) })
+    })
+
+    app.get('/voice/transcription/credentials', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ error: 'Provider credentials are only available to the hub owner' }, 403)
+        }
+        return c.json(await getTranscriptionCredentialStatus(resolveDataDir()))
+    })
+
+    app.put('/voice/transcription/credentials', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ error: 'Provider credentials are only available to the hub owner' }, 403)
+        }
+        const json = await c.req.json().catch(() => null)
+        const parsed = transcriptionCredentialsUpdateSchema.safeParse(json)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid transcription credentials payload' }, 400)
+        }
+        try {
+            const status = await updateTranscriptionCredentials(resolveDataDir(), parsed.data)
+            return c.json(status)
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to update credentials'
+            if (message.includes('environment variable')) {
+                return c.json({ error: message }, 409)
+            }
+            return c.json({ error: message }, 500)
+        }
+    })
+
+    app.post('/voice/transcription', bodyLimit({
+        maxSize: MAX_TRANSCRIPTION_BODY_BYTES,
+        onError: (c) => c.json({ error: 'Audio file too large' }, 413)
+    }), async (c) => {
+        const form = await c.req.formData().catch(() => null)
+        if (!form) return c.json({ error: 'Invalid form data' }, 400)
+
+        const provider = transcriptionProviderSchema.safeParse(form.get('provider'))
+        const mode = form.get('mode')
+        const file = form.get('file')
+        const languageValue = form.get('language')
+        const language = transcriptionLanguageSchema.safeParse(
+            typeof languageValue === 'string' && languageValue.trim() ? languageValue : undefined
+        )
+
+        if (!provider.success) return c.json({ error: 'Invalid transcription provider' }, 400)
+        if (!language.success) return c.json({ error: 'Invalid transcription language' }, 400)
+        if (mode !== null && mode !== 'standard') return c.json({ error: 'This endpoint only accepts standard transcription' }, 400)
+        if (!(file instanceof File)) return c.json({ error: 'Missing audio file' }, 400)
+        if (file.size === 0 || file.size > MAX_TRANSCRIPTION_BYTES) {
+            return c.json({ error: `Audio file must be between 1 byte and ${MAX_TRANSCRIPTION_BYTES} bytes` }, 400)
+        }
+        if (file.type && !file.type.startsWith('audio/') && file.type !== 'video/webm' && file.type !== 'video/mp4') {
+            return c.json({ error: 'Unsupported audio file type' }, 400)
+        }
+
+        return transcribeStandard(provider.data, file, language.data)
+    })
+
+    app.post('/voice/transcription/realtime-token', bodyLimit({
+        maxSize: MAX_REALTIME_TOKEN_BODY_BYTES,
+        onError: (c) => c.json({ error: 'Realtime token request too large' }, 413)
+    }), async (c) => {
+        const json = await c.req.json().catch(() => null)
+        const provider = realtimeTranscriptionProviderSchema.safeParse(json?.provider)
+        const language = transcriptionLanguageSchema.safeParse(json?.language || undefined)
+        if (!provider.success) return c.json({ error: 'Invalid realtime transcription provider' }, 400)
+        if (!language.success) return c.json({ error: 'Invalid transcription language' }, 400)
+        return createRealtimeTranscriptionToken(provider.data, language.data)
     })
 
     // Get Gemini API key for Gemini Live voice sessions
     // Gemini Live API does not support ephemeral tokens, so we proxy the key.
     // The key is short-lived in the browser session and never persisted client-side.
     app.post('/voice/gemini-token', async (c) => {
-        const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
+        const env = getProviderEnvironment()
+        const apiKey = env.GEMINI_API_KEY || env.GOOGLE_API_KEY
         if (!apiKey) {
             return c.json({
                 allowed: false,
@@ -285,7 +588,8 @@ export function createVoiceRoutes(): Hono<WebAppEnv> {
     // Check Qwen (DashScope) availability for Qwen Realtime voice sessions
     // The actual API key is never sent to the browser — it stays server-side in the WS proxy.
     app.post('/voice/qwen-token', async (c) => {
-        const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY
+        const env = getProviderEnvironment()
+        const apiKey = env.DASHSCOPE_API_KEY || env.QWEN_API_KEY
         if (!apiKey) {
             return c.json({
                 allowed: false,
@@ -316,7 +620,7 @@ export function createVoiceRoutes(): Hono<WebAppEnv> {
         const { customAgentId, customApiKey, voiceId } = parsed.data
 
         // Use custom credentials if provided, otherwise fall back to env vars
-        const apiKey = customApiKey || process.env.ELEVENLABS_API_KEY
+        const apiKey = customApiKey || getProviderEnvironment().ELEVENLABS_API_KEY
         const voiceAgentMap = parseVoiceAgentMap()
         const mappedAgentId = voiceId ? voiceAgentMap[voiceId] : undefined
         let agentId = customAgentId || mappedAgentId
@@ -430,7 +734,7 @@ export function createVoiceRoutes(): Hono<WebAppEnv> {
     // Get available ElevenLabs voices (includes user's voice clones)
     app.get('/voice/voices', async (c) => {
         const requestId = crypto.randomUUID()
-        const apiKey = process.env.ELEVENLABS_API_KEY
+        const apiKey = getProviderEnvironment().ELEVENLABS_API_KEY
         if (!apiKey) {
             console.warn('[Voice][Voices] Missing API key, returning empty voices list', { requestId })
             return c.json({ voices: [] })

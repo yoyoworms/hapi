@@ -48,7 +48,7 @@ export function getAutoArchiveBlockReason(
     if (metadata.lifecycleState !== 'running') {
         return 'not-running'
     }
-    if (metadata.pinnedAt != null) {
+    if (session.pinned || session.globalPinned || metadata.pinnedAt != null) {
         return 'pinned'
     }
     if (session.agentState?.controlledByUser === true) {

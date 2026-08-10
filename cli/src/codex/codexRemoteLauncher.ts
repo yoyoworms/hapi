@@ -1,6 +1,5 @@
 import React from 'react';
 import { randomUUID } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
 
 import { CodexAppServerClient } from './codexAppServerClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
@@ -14,7 +13,7 @@ import type { CodexSession } from './session';
 import type { EnhancedMode } from './loop';
 import { hasCodexCliOverrides } from './utils/codexCliOverrides';
 import { AppServerEventConverter } from './utils/appServerEventConverter';
-import { detectImageMimeType, registerGeneratedImage } from '@/modules/common/generatedImages';
+import { registerGeneratedImageFromPath } from '@/modules/common/generatedImages';
 import { registerAppServerPermissionHandlers } from './utils/appServerPermissionAdapter';
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
 import type { SkillMetadata, ThreadGoal, ThreadGoalStatus } from './appServerTypes';
@@ -29,38 +28,29 @@ import {
     type RemoteLauncherDisplayContext,
     type RemoteLauncherExitReason
 } from '@/modules/common/remote/RemoteLauncherBase';
+import { CodexConversationHistory } from './conversationHistory';
 
 
-async function registerGeneratedImageFromPath(args: { id: string; path: string; fileName?: string | null }): Promise<ReturnType<typeof registerGeneratedImage> | null> {
-    try {
-        const info = await lstat(args.path);
-        if (!info.isFile()) {
-            throw new Error('Path is not a regular file');
-        }
-        const maxImageBytes = 25 * 1024 * 1024;
-        if (info.size > maxImageBytes) {
-            throw new Error('Image is too large to display inline');
-        }
-        const bytes = await readFile(args.path);
-        const mimeType = detectImageMimeType(bytes);
-        if (!mimeType) {
-            throw new Error('Unsupported image content');
-        }
-        return registerGeneratedImage({
-            id: args.id,
-            path: args.path,
-            fileName: args.fileName,
-            mimeType,
-            bytes
-        });
-    } catch (error) {
-        logger.debug('[CodexRemoteLauncher] Failed to register generated image:', error instanceof Error ? error.message : String(error));
-        return null;
+async function registerGeneratedImageFromPathWrapper(args: { id: string; path: string; fileName?: string | null }): Promise<Awaited<ReturnType<typeof registerGeneratedImageFromPath>> | null> {
+    const image = await registerGeneratedImageFromPath({
+        id: args.id,
+        path: args.path,
+        fileName: args.fileName
+    });
+    if (!image) {
+        logger.debug('[CodexRemoteLauncher] Failed to register generated image from path');
     }
+    return image;
 }
 
 type HappyServer = Awaited<ReturnType<typeof buildHapiMcpBridge>>['server'];
-type QueuedMessage = { message: string; mode: EnhancedMode; isolate: boolean; hash: string };
+type QueuedMessage = {
+    message: string;
+    mode: EnhancedMode;
+    isolate: boolean;
+    hash: string;
+    items?: Array<{ message: string; localId?: string }>;
+};
 type ChildAgentRuntime = {
     reasoningProcessor: ReasoningProcessor;
     diffProcessor: DiffProcessor;
@@ -83,6 +73,7 @@ const THROTTLED_AGENT_RUN_ACTIVITY_KINDS = new Set(['thinking']);
 const CODEX_SPAWN_AGENT_FULL_HISTORY_ARGUMENT_ERROR =
     'Full-history forked agents inherit the parent agent type, model, and reasoning effort; ' +
     'omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.';
+const PLAN_MODE_NOT_SUPPORTED_MESSAGE = 'Plan mode is not supported by this Codex runtime.';
 
 function formatCodexResumeError(error: unknown): string {
     const info = extractErrorInfo(error);
@@ -232,6 +223,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
     private currentThreadId: string | null = null;
     private currentTurnId: string | null = null;
     private readonly activeChildTurns = new Map<string, string>();
+    readonly conversationHistory = new CodexConversationHistory(() => this.appServerClient);
     private resetActiveTurnState: (() => void) | null = null;
     private hasActiveTurnState: (() => boolean) | null = null;
     private hasInFlightParentTurn: (() => boolean) | null = null;
@@ -1018,6 +1010,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         let scheduleReadyAfterTurn: (() => void) | null = null;
         let clearReadyAfterTurnTimer: (() => void) | null = null;
         let turnInFlight = false;
+        let usageModel: string | null = null;
         let turnPreparationInFlight = false;
         let allowAnonymousTerminalEvent = false;
         let invalidThreadId: string | null = null;
@@ -2540,6 +2533,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             diffProcessor.reset();
             appServerEventConverter.reset();
             session.onThinkingChange(false);
+            this.conversationHistory.setBusy(false);
         };
         this.resetActiveTurnState = () => {
             resetCurrentTurnState();
@@ -2629,7 +2623,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             });
                             if (
                                 pendingThreadIdleFallback !== fallback
-                                || response.thread.status.type !== 'idle'
+                                || response.thread.status?.type !== 'idle'
                             ) {
                                 return;
                             }
@@ -2668,7 +2662,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             });
                             if (
                                 pendingChildThreadIdleFallbacks.get(threadId) !== fallback
-                                || response.thread.status.type !== 'idle'
+                                || response.thread.status?.type !== 'idle'
                             ) {
                                 return;
                             }
@@ -2943,6 +2937,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 if (threadId) {
                     if (!this.currentThreadId || this.currentThreadId === threadId) {
                         this.currentThreadId = threadId;
+                        this.conversationHistory.setThreadId(threadId);
+                        void this.conversationHistory.probeCapabilities().catch(() => {});
                         session.onSessionFound(threadId);
                     } else {
                         logger.debug(
@@ -3063,7 +3059,25 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return;
             }
 
-            if (isTerminalEvent && eventTurnId && eventTurnId === lastFinalizedTurnId) {
+            // Codex can immediately replay the just-finalized completion while
+            // a same-thread retry is being prepared. Treat that replay as the
+            // authoritative recovery terminal instead of leaving HAPI busy.
+            const isStaleSameThreadRecoveryTerminal = msgType === 'task_complete'
+                && turnInFlight
+                && (sameThreadRetryAttempt > 0 || sameThreadCompactAttempt > 0)
+                && Boolean(eventTurnId)
+                && eventTurnId === lastFinalizedTurnId
+                && Boolean(this.currentTurnId)
+                && eventTurnId !== this.currentTurnId
+                && Boolean(eventThreadId)
+                && eventThreadId === this.currentThreadId;
+
+            if (
+                isTerminalEvent
+                && eventTurnId
+                && eventTurnId === lastFinalizedTurnId
+                && !isStaleSameThreadRecoveryTerminal
+            ) {
                 logger.debug(`[Codex] Ignoring duplicate terminal event for turn ${eventTurnId}`);
                 return;
             }
@@ -3268,7 +3282,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     allowAnonymousTerminalEvent,
                     eventThreadId,
                     currentThreadId: this.currentThreadId,
-                    allowMatchingThreadIdTerminalEvent: msg.terminal_source === 'thread_status'
+                    allowMatchingThreadIdTerminalEvent: msg.terminal_source === 'thread_status',
+                    allowMismatchedTurnIdTerminalEvent: isStaleSameThreadRecoveryTerminal
                 })) {
                     logger.debug(
                         `[Codex] Ignoring terminal event ${msgType} without matching turn context; ` +
@@ -3368,6 +3383,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'task_started') {
                 clearReadyAfterTurnTimer?.();
                 turnInFlight = true;
+                this.conversationHistory.setBusy(true);
                 if (!eventTurnId && !this.currentTurnId) {
                     allowAnonymousTerminalEvent = true;
                 }
@@ -3378,6 +3394,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             if (isTerminalEvent) {
                 turnInFlight = false;
+                this.conversationHistory.setBusy(false);
                 allowAnonymousTerminalEvent = false;
                 if (session.thinking) {
                     logger.debug('thinking completed');
@@ -3475,7 +3492,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const imageId = randomUUID();
                 const savedPath = asString(msg.saved_path ?? msg.savedPath);
                 if (savedPath) {
-                    const image = await registerGeneratedImageFromPath({
+                    const image = await registerGeneratedImageFromPathWrapper({
                         id: imageId,
                         path: savedPath,
                         fileName: asString(msg.file_name ?? msg.fileName)
@@ -3489,7 +3506,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         sourceImageId,
                         fileName: image.fileName,
                         mimeType: image.mimeType,
-                        id: randomUUID()
+                        id: randomUUID(),
+                        source: {
+                            ingress: 'tool_result',
+                            flavor: 'codex',
+                            toolCallId: asString(msg.call_id ?? msg.callId)
+                        }
                     });
                 }
             }
@@ -3545,6 +3567,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadId = eventThreadId ?? this.currentThreadId;
                 session.sendAgentMessage({
                     ...addCodexEventScope(msg, 'parent', threadId),
+                    model: asString(msg.model) ?? usageModel,
                     id: randomUUID()
                 });
             }
@@ -3882,6 +3905,49 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
         });
 
+        const publishConversationHistoryCapabilities = async () => {
+            const conversationHistory = this.conversationHistory.getCapabilitiesForMetadata()?.conversationHistory;
+            try {
+                session.client.updateMetadata((metadata) => {
+                    const capabilities = { ...metadata?.capabilities };
+                    delete capabilities.conversationHistory;
+                    if (conversationHistory) {
+                        capabilities.conversationHistory = conversationHistory;
+                    }
+                    return {
+                        ...metadata,
+                        path: metadata?.path ?? session.path,
+                        host: metadata?.host ?? 'unknown',
+                        capabilities
+                    };
+                });
+            } catch {
+                // Best effort: transient hub disconnects must not stop Codex.
+            }
+        };
+        this.conversationHistory.setPublishCapabilities(publishConversationHistoryCapabilities);
+        this.conversationHistory.restoreTurns(
+            typeof session.client.getMetadata === 'function'
+                ? session.client.getMetadata()?.conversationHistoryTurns
+                : undefined
+        );
+        session.client.rpcHandlerManager.registerHandler(RPC_METHODS.ForkConversation, async (payload: unknown) => {
+            const messageLocalId = payload && typeof payload === 'object'
+                && typeof (payload as { messageLocalId?: unknown }).messageLocalId === 'string'
+                ? (payload as { messageLocalId: string }).messageLocalId
+                : undefined;
+            return await this.conversationHistory.fork(messageLocalId);
+        });
+        session.client.rpcHandlerManager.registerHandler(RPC_METHODS.RewindConversation, async (payload: unknown) => {
+            if (!payload || typeof payload !== 'object'
+                || typeof (payload as { messageLocalId?: unknown }).messageLocalId !== 'string') {
+                throw new Error('messageLocalId is required');
+            }
+            return await this.conversationHistory.rewind(
+                (payload as { messageLocalId: string }).messageLocalId
+            );
+        });
+
         try {
             await refreshNativeSkills(false);
         } catch (error) {
@@ -4087,6 +4153,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadId = asString(resumeThread?.id) ?? resumeCandidate;
                 applyResolvedModel(resumeRecord?.model);
                 this.currentThreadId = threadId;
+                this.conversationHistory.setThreadId(threadId);
+                void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
                 logger.debug(`[Codex] Resumed app-server thread ${threadId} for /compact`);
@@ -4152,6 +4220,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     const threadId = asString(resumeThread?.id) ?? resumeCandidate;
                     applyResolvedModel(resumeRecord?.model);
                     this.currentThreadId = threadId;
+                    this.conversationHistory.setThreadId(threadId);
+                    void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
                     return threadId;
@@ -4183,6 +4253,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     throw new Error('app-server thread/start did not return thread.id');
                 }
                 this.currentThreadId = threadId;
+                this.conversationHistory.setThreadId(threadId);
+                void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
                 return threadId;
@@ -4503,6 +4575,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     }
 
                     this.currentThreadId = threadId;
+                    this.conversationHistory.setThreadId(threadId);
+                    void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
                 } else {
@@ -4518,14 +4592,38 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     ...message.mode,
                     model: session.getModel() ?? message.mode.model
                 };
+                usageModel = typeof mode.model === 'string' && mode.model.trim()
+                    ? mode.model.trim()
+                    : null;
                 const shouldSendCollaborationMode = supportsTurnCollaborationMode
                     && Boolean(mode.collaborationMode);
+                const clientUserMessageId = message.items
+                    ?.map((item) => item.localId)
+                    .find((id): id is string => typeof id === 'string' && id.length > 0);
+                const rememberConversationHistoryTurn = (turnId: string) => {
+                    if (!clientUserMessageId) return;
+                    this.conversationHistory.rememberLocalIdTurn(clientUserMessageId, turnId);
+                    session.client.updateMetadata((metadata) => ({
+                        ...metadata,
+                        path: metadata?.path ?? session.path,
+                        host: metadata?.host ?? 'unknown',
+                        conversationHistoryPoints: {
+                            ...metadata?.conversationHistoryPoints,
+                            [clientUserMessageId]: true as const
+                        },
+                        conversationHistoryTurns: {
+                            ...metadata?.conversationHistoryTurns,
+                            [clientUserMessageId]: turnId
+                        }
+                    }));
+                };
                 const buildParams = (suppressCollaborationMode: boolean) => buildTurnStartParams({
                     threadId: this.currentThreadId!,
                     message: message.message,
                     cwd: session.path,
                     mode,
                     cliOverrides: session.codexCliOverrides,
+                    clientUserMessageId,
                     skills: nativeSkills,
                     overrides: suppressCollaborationMode
                         ? { suppressCollaborationMode: true }
@@ -4571,6 +4669,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                                 `expected=${expectedTurnId}, returned=${steerResponse.turnId}`
                             );
                         }
+                        rememberConversationHistoryTurn(expectedTurnId);
                     } catch (error) {
                         if (error instanceof Error && error.name === 'AbortError') {
                             throw error;
@@ -4591,6 +4690,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 }
 
                 turnInFlight = true;
+                this.conversationHistory.setBusy(true);
                 allowAnonymousTerminalEvent = false;
                 if (!session.thinking) {
                     session.onThinkingChange(true);
@@ -4599,10 +4699,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     mode.collaborationMode === 'plan'
                     && !supportsTurnCollaborationMode
                 ) {
-                    session.sendSessionEvent({
-                        type: 'message',
-                        message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
-                    });
+                    throw new Error(PLAN_MODE_NOT_SUPPORTED_MESSAGE);
                 }
                 let turnResponse: unknown;
                 try {
@@ -4613,10 +4710,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     if (shouldSendCollaborationMode && shouldRetryWithoutCollaborationMode(error)) {
                         supportsTurnCollaborationMode = false;
                         if (mode.collaborationMode === 'plan') {
-                            session.sendSessionEvent({
-                                type: 'message',
-                                message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
-                            });
+                            throw new Error(PLAN_MODE_NOT_SUPPORTED_MESSAGE);
                         }
                         turnResponse = await appServerClient.startTurn(buildParams(true), {
                             signal: this.abortController.signal
@@ -4632,6 +4726,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 if (turnInFlight) {
                     if (turnId) {
                         this.currentTurnId = turnId;
+                        rememberConversationHistoryTurn(turnId);
                         if (
                             this.currentThreadId
                             && this.trackLateParentTurnForAbort(this.currentThreadId, turnId)
@@ -4646,12 +4741,17 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 logger.warn('Error in codex session:', error);
                 const isAbortError = error instanceof Error && error.name === 'AbortError';
                 turnInFlight = false;
+                this.conversationHistory.setBusy(false);
                 allowAnonymousTerminalEvent = false;
                 this.currentTurnId = null;
 
                 if (isAbortError) {
                     messageBuffer.addMessage('Aborted by user', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Aborted by user' });
+                } else if (error instanceof Error && error.message === PLAN_MODE_NOT_SUPPORTED_MESSAGE) {
+                    const message = `Task failed: ${PLAN_MODE_NOT_SUPPORTED_MESSAGE}`;
+                    messageBuffer.addMessage(message, 'status');
+                    session.sendSessionEvent({ type: 'message', message });
                 } else {
                     messageBuffer.addMessage('Process exited unexpectedly', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });

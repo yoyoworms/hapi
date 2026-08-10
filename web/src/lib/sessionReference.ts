@@ -1,6 +1,8 @@
 import type { SessionSummary } from '@/types/api'
 import { normalizeSearch, sessionMatchesQuery } from '@/components/SessionList'
+import { truncateGraphemes } from '@/lib/graphemes'
 import { getSessionTitle } from '@/lib/sessionTitle'
+import { SESSION_REFERENCE_STEER_SUFFIX } from '@hapi/protocol/sessionCitation'
 
 export function buildSessionReferencePath(sessionId: string): string {
     const base = import.meta.env.BASE_URL ?? '/'
@@ -9,17 +11,17 @@ export function buildSessionReferencePath(sessionId: string): string {
 }
 
 function sanitizeSessionReferenceTitle(sessionTitle: string): string {
-    return sessionTitle.replace(/\s+/g, ' ').trim().slice(0, 120)
+    return truncateGraphemes(sessionTitle.replace(/\s+/g, ' ').trim(), 120)
 }
 
 /** Clipboard text for citing this session in another HAPI chat (not a public share link). */
 export function buildSessionReferenceText(sessionTitle: string, sessionId: string): string {
     const path = buildSessionReferencePath(sessionId)
     const title = sanitizeSessionReferenceTitle(sessionTitle)
-    if (title) {
-        return `See session ${JSON.stringify(title)} (${path}) for context`
-    }
-    return `See HAPI session ${path} for context`
+    const base = title
+        ? `See session ${JSON.stringify(title)} (${path}) for context`
+        : `See HAPI session ${path} for context`
+    return `${base}.${SESSION_REFERENCE_STEER_SUFFIX}`
 }
 
 export type MatchSessionsForMentionOptions = {

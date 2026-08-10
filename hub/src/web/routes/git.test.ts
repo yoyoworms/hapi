@@ -58,6 +58,29 @@ describe('generated images route', () => {
         // The whole point: a cache hit must not touch the CLI over the socket.
         expect(rpcCalls).toBe(0)
     })
+
+    it('serves audio inline and generic files as downloads with nosniff', async () => {
+        const session = { id: 'session-1', namespace: 'default', active: true } as unknown as Session
+        let mimeType = 'audio/wav'
+        const engine = {
+            resolveSessionAccess: () => ({ ok: true as const, sessionId: 'session-1', session }),
+            readGeneratedImage: async () => ({
+                success: true,
+                content: Buffer.from('media').toString('base64'),
+                mimeType,
+                fileName: mimeType === 'audio/wav' ? 'sample.wav' : 'archive.bin'
+            })
+        } as unknown as Partial<SyncEngine>
+
+        const audio = await buildApp(engine).request('/api/sessions/session-1/generated-images/audio-1')
+        expect(audio.headers.get('content-disposition')).toStartWith('inline;')
+        expect(audio.headers.get('x-content-type-options')).toBe('nosniff')
+
+        mimeType = 'application/octet-stream'
+        const file = await buildApp(engine).request('/api/sessions/session-1/generated-images/file-1')
+        expect(file.headers.get('content-disposition')).toStartWith('attachment;')
+        expect(file.headers.get('content-type')).toContain('application/octet-stream')
+    })
 })
 
 describe('session file relay', () => {
@@ -116,6 +139,67 @@ describe('file search route', () => {
             files: [
                 { fileName: 'large.txt', filePath: 'src', fullPath: 'src/large.txt', fileType: 'file', size: 500, modified: 200 },
                 { fileName: 'small.txt', filePath: 'src', fullPath: 'src/small.txt', fileType: 'file', size: 10, modified: 100 },
+            ]
+        })
+    })
+
+    it('normalizes ripgrep path separators before deriving file names and directories', async () => {
+        const session = {
+            id: 'session-1',
+            namespace: 'default',
+            active: true,
+            metadata: { path: 'C:\\project' }
+        } as unknown as Session
+        const engine = {
+            resolveSessionAccess: () => ({ ok: true as const, sessionId: 'session-1', session }),
+            runRipgrep: async () => ({
+                success: true,
+                stdout: 'src\\nested\\file.ts\nroot.ts\n'
+            }),
+            statFiles: async (_sessionId: string, paths: string[]) => ({
+                success: true,
+                entries: paths.map((path) => ({ path, size: 10, modified: 100 }))
+            })
+        } as unknown as Partial<SyncEngine>
+
+        const response = await buildApp(engine).request('/api/sessions/session-1/files?query=.ts')
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({
+            success: true,
+            files: [
+                { fileName: 'file.ts', filePath: 'src/nested', fullPath: 'src/nested/file.ts', fileType: 'file', size: 10, modified: 100 },
+                { fileName: 'root.ts', filePath: '', fullPath: 'root.ts', fileType: 'file', size: 10, modified: 100 },
+            ]
+        })
+    })
+
+    it('preserves backslashes in file names for non-Windows sessions', async () => {
+        const session = {
+            id: 'session-1',
+            namespace: 'default',
+            active: true,
+            metadata: { path: '/project' }
+        } as unknown as Session
+        const engine = {
+            resolveSessionAccess: () => ({ ok: true as const, sessionId: 'session-1', session }),
+            runRipgrep: async () => ({
+                success: true,
+                stdout: 'src/file\\name.ts\n'
+            }),
+            statFiles: async (_sessionId: string, paths: string[]) => ({
+                success: true,
+                entries: paths.map((path) => ({ path, size: 10, modified: 100 }))
+            })
+        } as unknown as Partial<SyncEngine>
+
+        const response = await buildApp(engine).request('/api/sessions/session-1/files?query=.ts')
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({
+            success: true,
+            files: [
+                { fileName: 'file\\name.ts', filePath: 'src', fullPath: 'src/file\\name.ts', fileType: 'file', size: 10, modified: 100 },
             ]
         })
     })

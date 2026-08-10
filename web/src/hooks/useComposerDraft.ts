@@ -1,45 +1,35 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { clearDraft, getDraft, saveDraft } from '@/lib/composer-drafts'
+import { useEffect, useRef, useState } from 'react'
+import { getDraft, saveDraft } from '@/lib/composer-drafts'
 import {
-    clearDraftAttachments,
     getDraftAttachments,
+    getRestoredUploadMetadata,
     saveDraftAttachments,
     type AttachmentDraftInput,
 } from '@/lib/composer-attachment-drafts'
+import { persistInactiveComposerAttachments, composerDraftWasHandedOff } from '@/lib/composer-draft-transfer'
 
-const DRAFT_SAVE_DEBOUNCE_MS = 250
-
-function attachmentDraftSetsEqual(
-    left: readonly AttachmentDraftInput[],
-    right: readonly AttachmentDraftInput[],
-): boolean {
-    if (left.length !== right.length) return false
-    return left.every((attachment, index) => {
-        const other = right[index]
-        return other !== undefined
-            && attachment.id === other.id
-            && attachment.file === other.file
-            && attachment.path === other.path
-            && attachment.previewUrl === other.previewUrl
-    })
+export type ComposerDraftHydration = {
+    /** Session represented by this status; prevents a previous session's ready state leaking across a key change. */
+    sessionId: string | undefined
+    complete: boolean
+    /** True when this hydration found and applied a persisted text or attachment draft. */
+    restoredAny: boolean
+    /** True when IndexedDB still holds attachment blobs (even if not restored into the adapter). */
+    hasStoredAttachments: boolean
 }
-
-export type ComposerDraftController = Readonly<{
-    /** Snapshot the draft before assistant-ui clears it synchronously. */
-    prepareForSubmit: (textOverride?: string) => void
-    /** Finalize a destination (currently scratchlist) that has durably accepted it. */
-    completeSubmission: () => void
-    /** Rehydrate the retained attachment snapshot after an async rejection. */
-    restoreAttachments: (draftSessionId?: string) => Promise<void>
-}>
 
 /**
  * Manages draft save/restore lifecycle for a composer.
  *
- * assistant-ui clears text before invoking `onNew` and removes attachments
- * before the async destination settles. `prepareForSubmit` snapshots both and
- * marks the next empty transition as transient. A later success explicitly
- * clears that snapshot; a rejection restores it.
+ * - On mount: restores saved draft via `setText` (deferred by one animation frame)
+ * - On mount: restores saved attachment files through the composer adapter
+ * - On unmount: saves current text and attachment files as a draft
+ * - The `draftReady` guard prevents saving before the initial restore completes,
+ *   avoiding the case where the runtime's empty initial text overwrites a real draft.
+ *
+ * The returned status is deliberately session-keyed. Consumers that must not
+ * overwrite persisted drafts (for example failed-send recovery after a keyed
+ * remount) can wait until `complete` and then respect `restoredAny`.
  */
 export function useComposerDraft(
     sessionId: string | undefined,
@@ -48,298 +38,167 @@ export function useComposerDraft(
     canRestoreAttachments: boolean,
     setText: (text: string) => void,
     addAttachment: (file: File) => Promise<void>,
-): ComposerDraftController {
+): ComposerDraftHydration {
     const composerTextRef = useRef(composerText)
     composerTextRef.current = composerText
     const attachmentsRef = useRef(attachments)
     attachmentsRef.current = attachments
-    const addAttachmentRef = useRef(addAttachment)
-    addAttachmentRef.current = addAttachment
-    const setTextRef = useRef(setText)
-    setTextRef.current = setText
 
     const draftReadyRef = useRef(false)
     const attachmentsReadyRef = useRef(false)
-    const pendingTextClearRef = useRef(false)
-    const pendingAttachmentsClearRef = useRef(false)
-    const preserveEmptyTextDraftRef = useRef(false)
-    const preserveEmptyAttachmentDraftRef = useRef(false)
-    const previousHasAttachmentsRef = useRef(attachments.length > 0)
-    const lastPersistedAttachmentSetRef = useRef<{
-        sessionId: string
-        attachments: readonly AttachmentDraftInput[]
-    } | null>(null)
-    const attachmentRestoreOccupiedRef = useRef(false)
-    const pendingAttachmentRestoreSessionRef = useRef<string | null>(null)
-    const restoreQueueRef = useRef<Promise<void>>(Promise.resolve())
-    const lifecycleGenerationRef = useRef(0)
-
-    const restoreAttachments = useCallback(async (draftSessionId?: string): Promise<void> => {
-        const sourceSessionId = draftSessionId ?? sessionId
-        if (!sourceSessionId) return
-        if (!canRestoreAttachments) {
-            // A session can become inactive between upload and POST failure.
-            // Remember the source so reopening it can finish the restoration.
-            pendingAttachmentRestoreSessionRef.current = sourceSessionId
-            return
-        }
-        pendingAttachmentRestoreSessionRef.current = null
-        const generation = lifecycleGenerationRef.current
-
-        const task = restoreQueueRef.current.catch(() => {}).then(async () => {
-            if (generation !== lifecycleGenerationRef.current) return
-            if (attachmentsRef.current.length > 0 || attachmentRestoreOccupiedRef.current) return
-
-            const files = await getDraftAttachments(sourceSessionId)
-            if (generation !== lifecycleGenerationRef.current) return
-            if (attachmentsRef.current.length > 0 || attachmentRestoreOccupiedRef.current) return
-            if (files.length === 0) return
-
-            // Reserve the empty composer before the first await. Mount restore,
-            // local rejection, and route-level mutation errors can all arrive
-            // together; only the first may add this attachment set.
-            attachmentRestoreOccupiedRef.current = true
-            let restored = 0
-            for (const file of files) {
-                if (generation !== lifecycleGenerationRef.current) break
-                try {
-                    await addAttachmentRef.current(file)
-                    restored += 1
-                } catch {
-                    // One corrupt/expired draft must not block the rest.
-                }
-            }
-            if (restored === 0) attachmentRestoreOccupiedRef.current = false
-        })
-        restoreQueueRef.current = task
-        await task
-    }, [canRestoreAttachments, sessionId])
+    const [hydration, setHydration] = useState<ComposerDraftHydration>(() => ({
+        sessionId,
+        complete: sessionId === undefined,
+        restoredAny: false,
+        hasStoredAttachments: false,
+    }))
 
     useEffect(() => {
-        if (!sessionId) return
+        if (!sessionId) {
+            setHydration({
+                sessionId: undefined,
+                complete: true,
+                restoredAny: false,
+                hasStoredAttachments: false,
+            })
+            return
+        }
 
-        lifecycleGenerationRef.current += 1
-        const generation = lifecycleGenerationRef.current
+        draftReadyRef.current = false
+        attachmentsReadyRef.current = false
+        setHydration({
+            sessionId,
+            complete: false,
+            restoredAny: false,
+            hasStoredAttachments: false,
+        })
+
         let disposed = false
         const frame = requestAnimationFrame(() => {
             const draft = getDraft(sessionId)
-            if (draft && !composerTextRef.current && !preserveEmptyTextDraftRef.current) {
-                setTextRef.current(draft)
+            const restoreText = Boolean(draft && !composerTextRef.current)
+            if (restoreText) {
+                // Mark before the external composer store gets its render so a
+                // consumer never mistakes this persisted replacement for empty.
+                setHydration({
+                    sessionId,
+                    complete: false,
+                    restoredAny: true,
+                    hasStoredAttachments: false,
+                })
+                setText(draft!)
             }
             draftReadyRef.current = true
-            if (canRestoreAttachments) {
-                const requestedSource = pendingAttachmentRestoreSessionRef.current
-                if (preserveEmptyAttachmentDraftRef.current && !requestedSource) {
-                    attachmentsReadyRef.current = true
-                    return
-                }
-                void restoreAttachments(requestedSource ?? sessionId).finally(() => {
-                    if (!disposed && generation === lifecycleGenerationRef.current) {
-                        attachmentsReadyRef.current = true
-                    }
+
+            if (!canRestoreAttachments) {
+                // Peek at stored blobs without restoring them into the inactive
+                // adapter so schedule/exclusion UI still knows they exist.
+                void getDraftAttachments(sessionId).then((files) => {
+                    if (disposed) return
+                    setHydration({
+                        sessionId,
+                        complete: true,
+                        restoredAny: restoreText,
+                        hasStoredAttachments: files.length > 0,
+                    })
+                }).catch(() => {
+                    if (disposed) return
+                    setHydration({
+                        sessionId,
+                        complete: true,
+                        restoredAny: restoreText,
+                        hasStoredAttachments: false,
+                    })
                 })
+                return
             }
+
+            void getDraftAttachments(sessionId).then(async (files) => {
+                // The promise belongs to this session's effect. A later keyed
+                // session can already be hydrating when it settles, so never
+                // publish old status or rehydrate old files after disposal.
+                if (disposed) return
+                // Same-id resume can flip inactive→active with a newly visible
+                // pick already in the adapter. Restore only missing stored ids
+                // instead of skipping the whole draft when anything is visible.
+                const visibleIds = new Set(attachmentsRef.current.map((item) => item.id))
+                const filesToRestore = files.filter((file) => {
+                    const id = getRestoredUploadMetadata(file)?.id
+                    return !id || !visibleIds.has(id)
+                })
+                // Text is already known to be restored; attachment presence by
+                // itself is not. An upload can fail, so only successful adds
+                // contribute to restoredAny in the final completion update.
+                setHydration((current) => current.sessionId === sessionId
+                    ? {
+                        sessionId,
+                        complete: false,
+                        restoredAny: restoreText || current.restoredAny,
+                        hasStoredAttachments: files.length > 0,
+                    }
+                    : current)
+                let restoredAttachment = false
+                if (filesToRestore.length > 0) {
+                    for (const file of filesToRestore) {
+                        if (disposed) break
+                        try {
+                            await addAttachment(file)
+                            restoredAttachment = true
+                        } catch {
+                            // Continue restoring remaining files; one failed
+                            // attachment must not discard a successful sibling.
+                        }
+                    }
+                }
+                return { restoredAttachment, hasStoredAttachments: files.length > 0 }
+            }).catch(() => {
+                // Attachment draft read is best effort.
+                return { restoredAttachment: false, hasStoredAttachments: false }
+            }).then((result) => {
+                if (!disposed) {
+                    attachmentsReadyRef.current = true
+                    setHydration((current) => current.sessionId === sessionId
+                        ? {
+                            ...current,
+                            complete: true,
+                            restoredAny: current.restoredAny || Boolean(result?.restoredAttachment),
+                            hasStoredAttachments: Boolean(result?.hasStoredAttachments),
+                        }
+                        : current)
+                }
+            })
         })
 
         return () => {
             disposed = true
             cancelAnimationFrame(frame)
-            lifecycleGenerationRef.current += 1
-            if (draftReadyRef.current) {
-                if (!(composerTextRef.current.length === 0 && preserveEmptyTextDraftRef.current)) {
-                    saveDraft(sessionId, composerTextRef.current)
-                }
+            // Cross-session resume already moved this draft; do not recreate the
+            // obsolete source id after the route change unmounts the composer.
+            if (composerDraftWasHandedOff(sessionId)) {
+                draftReadyRef.current = false
+                attachmentsReadyRef.current = false
+                return
             }
-            if (attachmentsRef.current.length > 0) {
+            if (draftReadyRef.current) {
+                saveDraft(sessionId, composerTextRef.current)
+            }
+            if (canRestoreAttachments && (attachmentsRef.current.length > 0 || attachmentsReadyRef.current)) {
                 saveDraftAttachments(sessionId, [...attachmentsRef.current])
-            } else if (
-                canRestoreAttachments
-                && attachmentsReadyRef.current
-                && !preserveEmptyAttachmentDraftRef.current
-            ) {
-                saveDraftAttachments(sessionId, [])
+            } else if (!canRestoreAttachments && attachmentsRef.current.length > 0) {
+                // Merge visible pending picks into IndexedDB; do not replace the
+                // hidden stored list with only the incomplete visible set.
+                void persistInactiveComposerAttachments(
+                    sessionId,
+                    composerTextRef.current,
+                    attachmentsRef.current,
+                ).catch((error) => {
+                    console.warn('[composer-draft] inactive persistence failed', error)
+                })
             }
             draftReadyRef.current = false
             attachmentsReadyRef.current = false
-            previousHasAttachmentsRef.current = attachmentsRef.current.length > 0
-            attachmentRestoreOccupiedRef.current = false
         }
-    }, [sessionId, canRestoreAttachments, restoreAttachments])
+    }, [sessionId, canRestoreAttachments]) // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Persist while the operator types. An empty transition immediately after
-    // prepareForSubmit is assistant-ui's optimistic clear, not user deletion.
-    useEffect(() => {
-        if (!sessionId) return
-        if (composerText.length === 0 && pendingTextClearRef.current) {
-            pendingTextClearRef.current = false
-            preserveEmptyTextDraftRef.current = true
-            return
-        }
-        if (composerText.length > 0) {
-            pendingTextClearRef.current = false
-            preserveEmptyTextDraftRef.current = false
-        } else if (preserveEmptyTextDraftRef.current) {
-            return
-        }
-
-        const timer = window.setTimeout(() => {
-            if (draftReadyRef.current) {
-                saveDraft(sessionId, composerTextRef.current)
-            }
-        }, DRAFT_SAVE_DEBOUNCE_MS)
-        return () => window.clearTimeout(timer)
-    }, [sessionId, composerText])
-
-    // Attachment files are persisted on every semantic composer update. This
-    // makes the File objects available even though assistant-ui removes its
-    // chips before the async mutation can fail.
-    useEffect(() => {
-        if (!sessionId) return
-        const hasAttachments = attachments.length > 0
-        const previouslyHadAttachments = previousHasAttachmentsRef.current
-        previousHasAttachmentsRef.current = hasAttachments
-
-        if (hasAttachments) {
-            preserveEmptyAttachmentDraftRef.current = false
-            if (draftReadyRef.current) {
-                const previous = lastPersistedAttachmentSetRef.current
-                if (
-                    previous?.sessionId !== sessionId
-                    || !attachmentDraftSetsEqual(previous.attachments, attachments)
-                ) {
-                    saveDraftAttachments(sessionId, [...attachments])
-                    lastPersistedAttachmentSetRef.current = {
-                        sessionId,
-                        attachments: [...attachments],
-                    }
-                }
-            }
-            return
-        }
-
-        if (previouslyHadAttachments) {
-            attachmentRestoreOccupiedRef.current = false
-        }
-        if (pendingAttachmentsClearRef.current && previouslyHadAttachments) {
-            pendingAttachmentsClearRef.current = false
-            preserveEmptyAttachmentDraftRef.current = true
-            return
-        }
-        if (preserveEmptyAttachmentDraftRef.current) return
-        if (previouslyHadAttachments) {
-            // A visible chip removed by the operator is authoritative even if
-            // the session became inactive meanwhile. Otherwise reopening can
-            // resurrect a file the user explicitly discarded.
-            clearDraftAttachments(sessionId)
-            lastPersistedAttachmentSetRef.current = { sessionId, attachments: [] }
-            return
-        }
-        if (canRestoreAttachments && attachmentsReadyRef.current) {
-            // Manual removal of the last chip must remove the saved draft.
-            clearDraftAttachments(sessionId)
-            lastPersistedAttachmentSetRef.current = { sessionId, attachments: [] }
-        }
-    }, [sessionId, attachments, canRestoreAttachments])
-
-    useEffect(() => {
-        if (!sessionId || typeof window === 'undefined') return
-        let persistedForCurrentBackground = false
-        const persistNow = () => {
-            if (
-                draftReadyRef.current
-                && !(composerTextRef.current.length === 0 && preserveEmptyTextDraftRef.current)
-            ) {
-                saveDraft(sessionId, composerTextRef.current)
-            }
-            if (attachmentsRef.current.length > 0) {
-                saveDraftAttachments(sessionId, [...attachmentsRef.current])
-            } else if (
-                canRestoreAttachments
-                && attachmentsReadyRef.current
-                && !preserveEmptyAttachmentDraftRef.current
-            ) {
-                saveDraftAttachments(sessionId, [])
-            }
-        }
-        const persistOncePerBackground = () => {
-            if (persistedForCurrentBackground) return
-            persistedForCurrentBackground = true
-            persistNow()
-        }
-        const handleVisibilityChange = () => {
-            if (document.visibilityState === 'hidden') {
-                persistOncePerBackground()
-            } else {
-                persistedForCurrentBackground = false
-            }
-        }
-        const handlePageShow = () => {
-            persistedForCurrentBackground = false
-        }
-        window.addEventListener('pagehide', persistOncePerBackground)
-        window.addEventListener('pageshow', handlePageShow)
-        document.addEventListener('visibilitychange', handleVisibilityChange)
-        return () => {
-            window.removeEventListener('pagehide', persistOncePerBackground)
-            window.removeEventListener('pageshow', handlePageShow)
-            document.removeEventListener('visibilitychange', handleVisibilityChange)
-        }
-    }, [sessionId, canRestoreAttachments])
-
-    const prepareForSubmit = useCallback((textOverride?: string) => {
-        if (!sessionId) return
-        // Synchronous cache updates guarantee restoration even if the user
-        // sends before the normal debounce/IndexedDB write has settled.
-        const submittedText = textOverride ?? composerTextRef.current
-        if (submittedText.length > 0) {
-            saveDraft(sessionId, submittedText)
-            pendingTextClearRef.current = true
-        }
-        if (attachmentsRef.current.length > 0) {
-            const current = attachmentsRef.current
-            const previous = lastPersistedAttachmentSetRef.current
-            if (
-                previous?.sessionId !== sessionId
-                || !attachmentDraftSetsEqual(previous.attachments, current)
-            ) {
-                saveDraftAttachments(sessionId, [...current])
-                lastPersistedAttachmentSetRef.current = {
-                    sessionId,
-                    attachments: [...current],
-                }
-            }
-            pendingAttachmentsClearRef.current = true
-        }
-    }, [sessionId])
-
-    const completeSubmission = useCallback(() => {
-        if (!sessionId) return
-        pendingTextClearRef.current = false
-        pendingAttachmentsClearRef.current = false
-
-        if (composerTextRef.current.length === 0) {
-            clearDraft(sessionId)
-        } else {
-            saveDraft(sessionId, composerTextRef.current)
-        }
-        preserveEmptyTextDraftRef.current = false
-
-        if (attachmentsRef.current.length === 0) {
-            clearDraftAttachments(sessionId)
-            lastPersistedAttachmentSetRef.current = { sessionId, attachments: [] }
-        } else {
-            saveDraftAttachments(sessionId, [...attachmentsRef.current])
-            lastPersistedAttachmentSetRef.current = {
-                sessionId,
-                attachments: [...attachmentsRef.current],
-            }
-        }
-        preserveEmptyAttachmentDraftRef.current = false
-    }, [sessionId])
-
-    return useMemo(() => ({
-        prepareForSubmit,
-        completeSubmission,
-        restoreAttachments,
-    }), [completeSubmission, prepareForSubmit, restoreAttachments])
+    return hydration
 }

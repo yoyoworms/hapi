@@ -14,7 +14,8 @@ import type {
 
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
-import { CodexAppServerClient, HAPI_CODEX_CONTEXT_DEFAULTS } from './codexAppServerClient';
+import { CodexAppServerClient } from './codexAppServerClient';
+import { HAPI_CODEX_CONTEXT_DEFAULTS } from './hapiContextPolicy';
 import { sanitizeCodexSessionEnvironment } from './codexProcessEnvironment';
 import type { GetAccountRateLimitsResponse, GetAccountResponse } from './appServerTypes';
 

@@ -93,6 +93,23 @@ describe('ApiClient error mapping', () => {
         expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session%20cursor/cursor-chat-store')
     })
 
+    it('lists and imports Pi sessions through the selected machine', async () => {
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, sessions: [], machineId: 'machine-1' }), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, results: [], machineId: 'machine-1' }), { status: 200 }))
+        const api = new ApiClient('test-token')
+
+        await api.getPiSessions('/tmp/project', 'machine-1')
+        await api.importPiSessions({ sessionIds: ['pi-1'], cwd: '/tmp/project', machineId: 'machine-1' })
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/pi/sessions?cwd=%2Ftmp%2Fproject&machineId=machine-1')
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/pi/import-sessions')
+        expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['pi-1'], cwd: '/tmp/project', machineId: 'machine-1' })
+        })
+    })
+
     it('loads the authoritative queued state for encoded session IDs', async () => {
         fetchMock.mockResolvedValueOnce(
             new Response(JSON.stringify({
@@ -116,26 +133,144 @@ describe('ApiClient error mapping', () => {
         expect(new Headers(init?.headers).get('content-type')).toBe('application/json')
     })
 
-    it('downloads a session-machine file through the authenticated Hub relay', async () => {
-        fetchMock.mockResolvedValueOnce(
-            new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
-                status: 200,
-                headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    it('forwards the selected delivery mode when sending a message', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await api.sendMessage('session /?#', 'steer this', 'local-1', undefined, null, 'steer')
+
+        const [url, init] = fetchMock.mock.calls[0] ?? []
+        expect(url).toBe('/api/sessions/session%20%2F%3F%23/messages')
+        expect(init).toMatchObject({
+            method: 'POST',
+            body: JSON.stringify({
+                text: 'steer this',
+                localId: 'local-1',
+                deliveryMode: 'steer',
             })
+        })
+    })
+
+    it('requests usage buckets in the viewer IANA time zone', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await api.getUsageSummary('7d', 'America/New_York')
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+            '/api/usage/summary?range=7d&timeZone=America%2FNew_York'
+        )
+    })
+
+    it('lets fetch set the multipart boundary for transcription uploads', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ text: 'hello' }), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        const file = new File(['audio'], 'speech.webm', { type: 'audio/webm' })
+        await api.transcribeVoice({ file, provider: 'openai', mode: 'standard' })
+
+        const [, init] = fetchMock.mock.calls[0] ?? []
+        expect(init?.body).toBeInstanceOf(FormData)
+        expect(new Headers(init?.headers).has('content-type')).toBe(false)
+    })
+
+    it('preserves an unavailable voice backend response', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ backend: null, backends: [] }), { status: 200 })
         )
 
         const api = new ApiClient('test-token')
-        const blob = await api.getSessionFileBlob(
-            'session /?#',
-            '/Users/liuxin/project/outputs/周报.xlsx'
+        await expect(api.fetchVoiceBackend()).resolves.toEqual({ backend: null, backends: [] })
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/voice/backend')
+    })
+
+    it('reads and updates masked transcription credentials', async () => {
+        const status = {
+            openai: { configured: true, source: 'settings', hint: '••••cret', editable: true },
+            elevenlabs: { configured: false, source: 'none', hint: null, editable: true },
+            deepgram: { configured: false, source: 'none', hint: null, editable: true },
+            groq: { configured: false, source: 'none', hint: null, editable: true },
+            openaiCompatible: {
+                configured: false,
+                source: 'none',
+                baseUrl: null,
+                model: null,
+                baseUrlEditable: true,
+                modelEditable: true,
+                apiKey: { configured: false, source: 'none', hint: null, editable: true },
+            },
+            voiceBackends: {
+                elevenlabs: { configured: false, source: 'none', hint: null, editable: true },
+                geminiLive: { configured: false, source: 'none', hint: null, editable: true },
+                qwenRealtime: { configured: false, source: 'none', hint: null, editable: true },
+            },
+        }
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.fetchTranscriptionCredentials()).resolves.toEqual(status)
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/voice/transcription/credentials')
+
+        await expect(api.updateTranscriptionCredentials({ openai: 'sk-test' })).resolves.toEqual(status)
+        const [, init] = fetchMock.mock.calls[1] ?? []
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/voice/transcription/credentials')
+        expect(init?.method).toBe('PUT')
+        expect(init?.body).toBe(JSON.stringify({ openai: 'sk-test' }))
+    })
+
+    it('forwards resume target, permission, and Codex identity together', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ sessionId: 'session-next' }), { status: 200 })
+        )
+        const api = new ApiClient('test-token')
+
+        await expect(api.resumeSession('session old', {
+            permissionMode: 'yolo',
+            resumeWithSessionId: 'native-thread',
+            codexAccountId: 'account-2'
+        })).resolves.toBe('session-next')
+
+        const [url, init] = fetchMock.mock.calls[0] ?? []
+        expect(url).toBe('/api/sessions/session%20old/resume')
+        expect(init).toMatchObject({
+            method: 'POST',
+            body: JSON.stringify({
+                permissionMode: 'yolo',
+                resumeWithSessionId: 'native-thread',
+                codexAccountId: 'account-2'
+            })
+        })
+    })
+
+    it('forwards sandbox and Codex account when spawning', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ type: 'success', sessionId: 'session-1' }), { status: 200 })
+        )
+        const api = new ApiClient('test-token')
+
+        await api.spawnSession(
+            'machine-1', '/repo', 'codex', undefined, undefined, undefined,
+            'simple', undefined, undefined, true, 'safe-yolo', 'account-2'
         )
 
-        expect(Array.from(new Uint8Array(await blob.arrayBuffer()))).toEqual([0x50, 0x4b, 0x03, 0x04])
-        const [url, init] = fetchMock.mock.calls[0] ?? []
-        const parsed = new URL(String(url), 'https://hapi.test')
-        expect(parsed.pathname).toBe('/api/sessions/session%20%2F%3F%23/file/raw')
-        expect(parsed.searchParams.get('path')).toBe('/Users/liuxin/project/outputs/周报.xlsx')
-        expect(parsed.searchParams.get('download')).toBe('true')
-        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer test-token')
+        const [, init] = fetchMock.mock.calls[0] ?? []
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+            directory: '/repo',
+            agent: 'codex',
+            sandbox: true,
+            permissionMode: 'safe-yolo',
+            codexAccountId: 'account-2'
+        })
+    })
+
+    it('loads runner-local Codex accounts from the selected machine', async () => {
+        const response = { success: true, accounts: [], defaultAccountId: 'system' }
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(response), { status: 200 }))
+        const api = new ApiClient('test-token')
+
+        await expect(api.getMachineCodexAccounts('machine / 1')).resolves.toEqual(response)
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/machines/machine%20%2F%201/codex-accounts')
     })
 })

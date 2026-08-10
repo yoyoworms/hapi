@@ -2,6 +2,7 @@ import { z } from 'zod'
 import {
     AttachmentMetadataSchema,
     CodexCollaborationModeSchema,
+    CopilotAgentModeSchema,
     DecryptedMessageSchema,
     MachineSchema,
     PermissionModeSchema,
@@ -49,10 +50,24 @@ export const CliMessagesResponseSchema = z.object({
 export type CliMessagesResponse = z.infer<typeof CliMessagesResponseSchema>
 
 export const CreateSessionResponseSchema = z.object({
-    session: SessionSchema
+    session: SessionSchema,
+    /** Hub opt-in for AGENT_NOTIFY_SUMMARY prompt injection (default off when omitted). */
+    sessionSummaryContract: z.boolean().optional()
 })
 
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>
+
+export const HubSettingsResponseSchema = z.object({
+    sessionSummaryContract: z.boolean()
+})
+
+export type HubSettingsResponse = z.infer<typeof HubSettingsResponseSchema>
+
+export const UpdateHubSettingsRequestSchema = z.object({
+    sessionSummaryContract: z.boolean()
+})
+
+export type UpdateHubSettingsRequest = z.infer<typeof UpdateHubSettingsRequestSchema>
 
 export const CreateMachineResponseSchema = z.object({
     machine: MachineSchema
@@ -62,6 +77,17 @@ export type CreateMachineResponse = z.infer<typeof CreateMachineResponseSchema>
 
 export const GetSessionResponseSchema = CreateSessionResponseSchema
 export type GetSessionResponse = CreateSessionResponse
+
+export const ClearOpencodeSessionResponseSchema = z.object({
+    ok: z.literal(true),
+    sessionId: z.string()
+})
+export type ClearOpencodeSessionResponse = z.infer<typeof ClearOpencodeSessionResponseSchema>
+
+export const ClearOpencodeSessionCallbackRequestSchema = z.object({
+    replacementSessionId: z.string()
+})
+export type ClearOpencodeSessionCallbackRequest = z.infer<typeof ClearOpencodeSessionCallbackRequestSchema>
 
 export type AuthResponse = {
     token: string
@@ -187,11 +213,62 @@ export type ListCodexSessionsRpcResponse = z.infer<typeof ListCodexSessionsRpcRe
 export type ArchiveCodexSessionRpcRequest = z.infer<typeof ArchiveCodexSessionRpcRequestSchema>
 export type ArchiveCodexSessionRpcResponse = z.infer<typeof ArchiveCodexSessionRpcResponseSchema>
 
+export const PiImportedMessageContentSchema = CodexImportedMessageSchema
+
+export const PiImportedMessageSchema = z.object({
+    localId: z.string().min(1),
+    entryId: z.string().min(1),
+    parentEntryId: z.string().nullable().optional(),
+    createdAt: z.number(),
+    content: PiImportedMessageContentSchema
+})
+
+export const PiLocalSessionSummarySchema = z.object({
+    id: z.string().min(1),
+    title: z.string(),
+    lastUserMessage: z.string().nullable().optional(),
+    cwd: z.string().nullable().optional(),
+    file: z.string().min(1),
+    modifiedAt: z.number(),
+    model: z.string().nullable().optional(),
+    thinkingLevel: z.string().nullable().optional(),
+    leafEntryId: z.string().nullable().optional(),
+    messageCount: z.number().int().nonnegative()
+})
+
+export const PiLocalSessionWithMessagesSchema = PiLocalSessionSummarySchema.extend({
+    messages: z.array(PiImportedMessageSchema),
+    activeEntryIds: z.array(z.string().min(1))
+})
+
+export const ListPiSessionsRpcRequestSchema = z.object({
+    cwd: z.string().nullable().optional(),
+    sessionIds: z.array(z.string().min(1)).optional()
+})
+
+export const ListPiSessionsRpcResponseSchema = z.union([
+    z.object({ success: z.literal(true), sessions: z.array(z.union([PiLocalSessionWithMessagesSchema, PiLocalSessionSummarySchema])) }),
+    z.object({ success: z.literal(false), error: z.string() })
+])
+
+export type PiImportedMessageContent = z.infer<typeof PiImportedMessageContentSchema>
+export type PiImportedMessage = z.infer<typeof PiImportedMessageSchema>
+export type PiLocalSessionSummary = z.infer<typeof PiLocalSessionSummarySchema>
+export type PiLocalSessionWithMessages = z.infer<typeof PiLocalSessionWithMessagesSchema>
+export type ListPiSessionsRpcRequest = z.infer<typeof ListPiSessionsRpcRequestSchema>
+export type ListPiSessionsRpcResponse = z.infer<typeof ListPiSessionsRpcResponseSchema>
+
 export const SessionCollaborationModeRequestSchema = z.object({
     mode: CodexCollaborationModeSchema
 })
 
 export type SessionCollaborationModeRequest = z.infer<typeof SessionCollaborationModeRequestSchema>
+
+export const SessionCopilotAgentModeRequestSchema = z.object({
+    mode: CopilotAgentModeSchema
+})
+
+export type SessionCopilotAgentModeRequest = z.infer<typeof SessionCopilotAgentModeRequestSchema>
 
 export const SessionModelRequestSchema = z.object({
     model: z.union([
@@ -233,11 +310,19 @@ export const RenameSessionRequestSchema = z.object({
 
 export type RenameSessionRequest = z.infer<typeof RenameSessionRequestSchema>
 
+/** Legacy POST /sessions/:id/pin contract; maps to project/none pin mode. */
 export const PinSessionRequestSchema = z.object({
     pinned: z.boolean()
 })
 
 export type PinSessionRequest = z.infer<typeof PinSessionRequestSchema>
+
+export const SetSessionPinnedRequestSchema = z.object({
+    mode: z.enum(['none', 'project', 'global'])
+})
+
+export type SetSessionPinnedRequest = z.infer<typeof SetSessionPinnedRequestSchema>
+export type SessionPinMode = SetSessionPinnedRequest['mode']
 
 /**
  * An empty string clears the custom name, so unlike session rename there is no
@@ -417,11 +502,15 @@ export const MessagesQuerySchema = z.object({
 
 export type MessagesQuery = z.infer<typeof MessagesQuerySchema>
 
+export const MessageDeliveryModeSchema = z.enum(['queue', 'steer'])
+export type MessageDeliveryMode = z.infer<typeof MessageDeliveryModeSchema>
+
 export const SendMessageRequestSchema = z.object({
     text: z.string(),
     localId: z.string().min(1).optional(),
     attachments: z.array(AttachmentMetadataSchema).optional(),
-    scheduledAt: z.number().int().positive().nullable().optional()
+    scheduledAt: z.number().int().positive().nullable().optional(),
+    deliveryMode: MessageDeliveryModeSchema.optional()
 }).refine(
     (data) => data.scheduledAt == null || typeof data.localId === 'string',
     { message: 'scheduledAt requires localId', path: ['localId'] }
@@ -431,9 +520,56 @@ export const SendMessageRequestSchema = z.object({
 ).refine(
     (data) => data.scheduledAt == null || !data.attachments?.length,
     { message: 'scheduled messages with attachments are not supported', path: ['attachments'] }
+).refine(
+    (data) => data.scheduledAt == null || data.deliveryMode !== 'steer',
+    { message: 'scheduled messages cannot use steer delivery', path: ['deliveryMode'] }
 )
 
 export type SendMessageRequest = z.infer<typeof SendMessageRequestSchema>
+
+export const ForkConversationRequestSchema = z.object({
+    messageLocalId: z.string().min(1).optional()
+})
+
+export type ForkConversationRequest = z.infer<typeof ForkConversationRequestSchema>
+
+export type ForkConversationResponse = {
+    sessionId: string
+}
+
+export const RewindConversationRequestSchema = z.object({
+    messageLocalId: z.string().min(1)
+})
+
+export type RewindConversationRequest = z.infer<typeof RewindConversationRequestSchema>
+
+export type RewindConversationResponse = {
+    success: true
+}
+
+/** CLI → hub RPC result for native fork (before HAPI child binding). */
+export type ForkConversationRpcResult = {
+    nativeSessionId: string
+    /** When true, hub must spawn with --fork-session (Claude). */
+    forkSession?: boolean
+}
+
+export type RewindConversationRpcResult = {
+    success: true
+    /** Truncate HAPI transcript at/after this localId, then accept rehydrated history. */
+    truncateFromLocalId: string
+    messages?: Array<{
+        content: unknown
+        localId?: string | null
+        createdAt?: number
+        invokedAt?: number | null
+    }>
+} | {
+    success: false
+    error: string
+    /** Native state is unchanged, cancelled, or was restored exactly. */
+    outcome: 'rejected' | 'cancelled' | 'source_restored'
+}
 
 export const QueuedStateRequestSchema = z.object({
     localIds: z.array(z.string().min(1)).max(1000)
@@ -530,17 +666,23 @@ export const SpawnSessionRequestSchema = z.object({
     modelReasoningEffort: z.string().optional(),
     yolo: z.boolean().optional(),
     permissionMode: PermissionModeSchema.optional(),
+    continueLatest: z.boolean().optional(),
     codexAccountId: z.string().min(1).optional(),
+    codexSourceAccountId: z.string().min(1).optional(),
+    sandbox: z.boolean().optional(),
     sessionType: z.enum(['simple', 'worktree']).optional(),
     worktreeName: z.string().optional(),
     serviceTier: z.enum(['fast', 'standard']).optional(),
-    collaborationMode: CodexCollaborationModeSchema.optional()
+    collaborationMode: CodexCollaborationModeSchema.optional(),
+    copilotAgentMode: CopilotAgentModeSchema.optional(),
+    startingMode: z.enum(['remote', 'pty']).optional()
 })
 
 export type SpawnSessionRequest = z.infer<typeof SpawnSessionRequestSchema>
 
 export const MachineListDirectoryRequestSchema = z.object({
-    path: z.string().min(1)
+    path: z.string().min(1),
+    includeHidden: z.boolean().optional()
 })
 
 export type MachineListDirectoryRequest = z.infer<typeof MachineListDirectoryRequestSchema>
@@ -571,6 +713,8 @@ export type GitCommandResponse = CommandResponse
 export type FileReadResponse = {
     success: boolean
     content?: string
+    size?: number
+    modified?: number
     error?: string
 }
 
@@ -692,6 +836,20 @@ export type GrokModelsResponse = {
 }
 export type ListGrokModelsResponse = GrokModelsResponse
 
+export type CopilotModelSummary = {
+    modelId: string
+    name?: string
+}
+
+export type CopilotModelsResponse = {
+    success: boolean
+    availableModels?: CopilotModelSummary[]
+    currentModelId?: string | null
+    error?: string
+}
+
+export type ListCopilotModelsResponse = CopilotModelsResponse
+
 export type GrokReasoningEffortResponse = {
     success: boolean
     options?: GrokReasoningEffortOption[]
@@ -710,6 +868,20 @@ export type OpencodeReasoningEffortResponse = {
     currentValue?: string | null
     error?: string
 }
+
+export type AgyModelSummary = {
+    modelId: string
+    name?: string
+}
+
+export type AgyModelsResponse = {
+    success: boolean
+    availableModels?: AgyModelSummary[]
+    currentModelId?: string | null
+    error?: string
+}
+
+export type ListAgyModelsResponse = AgyModelsResponse
 
 export type CursorModelSummary = OpencodeModelSummary
 
@@ -772,4 +944,36 @@ export type SqliteStorageUsageResponse = {
     walBytes: number
     shmBytes: number
     totalBytes: number
+}
+
+export type UsageSummaryBucket = {
+    key: string
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens: number
+    cacheCreationTokens: number
+    totalTokens: number
+    uncachedTokens: number
+    requests: number
+}
+
+export type UsageSummaryResponse = {
+    range: {
+        from: number | null
+        to: number | null
+    }
+    totals: {
+        inputTokens: number
+        outputTokens: number
+        cacheReadTokens: number
+        cacheCreationTokens: number
+        totalTokens: number
+        uncachedTokens: number
+        requests: number
+        sessions: number
+    }
+    daily: Array<UsageSummaryBucket & { key: string }>
+    byAgent: UsageSummaryBucket[]
+    byModel: UsageSummaryBucket[]
+    updatedAt: number
 }

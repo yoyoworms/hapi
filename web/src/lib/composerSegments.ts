@@ -1,4 +1,5 @@
 import { buildSessionReferencePath, parseSessionPathHref } from '@/lib/sessionReference'
+import { truncateGraphemes } from '@/lib/graphemes'
 import { findActiveWord } from '@/utils/findActiveWord'
 
 /** Object Replacement Character — one mirror slot per session atom. */
@@ -23,7 +24,7 @@ export type ComposerSelection = {
 }
 
 function sanitizeMentionTitle(title: string): string {
-    return title.replace(/\s+/g, ' ').trim().slice(0, 120)
+    return truncateGraphemes(title.replace(/\s+/g, ' ').trim(), 120)
 }
 
 function escapeMarkdownLinkLabel(title: string): string {
@@ -294,14 +295,13 @@ function parseExplicitBoolean(value: string | null | undefined): boolean | null 
 }
 
 /**
- * Rich segmented composer is opt-in while it is being brought to feature
- * parity with the textarea. It can be enabled explicitly with either:
- *   localStorage `hapi.composer.richMentions=1|true`
- *   query `?richMentions=1|true`
- *   build `VITE_RICH_COMPOSER_MENTIONS=1|true`
+ * Rich segmented composer is the product default (same as v1 @ autocomplete:
+ * no user opt-in). Emergency kill-switch only:
+ *   localStorage `hapi.composer.richMentions=0|false`
+ *   query `?richMentions=0|false`
+ *   build `VITE_RICH_COMPOSER_MENTIONS=0|false`
  *
- * An explicit `0|false` from any source remains an emergency kill switch and
- * wins over an enable flag from another source.
+ * An explicit disable from any source wins over values from another source.
  */
 export function isRichComposerMentionsEnabled(): boolean {
     const configuredValues: Array<boolean | null> = [
@@ -319,6 +319,18 @@ export function isRichComposerMentionsEnabled(): boolean {
         // ignore storage / URL access failures
     }
 
-    if (configuredValues.includes(false)) return false
-    return configuredValues.includes(true)
+    return !configuredValues.includes(false)
+}
+
+/**
+ * Composer empty-state placeholder i18n key.
+ * Continue-hint outranks mention hint; mention copy only when rich composer is on.
+ */
+export function resolveComposerPlaceholderKey(opts: {
+    richMentionsEnabled: boolean
+    showContinueHint: boolean
+}): 'misc.typeMessage' | 'misc.typeAMessageWithMentions' | 'misc.typeAMessage' {
+    if (opts.showContinueHint) return 'misc.typeMessage'
+    if (opts.richMentionsEnabled) return 'misc.typeAMessageWithMentions'
+    return 'misc.typeAMessage'
 }

@@ -170,7 +170,7 @@ describe('Codex activity headings', () => {
 })
 
 describe('buildVisibleChatBlocks', () => {
-    it('renders one or more structured Codex exploration commands as an open exploration group', () => {
+    it('renders one or more structured Codex exploration commands as a collapsed exploration group', () => {
         const read = makeToolBlock('codex-read', 'CodexBash', {
             command: 'cat package.json',
             command_source: 'agent',
@@ -200,6 +200,21 @@ describe('buildVisibleChatBlocks', () => {
         expect(visible[0].presentationMode).toBe('codex-exploration')
         expect(visible[0].defaultOpen).toBe(false)
         expect(visible[0].tools.map((tool) => tool.id)).toEqual(['codex-read', 'codex-search'])
+    })
+
+    it('opens exploration groups when the collapse preference is disabled', () => {
+        const visible = buildVisibleChatBlocks([
+            makeToolBlock('codex-read', 'CodexBash', {
+                command: 'cat package.json',
+                command_actions: [{ type: 'read', command: 'cat package.json', name: 'package.json', path: '/repo/package.json' }]
+            }),
+            makeToolBlock('codex-search', 'CodexBash', {
+                command: 'rg nativeTitle web/src',
+                command_actions: [{ type: 'search', command: 'rg nativeTitle web/src', query: 'nativeTitle' }]
+            })
+        ], { hasMoreMessages: false, codexExplorationCollapsed: false })
+
+        expect(isToolGroupBlock(visible[0]) && visible[0].defaultOpen).toBe(true)
     })
 
     it('keeps structured general Codex commands separate from exploration groups', () => {
@@ -434,5 +449,29 @@ describe('buildVisibleChatBlocks', () => {
         })
 
         expect(isToolGroupBlock(previous[0]) && isToolGroupBlock(next[0]) && previous[0].id === next[0].id).toBe(true)
+    })
+
+    it('does not assign one previous stable id to two newly split groups', () => {
+        const previous = buildVisibleChatBlocks([
+            makeToolBlock('read-1', 'Read'),
+            makeToolBlock('bash-1', 'Bash'),
+            makeToolBlock('grep-1', 'Grep'),
+            makeToolBlock('edit-1', 'Edit'),
+        ], { hasMoreMessages: false }).filter(isToolGroupBlock)
+
+        const next = buildVisibleChatBlocks([
+            makeToolBlock('read-1', 'Read'),
+            makeToolBlock('bash-1', 'Bash'),
+            makeTextBlock('boundary'),
+            makeToolBlock('grep-1', 'Grep'),
+            makeToolBlock('edit-1', 'Edit'),
+        ], {
+            hasMoreMessages: false,
+            previousGroups: previous,
+        }).filter(isToolGroupBlock)
+
+        expect(next).toHaveLength(2)
+        expect(new Set(next.map((group) => group.id)).size).toBe(2)
+        expect(next.filter((group) => group.id === previous[0]?.id)).toHaveLength(1)
     })
 })

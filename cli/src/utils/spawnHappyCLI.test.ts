@@ -279,4 +279,25 @@ describe('spawnHappyCLI windowsHide behavior', () => {
     expect(options.env?.HAPI_CODEX_APP_SERVER_BIN).toBe('/opt/codex');
     expect(options.env?.KEEP_ME).toBe('yes');
   });
+
+  it('can replace rather than overlay the parent environment for isolated children', async () => {
+    const previousLeak = process.env.HAPI_TEST_PARENT_ONLY;
+    process.env.HAPI_TEST_PARENT_ONLY = 'must-not-leak';
+    try {
+      const { spawnHappyCLI } = await import('./spawnHappyCLI');
+      spawnHappyCLI(['codex'], {
+        replaceEnv: true,
+        env: { HAPI_TEST_CHILD_ONLY: 'yes' },
+        stdio: 'ignore'
+      });
+
+      const options = getSpawnOptionsOrThrow();
+      expect(options.env?.HAPI_TEST_CHILD_ONLY).toBe('yes');
+      expect(options.env?.HAPI_TEST_PARENT_ONLY).toBeUndefined();
+      expect(options).not.toHaveProperty('replaceEnv');
+    } finally {
+      if (previousLeak === undefined) delete process.env.HAPI_TEST_PARENT_ONLY;
+      else process.env.HAPI_TEST_PARENT_ONLY = previousLeak;
+    }
+  });
 });

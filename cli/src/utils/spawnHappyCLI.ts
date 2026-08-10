@@ -143,7 +143,12 @@ export function getSpawnedWorkingDirectory(): string {
   return process.env.HAPI_SPAWN_CWD || process.cwd();
 }
 
-export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): ChildProcess {
+export type SpawnHappyCliOptions = SpawnOptions & {
+  /** Use options.env as the complete child environment instead of overlaying process.env. */
+  replaceEnv?: boolean;
+};
+
+export function spawnHappyCLI(args: string[], options: SpawnHappyCliOptions = {}): ChildProcess {
 
   let directory: string | URL | undefined;
   if ('cwd' in options) {
@@ -174,8 +179,11 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
   
   // On Windows, detached processes allocate a new console window by default.
   // windowsHide: true suppresses this to prevent cmd windows from accumulating.
-  const finalOptions: SpawnOptions = { ...options };
-  let finalEnv = { ...process.env, ...options.env };
+  const { replaceEnv = false, ...spawnOptions } = options;
+  const finalOptions: SpawnOptions = { ...spawnOptions };
+  let finalEnv = replaceEnv
+    ? { ...options.env }
+    : { ...process.env, ...options.env };
   if (args[0] === 'runner') {
     finalEnv = sanitizeCodexSessionEnvironment(finalEnv);
   }

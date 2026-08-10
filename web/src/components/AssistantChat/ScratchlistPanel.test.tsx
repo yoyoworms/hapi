@@ -375,3 +375,125 @@ describe('ScratchlistPanel', () => {
         expect(screen.queryByTestId('scratchlist-entry-age')).toBeNull()
     })
 })
+
+describe('ScratchlistDrawer disabled operations', () => {
+    it('disables and synchronously ignores move, delete, and promote actions while the parent send is pending', async () => {
+        const { ScratchlistDrawer } = await import('./ScratchlistPanel')
+        const entry = makeEntry({ id: 'pending-entry', text: 'held message' })
+        const onMove = vi.fn()
+        const onDelete = vi.fn()
+        const onPromoteToComposer = vi.fn()
+        const onPromoteToQueue = vi.fn(async () => true)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawer
+                    entries={[entry]}
+                    sessionId={SID}
+                    api={{} as never}
+                    disabled
+                    onMove={onMove}
+                    onDelete={onDelete}
+                    onPromoteToComposer={onPromoteToComposer}
+                    onPromoteToQueue={onPromoteToQueue}
+                />
+            </I18nProvider>,
+        )
+
+        const mutationButtons = [
+            ...screen.getAllByRole('button', { name: 'Move entry up' }),
+            ...screen.getAllByRole('button', { name: 'Move entry down' }),
+            screen.getByRole('button', { name: 'Copy into composer' }),
+            screen.getByRole('button', { name: 'Send to queue' }),
+            screen.getByRole('button', { name: 'Delete entry' }),
+        ]
+        for (const button of mutationButtons) {
+            expect(button).toBeDisabled()
+            fireEvent.click(button)
+        }
+        // Copy is read-only and remains available while a chat send is pending.
+        expect(screen.getByRole('button', { name: 'Copy text to clipboard (not images)' })).not.toBeDisabled()
+
+        await Promise.resolve()
+        expect(onMove).not.toHaveBeenCalled()
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(onPromoteToComposer).not.toHaveBeenCalled()
+        expect(onPromoteToQueue).not.toHaveBeenCalled()
+    })
+
+    it('locks copy-to-composer when a draft or attachment already owns the destination', async () => {
+        const { ScratchlistDrawer } = await import('./ScratchlistPanel')
+        const onPromoteToComposer = vi.fn()
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawer
+                    entries={[makeEntry({ id: 'held', text: 'do not overwrite me' })]}
+                    sessionId={SID}
+                    api={{} as never}
+                    promoteToComposerDisabled
+                    promoteToComposerDisabledReason="Clear the current draft before copying an entry"
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onPromoteToComposer={onPromoteToComposer}
+                    onPromoteToQueue={vi.fn(async () => true)}
+                />
+            </I18nProvider>,
+        )
+
+        const copyToComposer = screen.getByRole('button', {
+            name: /Copy into composer: Clear the current draft/,
+        })
+        expect(copyToComposer).toBeDisabled()
+        fireEvent.click(copyToComposer)
+        expect(onPromoteToComposer).not.toHaveBeenCalled()
+        // Destination locking is specific to copy; queue promotion stays available.
+        expect(screen.getByRole('button', { name: 'Send to queue' })).not.toBeDisabled()
+    })
+
+    it('keeps inactive-session attachment entries durable by disabling both promotion paths', async () => {
+        const { ScratchlistDrawer } = await import('./ScratchlistPanel')
+        const attachmentEntry = makeEntry({
+            id: 'attachment-entry',
+            text: 'with image',
+            attachments: [{
+                id: 'attachment-1',
+                filename: 'image.png',
+                mimeType: 'image/png',
+                size: 12,
+                path: 'hapi-hub:scratchlist/default/session-test/attachment-1-image.png',
+            }],
+        })
+        const onPromoteToComposer = vi.fn()
+        const onPromoteToQueue = vi.fn(async () => true)
+
+        render(
+            <I18nProvider>
+                <ScratchlistDrawer
+                    entries={[attachmentEntry]}
+                    sessionId={SID}
+                    api={{ fetchScratchlistAttachmentBlob: vi.fn().mockRejectedValue(new Error('not needed')) } as never}
+                    attachmentsSupported={false}
+                    attachmentsUnsupportedReason="Attachments require an active session"
+                    onMove={vi.fn()}
+                    onDelete={vi.fn()}
+                    onPromoteToComposer={onPromoteToComposer}
+                    onPromoteToQueue={onPromoteToQueue}
+                />
+            </I18nProvider>,
+        )
+
+        const composerAction = screen.getByRole('button', {
+            name: /Copy into composer: Attachments require an active session/,
+        })
+        const queueAction = screen.getByRole('button', {
+            name: /Send to queue: Attachments require an active session/,
+        })
+        expect(composerAction).toBeDisabled()
+        expect(queueAction).toBeDisabled()
+        fireEvent.click(composerAction)
+        fireEvent.click(queueAction)
+        expect(onPromoteToComposer).not.toHaveBeenCalled()
+        expect(onPromoteToQueue).not.toHaveBeenCalled()
+    })
+})

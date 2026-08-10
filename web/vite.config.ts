@@ -5,6 +5,23 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { shareTargetPathnameFromBase } from './src/lib/sharePath'
 
+function spaFallback(): Plugin {
+    return {
+        name: 'spa-fallback',
+        configureServer(server) {
+            server.middlewares.use((req, _res, next) => {
+                const url = (req.url ?? '').split('?')[0]
+                if (url === '/' || url === '' || url.includes('.') || url.startsWith('/@') || url.startsWith('/api') || url.startsWith('/socket.io') || url.startsWith('/src/')) {
+                    next()
+                    return
+                }
+                req.url = '/index.html'
+                next()
+            })
+        }
+    }
+}
+
 const base = process.env.VITE_BASE_URL || '/'
 const manifestBase = base.endsWith('/') ? base : `${base}/`
 const shareAction = shareTargetPathnameFromBase(base)
@@ -98,6 +115,7 @@ function rejectDuplicateReactRuntimes(): Plugin {
 }
 
 export default defineConfig({
+    appType: 'spa',
     define: {
         __APP_VERSION__: JSON.stringify(`${appVersion}.${getBuildNumber()}`),
         __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
@@ -119,6 +137,7 @@ export default defineConfig({
     plugins: [
         rejectDuplicateReactRuntimes(),
         react(),
+        spaFallback(),
         VitePWA({
             // User-controlled reload avoids mid-session surprise reloads (autoUpdate reloads all tabs).
             registerType: 'prompt',
@@ -194,7 +213,11 @@ export default defineConfig({
                 }
             },
             injectManifest: {
-                globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}']
+                globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+                // The SPA entry contains the complete multi-agent control surface.
+                // Keep it available offline after adding Pi history import instead
+                // of silently dropping the entry chunk from the PWA precache.
+                maximumFileSizeToCacheInBytes: 3 * 1024 * 1024
             },
             devOptions: {
                 enabled: true,

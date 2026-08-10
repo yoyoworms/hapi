@@ -1,13 +1,14 @@
 import { logger } from '@/ui/logger'
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
-import { join, resolve, sep } from 'path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, open, rm } from 'fs/promises'
+import { extname, join, resolve, sep } from 'path'
 import { rmSync } from 'node:fs'
-import { execSync } from 'node:child_process'
 import type { DeleteUploadResponse, UploadFileResponse } from '@hapi/protocol/apiTypes'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager'
 import { getErrorMessage, rpcError } from '../rpcResponses'
 import { getHapiBlobsDir } from '@/constants/uploadPaths'
+import { MAX_UPLOAD_BYTES } from '../attachmentLimits'
 
 interface UploadFileRequest {
     sessionId?: string
@@ -22,50 +23,54 @@ interface DeleteUploadRequest {
 }
 
 const uploadDirs = new Map<string, string>()
+const uploadFileIdentities = new Map<string, Map<string, string>>()
 const uploadDirPromises = new Map<string, Promise<string>>()
 const uploadDirCleanupRequested = new Set<string>()
 let cleanupRegistered = false
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-const MAX_IMAGE_DIMENSION = 2000
+const MAX_FILENAME_COMPONENT_BYTES = 255
 
-const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/tiff', 'image/bmp'])
+export type UploadFileIdentity = { dev: number; ino: number }
 
-/**
- * Resize image if any dimension exceeds MAX_IMAGE_DIMENSION (2000px).
- * Uses macOS `sips` (no external deps). Returns the (possibly modified) file path.
- */
-function resizeImageIfNeeded(filePath: string, mimeType: string): void {
-    if (!IMAGE_MIME_TYPES.has(mimeType)) return
-    try {
-        const info = execSync(`sips -g pixelWidth -g pixelHeight "${filePath}" 2>/dev/null`, { encoding: 'utf-8' })
-        const wMatch = info.match(/pixelWidth:\s*(\d+)/)
-        const hMatch = info.match(/pixelHeight:\s*(\d+)/)
-        if (!wMatch || !hMatch) return
-        const w = parseInt(wMatch[1], 10)
-        const h = parseInt(hMatch[1], 10)
-        if (w <= MAX_IMAGE_DIMENSION && h <= MAX_IMAGE_DIMENSION) return
-        // Resize longest edge to MAX_IMAGE_DIMENSION, maintaining aspect ratio
-        if (w >= h) {
-            execSync(`sips --resampleWidth ${MAX_IMAGE_DIMENSION} "${filePath}" 2>/dev/null`)
-        } else {
-            execSync(`sips --resampleHeight ${MAX_IMAGE_DIMENSION} "${filePath}" 2>/dev/null`)
-        }
-        logger.debug(`[upload] Resized image from ${w}x${h} to fit ${MAX_IMAGE_DIMENSION}px: ${filePath}`)
-    } catch (error) {
-        logger.debug('[upload] Image resize failed (non-fatal):', error)
-    }
+function uploadIdentityKey(identity: UploadFileIdentity): string {
+    return `${identity.dev}:${identity.ino}`
+}
+
+export function isAuthorizedUploadFile(path: string, sessionId: string | undefined, identity: UploadFileIdentity): boolean {
+    return uploadFileIdentities.get(getSessionKey(sessionId))?.get(resolve(path)) === uploadIdentityKey(identity)
 }
 
 function sanitizeFilename(filename: string): string {
-    // Remove path separators and limit length
+    // Remove path separators; byte-safe length fitting happens after the
+    // unique prefix is known so the original extension can be preserved.
     const sanitized = filename
         .replace(/[/\\]/g, '_')
         .replace(/\.\./g, '_')
         .replace(/\s+/g, '_')
-        .slice(0, 255)
 
     // If filename is empty after sanitization, use a default
     return sanitized || 'upload'
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+    let result = ''
+    let bytes = 0
+    for (const character of text) {
+        const characterBytes = Buffer.byteLength(character)
+        if (bytes + characterBytes > maxBytes) break
+        result += character
+        bytes += characterBytes
+    }
+    return result
+}
+
+function fitFilenameToBytes(filename: string, maxBytes: number): string {
+    const extension = extname(filename)
+    const extensionBytes = Buffer.byteLength(extension)
+    if (extension && extensionBytes <= maxBytes) {
+        const stem = filename.slice(0, -extension.length)
+        return `${truncateUtf8(stem, maxBytes - extensionBytes)}${extension}`
+    }
+    return truncateUtf8(filename, maxBytes) || 'upload'
 }
 
 function getSessionKey(sessionId?: string): string {
@@ -92,7 +97,7 @@ async function getOrCreateUploadDir(sessionId?: string): Promise<string> {
         return await inflight
     }
 
-    const safeKey = sanitizeFilename(sessionKey)
+    const safeKey = fitFilenameToBytes(sanitizeFilename(sessionKey), 120)
     const creation = (async () => {
         try {
             const blobsDir = getHapiBlobsDir()
@@ -132,6 +137,7 @@ export async function cleanupUploadDir(sessionId?: string): Promise<void> {
 
         const dir = uploadDirs.get(sessionKey)
         uploadDirs.delete(sessionKey)
+        uploadFileIdentities.delete(sessionKey)
         uploadDirPromises.delete(sessionKey)
 
         if (!dir) {
@@ -151,6 +157,7 @@ export async function cleanupUploadDir(sessionId?: string): Promise<void> {
 function cleanupUploadDirsSync(): void {
     const dirs = Array.from(uploadDirs.values())
     uploadDirs.clear()
+    uploadFileIdentities.clear()
     uploadDirPromises.clear()
     uploadDirCleanupRequested.clear()
 
@@ -163,7 +170,7 @@ function cleanupUploadDirsSync(): void {
     }
 }
 
-function isPathWithinUploadDir(path: string, sessionId?: string): boolean {
+export function isPathWithinUploadDir(path: string, sessionId?: string): boolean {
     const sessionKey = getSessionKey(sessionId)
     const resolvedPath = resolve(path)
     const activeDir = uploadDirs.get(sessionKey)
@@ -173,7 +180,7 @@ function isPathWithinUploadDir(path: string, sessionId?: string): boolean {
         return resolvedPath.startsWith(dirPrefix)
     }
 
-    const safeKey = sanitizeFilename(sessionKey)
+    const safeKey = fitFilenameToBytes(sanitizeFilename(sessionKey), 120)
     const resolvedPrefix = resolve(getHapiBlobsDir(), `${safeKey}-`)
     return resolvedPath.startsWith(resolvedPrefix)
 }
@@ -204,9 +211,15 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
             const dir = await getOrCreateUploadDir(data.sessionId)
             const sanitizedFilename = sanitizeFilename(data.filename)
 
-            // Add timestamp to avoid collisions
+            // Combine a readable timestamp with a random suffix so concurrent
+            // uploads of the same filename remain compatible with exclusive create.
             const timestamp = Date.now()
-            const uniqueFilename = `${timestamp}-${sanitizedFilename}`
+            const prefix = `${timestamp}-${randomUUID()}-`
+            const boundedFilename = fitFilenameToBytes(
+                sanitizedFilename,
+                MAX_FILENAME_COMPONENT_BYTES - Buffer.byteLength(prefix),
+            )
+            const uniqueFilename = `${prefix}${boundedFilename}`
             const filePath = join(dir, uniqueFilename)
 
             // Decode base64 content and write to file
@@ -214,58 +227,34 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
             if (buffer.length > MAX_UPLOAD_BYTES) {
                 return rpcError('File too large (max 50MB)')
             }
-            await writeFile(filePath, buffer)
-            resizeImageIfNeeded(filePath, data.mimeType)
+            const file = await open(filePath, 'wx', 0o600)
+            let operationError: unknown
+            try {
+                await file.writeFile(buffer)
+                const info = await file.stat()
+                const files = uploadFileIdentities.get(getSessionKey(data.sessionId)) ?? new Map<string, string>()
+                files.set(resolve(filePath), uploadIdentityKey(info))
+                uploadFileIdentities.set(getSessionKey(data.sessionId), files)
+            } catch (error) {
+                operationError = error
+            }
+            let closeError: unknown
+            try {
+                await file.close()
+            } catch (error) {
+                closeError = error
+            }
+            if (operationError || closeError) {
+                uploadFileIdentities.get(getSessionKey(data.sessionId))?.delete(resolve(filePath))
+                await rm(filePath, { force: true }).catch(() => {})
+                throw operationError ?? closeError
+            }
 
             logger.debug('File uploaded successfully:', filePath)
             return { success: true, path: filePath }
         } catch (error) {
             logger.debug('Failed to upload file:', error)
             return rpcError(getErrorMessage(error, 'Failed to upload file'))
-        }
-    })
-
-    // Handler for large files: hub stores the file, runner downloads via HTTP
-    rpcHandlerManager.registerHandler<{
-        sessionId?: string
-        filename: string
-        downloadUrl: string
-        mimeType: string
-    }, UploadFileResponse>('uploadFileFromHub', async (data) => {
-        logger.debug('Upload from hub request:', data.filename, 'downloadUrl:', data.downloadUrl)
-
-        if (!data.filename || !data.downloadUrl) {
-            return rpcError('Filename and downloadUrl are required')
-        }
-
-        try {
-            // Download file content from hub (downloadUrl is a full URL)
-            const hubUrl = data.downloadUrl
-            logger.debug('Downloading file from hub:', hubUrl)
-            const response = await fetch(hubUrl)
-            if (!response.ok) {
-                const errText = await response.text().catch(() => '')
-                return rpcError(`Failed to download from hub: ${response.status} ${errText}`)
-            }
-
-            const buffer = Buffer.from(await response.arrayBuffer())
-            if (buffer.length > MAX_UPLOAD_BYTES) {
-                return rpcError('File too large (max 50MB)')
-            }
-
-            const dir = await getOrCreateUploadDir(data.sessionId)
-            const sanitizedFilename = sanitizeFilename(data.filename)
-            const timestamp = Date.now()
-            const uniqueFilename = `${timestamp}-${sanitizedFilename}`
-            const filePath = join(dir, uniqueFilename)
-            await writeFile(filePath, buffer)
-            resizeImageIfNeeded(filePath, data.mimeType)
-
-            logger.debug('File uploaded from hub successfully:', filePath)
-            return { success: true, path: filePath }
-        } catch (error) {
-            logger.debug('Failed to upload file from hub:', error)
-            return rpcError(getErrorMessage(error, 'Failed to upload file from hub'))
         }
     })
 
@@ -281,6 +270,7 @@ export function registerUploadHandlers(rpcHandlerManager: RpcHandlerManager): vo
 
         try {
             await rm(path, { force: true })
+            uploadFileIdentities.get(getSessionKey(data.sessionId))?.delete(resolve(path))
             return { success: true }
         } catch (error) {
             logger.debug('Failed to delete upload file:', error)

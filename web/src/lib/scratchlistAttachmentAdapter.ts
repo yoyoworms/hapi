@@ -1,8 +1,8 @@
 import type { AttachmentAdapter, Attachment, CompleteAttachment, PendingAttachment } from '@assistant-ui/react'
 import type { ScratchlistAttachmentMetadata } from '@hapi/protocol'
 import {
+    isHubScratchlistAttachmentPath,
     parseHubScratchlistAttachmentPath,
-    SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE,
 } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
 import { getRestoredUploadMetadata } from '@/lib/composer-attachment-drafts'
@@ -43,19 +43,38 @@ export function hubAttachmentFromRestoredDraft(
     }
 }
 
-export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: string): AttachmentAdapter {
+export type ScratchlistAttachmentAdapter = AttachmentAdapter & {
+    /**
+     * After a successful park, `clearAttachments()` still calls `remove()`.
+     * Mark those chip ids so remove skips hub/chat deletes (blobs now live
+     * on the scratchlist entry).
+     */
+    releaseWithoutDelete(ids: Iterable<string>): void
+}
+
+export function createScratchlistAttachmentAdapter(
+    api: ApiClient,
+    sessionId: string,
+): ScratchlistAttachmentAdapter {
     const cancelledAttachmentIds = new Set<string>()
+    const releasedWithoutDeleteIds = new Set<string>()
 
     return {
-        // assistant-ui 0.14 reserves `*` for the universal matcher. `*/*`
-        // is parsed as a MIME wildcard with the literal top-level type `*`
-        // and therefore rejects every real file.
+        // assistant-ui uses the exact "*" sentinel for an allow-all adapter.
+        // "*/*" is forwarded to MIME matching and rejects every file before
+        // this adapter's add() method can run.
         accept: '*',
+
+        releaseWithoutDelete(ids: Iterable<string>): void {
+            for (const id of ids) {
+                releasedWithoutDeleteIds.add(id)
+            }
+        },
 
         async *add({ file }): AsyncGenerator<PendingAttachment> {
             const contentType = file.type || 'application/octet-stream'
             const restored = getRestoredUploadMetadata(file)
-            if (restored?.sourceSessionId === sessionId) {
+            if (restored?.path) {
                 const hubAttachment = hubAttachmentFromRestoredDraft(restored.path, file, contentType)
                 if (hubAttachment) {
                     yield {
@@ -74,21 +93,6 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
             }
 
             const id = randomId()
-
-            // Reject before publishing a running attachment. The composer draft
-            // controller persists resumable uploads, and must never receive an
-            // oversized File that the Hub will reject.
-            if (file.size > SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE) {
-                yield {
-                    id,
-                    type: 'file',
-                    name: `${file.name} (file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB)`,
-                    contentType,
-                    file,
-                    status: { type: 'incomplete', reason: 'error' }
-                }
-                return
-            }
 
             yield {
                 id,
@@ -148,20 +152,12 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
                     try {
                         previewUrl = await fileToDataUrl(file)
                     } catch {
-                        // Preview is optional; the Hub attachment is already
-                        // durable and remains usable without an inline image.
-                        previewUrl = undefined
+                        // Preview generation is optional after the upload has succeeded.
                     }
                 }
 
-                // remove() can race the optional FileReader above. Re-check
-                // after its await so a cancelled attachment is cleaned up
-                // instead of being yielded as ready and reappearing in UI.
                 if (cancelledAttachmentIds.has(id)) {
-                    await api.deleteScratchlistAttachment(
-                        sessionId,
-                        result.attachment.id
-                    ).catch(() => {})
+                    await api.deleteScratchlistAttachment(sessionId, result.attachment.id).catch(() => {})
                     return
                 }
 
@@ -189,17 +185,67 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
         },
 
         async remove(attachment: Attachment): Promise<void> {
+            if (releasedWithoutDeleteIds.delete(attachment.id)) {
+                return
+            }
             cancelledAttachmentIds.add(attachment.id)
             const pending = attachment as PendingScratchlistAttachment
             const hubId = pending.hubAttachment?.id
             if (hubId) {
                 await api.deleteScratchlistAttachment(sessionId, hubId).catch(() => {})
+                return
+            }
+            // Chat-path chip attached before scratchlist mode was enabled (#1226).
+            if (pending.path && !isHubScratchlistAttachmentPath(pending.path)) {
+                await api.deleteUploadFile(sessionId, pending.path).catch(() => {})
             }
         },
 
         async send(attachment: PendingAttachment): Promise<CompleteAttachment> {
             const pending = attachment as PendingScratchlistAttachment
-            const hubAttachment = pending.hubAttachment
+            let hubAttachment = pending.hubAttachment
+            let previewUrl = pending.previewUrl
+            let migratedFromPath: string | undefined
+
+            // Attach-before-mode: composer still holds a chat-path pending from
+            // the normal upload adapter. Migrate into hub scratchlist storage
+            // so park keeps the image (#1226). Fail closed (throw) — empty
+            // content would park text-only and clear chips silently.
+            //
+            // Do NOT delete the chat-path upload here: send() runs before
+            // scratchlist.add succeeds. If park is rejected (at-cap / 409 /
+            // network), the composer keeps chips that still reference the
+            // chat path; deleting early poisons retry and orphans the hub
+            // blob. Cleanup is deferred to onSendForComposer.
+            if (!hubAttachment) {
+                const file = attachment.file
+                if (!file) {
+                    throw new Error('Cannot park scratchlist attachment without file bytes')
+                }
+                const contentType = attachment.contentType || file.type || 'application/octet-stream'
+                const content = await fileToBase64(file)
+                const result = await api.uploadScratchlistAttachment(
+                    sessionId,
+                    attachment.name,
+                    content,
+                    contentType
+                )
+                if (!result.success || !result.attachment) {
+                    throw new Error(
+                        result.error ?? 'Failed to migrate attachment to scratchlist storage'
+                    )
+                }
+                hubAttachment = result.attachment
+                if (
+                    pending.path
+                    && !isHubScratchlistAttachmentPath(pending.path)
+                ) {
+                    migratedFromPath = pending.path
+                }
+                if (!previewUrl && isImageMimeType(contentType) && file.size <= MAX_PREVIEW_BYTES) {
+                    previewUrl = await fileToDataUrl(file)
+                }
+            }
 
             return {
                 id: attachment.id,
@@ -207,17 +253,16 @@ export function createScratchlistAttachmentAdapter(api: ApiClient, sessionId: st
                 name: attachment.name,
                 contentType: attachment.contentType,
                 status: { type: 'complete' },
-                content: hubAttachment
-                    ? [{
-                        type: 'text',
-                        text: JSON.stringify({
-                            __attachmentMetadata: {
-                                ...hubAttachment,
-                                previewUrl: pending.previewUrl
-                            }
-                        })
-                    }]
-                    : []
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        __attachmentMetadata: {
+                            ...hubAttachment,
+                            previewUrl,
+                            ...(migratedFromPath ? { migratedFromPath } : {}),
+                        }
+                    })
+                }]
             }
         }
     }

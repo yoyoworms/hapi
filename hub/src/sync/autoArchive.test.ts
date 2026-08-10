@@ -160,6 +160,12 @@ describe('SyncEngine auto-archive integration', () => {
                 { controlledByUser: false, requests: {} },
                 'default'
             )
+            expect(engine.handleSessionAlive({
+                sid: session.id,
+                time: NOW,
+                runtimeId: 'auto-archive-runtime',
+                runtimeGeneration: 1
+            })).toBe(true)
 
             await expect(engine.runAutoArchiveSweep(NOW + IDLE_MS)).resolves.toEqual([session.id])
             expect(killSession).toHaveBeenCalledWith(
@@ -171,6 +177,7 @@ describe('SyncEngine auto-archive integration', () => {
                 archivedBy: 'hub',
                 archiveReason: 'Auto-archived after 48 hours of inactivity'
             }))
+            expect(engine.getSession(session.id)?.active).toBe(false)
         } finally {
             engine.stop()
         }

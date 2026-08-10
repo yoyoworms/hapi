@@ -23,12 +23,14 @@ type TranscriptState = {
     sessionId: string | null;
     cwd: string | null;
     isSubagent: boolean;
+    sessionMatchToken: string | null;
 };
 
 type CodexTranscriptLocatorOptions = {
     cwd: string;
     startupTimestampMs: number;
     resumeSessionId?: string | null;
+    sessionMatchToken?: string | null;
     intervalMs?: number;
     settlementMs?: number;
     onLocated: (located: LocatedCodexTranscript) => void;
@@ -56,6 +58,7 @@ class CodexTranscriptLocatorImpl {
     private readonly targetCwd: string;
     private readonly startupTimestampMs: number;
     private readonly resumeSessionId: string | null;
+    private readonly sessionMatchToken: string | null;
     private readonly intervalMs: number;
     private readonly settlementMs: number;
     private readonly onLocated: CodexTranscriptLocatorOptions['onLocated'];
@@ -75,6 +78,7 @@ class CodexTranscriptLocatorImpl {
         this.targetCwd = normalizePath(options.cwd);
         this.startupTimestampMs = options.startupTimestampMs;
         this.resumeSessionId = options.resumeSessionId ?? null;
+        this.sessionMatchToken = options.sessionMatchToken ?? null;
         this.intervalMs = options.intervalMs ?? DEFAULT_LOCATOR_INTERVAL_MS;
         this.settlementMs = options.settlementMs ?? this.intervalMs;
         this.onLocated = options.onLocated;
@@ -173,7 +177,8 @@ class CodexTranscriptLocatorImpl {
             ino: fileStats.ino,
             sessionId: null,
             cwd: null,
-            isSubagent: false
+            isSubagent: false,
+            sessionMatchToken: null
         };
 
         const replaced = previous && previous.ino !== fileStats.ino;
@@ -190,7 +195,8 @@ class CodexTranscriptLocatorImpl {
                 ino: fileStats.ino,
                 sessionId: null,
                 cwd: null,
-                isSubagent: false
+                isSubagent: false,
+                sessionMatchToken: null
             };
         } else if (previous
             && fileStats.size === previous.size
@@ -247,6 +253,11 @@ class CodexTranscriptLocatorImpl {
                 }
             }
 
+            const eventMatchToken = extractSessionMatchTokenFromEvent(event);
+            if (eventMatchToken) {
+                state.sessionMatchToken = eventMatchToken;
+            }
+
             if (convertCodexEvent(event)?.userActivity) {
                 const eventTimestamp = parseTimestamp(event.timestamp);
                 if (eventTimestamp !== null && eventTimestamp >= this.startupTimestampMs) {
@@ -264,6 +275,9 @@ class CodexTranscriptLocatorImpl {
         this.states.set(transcriptPath, state);
 
         if (!sawFreshUserActivity || !state.sessionId) {
+            return null;
+        }
+        if (this.sessionMatchToken && state.sessionMatchToken !== this.sessionMatchToken) {
             return null;
         }
         if (this.resumeSessionId) {
@@ -375,6 +389,50 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | null {
     return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function extractSessionMatchToken(text: string | null): string | null {
+    if (!text) return null;
+    const match = text.match(
+        /(?:hapi[-\s]+session[-\s]+match[-\s]+token|HAPI session match token)\s*:?\s*([a-f0-9-]+)/i
+    );
+    return match?.[1] ?? null;
+}
+
+function extractSessionMatchTokenFromEvent(event: CodexSessionEvent): string | null {
+    const payload = asRecord(event.payload);
+    if (!payload) return null;
+
+    if (event.type === 'session_meta') {
+        const rawBaseInstructions = payload.base_instructions ?? payload.baseInstructions;
+        const baseInstructions = asRecord(rawBaseInstructions);
+        return extractSessionMatchToken(
+            asString(rawBaseInstructions)
+            ?? asString(baseInstructions?.text)
+        );
+    }
+
+    if (event.type === 'response_item') {
+        if (asString(payload.type) !== 'message' || asString(payload.role) !== 'developer') {
+            return null;
+        }
+        if (!Array.isArray(payload.content)) return null;
+        for (const part of payload.content) {
+            const matchToken = extractSessionMatchToken(asString(asRecord(part)?.text));
+            if (matchToken) return matchToken;
+        }
+        return null;
+    }
+
+    if (event.type === 'turn_context') {
+        const collaborationMode = asRecord(payload.collaboration_mode ?? payload.collaborationMode);
+        const settings = asRecord(collaborationMode?.settings);
+        return extractSessionMatchToken(
+            asString(settings?.developer_instructions ?? settings?.developerInstructions)
+        );
+    }
+
+    return null;
 }
 
 function parseTimestamp(value: unknown): number | null {

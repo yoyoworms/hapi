@@ -6,6 +6,8 @@ import {
     RunnerStateSchema
 } from '@hapi/protocol/schemas'
 import {
+    ClearOpencodeSessionResponseSchema,
+    ClearOpencodeSessionCallbackRequestSchema,
     CliMessagesResponseSchema,
     CreateMachineResponseSchema,
     CreateSessionResponseSchema,
@@ -13,6 +15,8 @@ import {
     LocalHandoffResponseSchema,
     LocalResumeTargetResponseSchema,
     ResumableSessionsResponseSchema,
+    type ClearOpencodeSessionResponse,
+    type ClearOpencodeSessionCallbackRequest,
     type CliMessagesResponse,
     type CreateMachineResponse,
     type CreateSessionResponse,
@@ -46,6 +50,8 @@ export type SessionEffort = string | null
 export { AgentStateSchema, AttachmentMetadataSchema, MachineMetadataSchema, MetadataSchema, RunnerStateSchema }
 
 export {
+    ClearOpencodeSessionCallbackRequestSchema,
+    ClearOpencodeSessionResponseSchema,
     CliMessagesResponseSchema,
     CreateMachineResponseSchema,
     CreateSessionResponseSchema,
@@ -56,6 +62,8 @@ export {
 }
 
 export type {
+    ClearOpencodeSessionCallbackRequest,
+    ClearOpencodeSessionResponse,
     CliMessagesResponse,
     CreateMachineResponse,
     CreateSessionResponse,
@@ -64,6 +72,9 @@ export type {
 
 export const MessageMetaSchema = z.object({
     sentFrom: z.string().optional(),
+    // Queue remains the default for existing clients. Pi-aware callers may
+    // explicitly request native steering while a turn is streaming.
+    deliveryMode: z.enum(['queue', 'steer']).optional(),
     fallbackModel: z.string().nullable().optional(),
     customSystemPrompt: z.string().nullable().optional(),
     appendSystemPrompt: z.string().nullable().optional(),

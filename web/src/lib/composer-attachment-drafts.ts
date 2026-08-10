@@ -1,15 +1,7 @@
 const DB_NAME = 'hapi-composer-drafts'
-const DB_VERSION = 2
+const DB_VERSION = 1
 const STORE = 'attachments'
-const META_STORE = 'attachment-meta'
 const MAX_DRAFTS = 50
-// Uploading a single normal attachment is capped at 50MB. Persist at most one
-// such payload (plus modest companions) per session and keep a small global
-// budget. Larger drafts remain in the in-memory cache for same-tab recovery;
-// attempting to clone them repeatedly into IndexedDB can terminate mobile tabs.
-const MAX_PERSISTED_DRAFT_BYTES = 64 * 1024 * 1024
-const MAX_PERSISTED_TOTAL_BYTES = 128 * 1024 * 1024
-const MAX_CACHE_BYTES = 128 * 1024 * 1024
 
 type StoredAttachment = {
     id: string
@@ -19,18 +11,13 @@ type StoredAttachment = {
     blob: Blob
     path?: string
     previewUrl?: string
+    uploadSessionId?: string
 }
 
 type StoredAttachmentDraft = {
     sessionId: string
     files: StoredAttachment[]
     updatedAt: number
-}
-
-type StoredAttachmentDraftMeta = {
-    sessionId: string
-    updatedAt: number
-    bytes: number
 }
 
 const cache = new Map<string, File[]>()
@@ -42,50 +29,14 @@ export type AttachmentDraftInput = {
     file: File
     path?: string
     previewUrl?: string
+    uploadSessionId?: string
 }
 
 export type RestoredUploadMetadata = {
     id: string
-    path: string
+    path?: string
     previewUrl?: string
-    /** Session whose CLI/Hub storage owns `path`. */
-    sourceSessionId: string
-}
-
-function storedDraftBytes(record: Pick<StoredAttachmentDraft, 'files'>): number {
-    return record.files.reduce((total, file) => total + file.blob.size, 0)
-}
-
-function fileSetBytes(files: readonly File[]): number {
-    return files.reduce((total, file) => total + file.size, 0)
-}
-
-/** @internal Exported for the storage-budget regression test. */
-export function canPersistAttachmentDraft(files: readonly Pick<File, 'size'>[]): boolean {
-    return files.reduce((total, file) => total + file.size, 0) <= MAX_PERSISTED_DRAFT_BYTES
-}
-
-function evictStoredDrafts(
-    store: IDBObjectStore,
-    metaStore: IDBObjectStore,
-    drafts: StoredAttachmentDraftMeta[],
-): void {
-    const newestFirst = [...drafts].sort((a, b) => b.updatedAt - a.updatedAt)
-    let kept = 0
-    let keptBytes = 0
-    for (const draft of newestFirst) {
-        const bytes = Number.isFinite(draft.bytes) ? Math.max(0, draft.bytes) : Infinity
-        const withinBudget = kept < MAX_DRAFTS
-            && bytes <= MAX_PERSISTED_DRAFT_BYTES
-            && keptBytes + bytes <= MAX_PERSISTED_TOTAL_BYTES
-        if (withinBudget) {
-            kept += 1
-            keptBytes += bytes
-            continue
-        }
-        store.delete(draft.sessionId)
-        metaStore.delete(draft.sessionId)
-    }
+    uploadSessionId?: string
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -95,44 +46,10 @@ function openDb(): Promise<IDBDatabase> {
             return
         }
         const request = indexedDB.open(DB_NAME, DB_VERSION)
-        request.onupgradeneeded = (event) => {
+        request.onupgradeneeded = () => {
             const db = request.result
-            const transaction = request.transaction
-            if (!transaction) return
-            const hadAttachmentStore = db.objectStoreNames.contains(STORE)
-            const store = hadAttachmentStore
-                ? transaction.objectStore(STORE)
-                : db.createObjectStore(STORE, { keyPath: 'sessionId' })
-            const metaStore = db.objectStoreNames.contains(META_STORE)
-                ? transaction.objectStore(META_STORE)
-                : db.createObjectStore(META_STORE, { keyPath: 'sessionId' })
-
-            // V1 evicted with getAll(), which materialized every stored Blob at
-            // once. Migrate one cursor value at a time into a tiny metadata
-            // store, then all future eviction scans touch metadata only.
-            if ((event.oldVersion ?? 0) < 2 && hadAttachmentStore) {
-                const cursorRequest = store.openCursor()
-                cursorRequest.onsuccess = () => {
-                    const cursor = cursorRequest.result
-                    if (cursor) {
-                        const record = cursor.value as StoredAttachmentDraft
-                        metaStore.put({
-                            sessionId: record.sessionId,
-                            updatedAt: record.updatedAt,
-                            bytes: storedDraftBytes(record),
-                        } satisfies StoredAttachmentDraftMeta)
-                        cursor.continue()
-                        return
-                    }
-                    const metaRequest = metaStore.getAll()
-                    metaRequest.onsuccess = () => {
-                        evictStoredDrafts(
-                            store,
-                            metaStore,
-                            metaRequest.result as StoredAttachmentDraftMeta[],
-                        )
-                    }
-                }
+            if (!db.objectStoreNames.contains(STORE)) {
+                db.createObjectStore(STORE, { keyPath: 'sessionId' })
             }
         }
         request.onsuccess = () => resolve(request.result)
@@ -160,50 +77,45 @@ function toStoredFile(attachment: AttachmentDraftInput): StoredAttachment {
         blob: file,
         path: attachment.path,
         previewUrl: attachment.previewUrl,
+        uploadSessionId: attachment.uploadSessionId,
     }
 }
 
-function toFile(file: StoredAttachment, sourceSessionId: string): File {
+function toFile(file: StoredAttachment): File {
     const restored = new File([file.blob], file.name, {
         type: file.type,
         lastModified: file.lastModified,
     })
-    if (file.path) {
-        restoredUploadMetadata.set(restored, {
-            id: file.id,
-            path: file.path,
-            previewUrl: file.previewUrl,
-            sourceSessionId,
-        })
-    }
+    // Always retain the stored id so pathless pending picks (failed resume)
+    // round-trip without inventing a synthetic id on the next persist pass.
+    restoredUploadMetadata.set(restored, {
+        id: file.id,
+        path: file.path,
+        previewUrl: file.previewUrl,
+        uploadSessionId: file.uploadSessionId,
+    })
     return restored
 }
 
 async function writeDraft(record: StoredAttachmentDraft | null, sessionId: string): Promise<void> {
+    // No IndexedDB (tests / SSR): cache is already updated by the caller.
+    if (typeof indexedDB === 'undefined') return
     const db = await openDb()
     await new Promise<void>((resolve, reject) => {
-        const transaction = db.transaction([STORE, META_STORE], 'readwrite')
+        const transaction = db.transaction(STORE, 'readwrite')
         const store = transaction.objectStore(STORE)
-        const metaStore = transaction.objectStore(META_STORE)
         if (record) {
-            const bytes = storedDraftBytes(record)
             store.put(record)
-            metaStore.put({
-                sessionId,
-                updatedAt: record.updatedAt,
-                bytes,
-            } satisfies StoredAttachmentDraftMeta)
+            const allRequest = store.getAll()
+            allRequest.onsuccess = () => {
+                const drafts = (allRequest.result as StoredAttachmentDraft[])
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                for (const stale of drafts.slice(MAX_DRAFTS)) {
+                    store.delete(stale.sessionId)
+                }
+            }
         } else {
             store.delete(sessionId)
-            metaStore.delete(sessionId)
-        }
-        const metaRequest = metaStore.getAll()
-        metaRequest.onsuccess = () => {
-            evictStoredDrafts(
-                store,
-                metaStore,
-                metaRequest.result as StoredAttachmentDraftMeta[],
-            )
         }
         transaction.oncomplete = () => {
             db.close()
@@ -226,22 +138,30 @@ function queueWrite(record: StoredAttachmentDraft | null, sessionId: string): vo
     })
 }
 
+async function awaitPendingWrites(...sessionIds: string[]): Promise<void> {
+    const unique = [...new Set(sessionIds)]
+    await Promise.all(unique.map(async (sessionId) => {
+        const pending = pendingWrites.get(sessionId)
+        // Propagate IndexedDB failures — same-target corrective writes must not
+        // look durable when the queued transaction rejected.
+        if (pending) await pending
+    }))
+}
+
 function setCachedFiles(sessionId: string, files: File[]): void {
     cache.delete(sessionId)
     cache.set(sessionId, files)
-    let cachedBytes = [...cache.values()].reduce(
-        (total, cachedFiles) => total + fileSetBytes(cachedFiles),
-        0,
-    )
-    while (cache.size > MAX_DRAFTS || (cachedBytes > MAX_CACHE_BYTES && cache.size > 1)) {
+    while (cache.size > MAX_DRAFTS) {
         const oldest = cache.keys().next().value as string | undefined
         if (!oldest) break
-        cachedBytes -= fileSetBytes(cache.get(oldest) ?? [])
         cache.delete(oldest)
     }
 }
 
-export async function getDraftAttachments(sessionId: string): Promise<File[]> {
+export async function getDraftAttachments(
+    sessionId: string,
+    options: { throwOnError?: boolean } = {},
+): Promise<File[]> {
     const cached = cache.get(sessionId)
     if (cached) return cached.map(copyFile)
 
@@ -259,16 +179,11 @@ export async function getDraftAttachments(sessionId: string): Promise<File[]> {
                 reject(transaction.error ?? new Error('Composer draft transaction failed'))
             }
         })
-        const files = record?.files.map((file) => toFile(file, record.sessionId)) ?? []
+        const files = record?.files.map(toFile) ?? []
         if (files.length > 0) setCachedFiles(sessionId, files)
-        if (record && !canPersistAttachmentDraft(files)) {
-            // Preserve this recovery in memory for the current tab, but remove
-            // an oversized legacy V1 record before a later getAll-like browser
-            // operation or quota pressure can amplify it.
-            queueWrite(null, sessionId)
-        }
         return files
-    } catch {
+    } catch (error) {
+        if (options.throwOnError) throw error
         return []
     }
 }
@@ -283,19 +198,111 @@ export function saveDraftAttachments(sessionId: string, attachments: AttachmentD
     }
 
     const storedFiles = attachments.map(toStoredFile)
-    const copies = storedFiles.map((file) => toFile(file, sessionId))
+    const copies = storedFiles.map(toFile)
     setCachedFiles(sessionId, copies)
-    if (!canPersistAttachmentDraft(copies)) {
-        // The current tab still owns `copies`; delete any stale persistent
-        // version so a reload never resurrects an older attachment set.
-        queueWrite(null, sessionId)
-        return
-    }
     queueWrite({
         sessionId,
         files: storedFiles,
         updatedAt: Date.now(),
     }, sessionId)
+}
+
+/**
+ * Atomically put the target draft and delete the source in one IndexedDB
+ * transaction (after draining any queued writes). `resolveAttachments` runs
+ * only after that drain so a mid-wait remove() is still honored.
+ */
+export async function moveDraftAttachments(
+    sourceSessionId: string,
+    targetSessionId: string,
+    resolveAttachments: () => AttachmentDraftInput[],
+): Promise<AttachmentDraftInput[]> {
+    if (sourceSessionId === targetSessionId) {
+        const attachments = resolveAttachments()
+        saveDraftAttachments(targetSessionId, attachments)
+        await awaitPendingWrites(targetSessionId)
+        return attachments
+    }
+
+    await awaitPendingWrites(sourceSessionId, targetSessionId)
+
+    // Re-sample after the drain — cancellation during awaitPendingWrites must win.
+    const attachments = resolveAttachments()
+    const storedFiles = attachments.map(toStoredFile)
+    const copies = storedFiles.map(toFile)
+
+    const previousSource = cache.has(sourceSessionId)
+        ? (cache.get(sourceSessionId) ?? []).map(copyFile)
+        : null
+    const previousTarget = cache.has(targetSessionId)
+        ? (cache.get(targetSessionId) ?? []).map(copyFile)
+        : null
+
+    setCachedFiles(targetSessionId, copies)
+    // Tombstone the source immediately so unmount cleanup / remount cannot
+    // re-read and re-persist the obsolete session id while the commit runs.
+    setCachedFiles(sourceSessionId, [])
+
+    // Environments without IndexedDB (tests / SSR) stay memory-only, matching
+    // saveDraftAttachments. Real IDB open/transaction failures must not look durable.
+    if (typeof indexedDB === 'undefined') {
+        return attachments
+    }
+
+    const restoreCaches = () => {
+        if (previousSource === null) {
+            cache.delete(sourceSessionId)
+        } else {
+            setCachedFiles(sourceSessionId, previousSource)
+        }
+        if (previousTarget === null) {
+            cache.delete(targetSessionId)
+        } else {
+            setCachedFiles(targetSessionId, previousTarget)
+        }
+    }
+
+    try {
+        const db = await openDb()
+        await new Promise<void>((resolve, reject) => {
+            const transaction = db.transaction(STORE, 'readwrite')
+            const store = transaction.objectStore(STORE)
+            // Delete the source before put/prune so a full 50-draft store does not
+            // briefly look like 51 rows and evict an unrelated session.
+            store.delete(sourceSessionId)
+            if (attachments.length === 0) {
+                store.delete(targetSessionId)
+            } else {
+                store.put({
+                    sessionId: targetSessionId,
+                    files: storedFiles,
+                    updatedAt: Date.now(),
+                })
+                const allRequest = store.getAll()
+                allRequest.onsuccess = () => {
+                    const drafts = (allRequest.result as StoredAttachmentDraft[])
+                        .sort((a, b) => b.updatedAt - a.updatedAt)
+                    for (const stale of drafts.slice(MAX_DRAFTS)) {
+                        if (stale.sessionId === targetSessionId) continue
+                        store.delete(stale.sessionId)
+                    }
+                }
+            }
+            transaction.oncomplete = () => {
+                db.close()
+                resolve()
+            }
+            transaction.onerror = () => {
+                db.close()
+                reject(transaction.error ?? new Error('Composer draft move failed'))
+            }
+            transaction.onabort = transaction.onerror
+        })
+        return attachments
+    } catch (error) {
+        restoreCaches()
+        throw error instanceof Error ? error : new Error('Composer draft move failed')
+    }
 }
 
 export function clearDraftAttachments(sessionId: string): void {

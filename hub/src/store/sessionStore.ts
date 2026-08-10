@@ -13,8 +13,12 @@ import {
     setSessionModelReasoningEffort,
     setSessionServiceTier,
     setSessionActive,
+    setSessionPinned,
+    setSessionPinMode,
+    type SessionPinMode,
     setSessionTeamState,
     setSessionTodos,
+    replaceSessionTodos,
     touchSessionUpdatedAt,
     updateSessionAgentState,
     updateSessionMetadata
@@ -63,6 +67,14 @@ export class SessionStore {
         return setSessionTodos(this.db, id, todos, todosUpdatedAt, namespace)
     }
 
+    replaceSessionTodos(
+        id: string,
+        todos: unknown,
+        namespace: string
+    ): boolean {
+        return replaceSessionTodos(this.db, id, todos, namespace)
+    }
+
     setSessionTeamState(id: string, teamState: unknown, updatedAt: number, namespace: string): boolean {
         return setSessionTeamState(this.db, id, teamState, updatedAt, namespace)
     }
@@ -90,6 +102,14 @@ export class SessionStore {
 
     setSessionActive(id: string, active: boolean, activeAt: number, namespace: string): boolean {
         return setSessionActive(this.db, id, active, activeAt, namespace)
+    }
+
+    setSessionPinned(id: string, pinned: boolean, namespace: string): boolean {
+        return setSessionPinned(this.db, id, pinned, namespace)
+    }
+
+    setSessionPinMode(id: string, mode: SessionPinMode, namespace: string): boolean {
+        return setSessionPinMode(this.db, id, mode, namespace)
     }
 
     touchSessionUpdatedAt(id: string, updatedAt: number, namespace: string): boolean {

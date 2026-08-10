@@ -6,19 +6,14 @@ import {
     buildCodexHookConfigArgs,
     buildModelReasoningEffortConfigArgs
 } from './utils/codexMcpConfig';
-import { codexSystemPrompt } from './utils/systemPrompt';
+import { getCodexSystemPrompt } from './utils/systemPrompt';
 import type { ReasoningEffort } from './appServerTypes';
 import { resolveCodexCommand } from './utils/codexExecutable';
 import type { McpServersConfig } from './utils/buildHapiMcpBridge';
-import { prepareHapiCodexContextArgs } from './codexAppServerClient';
+import { prepareHapiCodexContextArgs } from './hapiContextPolicy';
 
 export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
-    if (!sessionMatchToken) {
-        return instructions;
-    }
-    // Codex strips HTML comments from recorded session metadata, so keep this as
-    // plain text for the session scanner. It is only used to disambiguate
-    // concurrent local Codex launches in the same cwd.
+    if (!sessionMatchToken) return instructions;
     return `${instructions}\n\nHAPI session match token: ${sessionMatchToken}`;
 }
 
@@ -165,7 +160,7 @@ export async function codexLocal(opts: {
     }
 
     // Add developer instructions (system prompt)
-    args.push(...buildDeveloperInstructionsArg(appendSessionMatchToken(codexSystemPrompt, opts.sessionMatchToken)));
+    args.push(...buildDeveloperInstructionsArg(appendSessionMatchToken(getCodexSystemPrompt(), opts.sessionMatchToken)));
 
     if (opts.codexArgs) {
         // Before the first launch, Codex still needs the user's selector (for

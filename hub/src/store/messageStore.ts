@@ -3,6 +3,7 @@ import type { Database } from 'bun:sqlite'
 import type { StoredMessage } from './types'
 import {
     addMessage,
+    addImportedMessage,
     cancelQueuedMessage,
     deleteQueuedMessageById,
     lookupQueuedMessage,
@@ -22,11 +23,17 @@ import {
     countFutureScheduledLocalMessages,
     minFutureScheduledAtBySessionIds,
     countMessages,
-    markMessagesInvoked,
-    mergeSessionMessages,
     pruneOldMessages,
+    markMessagesInvoked,
+    markUninvokedImmediateMessages,
+    mergeSessionMessages,
+    moveUninvokedScheduledMessages,
+    moveUninvokedMessages,
     copyMessageToSession as copyStoredMessageToSession,
+    copyMessagesToSession as copyStoredMessagesToSession,
     getAllMessages,
+    getMessagesAfterSeq,
+    truncateMessagesFromLocalId,
     type CancelQueuedMessageResult,
     type LookupQueuedMessageResult,
     type LocalMessageState,
@@ -40,8 +47,12 @@ export class MessageStore {
         this.db = db
     }
 
-    addMessage(sessionId: string, content: unknown, localId?: string, scheduledAt?: number | null): StoredMessage {
-        return addMessage(this.db, sessionId, content, localId, scheduledAt)
+    addMessage(sessionId: string, content: unknown, localId?: string, scheduledAt?: number | null, createdAt?: number): StoredMessage {
+        return addMessage(this.db, sessionId, content, localId, scheduledAt, createdAt)
+    }
+
+    addImportedMessage(sessionId: string, content: unknown, localId: string, createdAt: number): { message: StoredMessage; inserted: boolean } {
+        return addImportedMessage(this.db, sessionId, content, localId, createdAt)
     }
 
     copyMessageToSession(
@@ -52,8 +63,19 @@ export class MessageStore {
         return copyStoredMessageToSession(this.db, sessionId, message)
     }
 
+    copyMessagesToSession(
+        sessionId: string,
+        messages: Array<Pick<StoredMessage, 'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt'>>
+    ): number {
+        return copyStoredMessagesToSession(this.db, sessionId, messages)
+    }
+
     getAllMessages(sessionId: string): StoredMessage[] {
         return getAllMessages(this.db, sessionId)
+    }
+
+    getMessagesAfterSeq(sessionId: string, afterSeq: number): StoredMessage[] {
+        return getMessagesAfterSeq(this.db, sessionId, afterSeq)
     }
 
     getMessages(sessionId: string, limit: number = 200): StoredMessage[] {
@@ -125,6 +147,10 @@ export class MessageStore {
         return countMessages(this.db, sessionId)
     }
 
+    pruneOldMessages(keepPerSession: number): number {
+        return pruneOldMessages(this.db, keepPerSession)
+    }
+
     cancelQueuedMessage(sessionId: string, messageId: string): CancelQueuedMessageResult {
         return cancelQueuedMessage(this.db, sessionId, messageId)
     }
@@ -141,11 +167,32 @@ export class MessageStore {
         return markMessagesInvoked(this.db, sessionId, localIds, invokedAt)
     }
 
+    markUninvokedImmediateMessages(sessionId: string, invokedAt: number): string[] {
+        return markUninvokedImmediateMessages(this.db, sessionId, invokedAt)
+    }
+
+    moveUninvokedScheduledMessages(fromSessionId: string, toSessionId: string): number {
+        return moveUninvokedScheduledMessages(this.db, fromSessionId, toSessionId)
+    }
+
+    moveUninvokedMessages(fromSessionId: string, toSessionId: string): number {
+        return moveUninvokedMessages(this.db, fromSessionId, toSessionId)
+    }
+
     mergeSessionMessages(fromSessionId: string, toSessionId: string): { moved: number; oldMaxSeq: number; newMaxSeq: number } {
         return mergeSessionMessages(this.db, fromSessionId, toSessionId)
     }
 
-    pruneOldMessages(keepPerSession: number): number {
-        return pruneOldMessages(this.db, keepPerSession)
+    truncateMessagesFromLocalId(
+        sessionId: string,
+        localId: string,
+        replacement: Array<{
+            content: unknown
+            localId?: string | null
+            createdAt?: number
+            invokedAt?: number | null
+        }> = []
+    ): { deleted: number; inserted: number; epoch: number } {
+        return truncateMessagesFromLocalId(this.db, sessionId, localId, replacement)
     }
 }

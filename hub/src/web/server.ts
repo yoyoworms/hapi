@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { compress } from 'hono/compress'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { join } from 'node:path'
@@ -7,6 +8,7 @@ import { serveStatic } from 'hono/bun'
 import { getConfiguration } from '../configuration'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import { buildGeminiLiveSetupMessage, QWEN_REALTIME_MODEL } from '@hapi/protocol/voice'
+import { getProviderEnvironment } from '../config/providerCredentials'
 import { createQwenProxyWebSocketHandler } from './qwenProxyHandler'
 import { decodeVoiceSystemPromptParam } from '../voiceSystemPromptParam'
 import type { SyncEngine } from '../sync/syncEngine'
@@ -14,22 +16,26 @@ import { createAuthMiddleware, type WebAppEnv } from './middleware/auth'
 import { createAuthRoutes } from './routes/auth'
 import { createBindRoutes } from './routes/bind'
 import { createEventsRoutes } from './routes/events'
-import { createSharesRoutes } from './routes/shares'
 import { createSessionsRoutes } from './routes/sessions'
 import { createMessagesRoutes } from './routes/messages'
 import { createPermissionsRoutes } from './routes/permissions'
 import { createMachinesRoutes } from './routes/machines'
 import { createStorageRoutes } from './routes/storage'
+import { createUsageRoutes } from './routes/usage'
 import { createGitRoutes } from './routes/git'
 import { createCliRoutes } from './routes/cli'
 import { createCodexDesktopRoutes } from './routes/codexDesktop'
+import { createPiSessionRoutes } from './routes/piSessions'
 import { createPushRoutes } from './routes/push'
-import { createUsageRoutes } from './routes/usage'
 import { createDevicesRoutes } from './routes/devices'
 import { createVoiceRoutes } from './routes/voice'
+import { createHubSettingsRoutes } from './routes/hubSettings'
+import { createWorkGraphRoutes } from './routes/workGraph'
 import type { SSEManager } from '../sse/sseManager'
 import type { VisibilityTracker } from '../visibility/visibilityTracker'
 import type { Server as BunServer, ServerWebSocket } from 'bun'
+import { applyDefaultWsCompression } from './wsCompression'
+import { acceptsGzip } from './sseCompression'
 import type { Server as SocketEngine } from '@socket.io/bun-engine'
 import { jwtVerify } from 'jose'
 import type { WebSocketData } from '@socket.io/bun-engine'
@@ -38,7 +44,9 @@ import { isBunCompiled } from '../utils/bunCompiled'
 import type { Store } from '../store'
 import type { PushService } from '../push/pushService'
 
-// One-time tokens for internal upload downloads (no JWT needed)
+// One-time bearer tokens for internal Hub → runner upload downloads. The
+// authenticated upload route creates and expires them; the download endpoint
+// consumes each token exactly once before auth middleware.
 export const uploadDownloadTokens = new Set<string>()
 
 // Normalise upstream close codes before forwarding to the browser client.
@@ -220,8 +228,8 @@ function createWebApp(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
-    pushService: PushService
     vapidPublicKey: string
+    pushService: PushService
     corsOrigins?: string[]
     embeddedAssetMap: Map<string, EmbeddedWebAsset> | null
     relayMode?: boolean
@@ -231,30 +239,54 @@ function createWebApp(options: {
 
     app.use('*', logger())
 
-    // Health check endpoint (no auth required)
-    app.get('/health', (c) => c.json({ status: 'ok', protocolVersion: PROTOCOL_VERSION }))
+    // Health check endpoint (no auth required).
+    // capabilities.workGraph is additive: old clients ignore unknown fields.
+    app.get('/health', (c) => c.json({
+        status: 'ok',
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: { workGraph: true }
+    }))
 
     const configuration = getConfiguration()
     const corsOrigins = options.corsOrigins ?? configuration.corsOrigins
     const corsOriginOption = corsOrigins.includes('*') ? '*' : corsOrigins
     const corsMiddleware = cors({
         origin: corsOriginOption,
-        allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowHeaders: ['authorization', 'content-type']
+        allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        // last-event-id: browsers attach it to EventSource reconnects for
+        // SSE replay; allow it in case a browser preflights the request.
+        allowHeaders: ['authorization', 'content-type', 'last-event-id']
     })
     app.use('/api/*', corsMiddleware)
-    app.use('/api/*', async (c, next) => {
-        await next()
-        c.res.headers.set('Cache-Control', 'no-store')
-    })
     app.use('/cli/*', corsMiddleware)
+
+    // Gzip JSON API responses. Over the relay tunnel every byte is metered
+    // twice (the SNI proxy copies in both directions), and API payloads are
+    // repetitive JSON that compresses to roughly a quarter of its size.
+    //
+    // This deliberately does not touch /api/events: streamSSE sets
+    // Transfer-Encoding, which hono's compress() skips, and that stream is
+    // already gzipped by compressSseResponse with an explicit sync flush.
+    // Binary uploads/downloads are skipped too - compress() only handles
+    // content types it knows are compressible.
+    //
+    // Gated on the q-aware parser because hono's compress() matches the
+    // Accept-Encoding value by substring: `gzip;q=0` - an explicit refusal -
+    // would otherwise still get a gzip body it cannot consume.
+    const gzipCompress = compress({ encoding: 'gzip' })
+    app.use('/api/*', async (c, next) => {
+        if (acceptsGzip(c.req.header('Accept-Encoding'))) {
+            return gzipCompress(c, next)
+        }
+        return next()
+    })
 
     app.route('/cli', createCliRoutes(options.getSyncEngine))
 
     app.route('/api', createAuthRoutes(options.jwtSecret, options.store))
     app.route('/api', createBindRoutes(options.jwtSecret, options.store))
 
-    // Internal upload download endpoint (no JWT auth, uses one-time token)
+    // Internal upload download endpoint (no JWT; protected by one-time token).
     app.get('/api/sessions/:id/upload/download/:filename', async (c) => {
         const token = c.req.query('token')
         if (!token || !uploadDownloadTokens.has(token)) {
@@ -262,46 +294,44 @@ function createWebApp(options: {
         }
         uploadDownloadTokens.delete(token)
 
-        const { join, resolve, sep } = await import('path')
-        const { tmpdir } = await import('os')
-        const { rm } = await import('fs/promises')
-        const sessionId = c.req.param('id')
-        const filename = c.req.param('filename')
+        const { resolve, sep } = await import('node:path')
+        const { tmpdir } = await import('node:os')
+        const { rm } = await import('node:fs/promises')
         const hubBlobsDir = join(tmpdir(), 'hapi-hub-blobs')
-        const filePath = join(hubBlobsDir, sessionId, filename)
-
+        const filePath = join(hubBlobsDir, c.req.param('id'), c.req.param('filename'))
         const resolvedPath = resolve(filePath)
         const resolvedDir = resolve(hubBlobsDir)
         if (!resolvedPath.startsWith(resolvedDir + sep)) {
             return c.json({ error: 'Invalid path' }, 400)
         }
 
-        try {
-            const file = Bun.file(filePath)
-            if (!await file.exists()) {
-                return c.json({ error: 'File not found' }, 404)
-            }
-            const arrayBuffer = await file.arrayBuffer()
-            await rm(filePath, { force: true }).catch(() => {})
-            return new Response(arrayBuffer, {
-                headers: { 'content-type': 'application/octet-stream' }
-            })
-        } catch {
-            return c.json({ error: 'Failed to read file' }, 500)
+        const file = Bun.file(filePath)
+        if (!await file.exists()) {
+            return c.json({ error: 'File not found' }, 404)
         }
+        const arrayBuffer = await file.arrayBuffer()
+        await rm(filePath, { force: true }).catch(() => {})
+        return new Response(arrayBuffer, {
+            headers: { 'content-type': 'application/octet-stream' }
+        })
     })
 
     app.use('/api/*', createAuthMiddleware(options.jwtSecret, options.store))
     app.route('/api', createEventsRoutes(options.getSseManager, options.getSyncEngine, options.getVisibilityTracker))
-    app.route('/api', createSharesRoutes(options.getSyncEngine, options.store, options.jwtSecret))
     app.route('/api', createSessionsRoutes(options.getSyncEngine))
     app.route('/api', createMessagesRoutes(options.getSyncEngine))
     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createStorageRoutes(configuration.dbPath))
+    app.route('/api', createHubSettingsRoutes(configuration.dataDir))
+    app.route('/api', createUsageRoutes(options.store, options.getSyncEngine))
     app.route('/api', createGitRoutes(options.getSyncEngine))
     // 中文注释：这里提供两类 Codex 辅助能力：扫描本地 transcript 以导入到 Hapi，以及按需重启 Codex Desktop 客户端。
     app.route('/api', createCodexDesktopRoutes({
+        store: options.store,
+        getSyncEngine: options.getSyncEngine
+    }))
+    app.route('/api', createPiSessionRoutes({
         store: options.store,
         getSyncEngine: options.getSyncEngine
     }))
@@ -311,9 +341,10 @@ function createWebApp(options: {
         pushService: options.pushService,
         getSseManager: options.getSseManager
     }))
-    app.route('/api', createUsageRoutes(options.getSyncEngine))
     app.route('/api', createDevicesRoutes(options.store))
-    app.route('/api', createVoiceRoutes())
+    app.route('/api', createVoiceRoutes({ dataDir: configuration.dataDir }))
+    // Path is intentionally NOT `/api/events` — that route is the SSE stream.
+    app.route('/api', createWorkGraphRoutes(options.store))
 
     // Skip static serving in relay mode, show helpful message on root
     if (options.relayMode) {
@@ -355,7 +386,7 @@ from GitHub Pages instead of through the relay tunnel.
         }
 
         app.use('*', async (c, next) => {
-            if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
+            if (c.req.path.startsWith('/api')) {
                 return await next()
             }
 
@@ -372,7 +403,7 @@ from GitHub Pages instead of through the relay tunnel.
         })
 
         app.get('*', async (c, next) => {
-            if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
+            if (c.req.path.startsWith('/api')) {
                 await next()
                 return
             }
@@ -395,20 +426,10 @@ from GitHub Pages instead of through the relay tunnel.
         return app
     }
 
-    // Cache control middleware: no-cache for HTML/SW, long cache for hashed assets
-    app.use('*', async (c, next) => {
-        await next()
-        if (c.req.path.startsWith('/assets/')) {
-            c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable')
-        } else if (c.req.path === '/' || c.req.path.endsWith('.html') || c.req.path.endsWith('sw.js')) {
-            c.res.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
-        }
-    })
-
     app.use('/assets/*', serveStatic({ root: distDir }))
 
     app.use('*', async (c, next) => {
-        if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
+        if (c.req.path.startsWith('/api')) {
             await next()
             return
         }
@@ -417,7 +438,7 @@ from GitHub Pages instead of through the relay tunnel.
     })
 
     app.get('*', async (c, next) => {
-        if (c.req.path.startsWith('/api') || c.req.path.startsWith('/cli') || c.req.path.startsWith('/socket.io')) {
+        if (c.req.path.startsWith('/api')) {
             await next()
             return
         }
@@ -434,8 +455,8 @@ export async function startWebServer(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
-    pushService: PushService
     vapidPublicKey: string
+    pushService: PushService
     socketEngine: SocketEngine
     corsOrigins?: string[]
     relayMode?: boolean
@@ -449,8 +470,8 @@ export async function startWebServer(options: {
         getVisibilityTracker: options.getVisibilityTracker,
         jwtSecret: options.jwtSecret,
         store: options.store,
-        pushService: options.pushService,
         vapidPublicKey: options.vapidPublicKey,
+        pushService: options.pushService,
         corsOrigins: options.corsOrigins,
         embeddedAssetMap,
         relayMode: options.relayMode,
@@ -470,10 +491,16 @@ export async function startWebServer(options: {
         hostname: configuration.listenHost,
         port: configuration.listenPort,
         idleTimeout: Math.max(30, socketHandler.idleTimeout),
-        maxRequestBodySize: Math.max(socketHandler.maxRequestBodySize, 100 * 1024 * 1024),
+        maxRequestBodySize: Math.max(socketHandler.maxRequestBodySize, 68 * 1024 * 1024),
         websocket: {
             ...originalWsHandler,
+            // Advertise permessage-deflate. Negotiation alone compresses
+            // nothing in Bun — each send() opts in — so open() below also
+            // makes compression the default for flagless sends. See
+            // wsCompression.ts for the contract.
+            perMessageDeflate: true,
             open(ws: unknown) {
+                applyDefaultWsCompression(ws as ServerWebSocket<unknown>)
                 const wsAny = ws as ServerWebSocket<{ _qwenProxy?: boolean; _geminiProxy?: boolean }>
                 if (wsAny.data?._geminiProxy) {
                     geminiProxyHandler.open(wsAny)
@@ -526,7 +553,8 @@ export async function startWebServer(options: {
 
             // Gemini Live WebSocket proxy
             if (url.pathname === '/api/voice/gemini-ws') {
-                const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
+                const env = getProviderEnvironment()
+                const apiKey = env.GEMINI_API_KEY || env.GOOGLE_API_KEY
                 if (!apiKey) {
                     return new Response('Gemini API key not configured', { status: 400 })
                 }
@@ -544,7 +572,8 @@ export async function startWebServer(options: {
             }
             // Qwen Realtime WebSocket proxy
             if (url.pathname === '/api/voice/qwen-ws') {
-                const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY
+                const env = getProviderEnvironment()
+                const apiKey = env.DASHSCOPE_API_KEY || env.QWEN_API_KEY
                 const model = QWEN_REALTIME_MODEL
                 const language = url.searchParams.get('language') ?? undefined
                 const voiceParam = url.searchParams.get('voice')?.trim() || undefined

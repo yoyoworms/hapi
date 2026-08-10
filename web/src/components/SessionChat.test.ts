@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     applyModelChangeWithReasoningRollback,
     buildGoalStateMessages,
-    getScratchlistToggleHotkeyAction,
     isScratchlistHotkeyBlockedTarget,
     isScratchlistToggleHotkey,
     resolvePiContextWindow,
@@ -228,8 +227,6 @@ describe('isScratchlistToggleHotkey', () => {
 
     it('rejects Cmd/Ctrl + S without shift (browser Save)', () => {
         // Plain Ctrl-S / Cmd-S remains the browser's Save Page shortcut.
-        // The recognized Shift chord can itself be Save Page As, which is why
-        // getScratchlistToggleHotkeyAction consumes it even when mode is locked.
         expect(isScratchlistToggleHotkey(k({ ctrlKey: true, key: 's' }))).toBe(false)
         expect(isScratchlistToggleHotkey(k({ metaKey: true, key: 's' }))).toBe(false)
     })
@@ -248,32 +245,6 @@ describe('isScratchlistToggleHotkey', () => {
     it('rejects unrelated keys', () => {
         expect(isScratchlistToggleHotkey(k({ ctrlKey: true, shiftKey: true, key: 'A' }))).toBe(false)
         expect(isScratchlistToggleHotkey(k({ ctrlKey: true, shiftKey: true, key: 'Tab' }))).toBe(false)
-    })
-})
-
-describe('getScratchlistToggleHotkeyAction', () => {
-    const shortcut = {
-        metaKey: false,
-        ctrlKey: true,
-        shiftKey: true,
-        altKey: false,
-        key: 's',
-    }
-
-    it('consumes the browser shortcut without toggling when attachments lock the destination', () => {
-        const textarea = document.createElement('textarea')
-        expect(getScratchlistToggleHotkeyAction(shortcut, textarea, true)).toBe('consume')
-    })
-
-    it('toggles when unlocked and ignores shortcuts inside dialogs', () => {
-        const textarea = document.createElement('textarea')
-        expect(getScratchlistToggleHotkeyAction(shortcut, textarea, false)).toBe('toggle')
-
-        const dialog = document.createElement('div')
-        dialog.setAttribute('role', 'dialog')
-        const button = document.createElement('button')
-        dialog.append(button)
-        expect(getScratchlistToggleHotkeyAction(shortcut, button, false)).toBe('ignore')
     })
 })
 

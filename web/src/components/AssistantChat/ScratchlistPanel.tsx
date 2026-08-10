@@ -321,7 +321,8 @@ function ScratchlistInventory({
     onMove,
     sessionId,
     api,
-    promoteToComposerDisabled,
+    disabled = false,
+    promoteToComposerDisabled = false,
     promoteToComposerDisabledReason,
     attachmentsSupported,
     attachmentsUnsupportedReason,
@@ -334,6 +335,7 @@ function ScratchlistInventory({
     onMove: (entry: ScratchlistEntry, direction: 'up' | 'down') => void
     sessionId?: string
     api?: ApiClient
+    disabled?: boolean
     promoteToComposerDisabled?: boolean
     promoteToComposerDisabledReason?: string
     attachmentsSupported?: boolean
@@ -367,6 +369,7 @@ function ScratchlistInventory({
                 const isFirst = index === 0
                 const isLast = index === entries.length - 1
                 const isBusy = busyEntryId === entry.id
+                const mutationsDisabled = disabled || isBusy
                 const attachmentPromotionDisabled = !canPromoteScratchlistEntryAttachments(
                     entry,
                     attachmentsSupported,
@@ -411,7 +414,7 @@ function ScratchlistInventory({
                                 aria-label={t('scratchlist.action.moveUp')}
                                 title={t('scratchlist.action.moveUp')}
                                 onClick={() => onMove(entry, 'up')}
-                                disabled={isFirst || isBusy}
+                                disabled={isFirst || mutationsDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <ArrowUpIcon />
@@ -421,7 +424,7 @@ function ScratchlistInventory({
                                 aria-label={t('scratchlist.action.moveDown')}
                                 title={t('scratchlist.action.moveDown')}
                                 onClick={() => onMove(entry, 'down')}
-                                disabled={isLast || isBusy}
+                                disabled={isLast || mutationsDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <ArrowDownIcon />
@@ -433,7 +436,7 @@ function ScratchlistInventory({
                                     : t('scratchlist.action.promoteToComposer')}
                                 title={composerDisabledReason ?? t('scratchlist.action.promoteToComposer')}
                                 onClick={() => onPromoteToComposer(entry)}
-                                disabled={isBusy || promoteToComposerDisabled || attachmentPromotionDisabled}
+                                disabled={mutationsDisabled || promoteToComposerDisabled || attachmentPromotionDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <PencilIcon />
@@ -445,7 +448,7 @@ function ScratchlistInventory({
                                     : t('scratchlist.action.promoteToQueue')}
                                 title={queueDisabledReason ?? t('scratchlist.action.promoteToQueue')}
                                 onClick={() => onPromoteToQueue(entry)}
-                                disabled={isBusy || attachmentPromotionDisabled}
+                                disabled={mutationsDisabled || attachmentPromotionDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <SendIcon />
@@ -474,7 +477,7 @@ function ScratchlistInventory({
                                 aria-label={t('scratchlist.action.delete')}
                                 title={t('scratchlist.action.delete')}
                                 onClick={() => onDelete(entry)}
-                                disabled={isBusy}
+                                disabled={mutationsDisabled}
                                 className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-30"
                             >
                                 <TrashIcon />
@@ -503,7 +506,8 @@ export function ScratchlistDrawer({
     onPromoteToQueue,
     sessionId,
     api,
-    promoteToComposerDisabled,
+    disabled = false,
+    promoteToComposerDisabled = false,
     promoteToComposerDisabledReason,
     attachmentsSupported,
     attachmentsUnsupportedReason,
@@ -515,6 +519,7 @@ export function ScratchlistDrawer({
     onPromoteToQueue: (entry: ScratchlistEntry) => Promise<boolean>
     sessionId: string
     api: ApiClient
+    disabled?: boolean
     promoteToComposerDisabled?: boolean
     promoteToComposerDisabledReason?: string
     attachmentsSupported?: boolean
@@ -530,6 +535,7 @@ export function ScratchlistDrawer({
     }, [entries.length, t])
 
     const handleDelete = useCallback((entry: ScratchlistEntry) => {
+        if (disabled) return
         if (shouldConfirmDelete(entry)) {
             const confirmed = typeof window !== 'undefined'
                 ? window.confirm(t('scratchlist.confirmDelete'))
@@ -537,36 +543,37 @@ export function ScratchlistDrawer({
             if (!confirmed) return
         }
         onDelete(entry.id)
-    }, [onDelete, t])
+    }, [disabled, onDelete, t])
 
     const handleMove = useCallback((entry: ScratchlistEntry, direction: 'up' | 'down') => {
+        if (disabled) return
         onMove(entry.id, direction)
-    }, [onMove])
+    }, [disabled, onMove])
 
     const handlePromoteToComposer = useCallback((entry: ScratchlistEntry) => {
+        if (disabled || promoteToComposerDisabled) return
         if (!canPromoteScratchlistEntryAttachments(entry, attachmentsSupported)) return
         void Promise.resolve(onPromoteToComposer(entry)).catch((error: unknown) => {
-            // The source entry is copy-style and remains durable. Avoid an
+            // Copy-style promotion keeps the source entry durable. Avoid an
             // unhandled click-handler rejection when attachment hydration fails.
             console.error('Failed to copy scratchlist entry to composer:', error)
         })
-    }, [attachmentsSupported, onPromoteToComposer])
+    }, [attachmentsSupported, disabled, onPromoteToComposer, promoteToComposerDisabled])
 
     const handlePromoteToQueue = useCallback(async (entry: ScratchlistEntry) => {
-        if (busyEntryId) return
+        if (disabled || busyEntryId) return
         if (!canPromoteScratchlistEntryAttachments(entry, attachmentsSupported)) return
         setBusyEntryId(entry.id)
         try {
             const accepted = await onPromoteToQueue(entry)
             if (accepted) onDelete(entry.id)
         } catch (error) {
-            // Keep the source entry. The host already cleans any partially
-            // staged CLI uploads before rethrowing.
+            // Keep the source entry when staging or sending fails.
             console.error('Failed to send scratchlist entry to queue:', error)
         } finally {
             setBusyEntryId(null)
         }
-    }, [attachmentsSupported, busyEntryId, onDelete, onPromoteToQueue])
+    }, [attachmentsSupported, busyEntryId, disabled, onDelete, onPromoteToQueue])
 
     return (
         <div className="mx-auto w-full max-w-content mb-1">
@@ -599,14 +606,15 @@ export function ScratchlistDrawer({
                         busyEntryId={busyEntryId}
                         sessionId={sessionId}
                         api={api}
-                        onPromoteToComposer={handlePromoteToComposer}
-                        onPromoteToQueue={handlePromoteToQueue}
-                        onDelete={handleDelete}
-                        onMove={handleMove}
+                        disabled={disabled}
                         promoteToComposerDisabled={promoteToComposerDisabled}
                         promoteToComposerDisabledReason={promoteToComposerDisabledReason}
                         attachmentsSupported={attachmentsSupported}
                         attachmentsUnsupportedReason={attachmentsUnsupportedReason}
+                        onPromoteToComposer={handlePromoteToComposer}
+                        onPromoteToQueue={handlePromoteToQueue}
+                        onDelete={handleDelete}
+                        onMove={handleMove}
                     />
                 </div>
             </div>

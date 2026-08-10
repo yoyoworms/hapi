@@ -1,4 +1,4 @@
-import { getClaudeModelLabel } from '@hapi/protocol'
+import { getAgyModelLabel, getClaudeModelLabel } from '@hapi/protocol'
 
 type SessionModelSource = {
     model?: string | null
@@ -9,20 +9,8 @@ export type SessionModelLabel = {
     value: string
 }
 
-function formatKnownClaudeModel(model: string): string | null {
-    const presetLabel = getClaudeModelLabel(model)
-    if (presetLabel) return presetLabel
-
-    const normalized = model.trim().toLowerCase()
-    const family = normalized.includes('opus') ? 'Opus'
-        : normalized.includes('sonnet') ? 'Sonnet'
-            : normalized.includes('haiku') ? 'Haiku'
-                : null
-    if (!family) return null
-
-    const version = normalized.match(/(?:opus|sonnet|haiku)-([0-9]+)-([0-9]+)/)
-    const suffix = normalized.includes('[1m]') ? ' 1M' : ''
-    return version ? `${family} ${version[1]}.${version[2]}${suffix}` : `${family}${suffix}`
+function getModelLabel(model: string): string | null {
+    return getAgyModelLabel(model) ?? getClaudeModelLabel(model)
 }
 
 export function getSessionModelLabel(session: SessionModelSource): SessionModelLabel | null {
@@ -30,7 +18,7 @@ export function getSessionModelLabel(session: SessionModelSource): SessionModelL
     if (explicitModel) {
         return {
             key: 'session.item.model',
-            value: formatKnownClaudeModel(explicitModel) ?? explicitModel
+            value: getModelLabel(explicitModel) ?? explicitModel
         }
     }
 

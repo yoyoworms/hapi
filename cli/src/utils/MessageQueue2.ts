@@ -282,10 +282,20 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * localIds of messages still pending in the queue (enqueued but not yet
+     * consumed/acked). Lets a caller reconcile them with the hub before a
+     * reset() that would otherwise drop them without an ack.
+     */
+    pendingLocalIds(): string[] {
+        return this.queue
+            .map((item) => item.localId)
+            .filter((id): id is string => typeof id === 'string');
+    }
+
+    /**
      * Drop messages that have not been collected yet without changing queue
-     * lifecycle or detaching an existing waiter. Abort uses this instead of
-     * reset(): reset() intentionally owns waiter/closed state and can orphan a
-     * run loop that installed its next wait concurrently with turn completion.
+     * lifecycle or detaching an existing waiter. Abort must not call reset(),
+     * because reset() owns waiter/closed state and can orphan the run loop.
      */
     clearPending(): void {
         logger.debug(`[MessageQueue2] clearPending() called. Clearing ${this.queue.length} messages`);

@@ -1,7 +1,8 @@
 import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
-import type { AgentAccountStatus, CodexCollaborationMode, PermissionMode } from '@hapi/protocol/types'
+import type { CopilotAgentMode } from '@hapi/protocol'
+import type { AgentAccountStatus, AgentState, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
 import { isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
 import type { Store, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
@@ -24,6 +25,7 @@ type SessionAlivePayload = {
     effort?: string | null
     serviceTier?: string | null
     collaborationMode?: CodexCollaborationMode
+    copilotAgentMode?: CopilotAgentMode
 }
 
 type SessionRuntimeSource = {
@@ -54,7 +56,11 @@ type UpdateStateHandler = ClientToServerEvents['update-state']
 const messageSchema = z.object({
     sid: z.string(),
     message: z.union([z.string(), z.unknown()]),
-    localId: z.string().optional()
+    localId: z.string().optional(),
+    // Client-provided origin timestamp (epoch ms) — e.g. a Claude transcript
+    // entry's own `timestamp`. Only honored for agent messages (no localId);
+    // see addMessage in messages.ts.
+    createdAt: z.number().optional()
 })
 
 const updateMetadataSchema = z.object({
@@ -105,15 +111,17 @@ function getAgentEventType(content: unknown): string | null {
 }
 
 function getAuthoritativeRuntimeSource(socket: CliSocketWithData): AuthoritativeSessionRuntimeSource | null {
+    const runtimeData = socket.data
     if (
-        typeof socket.data.runtimeId !== 'string'
-        || !Number.isSafeInteger(socket.data.runtimeGeneration)
+        !runtimeData
+        || typeof runtimeData.runtimeId !== 'string'
+        || !Number.isSafeInteger(runtimeData.runtimeGeneration)
     ) {
         return null
     }
     return {
-        runtimeId: socket.data.runtimeId,
-        runtimeGeneration: socket.data.runtimeGeneration as number
+        runtimeId: runtimeData.runtimeId,
+        runtimeGeneration: runtimeData.runtimeGeneration as number
     }
 }
 
@@ -139,7 +147,7 @@ function isCurrentRuntimeSocket(socket: CliSocketWithData, session: Pick<StoredS
     if (durableRuntimeId === null) {
         return true
     }
-    if (socket.data.runtimeId !== durableRuntimeId) {
+    if (socket.data?.runtimeId !== durableRuntimeId) {
         return false
     }
     const lifecycleState = session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
@@ -223,6 +231,21 @@ function attachRuntimeOwnershipMetadata(
     return metadata
 }
 
+const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation'] as const
+
+function preserveHubOwnedMetadata(incoming: unknown, current: unknown): unknown {
+    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return incoming
+    const next = { ...(incoming as Record<string, unknown>) }
+    const existing = current && typeof current === 'object' && !Array.isArray(current)
+        ? current as Record<string, unknown>
+        : {}
+    for (const key of HUB_OWNED_METADATA_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(existing, key)) next[key] = existing[key]
+        else delete next[key]
+    }
+    return next
+}
+
 export type SessionHandlersDeps = {
     store: Store
     resolveSessionAccess: ResolveSessionAccess
@@ -283,7 +306,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
 
-        const { sid, localId } = parsed.data
+        const { sid, localId, createdAt } = parsed.data
         const raw = parsed.data.message
 
         const content = typeof raw === 'string'
@@ -399,7 +422,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 if (first) recentContentUuids.delete(first)
             }
         }
-        const msg = store.messages.addMessage(sid, content, localId)
+        const msg = store.messages.addMessage(sid, content, localId, undefined, createdAt)
         if (shouldRecordSessionActivity(content)) {
             onSessionActivity?.(sid, msg.createdAt)
         }
@@ -408,7 +431,18 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (todos) {
             const updated = store.sessions.setSessionTodos(sid, todos, msg.createdAt, session.namespace)
             if (updated) {
-                onWebappEvent?.({ type: 'session-updated', sessionId: sid })
+                const stored = store.sessions.getSession(sid)
+                onWebappEvent?.({
+                    type: 'session-updated',
+                    sessionId: sid,
+                    data: {
+                        todos: {
+                            version: stored?.todosUpdatedAt ?? msg.createdAt,
+                            value: todos
+                        },
+                        updatedAt: stored?.updatedAt ?? msg.createdAt
+                    }
+                })
             }
         }
 
@@ -419,7 +453,21 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             const newTeamState = applyTeamStateDelta(existingTeamState ?? null, teamDelta)
             const updated = store.sessions.setSessionTeamState(sid, newTeamState, msg.createdAt, session.namespace)
             if (updated) {
-                onWebappEvent?.({ type: 'session-updated', sessionId: sid })
+                const stored = store.sessions.getSession(sid)
+                // Versioned clear: value null = TeamDelete. Consumers gate on
+                // version (store team_state_updated_at) so dual SSE cannot
+                // resurrect a deleted team from a lagged older event.
+                onWebappEvent?.({
+                    type: 'session-updated',
+                    sessionId: sid,
+                    data: {
+                        teamState: {
+                            version: stored?.teamStateUpdatedAt ?? msg.createdAt,
+                            value: newTeamState
+                        },
+                        updatedAt: stored?.updatedAt ?? msg.createdAt
+                    }
+                })
             }
         }
 
@@ -540,7 +588,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
 
         const result = store.sessions.updateSessionMetadata(
             sid,
-            metadataWithRuntime,
+            preserveHubOwnedMetadata(metadataWithRuntime, current?.metadata ?? sessionAccess.value.metadata),
             expectedVersion,
             sessionAccess.value.namespace
         )
@@ -559,6 +607,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 metadata: result.value,
                 ...(runtimeSource ?? {})
             })
+            const stored = store.sessions.getSession(sid)
             const update = {
                 id: randomUUID(),
                 seq: Date.now(),
@@ -577,7 +626,19 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
             }
             socket.to(`session:${sid}`).emit('update', update)
-            onWebappEvent?.({ type: 'session-updated', sessionId: sid })
+            onWebappEvent?.({
+                type: 'session-updated',
+                sessionId: sid,
+                // The unknown-cast here mirrors the schema's MetadataSchema.nullable()
+                // shape: the store returns raw JSON, the wire schema parses it on
+                // both ends. Keeping the broadcast shape identical to the socket.io
+                // `update-session` body (line ~213) lets the same patch travel
+                // through both fan-out channels without divergence.
+                data: {
+                    metadata: { version: result.version, value: result.value as Metadata | null },
+                    updatedAt: stored?.updatedAt ?? Date.now()
+                }
+            })
         }
     }
 
@@ -621,6 +682,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         if (result.result === 'success') {
+            const stored = store.sessions.getSession(sid)
             const update = {
                 id: randomUUID(),
                 seq: Date.now(),
@@ -633,7 +695,14 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
             }
             socket.to(`session:${sid}`).emit('update', update)
-            onWebappEvent?.({ type: 'session-updated', sessionId: sid })
+            onWebappEvent?.({
+                type: 'session-updated',
+                sessionId: sid,
+                data: {
+                    agentState: { version: result.version, value: agentState as AgentState | null },
+                    updatedAt: stored?.updatedAt ?? Date.now()
+                }
+            })
         }
     }
 
@@ -757,10 +826,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         // rows after the CLI exits — there is no longer an ack path, so they would
         // stay queued forever.  The 5-second tick in syncEngine.expireInactive
         // emits scheduled rows when they mature, regardless of session end.
-        try {
-            onSweepImmediateQueued?.(data.sid, Date.now())
-        } catch (err) {
-            console.error('session-end sweep failed', err)
+        if (data.reason !== 'cleared') {
+            try {
+                onSweepImmediateQueued?.(data.sid, Date.now())
+            } catch (err) {
+                console.error('session-end sweep failed', err)
+            }
         }
     })
 }

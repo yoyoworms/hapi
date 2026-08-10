@@ -20,14 +20,15 @@ type SessionActionMenuProps = {
     sessionId: string
     sessionTitle: string
     sessionActive: boolean
-    isPinned?: boolean
-    onTogglePin?: () => void
     onRename: () => void
-    onResume?: () => void
+    sessionPinned?: boolean
+    sessionGlobalPinned?: boolean
+    onSetPinMode?: (mode: 'none' | 'project' | 'global') => void
     onRestart?: () => void
     onExport?: () => void
     onShare?: () => void
     onSyncCodex?: () => void
+    onSyncPi?: () => void
     onSwitchCodexAccount?: () => void
     onArchive: () => void
     onReopen?: () => void
@@ -39,18 +40,7 @@ type SessionActionMenuProps = {
 
 function ShareLinkIcon(props: { className?: string }) {
     return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
             <circle cx="18" cy="5" r="3" />
             <circle cx="6" cy="12" r="3" />
             <circle cx="18" cy="19" r="3" />
@@ -60,41 +50,24 @@ function ShareLinkIcon(props: { className?: string }) {
     )
 }
 
-function PlayIcon(props: { className?: string }) {
+function RestartIcon(props: { className?: string }) {
     return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
-            <polygon points="5 3 19 12 5 21 5 3" />
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+            <path d="M16 16h5v5" />
         </svg>
     )
 }
 
-function PinIcon(props: { className?: string }) {
+function AccountSwitchIcon(props: { className?: string }) {
     return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
-            <path d="M12 17v5" />
-            <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V5a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+            <circle cx="9" cy="7" r="4" />
+            <path d="m17 8 4-4" />
+            <path d="m17 4 4 4" />
         </svg>
     )
 }
@@ -119,24 +92,14 @@ function EditIcon(props: { className?: string }) {
     )
 }
 
-function RestartIcon(props: { className?: string }) {
+function PinIcon(props: { className?: string; filled?: boolean }) {
     return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-            <path d="M16 16h5v5" />
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+            fill={props.filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2"
+            strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+            <path d="M12 17v5" />
+            <path d="M5 17h14" />
+            <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
         </svg>
     )
 }
@@ -197,8 +160,8 @@ function ReopenIcon(props: { className?: string }) {
             strokeLinejoin="round"
             className={props.className}
         >
-            <path d="M3 12a9 9 0 1 0 3-6.7" />
-            <polyline points="3 4 3 10 9 10" />
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
         </svg>
     )
 }
@@ -217,32 +180,10 @@ function SyncIcon(props: { className?: string }) {
             strokeLinejoin="round"
             className={props.className}
         >
-            <path d="M3 12a9 9 0 0 1 15.5-6.2" />
-            <path d="M18 3v6h-6" />
-            <path d="M21 12a9 9 0 0 1-15.5 6.2" />
-            <path d="M6 21v-6h6" />
-        </svg>
-    )
-}
-
-function AccountSwitchIcon(props: { className?: string }) {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={props.className}
-        >
-            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-            <circle cx="9" cy="7" r="4" />
-            <path d="m17 8 4-4" />
-            <path d="m17 4 4 4" />
+            <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+            <path d="M21 3v5h-5" />
+            <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+            <path d="M3 21v-5h5" />
         </svg>
     )
 }
@@ -285,14 +226,15 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         sessionId,
         sessionTitle,
         sessionActive,
-        isPinned = false,
-        onTogglePin,
         onRename,
-        onResume,
+        sessionPinned = false,
+        sessionGlobalPinned = false,
+        onSetPinMode,
         onRestart,
         onExport,
         onShare,
         onSyncCodex,
+        onSyncPi,
         onSwitchCodexAccount,
         onArchive,
         onReopen,
@@ -306,11 +248,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const internalId = useId()
     const resolvedMenuId = menuId ?? `session-action-menu-${internalId}`
     const headingId = `${resolvedMenuId}-heading`
-
-    const handleTogglePin = () => {
-        onClose()
-        onTogglePin?.()
-    }
 
     const handleRename = () => {
         onClose()
@@ -327,9 +264,9 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         }
     }
 
-    const handleResume = () => {
+    const handleSetPinMode = (mode: 'none' | 'project' | 'global') => {
         onClose()
-        onResume?.()
+        onSetPinMode?.(mode)
     }
 
     const handleRestart = () => {
@@ -360,6 +297,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleSyncCodex = () => {
         onClose()
         onSyncCodex?.()
+    }
+
+    const handleSyncPi = () => {
+        onClose()
+        onSyncPi?.()
     }
 
     const handleSwitchCodexAccount = () => {
@@ -463,7 +405,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     return (
         <div
             ref={menuRef}
-            className="fixed z-50 min-w-[200px] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
+            className="fixed z-50 max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-16px)] min-w-[200px] overflow-y-auto overscroll-contain rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
             style={menuStyle}
         >
             <div
@@ -478,18 +420,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                 aria-labelledby={headingId}
                 className="flex flex-col gap-1"
             >
-                {onTogglePin ? (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
-                        onClick={handleTogglePin}
-                    >
-                        <PinIcon className="text-[var(--app-hint)]" />
-                        {isPinned ? t('session.action.unpin') : t('session.action.pin')}
-                    </button>
-                ) : null}
-
                 <button
                     type="button"
                     role="menuitem"
@@ -510,16 +440,27 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     {t('session.action.copyReference')}
                 </button>
 
-                {!sessionActive && onResume ? (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} text-[var(--app-link)] hover:bg-[var(--app-link)]/10`}
-                        onClick={handleResume}
-                    >
-                        <PlayIcon className="text-[var(--app-link)]" />
-                        {t('session.action.resume')}
-                    </button>
+                {onSetPinMode ? (
+                    <>
+                        <button
+                            type="button"
+                            role="menuitem"
+                            className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                            onClick={() => handleSetPinMode(sessionPinned ? 'none' : 'project')}
+                        >
+                            <PinIcon filled={sessionPinned} className="text-[var(--app-hint)]" />
+                            {t(sessionPinned ? 'session.action.unpinProject' : 'session.action.pinProject')}
+                        </button>
+                        <button
+                            type="button"
+                            role="menuitem"
+                            className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                            onClick={() => handleSetPinMode(sessionGlobalPinned ? 'none' : 'global')}
+                        >
+                            <PinIcon filled={sessionGlobalPinned} className="text-[var(--app-hint)]" />
+                            {t(sessionGlobalPinned ? 'session.action.unpinGlobal' : 'session.action.pinGlobal')}
+                        </button>
+                    </>
                 ) : null}
 
                 {sessionActive && onRestart ? (
@@ -567,6 +508,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <SyncIcon className="text-[var(--app-hint)]" />
                         {t('session.action.syncCodex')}
+                    </button>
+                ) : null}
+
+                {onSyncPi ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                        onClick={handleSyncPi}
+                    >
+                        <SyncIcon className="text-[var(--app-hint)]" />
+                        {t('session.action.syncPi')}
                     </button>
                 ) : null}
 

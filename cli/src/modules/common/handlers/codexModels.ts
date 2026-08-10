@@ -7,13 +7,25 @@ import {
     type ListCodexModelsResponse
 } from '../codexModels';
 import { getErrorMessage, rpcError } from '../rpcResponses';
+import { codexAccountManager } from '@/codex/codexAccountManager';
 
-export function registerCodexModelHandlers(rpcHandlerManager: RpcHandlerManager): void {
+export function registerCodexModelHandlers(
+    rpcHandlerManager: RpcHandlerManager,
+    machineScoped: boolean = false
+): void {
     rpcHandlerManager.registerHandler<ListCodexModelsRequest, ListCodexModelsResponse>(RPC_METHODS.ListCodexModels, async (data) => {
         logger.debug('List Codex models request');
 
         try {
-            const models = await listCodexModels(data?.includeHidden === true);
+            let environment: Record<string, string> | undefined;
+            if (machineScoped || data?.accountId) {
+                const account = await codexAccountManager.resolveAccount(data?.accountId);
+                environment = {
+                    CODEX_HOME: account.homeDir,
+                    ...account.env
+                };
+            }
+            const models = await listCodexModels(data?.includeHidden === true, environment);
             return { success: true, models };
         } catch (error) {
             logger.debug('Failed to list Codex models:', error);

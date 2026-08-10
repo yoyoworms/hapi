@@ -4,6 +4,10 @@ import type { AppendMessage, AttachmentAdapter, ThreadMessageLike } from '@assis
 import { useExternalMessageConverter, useExternalStoreRuntime } from '@assistant-ui/react'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
+import {
+    consumeComposerSendIntent,
+    type ComposerSendIntent,
+} from '@/lib/messageDelivery'
 import { safeStringify } from '@hapi/protocol'
 import { renderEventLabel } from '@/chat/presentation'
 import type { ChatBlock, CliOutputBlock, CodexReview, UsageData } from '@/chat/types'
@@ -11,6 +15,7 @@ import type { AgentEvent, ToolCallBlock } from '@/chat/types'
 import type { ToolGroupBlock, VisibleChatBlock } from '@/chat/toolGroups'
 import { visibleBlockRole } from '@/chat/toolGroups'
 import type { AttachmentMetadata, MessageStatus as HappyMessageStatus, Session } from '@/types/api'
+import { buildShareHiddenByMessageId } from '@/lib/shareTurnAvailability'
 
 /**
  * Aggregated metadata for a multi-turn response group, surfaced on the
@@ -50,45 +55,9 @@ export type HappyChatMessageMetadata = {
 export type HappyRuntimeExtras = Readonly<{
     messagesVersion: number
     historyVersion: number
+    runningSince: number
+    shareHiddenByMessageId: ReadonlySet<string>
 }>
-
-/**
- * assistant-ui empties its composer before awaiting the external `onNew`
- * callback. The send path therefore has to report what should happen to the
- * persisted draft after its asynchronous destination has answered.
- */
-export type ComposerSendOutcome = Readonly<{
-    accepted: boolean
-    /** Scratchlist writes are final here; chat writes wait for mutation onSuccess. */
-    clearDraftOnSuccess?: boolean
-}>
-
-export type ComposerDraftActionEvent = Readonly<{
-    id: number
-    action: 'clear' | 'restore'
-    text: string
-    attachments?: AttachmentMetadata[]
-    scheduledAt: number | null
-}>
-
-export type ComposerDraftSettlement = Readonly<{
-    action: ComposerDraftActionEvent['action'] | null
-    error?: unknown
-}>
-
-/** Await the app destination even though assistant-ui does not await it. */
-export async function resolveComposerDraftSettlement(
-    send: () => Promise<ComposerSendOutcome>,
-): Promise<ComposerDraftSettlement> {
-    try {
-        const outcome = await send()
-        if (!outcome.accepted) return { action: 'restore' }
-        if (outcome.clearDraftOnSuccess) return { action: 'clear' }
-        return { action: null }
-    } catch (error) {
-        return { action: 'restore', error }
-    }
-}
 
 function formatCodexReviewText(review: CodexReview): string {
     const lines = ['Codex review']
@@ -398,6 +367,59 @@ export function assignThreadMessageIds(
     return assignThreadMessageIdsWithStableWrappers(blocks, new WeakMap())
 }
 
+/**
+ * Finds the latest conversation-history boundary that is safe to fork.
+ * While the main agent is running, every block from the latest invoked user
+ * message onward belongs to the active turn and must not become a transient
+ * "completed" boundary as streaming events reshape the visible block list.
+ */
+export function findLatestCompletedBoundaryId(
+    blocks: readonly VisibleChatBlock[],
+    isRunning: boolean,
+    activeTurnStartedAt: number | null
+): string | null {
+    const assigned = assignThreadMessageIds(blocks)
+    let limit = assigned.length
+
+    if (isRunning) {
+        const activeTurnStart = activeTurnStartedAt === null
+            ? assigned.findLastIndex(({ block }) => (
+                visibleBlockRole(block) === 'user' && block.invokedAt != null
+            ))
+            : assigned.findIndex(({ block }) => (
+                visibleBlockRole(block) === 'user'
+                && (block.invokedAt ?? block.createdAt) >= activeTurnStartedAt
+            ))
+        if (activeTurnStart >= 0) {
+            limit = activeTurnStart
+        } else if (activeTurnStartedAt === null) {
+            return null
+        } else {
+            const firstActiveBlock = assigned.findIndex(({ block }) => (
+                (block.invokedAt ?? block.createdAt) >= activeTurnStartedAt
+            ))
+            if (firstActiveBlock >= 0) {
+                limit = firstActiveBlock
+            }
+        }
+    }
+
+    let candidate: string | null = null
+    let previousRole: ReturnType<typeof visibleBlockRole> | null = null
+    for (let index = 0; index < limit; index += 1) {
+        const { block, threadMessageId } = assigned[index]
+        const role = visibleBlockRole(block)
+        if (
+            (role === 'user' && block.invokedAt != null)
+            || (role === 'assistant' && previousRole !== 'assistant')
+        ) {
+            candidate = threadMessageId
+        }
+        previousRole = role
+    }
+    return candidate
+}
+
 function toThreadMessageLike(
     block: VisibleChatBlock,
     threadMessageId: string,
@@ -653,15 +675,20 @@ export function useHappyRuntime(props: {
         text: string,
         attachments?: AttachmentMetadata[],
         scheduledAt?: number | null,
-    ) => Promise<ComposerSendOutcome>
-    onComposerDraftAction?: (event: ComposerDraftActionEvent) => void
+        intent?: ComposerSendIntent,
+    ) => void
     onAbort: () => Promise<void>
     attachmentAdapter?: AttachmentAdapter
     allowSendWhenInactive?: boolean
     pendingScheduleRef?: React.RefObject<PendingSchedule | null>
+    /**
+     * Shared one-shot ref with HappyComposer. The composer marks the next
+     * `api.composer().send()`; this adapter consumes and resets the mark as
+     * soon as assistant-ui emits the corresponding AppendMessage.
+     */
+    pendingSendIntentRef?: React.MutableRefObject<ComposerSendIntent>
 }) {
     const isRunning = props.isRunning ?? props.session.thinking
-    const draftActionIdRef = useRef(0)
 
     // Compute response-group aggregates once per block list so we can
     // inject the summed metadata onto each group's first visible block.
@@ -725,6 +752,10 @@ export function useHappyRuntime(props: {
     })
 
     const onNew = useCallback(async (message: AppendMessage) => {
+        const intent = consumeComposerSendIntent(props.pendingSendIntentRef)
+        // Reset before any early return so an empty submission, extraction
+        // failure, or downstream exception cannot leak an explicit queue
+        // gesture into the next ordinary send.
         const { text, attachments } = extractMessageContent(message)
         if (!text && attachments.length === 0) return
         // Resolve pendingSchedule at send time (Date.now()) so preset-type schedules
@@ -732,38 +763,24 @@ export function useHappyRuntime(props: {
         // moment the user clicked the preset button.
         const sendNow = Date.now()
         const scheduledAt = resolvePendingSchedule(props.pendingScheduleRef?.current ?? null, sendNow)
-        const submittedAttachments = attachments.length > 0 ? attachments : undefined
-        const emitDraftAction = (action: ComposerDraftActionEvent['action']) => {
-            draftActionIdRef.current += 1
-            props.onComposerDraftAction?.({
-                id: draftActionIdRef.current,
-                action,
-                text,
-                attachments: submittedAttachments,
-                scheduledAt,
-            })
-        }
-
-        // BaseComposerRuntimeCore intentionally does not await handleSend;
-        // this continuation still runs and explicitly restores the draft
-        // when an async destination rejects the submission.
-        const settlement = await resolveComposerDraftSettlement(
-            () => props.onSendMessage(text, submittedAttachments, scheduledAt)
-        )
-        if (settlement.error !== undefined) {
-            console.error('Composer destination rejected the submission:', settlement.error)
-        }
-        if (settlement.action) emitDraftAction(settlement.action)
-    }, [props.onSendMessage, props.onComposerDraftAction, props.pendingScheduleRef])
+        props.onSendMessage(text, attachments.length > 0 ? attachments : undefined, scheduledAt, intent)
+    }, [props.onSendMessage, props.pendingScheduleRef, props.pendingSendIntentRef])
 
     const onCancel = useCallback(async () => {
         await props.onAbort()
     }, [props.onAbort])
 
+    const runningSince = props.session.activeTurnStartedAt ?? 0
+    const shareHiddenByMessageId = useMemo(
+        () => buildShareHiddenByMessageId(convertedMessages, isRunning, runningSince),
+        [convertedMessages, isRunning, runningSince]
+    )
     const extras = useMemo<HappyRuntimeExtras>(() => ({
         messagesVersion: props.messagesVersion,
-        historyVersion: props.historyVersion
-    }), [props.messagesVersion, props.historyVersion])
+        historyVersion: props.historyVersion,
+        runningSince,
+        shareHiddenByMessageId
+    }), [props.messagesVersion, props.historyVersion, runningSince, shareHiddenByMessageId])
 
     // Memoize the adapter to avoid recreating on every render
     // useExternalStoreRuntime may use adapter identity for subscriptions

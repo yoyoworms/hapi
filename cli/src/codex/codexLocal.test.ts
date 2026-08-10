@@ -1,27 +1,9 @@
 import { win32 } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const {
-    prepareHapiCodexContextArgsMock,
-    resolveCodexCommandMock,
-    spawnWithTerminalGuardMock
-} = vi.hoisted(() => ({
-    prepareHapiCodexContextArgsMock: vi.fn(() => [
-        '-c',
-        'model_catalog_json="/tmp/hapi-context.json"',
-        '-c',
-        'model_context_window=372000',
-        '-c',
-        'model_auto_compact_token_limit=330000',
-        '-c',
-        'model_auto_compact_token_limit_scope="total"'
-    ]),
+const { resolveCodexCommandMock, spawnWithTerminalGuardMock } = vi.hoisted(() => ({
     resolveCodexCommandMock: vi.fn(() => ({ command: 'codex', args: [] as string[] })),
     spawnWithTerminalGuardMock: vi.fn(async (_options: unknown) => {})
-}));
-
-vi.mock('./codexAppServerClient', () => ({
-    prepareHapiCodexContextArgs: prepareHapiCodexContextArgsMock
 }));
 
 vi.mock('./utils/codexExecutable', () => ({
@@ -107,8 +89,11 @@ describe('filterResumeSubcommand', () => {
 });
 
 describe('appendSessionMatchToken', () => {
-    it('uses visible text because Codex strips HTML comments from session metadata', () => {
-        const result = appendSessionMatchToken('base instructions', '11111111-1111-4111-8111-111111111111');
+    it('records visible text that can be recovered from Codex transcripts', () => {
+        const result = appendSessionMatchToken(
+            'base instructions',
+            '11111111-1111-4111-8111-111111111111'
+        );
 
         expect(result).toContain('base instructions');
         expect(result).toContain('HAPI session match token: 11111111-1111-4111-8111-111111111111');
@@ -118,7 +103,6 @@ describe('appendSessionMatchToken', () => {
 
 describe('codexLocal', () => {
     beforeEach(() => {
-        prepareHapiCodexContextArgsMock.mockClear();
         resolveCodexCommandMock.mockReset();
         resolveCodexCommandMock.mockReturnValue({ command: 'codex', args: [] as string[] });
         spawnWithTerminalGuardMock.mockClear();
@@ -168,20 +152,6 @@ describe('codexLocal', () => {
 
         const args = spawnOptions.args;
         expect(args[0]).toBe(codexScriptPath);
-        expect(prepareHapiCodexContextArgsMock).toHaveBeenCalledWith({
-            command: 'node',
-            args: [codexScriptPath]
-        }, process.env);
-        expect(args.slice(1, 9)).toEqual([
-            '-c',
-            'model_catalog_json="/tmp/hapi-context.json"',
-            '-c',
-            'model_context_window=372000',
-            '-c',
-            'model_auto_compact_token_limit=330000',
-            '-c',
-            'model_auto_compact_token_limit_scope="total"'
-        ]);
         const hookArg = args.find((arg) => arg.startsWith('hooks.SessionStart='));
         expect(hookArg).toBeDefined();
         expect(hookArg).toContain('{ hooks = [{ type = "command", command = "');

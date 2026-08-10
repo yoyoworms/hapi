@@ -17,7 +17,9 @@ describe('Store V14→V15 migration: scratchlist attachments column', () => {
         const store = new Store(':memory:')
         const cols = getColumns(store, 'session_scratchlist')
         expect(cols).toContain('attachments')
-        expect(getUserVersion(store)).toBe(16)
+        expect(getColumns(store, 'usage_events')).toContain('last_input_tokens')
+        expect(getColumns(store, 'usage_scan_state')).toContain('last_seq')
+        expect(getUserVersion(store)).toBe(24)
         store.close()
     })
 
@@ -36,14 +38,16 @@ describe('Store V14→V15 migration: scratchlist attachments column', () => {
             store = new Store(dbPath)
             const cols = getColumns(store, 'session_scratchlist')
             expect(cols).toContain('attachments')
-            expect(getUserVersion(store)).toBe(16)
+            expect(getColumns(store, 'usage_events')).toContain('last_input_tokens')
+            expect(getColumns(store, 'usage_scan_state')).toContain('last_seq')
+            expect(getUserVersion(store)).toBe(24)
         } finally {
             store?.close()
             rmSync(dir, { recursive: true, force: true })
         }
     })
 
-    it('converged DB reopen is idempotent: schema unchanged', () => {
+    it('latest DB reopen is idempotent: schema unchanged', () => {
         const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-v15-idempotent-'))
         const dbPath = join(dir, 'test.db')
         let store1: Store | undefined
@@ -56,7 +60,7 @@ describe('Store V14→V15 migration: scratchlist attachments column', () => {
             store2 = new Store(dbPath)
             const cols2 = getColumns(store2, 'session_scratchlist')
             expect(cols2).toEqual(cols1)
-            expect(getUserVersion(store2)).toBe(16)
+            expect(getUserVersion(store2)).toBe(24)
         } finally {
             store2?.close()
             store1?.close()

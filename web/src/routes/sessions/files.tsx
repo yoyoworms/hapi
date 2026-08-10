@@ -18,11 +18,13 @@ import {
 } from '@/lib/files-i18n'
 import { encodeBase64 } from '@/lib/utils'
 import { queryKeys } from '@/lib/query-keys'
+import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { formatFileMetadata } from '@/lib/file-metadata'
 import { useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from '@/lib/use-translation'
 import * as Popover from '@radix-ui/react-popover'
 import { CheckIcon, CloseIcon } from '@/components/icons'
+import { Button } from '@/components/ui/button'
 import {
     DEFAULT_DIRECTORY_SORT,
     type DirectorySort,
@@ -94,7 +96,7 @@ function DirectorySortMenu(props: { sort: DirectorySort; onChange: (sort: Direct
                 <button
                     type="button"
                     className={props.embedded
-                        ? 'flex w-10 shrink-0 self-stretch items-center justify-center rounded-r-md rounded-l-sm text-[var(--app-hint)] transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
+                        ? 'flex w-10 shrink-0 self-stretch items-center justify-center rounded-r-md rounded-l-sm text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]'
                         : 'flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]'}
                     title={t('files.sort.title')}
                     aria-label={t('files.sort.title')}
@@ -260,8 +262,7 @@ function SearchResultRow(props: {
     onOpen: () => void
     showDivider: boolean
 }) {
-    const { t, locale } = useTranslation()
-    const subtitle = getProjectRootLabel(props.file.filePath, t)
+    const { locale } = useTranslation()
     const metadata = formatFileMetadata(props.file.size, props.file.modified, locale)
     const icon = props.file.fileType === 'file'
         ? <FileIcon fileName={props.file.fileName} size={22} />
@@ -275,11 +276,8 @@ function SearchResultRow(props: {
         >
             {icon}
             <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">{props.file.fileName}</div>
-                <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--app-hint)]">
-                    <span className="truncate">{subtitle}</span>
-                    {metadata ? <span className="shrink-0">{metadata}</span> : null}
-                </div>
+                <div className="truncate font-medium">{props.file.fullPath}</div>
+                {metadata ? <div className="text-xs text-[var(--app-hint)]">{metadata}</div> : null}
             </div>
         </button>
     )
@@ -476,24 +474,28 @@ export default function FilesPage() {
                 outlineActive={false}
                 api={api}
                 onSessionDeleted={goBack}
-                onSessionReopened={(newSessionId) => {
-                    navigate({
-                        to: '/sessions/$sessionId/files',
-                        params: { sessionId: newSessionId },
-                        replace: true,
-                    })
+                onSessionReopened={async (newSessionId) => {
+                    await transferComposerDraftThenNavigate(
+                        session.id,
+                        newSessionId,
+                        () => navigate({
+                            to: '/sessions/$sessionId/files',
+                            params: { sessionId: newSessionId },
+                            replace: true,
+                        }),
+                    )
                 }}
             />
 
             <div className="bg-[var(--app-bg)]">
                 <div className="mx-auto flex w-full max-w-content items-center gap-2 border-b border-[var(--app-border)] p-3">
-                    <div className="relative min-w-0 flex-1 rounded-md bg-[var(--app-subtle-bg)]">
-                        <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--app-hint)]" />
+                    <div className="relative min-w-0 flex-1">
+                        <SearchIcon className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--app-hint)]" />
                         <input
                             value={searchQuery}
                             onChange={(event) => setSearchQuery(event.target.value)}
                             placeholder={t('files.page.searchPlaceholder')}
-                            className="w-full bg-transparent py-2 pl-10 pr-20 text-sm text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none"
+                            className="h-9 w-full rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] py-2 pl-9 pr-20 text-sm text-[var(--app-fg)] outline-none placeholder:text-[var(--app-hint)] focus:border-[var(--app-link)] focus:ring-1 focus:ring-[var(--app-link)]"
                             autoCapitalize="none"
                             autoCorrect="off"
                         />
@@ -514,15 +516,16 @@ export default function FilesPage() {
                             </div>
                         ) : null}
                     </div>
-                    <button
+                    <Button
+                        variant="outline"
                         type="button"
                         onClick={handleRefresh}
-                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)]"
+                        className="h-9 w-9 shrink-0 px-0"
                         title={t('files.page.refreshFilesystem')}
                         aria-label={t('files.page.refreshFilesystem')}
                     >
                         <RefreshIcon />
-                    </button>
+                    </Button>
                 </div>
             </div>
 

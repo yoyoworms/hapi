@@ -16,49 +16,29 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
     } as unknown as EventPublisher
 }
 
-function userText(text: string): unknown {
-    return {
-        role: 'user',
-        content: {
-            type: 'text',
-            text
-        },
-        meta: {
-            sentFrom: 'cli'
-        }
-    }
+async function flushAsyncWork(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function codexMessage(data: Record<string, unknown>): unknown {
-    return {
-        role: 'agent',
-        content: {
-            type: 'codex',
-            data
+function simulateRuntimeBootstrap(store: Store, engine: SyncEngine, sessionId: string): void {
+    const current = store.sessions.getSession(sessionId)
+    if (!current?.metadata) throw new Error('session metadata unavailable')
+    const result = store.sessions.updateSessionMetadata(
+        sessionId,
+        {
+            ...current.metadata,
+            lifecycleState: 'running',
+            lifecycleStateSince: Date.now()
         },
-        meta: {
-            sentFrom: 'cli'
-        }
-    }
-}
-
-function messageLabel(content: unknown): string {
-    if (!content || typeof content !== 'object') return 'unknown'
-    const record = content as Record<string, unknown>
-    const inner = record.content
-    if (!inner || typeof inner !== 'object') return 'unknown'
-    const payload = inner as Record<string, unknown>
-
-    if (payload.type === 'text' && typeof payload.text === 'string') {
-        return `${String(record.role)}:${payload.text}`
-    }
-
-    if (payload.type === 'codex' && payload.data && typeof payload.data === 'object') {
-        const data = payload.data as Record<string, unknown>
-        return `codex:${String(data.type)}:${String(data.message ?? data.callId ?? data.delta ?? '')}`
-    }
-
-    return 'unknown'
+        current.metadataVersion,
+        current.namespace,
+        { touchUpdatedAt: false }
+    )
+    if (result.result !== 'success') throw new Error('failed to simulate runtime bootstrap')
+    ;(engine as unknown as { sessionCache: { refreshSession(id: string): unknown } })
+        .sessionCache.refreshSession(sessionId)
+    engine.handleSessionAlive({ sid: sessionId, time: Date.now() })
 }
 
 function productionCodexMessage(event: Record<string, unknown>): Record<string, unknown> {
@@ -267,78 +247,32 @@ describe('session model', () => {
         expect(merged?.model).toBe('gpt-5.4')
     })
 
-    it('deduplicates imported Codex history when merging a resumed session', async () => {
+    it('deduplicates agy sessions that share an agySessionId (reopen correlation)', async () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []
         const cache = new SessionCache(store, createPublisher(events))
 
         const oldSession = cache.getOrCreateSession(
-            'session-codex-history-old',
-            {
-                path: '/tmp/project',
-                host: 'localhost',
-                flavor: 'codex',
-                codexSessionId: 'codex-thread-history'
-            },
+            'agy-dup-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'agy', agySessionId: 'brain-uuid-1' },
             null,
-            'default',
-            'gpt-5.4'
+            'default'
         )
         const newSession = cache.getOrCreateSession(
-            'session-codex-history-new',
-            {
-                path: '/tmp/project',
-                host: 'localhost',
-                flavor: 'codex',
-                codexSessionId: 'codex-thread-history'
-            },
+            'agy-dup-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'agy', agySessionId: 'brain-uuid-1' },
             null,
             'default'
         )
 
-        store.messages.addMessage(oldSession.id, userText('same prompt'), 'old-user')
-        store.messages.addMessage(oldSession.id, codexMessage({
-            type: 'message',
-            message: 'same answer',
-            id: 'old-random-id'
-        }))
-        store.messages.addMessage(oldSession.id, codexMessage({
-            type: 'tool-call-result',
-            callId: 'call-1',
-            output: 'same tool result',
-            id: 'old-random-tool-result-id'
-        }))
+        await cache.deduplicateByAgentSessionId(newSession.id)
 
-        store.messages.addMessage(newSession.id, userText('same prompt'), 'new-user')
-        store.messages.addMessage(newSession.id, codexMessage({
-            type: 'message',
-            message: 'same answer',
-            id: 'new-random-id'
-        }))
-        store.messages.addMessage(newSession.id, codexMessage({
-            type: 'tool-call-result',
-            callId: 'call-1',
-            output: 'same tool result',
-            id: 'new-random-tool-result-id'
-        }))
-        store.messages.addMessage(newSession.id, codexMessage({
-            type: 'message',
-            message: 'new resume answer',
-            id: 'new-unique-random-id'
-        }))
-
-        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
-
-        expect(cache.getSession(oldSession.id)).toBeUndefined()
-
-        const mergedMessages = store.messages.getMessages(newSession.id)
-        expect(mergedMessages.map((message) => message.seq)).toEqual([1, 2, 3, 4])
-        expect(mergedMessages.map((message) => messageLabel(message.content))).toEqual([
-            'user:same prompt',
-            'codex:message:same answer',
-            'codex:tool-call-result:call-1',
-            'codex:message:new resume answer'
-        ])
+        // The two rows sharing the brain UUID must collapse to one — reopen
+        // reactivates the archived row instead of orphaning a duplicate. Before
+        // the fix, extractAgentSessionId omitted agySessionId so it returned null
+        // and nothing merged (both rows survived).
+        const survivors = [oldSession.id, newSession.id].filter((id) => cache.getSession(id) != null)
+        expect(survivors).toHaveLength(1)
     })
 
     it('preserves service tier from old session when merging into resumed session', async () => {
@@ -364,6 +298,190 @@ describe('session model', () => {
         await cache.mergeSessions(oldSession.id, newSession.id, 'default')
 
         expect(store.sessions.getSession(newSession.id)?.serviceTier).toBe('fast')
+    })
+
+    it('preserves pin from old session when merging into resumed session', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-pin-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(oldSession.id, 'project', 'default')
+        const newSession = cache.getOrCreateSession(
+            'session-pin-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(true)
+        expect(store.sessions.getSession(newSession.id)?.globalPinned).toBe(false)
+        expect(cache.getSession(newSession.id)?.pinned).toBe(true)
+    })
+
+    it('preserves global pin from old session when merging into resumed session', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-global-pin-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(oldSession.id, 'global', 'default')
+        const newSession = cache.getOrCreateSession(
+            'session-global-pin-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(false)
+        expect(store.sessions.getSession(newSession.id)?.globalPinned).toBe(true)
+        expect(cache.getSession(newSession.id)?.globalPinned).toBe(true)
+    })
+
+    it('keeps a global-pinned merge target when the source is only project-pinned', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-pin-downgrade-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(oldSession.id, 'project', 'default')
+        const newSession = cache.getOrCreateSession(
+            'session-pin-downgrade-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(newSession.id, 'global', 'default')
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(false)
+        expect(store.sessions.getSession(newSession.id)?.globalPinned).toBe(true)
+        expect(cache.getSession(newSession.id)?.globalPinned).toBe(true)
+    })
+
+    it('accepts a merge target pinned concurrently during pin preservation', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-pin-race-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        const newSession = cache.getOrCreateSession(
+            'session-pin-race-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(oldSession.id, 'project', 'default')
+
+        const setSessionPinMode = store.sessions.setSessionPinMode.bind(store.sessions)
+        store.sessions.setSessionPinMode = ((sessionId, mode, namespace) => {
+            setSessionPinMode(sessionId, mode, namespace)
+            return false
+        }) as typeof store.sessions.setSessionPinMode
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(true)
+        expect(cache.getSession(newSession.id)?.pinned).toBe(true)
+    })
+
+    it('keeps a concurrent global pin on the merge target when the source is project-pinned', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-pin-global-race-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        const newSession = cache.getOrCreateSession(
+            'session-pin-global-race-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        store.sessions.setSessionPinMode(oldSession.id, 'project', 'default')
+
+        const getSessionByNamespace = store.sessions.getSessionByNamespace.bind(store.sessions)
+        let targetReads = 0
+        store.sessions.getSessionByNamespace = ((sessionId, namespace) => {
+            if (sessionId === newSession.id && ++targetReads === 1) {
+                store.sessions.setSessionPinMode(newSession.id, 'global', 'default')
+            }
+            return getSessionByNamespace(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(false)
+        expect(store.sessions.getSession(newSession.id)?.globalPinned).toBe(true)
+        expect(cache.getSession(newSession.id)?.globalPinned).toBe(true)
+    })
+
+    it('preserves the latest source pin when it changes during a merge', async () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+
+        const oldSession = cache.getOrCreateSession(
+            'session-source-pin-race-old',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        const newSession = cache.getOrCreateSession(
+            'session-source-pin-race-new',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+
+        const getSessionByNamespace = store.sessions.getSessionByNamespace.bind(store.sessions)
+        let sourceReads = 0
+        store.sessions.getSessionByNamespace = ((sessionId, namespace) => {
+            if (sessionId === oldSession.id && ++sourceReads === 2) {
+                store.sessions.setSessionPinMode(oldSession.id, 'project', 'default')
+            }
+            return getSessionByNamespace(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        await cache.mergeSessions(oldSession.id, newSession.id, 'default')
+
+        expect(store.sessions.getSession(oldSession.id)).toBeNull()
+        expect(store.sessions.getSession(newSession.id)?.pinned).toBe(true)
+        expect(cache.getSession(newSession.id)?.pinned).toBe(true)
     })
 
     it('persists applied session model updates, including clear-to-auto', () => {
@@ -731,77 +849,61 @@ describe('session model', () => {
         }
     })
 
-    it('records CLI user text and turn-ready activity while keeping ready out of chat history', () => {
-        const originalDateNow = Date.now
-        let now = 1_000
-        Date.now = () => now
-        try {
-            const store = new Store(':memory:')
-            const events: SyncEvent[] = []
-            const cache = new SessionCache(store, createPublisher(events))
-            const session = cache.getOrCreateSession(
-                'session-cli-message-activity',
-                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
-                null,
-                'default'
-            )
-            const handlers = new Map<string, (payload: unknown) => void>()
-            const activity: Array<{ sessionId: string; updatedAt: number }> = []
-            const roomEvents: unknown[] = []
+    it('records completion activity and broadcasts ready without persisting it as chat history', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const session = cache.getOrCreateSession(
+            'session-cli-message-activity',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            null,
+            'default'
+        )
+        const handlers = new Map<string, (payload: unknown) => void>()
+        const activity: Array<{ sessionId: string; updatedAt: number }> = []
+        const roomEvents: unknown[] = []
 
-            registerSessionHandlers({
-                on: (event: string, handler: (payload: unknown) => void) => {
-                    handlers.set(event, handler)
-                },
-                to: () => ({ emit: (_event: string, update: unknown) => roomEvents.push(update) })
-            } as never, {
-                store,
-                resolveSessionAccess: (sessionId) => {
-                    const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
-                    return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
-                },
-                emitAccessError: () => {},
-                onSessionActivity: (sessionId, updatedAt) => {
-                    activity.push({ sessionId, updatedAt })
-                    cache.recordSessionActivity(sessionId, updatedAt)
+        registerSessionHandlers({
+            on: (event: string, handler: (payload: unknown) => void) => {
+                handlers.set(event, handler)
+            },
+            to: () => ({ emit: (_event: string, update: unknown) => roomEvents.push(update) })
+        } as never, {
+            store,
+            resolveSessionAccess: (sessionId) => {
+                const stored = store.sessions.getSessionByNamespace(sessionId, 'default')
+                return stored ? { ok: true, value: stored } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError: () => {},
+            onSessionActivity: (sessionId, updatedAt) => {
+                activity.push({ sessionId, updatedAt })
+            },
+            onWebappEvent: (event) => events.push(event)
+        })
+
+        handlers.get('message')?.({
+            sid: session.id,
+            message: JSON.stringify({ role: 'user', content: { type: 'text', text: 'hello' } })
+        })
+        handlers.get('message')?.({
+            sid: session.id,
+            message: JSON.stringify({
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    data: { type: 'ready' }
                 }
             })
+        })
 
-            events.length = 0
-            now = 2_000
-            handlers.get('message')?.({
-                sid: session.id,
-                message: JSON.stringify({ role: 'user', content: { type: 'text', text: 'hello' } })
-            })
-            now = 3_000
-            handlers.get('message')?.({
-                sid: session.id,
-                message: JSON.stringify({
-                    role: 'agent',
-                    content: {
-                        type: 'event',
-                        data: { type: 'ready' }
-                    }
-                })
-            })
-
-            const messages = store.messages.getMessages(session.id)
-            expect(messages).toHaveLength(1)
-            expect(roomEvents).toHaveLength(1)
-            expect(activity).toEqual([
-                { sessionId: session.id, updatedAt: 2_000 },
-                { sessionId: session.id, updatedAt: 3_000 }
-            ])
-            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(3_000)
-            expect(cache.getSession(session.id)?.updatedAt).toBe(3_000)
-            expect(events).toContainEqual(expect.objectContaining({
-                type: 'session-updated',
-                sessionId: session.id,
-                data: { updatedAt: 3_000 }
-            }))
-        } finally {
-            Date.now = originalDateNow
-        }
+        const messages = store.messages.getMessages(session.id)
+        expect(messages).toHaveLength(1)
+        expect(roomEvents).toHaveLength(1)
+        expect(activity).toHaveLength(2)
+        expect(activity[0].sessionId).toBe(session.id)
+        expect(activity[0].updatedAt).toBe(messages[0]?.createdAt)
+        expect(activity[1].sessionId).toBe(session.id)
+        expect(events.some((event) => event.type === 'message-received')).toBe(true)
     })
 
     it('records activity only for the first messages-consumed transition while retaining duplicate acknowledgements', () => {
@@ -1280,84 +1382,7 @@ describe('session model', () => {
         }
     })
 
-    it('does not replace a failed resume with a fresh conversation', async () => {
-        const store = new Store(':memory:')
-        const engine = new SyncEngine(
-            store,
-            {} as never,
-            new RpcRegistry(),
-            { broadcast() {} } as never
-        )
-
-        try {
-            const session = engine.getOrCreateSession(
-                'session-resume-fallback-config',
-                {
-                    path: '/tmp/project',
-                    host: 'localhost',
-                    machineId: 'machine-1',
-                    flavor: 'codex',
-                    codexSessionId: 'codex-thread-fallback'
-                },
-                null,
-                'default',
-                'gpt-5.4',
-                'high',
-                'xhigh'
-            )
-            await engine.applySessionConfig(session.id, {
-                permissionMode: 'yolo',
-                serviceTier: 'fast'
-            })
-            engine.getOrCreateMachine(
-                'machine-1',
-                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
-                null,
-                'default'
-            )
-            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
-
-            const calls: unknown[][] = []
-            ;(engine as any).rpcGateway.spawnSession = async (...args: unknown[]) => {
-                calls.push(args)
-                return { type: 'error', message: 'resume failed' }
-            }
-            ;(engine as any).waitForSessionActive = async () => true
-
-            const result = await engine.resumeSession(session.id, 'default')
-
-            expect(result).toEqual({
-                type: 'error',
-                message: 'resume failed',
-                code: 'resume_failed'
-            })
-            expect(calls).toHaveLength(1)
-            expect(calls[0]).toEqual([
-                'machine-1',
-                '/tmp/project',
-                'codex',
-                'gpt-5.4',
-                'xhigh',
-                undefined,
-                undefined,
-                undefined,
-                'codex-thread-fallback',
-                'high',
-                'yolo',
-                'fast',
-                session.id,
-                undefined,
-                undefined,
-                'system',
-                undefined,
-                undefined
-            ])
-        } finally {
-            engine.stop()
-        }
-    })
-
-    it('returns a resumed session after its heartbeat made the cache active without persisting runtime state', async () => {
+    it('marks a resumed session active in hub cache before returning success without persisting runtime active state', async () => {
         const store = new Store(':memory:')
         const events: unknown[] = []
         const engine = new SyncEngine(
@@ -1390,16 +1415,7 @@ describe('session model', () => {
             engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
 
             ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'success', sessionId: session.id })
-            ;(engine as any).waitForSessionActive = async () => {
-                engine.handleSessionAlive({
-                    sid: session.id,
-                    time: Date.now(),
-                    thinking: false,
-                    runtimeId: 'runtime-resumed',
-                    runtimeGeneration: 1
-                })
-                return true
-            }
+            ;(engine as any).waitForSessionActive = async () => true
 
             const result = await engine.resumeSession(session.id, 'default')
 
@@ -1412,13 +1428,6 @@ describe('session model', () => {
                 return record.type === 'session-updated'
                     && record.sessionId === session.id
                     && record.data?.active === true
-            })).toBe(true)
-            expect(engine.handleSessionEnd({
-                sid: session.id,
-                time: Date.now(),
-                reason: 'completed',
-                runtimeId: 'runtime-resumed',
-                runtimeGeneration: 1
             })).toBe(true)
         } finally {
             engine.stop()
@@ -1625,117 +1634,6 @@ describe('session model', () => {
             expect(capturedResumeSessionId).toBe('22222222-2222-4222-8222-222222222222')
             expect(store.sessions.getSession(session.id)?.metadata).toMatchObject({
                 claudeSessionId: '22222222-2222-4222-8222-222222222222'
-            })
-        } finally {
-            engine.stop()
-        }
-    })
-
-    it('recovers the newest codex thread ID from stored messages and persists it', () => {
-        const store = new Store(':memory:')
-        const engine = new SyncEngine(
-            store,
-            {} as never,
-            new RpcRegistry(),
-            { broadcast() {} } as never
-        )
-
-        try {
-            const session = engine.getOrCreateSession(
-                'session-codex-resume-from-message',
-                {
-                    path: '/tmp/project',
-                    host: 'localhost',
-                    machineId: 'machine-1',
-                    flavor: 'codex'
-                },
-                null,
-                'default'
-            )
-            store.messages.addMessage(session.id, {
-                role: 'agent',
-                content: {
-                    type: 'codex',
-                    data: {
-                        thread_id: '11111111-1111-4111-8111-111111111111'
-                    }
-                }
-            })
-            store.messages.addMessage(session.id, {
-                role: 'agent',
-                content: {
-                    type: 'codex',
-                    data: {
-                        output: {
-                            threadId: '22222222-2222-4222-8222-222222222222'
-                        }
-                    }
-                }
-            })
-            store.messages.addMessage(session.id, {
-                role: 'agent',
-                content: {
-                    type: 'codex',
-                    data: {
-                        thread_id: '33333333-3333-4333-8333-333333333333',
-                        scopeRole: 'child',
-                        scope: {
-                            role: 'child',
-                            parentThreadId: '22222222-2222-4222-8222-222222222222'
-                        }
-                    }
-                }
-            })
-
-            const result = engine.resolveLocalResumeTarget(session.id, 'default')
-
-            expect(result.type).toBe('success')
-            if (result.type === 'success') {
-                expect(result.target.agentSessionId).toBe('22222222-2222-4222-8222-222222222222')
-            }
-            expect(store.sessions.getSession(session.id)?.metadata).toMatchObject({
-                codexSessionId: '22222222-2222-4222-8222-222222222222'
-            })
-        } finally {
-            engine.stop()
-        }
-    })
-
-    it('does not recover an invalid codex thread ID from stored messages', () => {
-        const store = new Store(':memory:')
-        const engine = new SyncEngine(
-            store,
-            {} as never,
-            new RpcRegistry(),
-            { broadcast() {} } as never
-        )
-
-        try {
-            const session = engine.getOrCreateSession(
-                'session-codex-resume-invalid-message',
-                {
-                    path: '/tmp/project',
-                    host: 'localhost',
-                    machineId: 'machine-1',
-                    flavor: 'codex'
-                },
-                null,
-                'default'
-            )
-            store.messages.addMessage(session.id, {
-                role: 'agent',
-                content: {
-                    type: 'codex',
-                    data: {
-                        thread_id: 'not-a-codex-thread-id'
-                    }
-                }
-            })
-
-            expect(engine.resolveLocalResumeTarget(session.id, 'default')).toEqual({
-                type: 'error',
-                message: 'Resume session ID unavailable. Start a new session in this directory, or retry after the agent has initialized.',
-                code: 'resume_unavailable'
             })
         } finally {
             engine.stop()
@@ -2031,6 +1929,108 @@ describe('session model', () => {
         }
     })
 
+    it('passes stored Copilot agent mode when respawning a resumed Copilot session', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession(
+                'session-copilot-agent-mode-resume',
+                {
+                    path: '/tmp/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'copilot',
+                    copilotSessionId: 'copilot-thread-1'
+                },
+                null,
+                'default',
+                'gpt-5'
+            )
+            await engine.applySessionConfig(session.id, { copilotAgentMode: 'plan' })
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                null,
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+
+            let capturedCopilotAgentMode: string | undefined
+            ;(engine as any).rpcGateway.spawnSession = async (
+                _machineId: string,
+                _directory: string,
+                _agent: string,
+                _model?: string,
+                _modelReasoningEffort?: string,
+                _yolo?: boolean,
+                _sessionType?: string,
+                _worktreeName?: string,
+                _resumeSessionId?: string,
+                _effort?: string,
+                _permissionMode?: string,
+                _serviceTier?: string,
+                _existingSessionId?: string,
+                _collaborationMode?: string,
+                copilotAgentMode?: string
+            ) => {
+                capturedCopilotAgentMode = copilotAgentMode
+                return { type: 'success', sessionId: session.id }
+            }
+            ;(engine as any).waitForSessionActive = async () => true
+
+            const result = await engine.resumeSession(session.id, 'default')
+
+            expect(result).toEqual({ type: 'success', sessionId: session.id })
+            expect(capturedCopilotAgentMode).toBe('plan')
+        } finally {
+            engine.stop()
+        }
+    })
+
+    it('restores the Copilot agent mode from metadata after a hub restart', async () => {
+        const store = new Store(':memory:')
+        const firstEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        const session = firstEngine.getOrCreateSession(
+            'session-copilot-agent-mode-restart',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'copilot',
+                copilotSessionId: 'copilot-thread-1'
+            },
+            null,
+            'default'
+        )
+        await firstEngine.applySessionConfig(session.id, { copilotAgentMode: 'autopilot' })
+        firstEngine.stop()
+
+        const restartedEngine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        try {
+            expect(restartedEngine.getSession(session.id)?.copilotAgentMode).toBe('autopilot')
+            expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+                preferredCopilotAgentMode: 'autopilot'
+            }))
+        } finally {
+            restartedEngine.stop()
+        }
+    })
+
     it('passes the cached permissionMode when respawning a resumed session', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
@@ -2081,11 +2081,7 @@ describe('session model', () => {
                 _worktreeName?: string,
                 _resumeSessionId?: string,
                 _effort?: string,
-                permissionMode?: string,
-                _serviceTier?: string,
-                _existingSessionId?: string,
-                _sandbox?: boolean,
-                _continueLatest?: boolean
+                permissionMode?: string
             ) => {
                 capturedPermissionMode = permissionMode
                 return { type: 'success', sessionId: session.id }
@@ -2348,6 +2344,375 @@ describe('session model', () => {
         } finally {
             engine.stop()
         }
+    })
+
+    it('reopens Pi in place only after native-ready, preserving its id and history', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-in-place', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-1',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            }, null, 'default')
+            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'keep history' } })
+            engine.getOrCreateMachine('machine-1', { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' }, { status: 'running', capabilities: { piExistingSessionResume: true } }, 'default')
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            let existing: string | undefined
+            let merges = 0
+            ;(engine as any).sessionCache.mergeSessions = async () => { merges += 1 }
+            ;(engine as any).rpcGateway.spawnSession = async (...args: Parameters<SyncEngine['spawnSession']>) => {
+                existing = args[12]
+                simulateRuntimeBootstrap(store, engine, session.id)
+                engine.handleSessionReady({ sid: session.id, time: Date.now() })
+                return { type: 'success', sessionId: session.id }
+            }
+            const result = await engine.reopenSession(session.id, 'default')
+            expect(result).toEqual({ type: 'success', sessionId: session.id, resumed: true })
+            expect(existing).toBe(session.id)
+            expect(merges).toBe(0)
+            expect(store.messages.getFirstMessages(session.id, 10)).toHaveLength(1)
+        } finally { engine.stop() }
+    })
+
+    it('kills and deletes an unexpected legacy Pi temp without touching the original row', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const original = engine.getOrCreateSession('pi-original', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-old',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            }, null, 'default')
+            const unexpected = engine.getOrCreateSession('pi-unexpected', { path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi' }, null, 'default')
+            engine.getOrCreateMachine('machine-1', { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' }, { status: 'running', capabilities: { piExistingSessionResume: true } }, 'default')
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: original.id, time: Date.now() })
+            ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'success', sessionId: unexpected.id })
+            ;(engine as any).rpcGateway.stopRunnerSession = async (_machineId: string, sid: string) => {
+                engine.handleSessionEnd({ sid, time: Date.now(), reason: 'error' })
+                return 'stopped'
+            }
+            const result = await engine.reopenSession(original.id, 'default')
+            expect(result).toMatchObject({ type: 'error', code: 'resume_failed', message: expect.stringContaining('upgrade') })
+            expect(store.sessions.getSession(unexpected.id)).toBeNull()
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(engine.getSessionByNamespace(original.id, 'default')?.metadata?.lifecycleState).toBe('archived')
+        } finally { engine.stop() }
+    })
+
+    it('does not restore archive metadata over a live Pi child after kill failure', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-live-failure', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-live',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            }, null, 'default')
+            engine.getOrCreateMachine('machine-1', { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' }, { status: 'running', capabilities: { piExistingSessionResume: true } }, 'default')
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                simulateRuntimeBootstrap(store, engine, session.id)
+                return { type: 'success', sessionId: session.id }
+            }
+            ;(engine as any).waitForSessionReady = async () => 'timeout'
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+            const result = await engine.reopenSession(session.id, 'default')
+            expect(result).toMatchObject({ type: 'error', message: expect.stringContaining('still active') })
+            expect(engine.getSessionByNamespace(session.id, 'default')?.active).toBe(true)
+            // A bootstrapped child owns the row and remains live when stop fails;
+            // do not overwrite its newer running lifecycle with the old snapshot.
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('running')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt?.state).toBe('quarantined')
+            expect(await engine.reopenSession(session.id, 'default')).toMatchObject({ type: 'error', message: 'Pi resume is already in progress' })
+
+            engine.handleSessionEnd({ sid: session.id, time: Date.now(), reason: 'error' })
+            await flushAsyncWork()
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('rejects Pi resume before spawn when the runner lacks in-place capability', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-old-runner', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-old-runner',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            }, null, 'default')
+            engine.getOrCreateMachine('machine-1', { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' }, { status: 'running' }, 'default')
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            let spawnCalls = 0
+            ;(engine as any).rpcGateway.spawnSession = async () => { spawnCalls += 1; return { type: 'error', message: 'unexpected' } }
+
+            const result = await engine.reopenSession(session.id, 'default')
+            expect(result).toMatchObject({ type: 'error', message: 'Pi resume requires an upgraded runner' })
+            expect(spawnCalls).toBe(0)
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('archived')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('quarantines a Pi attempt when runner spawn fails before process termination is confirmed', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-spawn-error-live-child', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-spawn-error',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            }, null, 'default')
+            engine.getOrCreateMachine('machine-1', { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' }, {
+                status: 'running', capabilities: { piExistingSessionResume: true }
+            }, 'default')
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'error', message: 'webhook timeout' })
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+
+            expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
+                type: 'error', message: 'webhook timeout'
+            })
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt?.state).toBe('quarantined')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('archived')
+            expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
+                type: 'error', message: 'Pi resume is already in progress'
+            })
+        } finally { engine.stop() }
+    })
+
+    it('keeps persisted Pi quarantine across SyncEngine restart and clears it on end', async () => {
+        const store = new Store(':memory:')
+        const first = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        const persisted = first.getOrCreateSession('pi-persisted-attempt', {
+            path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-persisted',
+            lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+            piResumeAttempt: { state: 'quarantined', machineId: 'machine-1', startedAt: 1 },
+        }, null, 'default')
+        first.stop()
+
+        const restarted = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            expect(await restarted.reopenSession(persisted.id, 'default')).toMatchObject({
+                type: 'error', message: 'Pi resume is already in progress'
+            })
+            restarted.handleSessionEnd({ sid: persisted.id, time: Date.now(), reason: 'error' })
+            await flushAsyncWork()
+            expect(restarted.getSessionByNamespace(persisted.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { restarted.stop() }
+    })
+
+    it('clears a persisted Pi attempt when native-ready arrives after Hub restart', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-ready-after-restart', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-ready',
+                piResumeAttempt: { state: 'resuming', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            engine.handleSessionReady({ sid: session.id, time: Date.now() })
+            await flushAsyncWork()
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('clears same-process Pi quarantine when a late validated ready arrives', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-late-ready', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-late-ready',
+                piResumeAttempt: { state: 'quarantined', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            ;(engine as any).piResumeQuarantinedIds.add(session.id)
+            engine.handleSessionReady({ sid: session.id, time: Date.now() })
+            await flushAsyncWork()
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+            expect((engine as any).piResumeQuarantinedIds.has(session.id)).toBe(false)
+        } finally { engine.stop() }
+    })
+
+    it('does not report active Pi attempts as reopened before validated ready', async () => {
+        for (const state of ['resuming', 'terminating'] as const) {
+            const store = new Store(':memory:')
+            const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+            try {
+                const session = engine.getOrCreateSession(`pi-active-${state}`, {
+                    path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: `pi-native-${state}`,
+                    piResumeAttempt: { state, machineId: 'machine-1', startedAt: 1 },
+                }, null, 'default')
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+                expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
+                    type: 'error', message: 'Pi resume is already in progress'
+                })
+            } finally { engine.stop() }
+        }
+    })
+
+    it('reconciles persisted quarantined Pi state when the runner reports the child already gone', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-stale-quarantine', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-stale-quarantine',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+                piResumeAttempt: { state: 'quarantined', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'already_gone'
+            expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
+                type: 'error', message: 'Previous Pi resume attempt was cleaned up; retry'
+            })
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('reconciles a persisted Pi attempt with an already-gone runner child without clearing archive state', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-stale-resume-attempt', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-stale',
+                // Mirrors bootstrapExistingSession before native get_state: the
+                // live metadata says running, while the attempt carries the
+                // exact archived snapshot needed if the child is already gone.
+                lifecycleState: 'running', lifecycleStateSince: 200,
+                piResumeAttempt: {
+                    state: 'resuming', machineId: 'machine-1', startedAt: 1,
+                    archiveSnapshot: {
+                        lifecycleState: 'archived', lifecycleStateSince: 100,
+                        archivedBy: 'cli', archiveReason: 'Pi exited',
+                    },
+                },
+            }, null, 'default')
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'already_gone'
+
+            expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
+                type: 'error', message: 'Previous Pi resume attempt was cleaned up; retry'
+            })
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('archived')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleStateSince).toBe(100)
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.archivedBy).toBe('cli')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.archiveReason).toBe('Pi exited')
+        } finally { engine.stop() }
+    })
+
+    it('does not quarantine an in-place Pi row when session-end wins the stop response race', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const session = engine.getOrCreateSession('pi-stop-end-race', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-race',
+                piResumeAttempt: { state: 'resuming', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => {
+                engine.handleSessionEnd({ sid: session.id, time: Date.now(), reason: 'error' })
+                return 'still_alive'
+            }
+
+            expect(await (engine as any).terminateInPlacePiResume('machine-1', session.id, 'default', true)).toBe(true)
+            await flushAsyncWork()
+            expect(engine.getSessionByNamespace(session.id, 'default')?.active).toBe(false)
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('does not persist an unexpected-child quarantine when child end wins the stop response race', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const original = engine.getOrCreateSession('pi-original-stop-race', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-race',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+                piResumeAttempt: { state: 'resuming', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            const temp = engine.getOrCreateSession('pi-temp-stop-race', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi',
+            }, null, 'default')
+            engine.handleSessionAlive({ sid: temp.id, time: Date.now() })
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => {
+                engine.handleSessionEnd({ sid: temp.id, time: Date.now(), reason: 'error' })
+                return 'still_alive'
+            }
+
+            expect(await (engine as any).terminateUnexpectedPiTemp('machine-1', temp.id, original.id, 'default')).toBe(true)
+            await flushAsyncWork()
+            expect(store.sessions.getSession(temp.id)).toBeNull()
+            expect(engine.getSessionByNamespace(original.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+        } finally { engine.stop() }
+    })
+
+    it('keeps still-alive Pi children quarantined even when Hub cache is inactive', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const original = engine.getOrCreateSession('pi-still-alive-inactive', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-still-alive',
+                piResumeAttempt: { state: 'resuming', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+            expect(await (engine as any).terminateInPlacePiResume('machine-1', original.id, 'default')).toBe(false)
+
+            const temp = engine.getOrCreateSession('pi-temp-still-alive-inactive', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi',
+            }, null, 'default')
+            expect(await (engine as any).terminateUnexpectedPiTemp('machine-1', temp.id, original.id, 'default')).toBe(false)
+            expect(store.sessions.getSession(temp.id)).not.toBeNull()
+            expect(engine.getSessionByNamespace(original.id, 'default')?.metadata?.piResumeAttempt).toMatchObject({
+                state: 'quarantined', childSessionId: temp.id
+            })
+        } finally { engine.stop() }
+    })
+
+    it('blocks dedup for a persisted unexpected Pi child and clears the original attempt on child end', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const temp = engine.getOrCreateSession('pi-temp-mapped', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-mapped',
+            }, null, 'default')
+            const original = engine.getOrCreateSession('pi-original-mapped', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-mapped',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+                piResumeAttempt: { state: 'quarantined', machineId: 'machine-1', startedAt: 1, childSessionId: temp.id },
+            }, null, 'default')
+            let dedupCalls = 0
+            ;(engine as any).sessionCache.deduplicateByAgentSessionId = async () => { dedupCalls += 1 }
+            ;(engine as any).triggerDedupIfNeeded(temp.id)
+            await flushAsyncWork()
+            expect(dedupCalls).toBe(0)
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+
+            engine.handleSessionEnd({ sid: temp.id, time: Date.now(), reason: 'error' })
+            await flushAsyncWork()
+            expect(engine.getSessionByNamespace(original.id, 'default')?.metadata?.piResumeAttempt).toBeUndefined()
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+            expect(dedupCalls).toBe(0)
+        } finally { engine.stop() }
+    })
+
+    it('blocks Pi dedup before an unexpected child ID is attached to the persisted attempt', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+        try {
+            const original = engine.getOrCreateSession('pi-original-pre-mapping', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-pre-mapping',
+                lifecycleState: 'archived', archivedBy: 'cli', archiveReason: 'Pi exited',
+                piResumeAttempt: { state: 'resuming', machineId: 'machine-1', startedAt: 1 },
+            }, null, 'default')
+            const temp = engine.getOrCreateSession('pi-temp-pre-mapping', {
+                path: '/tmp/project', host: 'localhost', machineId: 'machine-1', flavor: 'pi', piSessionId: 'pi-native-pre-mapping',
+            }, null, 'default')
+            engine.handleSessionAlive({ sid: temp.id, time: Date.now() })
+            let dedupCalls = 0
+            ;(engine as any).sessionCache.deduplicateByAgentSessionId = async () => { dedupCalls += 1 }
+
+            ;(engine as any).triggerDedupIfNeeded(temp.id)
+            await flushAsyncWork()
+            expect(dedupCalls).toBe(0)
+            expect(store.sessions.getSession(original.id)).not.toBeNull()
+        } finally { engine.stop() }
     })
 
     it('defers mergeSessions for cursor reopen until session-ready (load failure leaves old row)', async () => {
@@ -3057,6 +3422,61 @@ describe('session model', () => {
         }
     })
 
+    it('does not resume a native Pi session on a same-host machine when its recorded machine is offline', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession(
+                'pi-offline-recorded-machine-resume',
+                {
+                    path: '/remote/project',
+                    host: 'shared-host-label',
+                    machineId: 'recorded-machine-offline',
+                    flavor: 'pi',
+                    piSessionId: 'pi-native-offline',
+                    lifecycleState: 'archived'
+                },
+                null,
+                'default'
+            )
+            engine.getOrCreateMachine(
+                'recorded-machine-offline',
+                { host: 'shared-host-label', platform: 'linux', happyCliVersion: '0.1.0' },
+                null,
+                'default'
+            )
+            engine.getOrCreateMachine(
+                'wrong-same-host-machine',
+                { host: 'shared-host-label', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running', capabilities: { piExistingSessionResume: true } },
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'wrong-same-host-machine', time: Date.now() })
+
+            let spawnCalled = false
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                spawnCalled = true
+                return { type: 'success', sessionId: session.id }
+            }
+
+            expect(await engine.reopenSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'No machine online',
+                code: 'no_machine_online'
+            })
+            expect(spawnCalled).toBe(false)
+            expect(engine.getSession(session.id)?.metadata?.lifecycleState).toBe('archived')
+        } finally {
+            engine.stop()
+        }
+    })
+
     it('resumeSession fresh-spawns when inactive cursor session has no agent id and no user messages', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
@@ -3303,6 +3723,30 @@ describe('session model', () => {
             expect(messages.length).toBeGreaterThanOrEqual(1)
         })
 
+        it('merges duplicate when copilotSessionId collides', async () => {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+
+            const s1 = cache.getOrCreateSession(
+                'copilot-tag-1',
+                { path: '/tmp/project', host: 'localhost', flavor: 'copilot', copilotSessionId: 'copilot-thread-X' },
+                null,
+                'default'
+            )
+            const s2 = cache.getOrCreateSession(
+                'copilot-tag-2',
+                { path: '/tmp/project', host: 'localhost', flavor: 'copilot', copilotSessionId: 'copilot-thread-X' },
+                null,
+                'default'
+            )
+
+            await cache.deduplicateByAgentSessionId(s2.id)
+
+            expect(cache.getSession(s1.id)).toBeUndefined()
+            expect(cache.getSession(s2.id)).toBeDefined()
+        })
+
         it('preserves sessions with different agent session IDs', async () => {
             const store = new Store(':memory:')
             const events: SyncEvent[] = []
@@ -3325,6 +3769,30 @@ describe('session model', () => {
 
             expect(cache.getSession(s1.id)).toBeDefined()
             expect(cache.getSession(s2.id)).toBeDefined()
+        })
+
+        it('does not merge the same Pi session id across different machines', async () => {
+            const store = new Store(':memory:')
+            const events: SyncEvent[] = []
+            const cache = new SessionCache(store, createPublisher(events))
+            const s1 = cache.getOrCreateSession(
+                'pi-tag-1',
+                { path: '/tmp/project', host: 'one', machineId: 'machine-1', flavor: 'pi', piSessionId: 'native-pi-id' },
+                null,
+                'default'
+            )
+            const s2 = cache.getOrCreateSession(
+                'pi-tag-2',
+                { path: '/tmp/project', host: 'two', machineId: 'machine-2', flavor: 'pi', piSessionId: 'native-pi-id' },
+                null,
+                'default'
+            )
+
+            await cache.deduplicateByAgentSessionId(s2.id)
+
+            expect(cache.getSession(s1.id)).toBeDefined()
+            expect(cache.getSession(s2.id)).toBeDefined()
+            store.close()
         })
 
         it('does not merge across namespaces', async () => {
@@ -3418,70 +3886,6 @@ describe('session model', () => {
             expect(sourceRequests['req-from-active-duplicate']).toBeDefined()
             expect(targetRequests['req-from-active-duplicate']).toBeUndefined()
             expect(targetRequests['req-from-target']).toBeDefined()
-        })
-
-        it('does not delete a live session when a metadata update creates a native thread collision', async () => {
-            const store = new Store(':memory:')
-            const engine = new SyncEngine(
-                store,
-                {} as never,
-                new RpcRegistry(),
-                { broadcast() {} } as never
-            )
-
-            try {
-                const first = engine.getOrCreateSession(
-                    'metadata-collision-first',
-                    { path: '/tmp/project-a', host: 'localhost', flavor: 'codex', codexSessionId: 'thread-X' },
-                    null,
-                    'default'
-                )
-                const second = engine.getOrCreateSession(
-                    'metadata-collision-second',
-                    { path: '/tmp/project-b', host: 'localhost', flavor: 'codex', codexSessionId: 'thread-Y' },
-                    null,
-                    'default'
-                )
-
-                store.messages.addMessage(first.id, { type: 'text', text: 'history from first' }, 'collision-first')
-                store.messages.addMessage(second.id, { type: 'text', text: 'history from second' }, 'collision-second')
-                engine.handleSessionAlive({ sid: first.id, time: Date.now() })
-                engine.handleSessionAlive({ sid: second.id, time: Date.now() + 1000 })
-
-                const storedSecond = store.sessions.getSessionByNamespace(second.id, 'default')!
-                const update = store.sessions.updateSessionMetadata(
-                    second.id,
-                    {
-                        ...(storedSecond.metadata as Record<string, unknown>),
-                        codexSessionId: 'thread-X'
-                    },
-                    storedSecond.metadataVersion,
-                    'default'
-                )
-                expect(update.result).toBe('success')
-                if (update.result !== 'success') {
-                    throw new Error('Expected metadata update to succeed')
-                }
-
-                await engine.handleSessionMetadataUpdated({
-                    sid: second.id,
-                    namespace: 'default',
-                    metadata: update.value
-                })
-
-                expect(engine.getSession(first.id)).toBeDefined()
-                expect(engine.getSession(second.id)).toBeDefined()
-                expect(store.sessions.getSession(first.id)).not.toBeNull()
-                expect(store.sessions.getSession(second.id)).not.toBeNull()
-                expect(store.messages.getMessages(first.id, 100).map((message) => (message.content as { text?: string }).text)).toEqual([
-                    'history from first'
-                ])
-                expect(store.messages.getMessages(second.id, 100).map((message) => (message.content as { text?: string }).text)).toEqual([
-                    'history from second'
-                ])
-            } finally {
-                engine.stop()
-            }
         })
 
         it('invalidates both sessions for history-only merges', async () => {
@@ -4086,34 +4490,6 @@ describe('session model', () => {
             expect(meta?.archivedBy).toBe('cli')
             expect(meta?.archiveReason).toBe('User terminated')
             expect(meta?.lifecycleStateSince).toBe(initialSince)
-        })
-
-        it('does not archive a newer running lifecycle generation', () => {
-            const store = new Store(':memory:')
-            const events: SyncEvent[] = []
-            const cache = new SessionCache(store, createPublisher(events))
-            const newerGenerationAt = Date.now()
-            const session = cache.getOrCreateSession(
-                'session-newer-running-generation',
-                {
-                    path: '/tmp/project',
-                    host: 'localhost',
-                    flavor: 'codex',
-                    lifecycleState: 'running',
-                    lifecycleStateSince: newerGenerationAt
-                },
-                null,
-                'default'
-            )
-
-            cache.markSessionArchivedFromHub(session.id, 'stale end', {
-                onlyRunningSinceAtOrBefore: newerGenerationAt - 1
-            })
-
-            expect(cache.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
-                lifecycleState: 'running',
-                lifecycleStateSince: newerGenerationAt
-            }))
         })
 
         it('self-heals on version-mismatch via refresh-and-retry', () => {

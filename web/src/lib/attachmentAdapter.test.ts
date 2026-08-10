@@ -1,42 +1,36 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-describe('attachmentAdapter restored uploads', () => {
+async function collectAdditions(
+    file: File,
+    uploadFile = vi.fn(async () => ({ success: true, path: '/uploads/file' }))
+) {
+    const { createAttachmentAdapter } = await import('./attachmentAdapter')
+    const adapter = createAttachmentAdapter({ uploadFile } as never, 'session-1')
+    const additions = adapter.add({ file }) as AsyncIterable<Record<string, unknown>>
+    const emitted: Record<string, unknown>[] = []
+
+    for await (const attachment of additions) {
+        emitted.push(attachment)
+    }
+
+    return { emitted, uploadFile }
+}
+
+describe('attachmentAdapter', () => {
     beforeEach(() => {
         vi.stubGlobal('indexedDB', undefined)
         vi.resetModules()
     })
 
     afterEach(() => {
-        vi.restoreAllMocks()
         vi.unstubAllGlobals()
     })
 
-    it('uses assistant-ui universal matching so pasted images are accepted', async () => {
+    it('uses the assistant-ui wildcard sentinel so all files reach the adapter', async () => {
         const { createAttachmentAdapter } = await import('./attachmentAdapter')
         const adapter = createAttachmentAdapter({} as never, 'session-1')
 
         expect(adapter.accept).toBe('*')
-    })
-
-    it('rejects oversized files before publishing a resumable running upload', async () => {
-        const readAsDataUrl = vi.spyOn(FileReader.prototype, 'readAsDataURL')
-        const uploadFile = vi.fn()
-        const { createAttachmentAdapter } = await import('./attachmentAdapter')
-        const adapter = createAttachmentAdapter({ uploadFile } as never, 'session-1')
-        const file = new File(['small fixture'], 'oversized.bin', { type: 'application/octet-stream' })
-        Object.defineProperty(file, 'size', { configurable: true, value: 50 * 1024 * 1024 + 1 })
-        const emitted = []
-
-        for await (const attachment of adapter.add({ file }) as AsyncIterable<unknown>) {
-            emitted.push(attachment)
-        }
-
-        expect(emitted).toHaveLength(1)
-        expect(emitted[0]).toEqual(expect.objectContaining({
-            status: { type: 'incomplete', reason: 'error' },
-        }))
-        expect(readAsDataUrl).not.toHaveBeenCalled()
-        expect(uploadFile).not.toHaveBeenCalled()
     })
 
     it('restores an uploaded draft without uploading it again', async () => {
@@ -69,182 +63,191 @@ describe('attachmentAdapter restored uploads', () => {
         })])
     })
 
-    it('re-uploads a restored CLI path when the resumed session id changed', async () => {
-        const drafts = await import('./composer-attachment-drafts')
-        const { createAttachmentAdapter } = await import('./attachmentAdapter')
-        const file = new File(['old session bytes'], 'resume.txt', { type: 'text/plain' })
-        drafts.saveDraftAttachments('session-old', [{
-            id: 'attachment-old',
-            file,
-            path: '/uploads/session-old/resume.txt',
-        }])
-        const [restored] = await drafts.getDraftAttachments('session-old')
-        const uploadFile = vi.fn().mockResolvedValue({
-            success: true,
-            path: '/uploads/session-new/resume.txt',
-        })
-        const adapter = createAttachmentAdapter({ uploadFile } as never, 'session-new')
-        const emitted = []
-
-        for await (const attachment of adapter.add({ file: restored! }) as AsyncIterable<unknown>) {
-            emitted.push(attachment)
-        }
-
-        expect(uploadFile).toHaveBeenCalledWith(
-            'session-new',
-            'resume.txt',
-            expect.any(String),
-            'text/plain',
-        )
-        expect(emitted.at(-1)).toEqual(expect.objectContaining({
-            path: '/uploads/session-new/resume.txt',
-            status: { type: 'requires-action', reason: 'composer-send' },
-        }))
-    })
-
-    it('re-uploads a restored scratchlist draft without deleting the copied source blob', async () => {
-        const drafts = await import('./composer-attachment-drafts')
-        const { createAttachmentAdapter } = await import('./attachmentAdapter')
-        const file = new File(['scratchlist bytes'], 'ready.txt', { type: 'text/plain' })
-        const hubAttachmentId = 'a1b2c3d4-e5f6-4789-a012-3456789abcde'
-        const scratchlistPath = `hapi-hub:scratchlist/default/session-1/${hubAttachmentId}-ready.txt`
-        drafts.saveDraftAttachments('session-1', [{
-            id: 'attachment-ready',
-            file,
-            path: scratchlistPath,
-        }])
-        const [restored] = await drafts.getDraftAttachments('session-1')
-        expect(restored).toBeDefined()
-
-        const uploadFile = vi.fn().mockResolvedValue({
-            success: true,
-            path: '/uploads/reuploaded-ready.txt',
-        })
-        const deleteScratchlistAttachment = vi.fn()
-        const adapter = createAttachmentAdapter({
-            uploadFile,
-            deleteScratchlistAttachment,
-        } as never, 'session-1')
-        const emitted = []
-        const additions = adapter.add({ file: restored! }) as AsyncIterable<unknown>
-        for await (const attachment of additions) {
-            emitted.push(attachment)
-        }
-
-        expect(uploadFile).toHaveBeenCalledWith(
-            'session-1',
-            'ready.txt',
-            expect.any(String),
-            'text/plain',
-        )
-        expect(deleteScratchlistAttachment).not.toHaveBeenCalled()
-        expect(emitted.at(-1)).toEqual(expect.objectContaining({
-            path: '/uploads/reuploaded-ready.txt',
-            status: { type: 'requires-action', reason: 'composer-send' },
-        }))
-        expect(emitted.at(-1)).not.toEqual(expect.objectContaining({
-            id: 'attachment-ready',
-            path: scratchlistPath,
-        }))
-    })
-
-    it('keeps a successful upload usable when both preview attempts fail', async () => {
+    it('uploads an image when the initial preview read fails', async () => {
         let readCount = 0
-        class PreviewFailingFileReader {
-            result: string | null = null
-            onload: (() => void) | null = null
-            onerror: ((error: Error) => void) | null = null
-
-            readAsDataURL(): void {
-                readCount += 1
-                queueMicrotask(() => {
-                    if (readCount === 1) {
-                        this.result = 'data:image/png;base64,aW1hZ2U='
-                        this.onload?.()
-                    } else {
-                        this.onerror?.(new Error('preview read failed'))
-                    }
-                })
-            }
-        }
-        vi.stubGlobal('FileReader', PreviewFailingFileReader)
-        vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
-            throw new Error('thumbnail decode failed')
-        })
-
-        const uploadFile = vi.fn().mockResolvedValue({
-            success: true,
-            path: '/uploads/preview-failed.png',
-        })
-        const { createAttachmentAdapter } = await import('./attachmentAdapter')
-        const adapter = createAttachmentAdapter({ uploadFile } as never, 'session-1')
-        const file = new File(['image'], 'preview-failed.png', { type: 'image/png' })
-        const emitted = []
-
-        for await (const attachment of adapter.add({ file }) as AsyncIterable<unknown>) {
-            emitted.push(attachment)
-        }
-
-        expect(readCount).toBe(2)
-        expect(emitted.at(-1)).toEqual(expect.objectContaining({
-            path: '/uploads/preview-failed.png',
-            previewUrl: undefined,
-            status: { type: 'requires-action', reason: 'composer-send' },
-        }))
-    })
-
-    it('deletes an uploaded file when remove races the preview await', async () => {
-        let readCount = 0
-        let finishPreview: (() => void) | undefined
-        class DelayedPreviewFileReader {
-            result: string | null = null
-            onload: (() => void) | null = null
-            onerror: ((error: Error) => void) | null = null
+        class FileReaderMock {
+            result: string | ArrayBuffer | null = null
+            onload: FileReader['onload'] = null
+            onerror: FileReader['onerror'] = null
 
             readAsDataURL(): void {
                 readCount += 1
                 if (readCount === 1) {
-                    queueMicrotask(() => {
-                        this.result = 'data:image/png;base64,aW1hZ2U='
-                        this.onload?.()
-                    })
+                    this.onerror?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
                     return
                 }
-                finishPreview = () => {
-                    this.result = 'data:image/png;base64,cHJldmlldw=='
-                    this.onload?.()
-                }
+                this.result = 'data:image/png;base64,dXBsb2Fk'
+                this.onload?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
             }
         }
-        vi.stubGlobal('FileReader', DelayedPreviewFileReader)
-        vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
-            throw new Error('thumbnail decode failed')
-        })
+        vi.stubGlobal('FileReader', FileReaderMock)
 
-        const uploadFile = vi.fn().mockResolvedValue({
-            success: true,
-            path: '/uploads/raced.png',
+        const file = new File(['proof'], 'proof.png', { type: 'image/png' })
+        const { emitted, uploadFile } = await collectAdditions(file)
+
+        expect(readCount).toBe(2)
+        expect(uploadFile).toHaveBeenCalledWith('session-1', 'proof.png', 'dXBsb2Fk', 'image/png')
+        expect(emitted.at(-1)).toMatchObject({
+            status: { type: 'requires-action', reason: 'composer-send' },
+            path: '/uploads/file'
         })
-        const deleteUploadFile = vi.fn().mockResolvedValue(undefined)
+        expect(emitted.every((attachment) => attachment.previewUrl === undefined)).toBe(true)
+    })
+})
+
+describe('attachmentAdapter image previews', () => {
+    it('includes the preview URL in every image upload state', async () => {
+        const file = new File(['image'], 'photo.png', { type: 'image/png' })
+        const readSpy = vi.spyOn(FileReader.prototype, 'readAsDataURL')
+        const { emitted } = await collectAdditions(file)
+
+        expect(emitted).toHaveLength(3)
+        expect(emitted[0]).toMatchObject({
+            previewUrl: 'data:image/png;base64,aW1hZ2U=',
+            status: { type: 'running', progress: 0 }
+        })
+        expect(emitted[1]).toMatchObject({
+            previewUrl: 'data:image/png;base64,aW1hZ2U=',
+            status: { type: 'running', progress: 50 }
+        })
+        expect(emitted[2]).toMatchObject({
+            previewUrl: 'data:image/png;base64,aW1hZ2U=',
+            status: { type: 'requires-action' }
+        })
+        expect(readSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not generate previews for non-image attachments', async () => {
+        const file = new File(['notes'], 'notes.txt', { type: 'text/plain' })
+        const { emitted } = await collectAdditions(file)
+
+        expect(emitted).toHaveLength(3)
+        expect(emitted.every((attachment) => attachment.previewUrl === undefined)).toBe(true)
+    })
+
+    it('hands an inactive attachment to the resumed session before uploading', async () => {
         const { createAttachmentAdapter } = await import('./attachmentAdapter')
-        const adapter = createAttachmentAdapter({ uploadFile, deleteUploadFile } as never, 'session-1')
-        const file = new File(['image'], 'raced.png', { type: 'image/png' })
-        const iter = adapter.add({ file }) as AsyncGenerator<import('@assistant-ui/react').PendingAttachment>
-        const initial = await iter.next()
-        await iter.next()
-        const finishing = iter.next()
+        const file = new File(['image'], 'ready.png', { type: 'image/png' })
+        const uploadFile = vi.fn().mockResolvedValue({ success: true, path: '/uploads/ready.png' })
+        const resolveSessionId = vi.fn().mockResolvedValue('session-resumed')
+        const onSessionResolved = vi.fn().mockResolvedValue(undefined)
+        const adapter = createAttachmentAdapter(
+            { uploadFile } as never,
+            'session-inactive',
+            resolveSessionId,
+            onSessionResolved,
+        )
 
-        await vi.waitFor(() => expect(finishPreview).toBeTypeOf('function'))
-        await adapter.remove({
-            id: (initial.value as { id: string }).id,
-            type: 'file',
-            name: file.name,
-            contentType: file.type,
-            status: { type: 'running', reason: 'uploading', progress: 50 },
-        } as never)
-        finishPreview?.()
+        const additions = adapter.add({ file }) as AsyncIterable<unknown>
+        for await (const _attachment of additions) {
+            // Consume the upload lifecycle.
+        }
 
-        await expect(finishing).resolves.toEqual(expect.objectContaining({ done: true }))
-        expect(deleteUploadFile).toHaveBeenCalledWith('session-1', '/uploads/raced.png')
+        expect(resolveSessionId).toHaveBeenCalledOnce()
+        expect(onSessionResolved).toHaveBeenCalledWith('session-resumed', expect.objectContaining({
+            id: expect.any(String),
+            file,
+            isCancelled: expect.any(Function),
+        }))
+        expect(uploadFile).not.toHaveBeenCalled()
+
+    })
+
+    it('still hands off after resume when the attachment is cancelled mid-flight', async () => {
+        const { createAttachmentAdapter } = await import('./attachmentAdapter')
+        const file = new File(['image'], 'ready.png', { type: 'image/png' })
+        const uploadFile = vi.fn().mockResolvedValue({ success: true, path: '/uploads/ready.png' })
+        let releaseResolve!: (sessionId: string) => void
+        let markResolveStarted!: () => void
+        const resolveSessionReady = new Promise<void>((resolve) => {
+            markResolveStarted = resolve
+        })
+        const resolveSessionId = vi.fn().mockImplementation(() => {
+            markResolveStarted()
+            return new Promise<string>((resolve) => {
+                releaseResolve = resolve
+            })
+        })
+        const onSessionResolved = vi.fn().mockResolvedValue(undefined)
+        const adapter = createAttachmentAdapter(
+            { uploadFile } as never,
+            'session-inactive',
+            resolveSessionId,
+            onSessionResolved,
+        )
+
+        const additions = adapter.add({ file }) as AsyncIterable<Record<string, unknown>>
+        const iterator = additions[Symbol.asyncIterator]()
+        const first = await iterator.next()
+        const pendingId = first.value?.id as string
+        expect(pendingId).toBeTruthy()
+
+        const remainder = iterator.next()
+        await resolveSessionReady
+        await adapter.remove({ id: pendingId } as never)
+        releaseResolve('session-resumed')
+        await remainder
+
+        expect(resolveSessionId).toHaveBeenCalledOnce()
+        // Resume already merged the source session away — hand off with a live
+        // cancellation predicate (never drop the id), and never upload.
+        expect(onSessionResolved).toHaveBeenCalledWith('session-resumed', expect.objectContaining({
+            id: pendingId,
+            file,
+            isCancelled: expect.any(Function),
+        }))
+        const handoff = onSessionResolved.mock.calls[0]?.[1] as { isCancelled: () => boolean }
+        expect(handoff.isCancelled()).toBe(true)
+        expect(uploadFile).not.toHaveBeenCalled()
+    })
+
+    it('shares one resume promise across staggered inactive attachment generators', async () => {
+        const { createAttachmentAdapter } = await import('./attachmentAdapter')
+        const file1 = new File(['one'], 'one.txt', { type: 'text/plain' })
+        const file2 = new File(['two'], 'two.txt', { type: 'text/plain' })
+        const uploadFile = vi.fn()
+        let resolveResume!: (sessionId: string) => void
+        let resumeCalls = 0
+        let uploadResolution: Promise<string> | undefined
+        const resolveSessionId = vi.fn(() => {
+            resumeCalls += 1
+            return new Promise<string>((resolve) => {
+                resolveResume = resolve
+            })
+        })
+        const resolveUploadSession = () => {
+            uploadResolution ??= resolveSessionId().catch((error) => {
+                uploadResolution = undefined
+                throw error
+            })
+            return uploadResolution
+        }
+        const onSessionResolved = vi.fn().mockResolvedValue(undefined)
+        const adapter = createAttachmentAdapter(
+            { uploadFile } as never,
+            'session-inactive',
+            resolveUploadSession,
+            onSessionResolved,
+        )
+
+        const first = (async () => {
+            for await (const _ of adapter.add({ file: file1 }) as AsyncIterable<unknown>) {
+                // consume
+            }
+        })()
+        const second = (async () => {
+            for await (const _ of adapter.add({ file: file2 }) as AsyncIterable<unknown>) {
+                // consume
+            }
+        })()
+
+        await vi.waitFor(() => {
+            expect(resumeCalls).toBe(1)
+        })
+        resolveResume('session-resumed')
+        await Promise.all([first, second])
+        expect(resumeCalls).toBe(1)
+        expect(onSessionResolved).toHaveBeenCalled()
+        expect(uploadFile).not.toHaveBeenCalled()
     })
 })

@@ -102,7 +102,6 @@ export function SessionRowSummary(props: {
     showPath?: boolean
     showDetailedStatus?: boolean
     selected?: boolean
-    pinned?: boolean
     /**
      * When false, attention is a bare colored dot (no nested HoverTooltip).
      * Use false inside an already-open chip tooltip portal.
@@ -112,17 +111,25 @@ export function SessionRowSummary(props: {
     attentionTooltipId?: string
     scheduleTooltipId?: string
     className?: string
+    /** Rows inside the pinned "in progress" section skip the text label (dot only). */
+    inRunningSection?: boolean
+    /** Short project name shown under the title (pinned "in progress" rows). */
+    projectLabel?: string
+    /** Machine label shown next to the project name (pinned "in progress" rows). */
+    machineLabel?: string
 }) {
     const {
         session: s,
         showPath = true,
         showDetailedStatus = true,
         selected = false,
-        pinned = false,
         nestedTooltips = true,
         attentionTooltipId: attentionTooltipIdProp,
         scheduleTooltipId: scheduleTooltipIdProp,
         className,
+        inRunningSection = false,
+        projectLabel,
+        machineLabel,
     } = props
     const { t } = useTranslation()
     const sessionName = getSessionTitle(s)
@@ -138,6 +145,8 @@ export function SessionRowSummary(props: {
         [s, selected, showDetailedStatus]
     )
     const attentionLabel = attention ? getAttentionLabel(attention, t) : null
+    const urgentAttention = attention !== null
+        && (attention.kind === 'permission' || attention.kind === 'input')
     const scheduledLabel = s.futureScheduledMessageCount > 1
         ? t('session.item.scheduledMessages', { count: s.futureScheduledMessageCount })
         : t('session.item.scheduledMessage')
@@ -161,19 +170,41 @@ export function SessionRowSummary(props: {
                     >
                         {sessionName}
                     </div>
-                    {pinned ? (
-                        <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 24 24"
-                            fill="currentColor"
-                            className="h-3 w-3 shrink-0 text-[var(--app-hint)]"
-                            aria-label={t('session.pinned')}
-                        >
-                            <path d="M16 12V4h1a1 1 0 0 0 0-2H7a1 1 0 0 0 0 2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2z" />
-                        </svg>
-                    ) : null}
                     {s.active && s.thinking ? (
-                        <LoaderIcon className="h-3.5 w-3.5 shrink-0 animate-spin-slow text-[var(--app-hint)]" />
+                        <LoaderIcon className="h-3.5 w-3.5 shrink-0 animate-spin-slow text-[var(--app-badge-success-text)]" />
+                    ) : urgentAttention && nestedTooltips && attentionId ? (
+                        <SessionAttentionIndicator
+                            attention={attention}
+                            summary={s}
+                            label={attentionLabel ?? ''}
+                            tooltipId={attentionId}
+                        />
+                    ) : urgentAttention ? (
+                        <span
+                            className={`inline-flex h-2 w-2 shrink-0 rounded-full ${ATTENTION_DOT_CLASS[attention.kind]}`}
+                            title={attentionLabel ?? undefined}
+                            aria-label={attentionLabel ?? undefined}
+                        />
+                    ) : s.active && (s.backgroundTaskCount ?? 0) > 0 ? (
+                        <span
+                            className="inline-flex shrink-0 items-center gap-1 text-[var(--app-badge-success-text)]"
+                            title={t('session.item.running')}
+                        >
+                            <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" aria-hidden="true" />
+                            {!inRunningSection ? (
+                                <span className="text-[11px] font-medium leading-none">{t('session.item.running')}</span>
+                            ) : null}
+                        </span>
+                    ) : s.active && (s.pendingRequestsCount ?? 0) > 0 ? (
+                        <span
+                            className="inline-flex shrink-0 items-center gap-1 text-[var(--app-badge-warning-text)]"
+                            title={t('session.item.pending')}
+                        >
+                            <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" aria-hidden="true" />
+                            {!inRunningSection ? (
+                                <span className="text-[11px] font-medium leading-none">{t('session.item.pending')}</span>
+                            ) : null}
+                        </span>
                     ) : attention && nestedTooltips && attentionId ? (
                         <SessionAttentionIndicator
                             attention={attention}
@@ -227,7 +258,11 @@ export function SessionRowSummary(props: {
                     ) : null}
                 </div>
             </div>
-            {showPath || worktreeLabel ? (
+            {projectLabel || machineLabel ? (
+                <div className="truncate text-xs text-[var(--app-hint)]" title={[projectLabel, machineLabel].filter(Boolean).join(' · ')}>
+                    {[projectLabel, machineLabel].filter(Boolean).join(' · ')}
+                </div>
+            ) : showPath || worktreeLabel ? (
                 <div
                     className="truncate text-xs text-[var(--app-hint)]"
                     title={worktreeLabel

@@ -1,4 +1,4 @@
-import type { Metadata, Session, WorktreeMetadata } from './schemas'
+import type { AgentState, Metadata, Session, TodoItem, WorktreeMetadata } from './schemas'
 import { isKnownFlavor } from './flavors'
 import type { AgentFlavor } from './modes'
 
@@ -22,8 +22,9 @@ export type PendingRequest = {
     id: string
     kind: PendingRequestKind
     tool: string
-    /** Epoch ms when the request was raised; falls back to `session.updatedAt`
-     *  for older requests that were stored without `createdAt`. */
+    /** Epoch ms when the request was raised; falls back to the caller-supplied
+     *  `fallbackSince` (typically `session.updatedAt`) for older requests
+     *  stored without `createdAt`. */
     since: number
 }
 
@@ -34,14 +35,14 @@ function classifyKind(tool: string): PendingRequestKind {
 export type SessionSummaryMetadata = {
     name?: string
     path: string
-    host?: string
     machineId?: string
     summary?: { text: string }
     flavor?: string | null
     worktree?: WorktreeMetadata
     agentSessionId?: string
-    pinnedAt?: number | null
     lifecycleState?: string
+    /** Loopback MCP URL when session CLI happy server is running (#956). */
+    hapiMcpUrl?: string
 }
 
 export type SessionSummary = {
@@ -50,7 +51,15 @@ export type SessionSummary = {
     thinking: boolean
     activeAt: number
     updatedAt: number
+    pinned?: boolean
+    globalPinned?: boolean
     metadata: SessionSummaryMetadata | null
+    /** Watermarks for structured SSE patches (PR #897). List cache must gate
+     *  without requiring a detail query — otherwise global SSE forces O(N)
+     *  /sessions invalidation for every versioned write. */
+    metadataVersion: number
+    agentStateVersion: number
+    todosUpdatedAt: number
     todoProgress: { completed: number; total: number } | null
     pendingRequestsCount: number
     pendingRequestKinds: PendingRequestKind[]
@@ -67,35 +76,11 @@ export type SessionSummary = {
     effort: string | null
 }
 
-export function getPendingRequests(
-    session: Session,
-    cap: number = PENDING_REQUEST_SUMMARY_CAP
-): PendingRequest[] {
-    const requests = session.agentState?.requests
-    if (!requests) {
-        return []
-    }
-
-    const items: PendingRequest[] = []
-    for (const [id, request] of Object.entries(requests)) {
-        items.push({
-            id,
-            kind: classifyKind(request.tool),
-            tool: request.tool,
-            since: typeof request.createdAt === 'number' ? request.createdAt : session.updatedAt
-        })
-    }
-
-    items.sort((a, b) => {
-        if (a.since !== b.since) return a.since - b.since
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
-    })
-
-    return cap >= items.length ? items : items.slice(0, cap)
-}
-
-export function getPendingRequestKinds(session: Session): PendingRequestKind[] {
-    const requests = session.agentState?.requests
+// Re-exported as a standalone derivation so SSE patch handlers can recompute
+// summary fields from a structured `agentState` patch without needing the
+// full Session in hand.
+export function computePendingRequestKinds(agentState: AgentState | null | undefined): PendingRequestKind[] {
+    const requests = agentState?.requests
     if (!requests) {
         return []
     }
@@ -110,14 +95,69 @@ export function getPendingRequestKinds(session: Session): PendingRequestKind[] {
         : Array.from(kinds)
 }
 
+export function computePendingRequests(
+    agentState: AgentState | null | undefined,
+    fallbackSince: number,
+    cap: number = PENDING_REQUEST_SUMMARY_CAP
+): PendingRequest[] {
+    const requests = agentState?.requests
+    if (!requests) {
+        return []
+    }
+
+    const items: PendingRequest[] = []
+    for (const [id, request] of Object.entries(requests)) {
+        items.push({
+            id,
+            kind: classifyKind(request.tool),
+            tool: request.tool,
+            since: typeof request.createdAt === 'number' ? request.createdAt : fallbackSince
+        })
+    }
+
+    items.sort((a, b) => {
+        if (a.since !== b.since) return a.since - b.since
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    })
+
+    return cap >= items.length ? items : items.slice(0, cap)
+}
+
+export function getPendingRequestKinds(session: Session): PendingRequestKind[] {
+    return computePendingRequestKinds(session.agentState)
+}
+
+export function getPendingRequests(
+    session: Session,
+    cap: number = PENDING_REQUEST_SUMMARY_CAP
+): PendingRequest[] {
+    return computePendingRequests(session.agentState, session.updatedAt, cap)
+}
+
+export function computePendingRequestsCount(agentState: AgentState | null | undefined): number {
+    return agentState?.requests ? Object.keys(agentState.requests).length : 0
+}
+
+export function computeTodoProgress(todos: TodoItem[] | undefined): SessionSummary['todoProgress'] {
+    if (!todos?.length) {
+        return null
+    }
+    return {
+        completed: todos.filter((todo) => todo.status === 'completed').length,
+        total: todos.length
+    }
+}
+
 const AGENT_SESSION_ID_FIELD_BY_FLAVOR = {
     claude: 'claudeSessionId',
     codex: 'codexSessionId',
     gemini: 'geminiSessionId',
     opencode: 'opencodeSessionId',
     grok: 'grokSessionId',
+    agy: 'agySessionId',
     cursor: 'cursorSessionId',
     kimi: 'kimiSessionId',
+    copilot: 'copilotSessionId',
     pi: 'piSessionId'
 } as const satisfies Record<AgentFlavor, keyof Metadata>
 
@@ -137,43 +177,47 @@ function getSummaryAgentSessionId(metadata: Metadata): string | undefined {
         ?? metadata.geminiSessionId
         ?? metadata.opencodeSessionId
         ?? metadata.grokSessionId
+        ?? metadata.agySessionId
         ?? metadata.cursorSessionId
         ?? metadata.kimiSessionId
+        ?? metadata.copilotSessionId
         ?? undefined
 }
 
+export function toSessionSummaryMetadata(metadata: Metadata | null | undefined): SessionSummaryMetadata | null {
+    if (!metadata) {
+        return null
+    }
+    return {
+        name: metadata.name,
+        path: metadata.path,
+        machineId: metadata.machineId ?? undefined,
+        summary: metadata.summary ? { text: metadata.summary.text } : undefined,
+        flavor: metadata.flavor ?? null,
+        worktree: metadata.worktree,
+        agentSessionId: getSummaryAgentSessionId(metadata),
+        lifecycleState: metadata.lifecycleState,
+        hapiMcpUrl: metadata.hapiMcpUrl ?? undefined
+    }
+}
+
 export function toSessionSummary(session: Session): SessionSummary {
-    const pendingRequestsCount = session.agentState?.requests ? Object.keys(session.agentState.requests).length : 0
-
-    const metadata: SessionSummaryMetadata | null = session.metadata ? {
-        name: session.metadata.name,
-        path: session.metadata.path,
-        host: session.metadata.host ?? undefined,
-        machineId: session.metadata.machineId ?? undefined,
-        summary: session.metadata.summary ? { text: session.metadata.summary.text } : undefined,
-        flavor: session.metadata.flavor ?? null,
-        worktree: session.metadata.worktree,
-        agentSessionId: getSummaryAgentSessionId(session.metadata),
-        pinnedAt: session.metadata.pinnedAt ?? null,
-        lifecycleState: session.metadata.lifecycleState
-    } : null
-
-    const todoProgress = session.todos?.length ? {
-        completed: session.todos.filter(t => t.status === 'completed').length,
-        total: session.todos.length
-    } : null
-
     return {
         id: session.id,
         active: session.active,
         thinking: session.thinking,
         activeAt: session.activeAt,
         updatedAt: session.updatedAt,
-        metadata,
-        todoProgress,
-        pendingRequestsCount,
-        pendingRequestKinds: getPendingRequestKinds(session),
-        pendingRequests: getPendingRequests(session),
+        pinned: session.pinned ?? false,
+        globalPinned: session.globalPinned ?? false,
+        metadata: toSessionSummaryMetadata(session.metadata),
+        metadataVersion: session.metadataVersion,
+        agentStateVersion: session.agentStateVersion,
+        todosUpdatedAt: session.todosUpdatedAt ?? 0,
+        todoProgress: computeTodoProgress(session.todos),
+        pendingRequestsCount: computePendingRequestsCount(session.agentState),
+        pendingRequestKinds: computePendingRequestKinds(session.agentState),
+        pendingRequests: computePendingRequests(session.agentState, session.updatedAt),
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         futureScheduledMessageCount: 0,
         nextScheduledAt: null,

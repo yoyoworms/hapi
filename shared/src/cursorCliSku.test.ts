@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
     cursorCliSkuBaseId,
     findBestCliSkuForAcpWire,
+    isCursorAcpCatalogModelId,
     isCursorAcpWireModelId,
+    isCursorCliSkuVariantId,
     matchCliSkuToAcpWireId,
     parseCursorAvailableModelsFromRejection,
     remapStaleCursorModelId
@@ -107,6 +109,81 @@ describe('remapStaleCursorModelId', () => {
             ])
         ).toBe('cursor-grok-4.5-high-fast');
     });
+
+    it('maps non-legacy bracket wires onto bare catalog bases (#1428)', () => {
+        const bareCatalog = [
+            { modelId: 'gpt-5.3-codex' },
+            { modelId: 'composer-2.5' },
+            { modelId: 'claude-opus-5' },
+            { modelId: 'grok-4.5' },
+        ];
+        expect(remapStaleCursorModelId('gpt-5.3-codex[fast=false]', bareCatalog)).toBe('gpt-5.3-codex');
+        expect(remapStaleCursorModelId('claude-opus-5[fast=false]', bareCatalog)).toBe('claude-opus-5');
+        expect(remapStaleCursorModelId('composer-2.5[fast=false]', bareCatalog)).toBe('composer-2.5');
+        expect(remapStaleCursorModelId('grok-4.5[fast=false]', bareCatalog)).toBe('grok-4.5');
+    });
+
+    it('maps bracket wires onto matching CLI SKUs from stderr-style catalogs', () => {
+        const skuCatalog = [
+            { modelId: 'gpt-5.3-codex' },
+            { modelId: 'gpt-5.3-codex-fast' },
+            { modelId: 'gpt-5.3-codex-high' },
+            { modelId: 'gpt-5.3-codex-high-fast' },
+        ];
+        expect(remapStaleCursorModelId('gpt-5.3-codex[fast=false]', skuCatalog)).toBe('gpt-5.3-codex');
+        expect(remapStaleCursorModelId('gpt-5.3-codex[fast=true]', skuCatalog)).toBe('gpt-5.3-codex-fast');
+    });
+
+    it('maps incomplete hub wires onto nearest live ACP configOption wires', () => {
+        const wireCatalog = [
+            { modelId: 'gpt-5.3-codex[reasoning=medium,fast=false]' },
+            { modelId: 'gpt-5.3-codex[reasoning=medium,fast=true]' },
+        ];
+        expect(remapStaleCursorModelId('gpt-5.3-codex[fast=false]', wireCatalog)).toBe(
+            'gpt-5.3-codex[reasoning=medium,fast=false]'
+        );
+        expect(remapStaleCursorModelId('gpt-5.3-codex[fast=true]', wireCatalog)).toBe(
+            'gpt-5.3-codex[reasoning=medium,fast=true]'
+        );
+    });
+
+    it('prefers CLI SKU over an exact cached ACP wire (mixed catalog spawn-safe)', () => {
+        expect(
+            remapStaleCursorModelId('gpt-5.3-codex[fast=false]', [
+                { modelId: 'gpt-5.3-codex[fast=false]' },
+                { modelId: 'gpt-5.3-codex' },
+                { modelId: 'gpt-5.3-codex-fast' },
+            ])
+        ).toBe('gpt-5.3-codex');
+        expect(
+            remapStaleCursorModelId('gpt-5.3-codex[fast=true]', [
+                { modelId: 'gpt-5.3-codex[fast=true]' },
+                { modelId: 'gpt-5.3-codex' },
+                { modelId: 'gpt-5.3-codex-fast' },
+            ])
+        ).toBe('gpt-5.3-codex-fast');
+    });
+
+    it('does not pick a wire that contradicts explicit request params', () => {
+        expect(
+            remapStaleCursorModelId('claude-opus-4-8[thinking=false,effort=high]', [
+                { modelId: 'claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]' },
+                { modelId: 'claude-opus-4-8[thinking=true,context=300k,effort=low,fast=false]' },
+            ])
+        ).toBeNull();
+        expect(
+            remapStaleCursorModelId('claude-opus-4-8[thinking=true,effort=high]', [
+                { modelId: 'claude-opus-4-8[thinking=true,context=300k,effort=low,fast=false]' },
+                { modelId: 'claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]' },
+            ])
+        ).toBe('claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]');
+    });
+
+    it('does not silently downgrade unavailable explicit CLI SKU variants', () => {
+        expect(
+            remapStaleCursorModelId('gpt-5.5-high-fast', [{ modelId: 'gpt-5.5-medium' }])
+        ).toBeNull();
+    });
 });
 
 describe('parseCursorAvailableModelsFromRejection', () => {
@@ -197,8 +274,58 @@ describe('round-trip (regression for #883: "selected but no response")', () => {
 });
 
 describe('isCursorAcpWireModelId', () => {
-    it('detects wire ids', () => {
+    it('detects parameterized wire ids only', () => {
         expect(isCursorAcpWireModelId('gpt-5.5[fast=false]')).toBe(true);
+        expect(isCursorAcpWireModelId('default[]')).toBe(true);
+        expect(isCursorAcpWireModelId('composer-2.5')).toBe(false);
         expect(isCursorAcpWireModelId('gpt-5.5-high-fast')).toBe(false);
+    });
+});
+
+describe('isCursorCliSkuVariantId', () => {
+    it('detects effort/speed CLI SKU slugs', () => {
+        expect(isCursorCliSkuVariantId('gpt-5.5-high-fast')).toBe(true);
+        expect(isCursorCliSkuVariantId('composer-2.5-fast')).toBe(true);
+        expect(isCursorCliSkuVariantId('claude-opus-4-8-thinking-high-fast')).toBe(true);
+        expect(isCursorCliSkuVariantId('composer-2.5')).toBe(false);
+        expect(isCursorCliSkuVariantId('composer-2.5[fast=true]')).toBe(false);
+    });
+});
+
+describe('isCursorAcpCatalogModelId', () => {
+    it('accepts parameterized wires and bare non-default ACP bases', () => {
+        expect(isCursorAcpCatalogModelId('composer-2.5[fast=false]')).toBe(true);
+        expect(isCursorAcpCatalogModelId('default[]')).toBe(true);
+        expect(isCursorAcpCatalogModelId('composer-2.5')).toBe(true);
+        expect(isCursorAcpCatalogModelId('claude-opus-4-8')).toBe(true);
+    });
+
+    it('rejects CLI effort/speed SKUs and default tokens', () => {
+        expect(isCursorAcpCatalogModelId('gpt-5.5-high-fast')).toBe(false);
+        expect(isCursorAcpCatalogModelId('composer-2.5-fast')).toBe(false);
+        expect(isCursorAcpCatalogModelId('default')).toBe(false);
+        expect(isCursorAcpCatalogModelId('auto')).toBe(false);
+        expect(isCursorAcpCatalogModelId('')).toBe(false);
+    });
+});
+
+describe('matchCliSkuToAcpWireId with bare ACP catalog (#1129)', () => {
+    it('maps base SKUs onto bare ACP ids but rejects suffixed variants', () => {
+        const bare = [{ modelId: 'composer-2.5' }, { modelId: 'gpt-5.5' }];
+        expect(matchCliSkuToAcpWireId('composer-2.5', bare)).toBe('composer-2.5');
+        expect(matchCliSkuToAcpWireId('gpt-5.5', bare)).toBe('gpt-5.5');
+        expect(matchCliSkuToAcpWireId('composer-2.5-fast', bare)).toBeNull();
+        expect(matchCliSkuToAcpWireId('gpt-5.5-high-fast', bare)).toBeNull();
+        expect(matchCliSkuToAcpWireId('gpt-5.5-medium', bare)).toBeNull();
+    });
+
+    it('still maps suffixed SKUs when parameterized ACP wires exist', () => {
+        const wires = [
+            { modelId: 'gpt-5.5[context=272k,reasoning=medium,fast=false]' },
+            { modelId: 'gpt-5.5[context=272k,reasoning=high,fast=true]' }
+        ];
+        expect(matchCliSkuToAcpWireId('gpt-5.5-high-fast', wires)).toBe(
+            'gpt-5.5[context=272k,reasoning=high,fast=true]'
+        );
     });
 });

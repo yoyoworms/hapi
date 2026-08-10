@@ -7,6 +7,7 @@ import {
     insertSegmentsInComposerSegments,
     insertSessionMentionInComposerSegments,
     isRichComposerMentionsEnabled,
+    resolveComposerPlaceholderKey,
     mirrorComposerSegments,
     parseComposerSegments,
     serializeComposerSegments,
@@ -58,6 +59,19 @@ describe('serializeComposerSegments', () => {
             { type: 'session', id: '  ', title: 'orphan title' },
             { type: 'text', text: ' after' },
         ])).toBe('before  after')
+    })
+
+    it('keeps the 120 UTF-16-unit mention title limit without splitting an emoji', () => {
+        const title = `${'a'.repeat(119)}😀x`
+        const expectedTitle = 'a'.repeat(119)
+        expect(serializeComposerSegments([
+            { type: 'session', id: 'emoji-session', title },
+        ])).toBe(`[${expectedTitle}](/sessions/emoji-session)`)
+
+        const fittingTitle = `${'a'.repeat(118)}😀x`
+        expect(serializeComposerSegments([
+            { type: 'session', id: 'emoji-session', title: fittingTitle },
+        ])).toBe(`[${'a'.repeat(118)}😀](/sessions/emoji-session)`)
     })
 })
 
@@ -193,37 +207,70 @@ describe('isRichComposerMentionsEnabled', () => {
         vi.unstubAllEnvs()
     })
 
-    it('defaults to OFF', () => {
+    it('defaults to ON', () => {
         window.localStorage.removeItem('hapi.composer.richMentions')
         window.history.replaceState({}, '', window.location.pathname)
-        expect(isRichComposerMentionsEnabled()).toBe(false)
+        expect(isRichComposerMentionsEnabled()).toBe(true)
     })
 
-    it.each(['1', 'true', 'TRUE'])('opts in via localStorage=%s', (value) => {
+    it.each(['1', 'true', 'TRUE'])('stays on with localStorage=%s', (value) => {
         window.localStorage.setItem('hapi.composer.richMentions', value)
         expect(isRichComposerMentionsEnabled()).toBe(true)
     })
 
-    it.each(['1', 'true'])('opts in via ?richMentions=%s', (value) => {
+    it.each(['1', 'true'])('stays on with ?richMentions=%s', (value) => {
         window.history.replaceState({}, '', `${window.location.pathname}?richMentions=${value}`)
         expect(isRichComposerMentionsEnabled()).toBe(true)
     })
 
-    it('opts in via the build flag', () => {
+    it('stays on with the build flag', () => {
         vi.stubEnv('VITE_RICH_COMPOSER_MENTIONS', 'true')
         expect(isRichComposerMentionsEnabled()).toBe(true)
     })
 
-    it('keeps an explicit zero as a kill switch', () => {
-        window.localStorage.setItem('hapi.composer.richMentions', '1')
-        window.history.replaceState({}, '', `${window.location.pathname}?richMentions=0`)
+    it.each(['0', 'false', 'FALSE'])('uses localStorage=%s as a kill switch', (value) => {
+        window.localStorage.setItem('hapi.composer.richMentions', value)
         expect(isRichComposerMentionsEnabled()).toBe(false)
     })
 
-    it('does not enable for unrecognized values', () => {
+    it.each(['0', 'false'])('uses ?richMentions=%s as a kill switch', (value) => {
+        window.localStorage.setItem('hapi.composer.richMentions', '1')
+        window.history.replaceState({}, '', `${window.location.pathname}?richMentions=${value}`)
+        expect(isRichComposerMentionsEnabled()).toBe(false)
+    })
+
+    it.each(['0', 'false'])('uses build flag=%s as a kill switch', (value) => {
+        vi.stubEnv('VITE_RICH_COMPOSER_MENTIONS', value)
+        expect(isRichComposerMentionsEnabled()).toBe(false)
+    })
+
+    it('ignores unrecognized values', () => {
         window.localStorage.setItem('hapi.composer.richMentions', 'yes')
         window.history.replaceState({}, '', `${window.location.pathname}?richMentions=on`)
-        expect(isRichComposerMentionsEnabled()).toBe(false)
+        expect(isRichComposerMentionsEnabled()).toBe(true)
+    })
+})
+
+describe('resolveComposerPlaceholderKey', () => {
+    it('prefers continue hint over mention copy', () => {
+        expect(resolveComposerPlaceholderKey({
+            richMentionsEnabled: true,
+            showContinueHint: true,
+        })).toBe('misc.typeMessage')
+    })
+
+    it('uses mention-aware placeholder when rich composer is on', () => {
+        expect(resolveComposerPlaceholderKey({
+            richMentionsEnabled: true,
+            showContinueHint: false,
+        })).toBe('misc.typeAMessageWithMentions')
+    })
+
+    it('keeps generic placeholder when rich composer is killed', () => {
+        expect(resolveComposerPlaceholderKey({
+            richMentionsEnabled: false,
+            showContinueHint: false,
+        })).toBe('misc.typeAMessage')
     })
 })
 
@@ -242,6 +289,7 @@ describe('serializeComposerSelection', () => {
         const segments: ComposerSegment[] = [{ type: 'text', text: 'abc' }]
         expect(serializeComposerSelection(segments, { start: 1, end: 1 })).toBeNull()
     })
+
 })
 
 describe('insertSegmentsInComposerSegments', () => {

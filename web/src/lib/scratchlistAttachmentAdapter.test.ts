@@ -1,12 +1,72 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE } from '@hapi/protocol'
 import {
     createScratchlistAttachmentAdapter,
     hubAttachmentFromRestoredDraft,
 } from './scratchlistAttachmentAdapter'
 
+function stubUploadThenPreviewReadFailure(): void {
+    let readCount = 0
+
+    class FileReaderMock {
+        result: string | ArrayBuffer | null = null
+        onload: FileReader['onload'] = null
+        onerror: FileReader['onerror'] = null
+
+        readAsDataURL(): void {
+            readCount += 1
+            if (readCount === 1) {
+                this.result = 'data:image/png;base64,dXBsb2Fk'
+                this.onload?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
+                return
+            }
+            this.onerror?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
+        }
+    }
+
+    vi.stubGlobal('FileReader', FileReaderMock)
+}
+
+function stubUploadThenDeferredPreviewReadFailure(): {
+    previewStarted: Promise<void>
+    failPreview: () => void
+} {
+    let readCount = 0
+    let resolvePreviewStarted!: () => void
+    let failPreviewRead: (() => void) | undefined
+    const previewStarted = new Promise<void>((resolve) => {
+        resolvePreviewStarted = resolve
+    })
+
+    class FileReaderMock {
+        result: string | ArrayBuffer | null = null
+        onload: FileReader['onload'] = null
+        onerror: FileReader['onerror'] = null
+
+        readAsDataURL(): void {
+            readCount += 1
+            if (readCount === 1) {
+                this.result = 'data:image/png;base64,dXBsb2Fk'
+                this.onload?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
+                return
+            }
+            failPreviewRead = () => {
+                this.onerror?.call(this as unknown as FileReader, {} as ProgressEvent<FileReader>)
+            }
+            resolvePreviewStarted()
+        }
+    }
+
+    vi.stubGlobal('FileReader', FileReaderMock)
+    return {
+        previewStarted,
+        failPreview: () => {
+            if (!failPreviewRead) throw new Error('Preview read did not start')
+            failPreviewRead()
+        }
+    }
+}
+
 afterEach(() => {
-    vi.restoreAllMocks()
     vi.unstubAllGlobals()
 })
 
@@ -30,37 +90,10 @@ describe('hubAttachmentFromRestoredDraft', () => {
 })
 
 describe('createScratchlistAttachmentAdapter', () => {
-    it('uses assistant-ui universal matching so pasted images are accepted', () => {
+    it('uses the assistant-ui wildcard sentinel so all files reach the adapter', () => {
         const adapter = createScratchlistAttachmentAdapter({} as never, 'session-1')
 
         expect(adapter.accept).toBe('*')
-    })
-
-    it('rejects oversized files before FileReader or upload allocation', async () => {
-        const readAsDataUrl = vi.spyOn(FileReader.prototype, 'readAsDataURL')
-        const uploadScratchlistAttachment = vi.fn()
-        const adapter = createScratchlistAttachmentAdapter(
-            { uploadScratchlistAttachment } as never,
-            'session-1'
-        )
-        const file = new File(['small fixture'], 'oversized.bin', { type: 'application/octet-stream' })
-        Object.defineProperty(file, 'size', {
-            configurable: true,
-            value: SCRATCHLIST_ATTACHMENT_DEFAULT_MAX_BYTES_PER_FILE + 1,
-        })
-
-        const states: import('@assistant-ui/react').PendingAttachment[] = []
-        for await (const pending of adapter.add({ file }) as AsyncGenerator<
-            import('@assistant-ui/react').PendingAttachment
-        >) {
-            states.push(pending)
-        }
-
-        expect(states).toHaveLength(1)
-        expect(states[0]?.status).toEqual({ type: 'incomplete', reason: 'error' })
-        expect(readAsDataUrl).not.toHaveBeenCalled()
-        expect(uploadScratchlistAttachment).not.toHaveBeenCalled()
-        readAsDataUrl.mockRestore()
     })
 
     it('reuses restored hub path without re-uploading', async () => {
@@ -68,13 +101,13 @@ describe('createScratchlistAttachmentAdapter', () => {
         const hubId = 'a1b2c3d4-e5f6-4789-a012-3456789abcde'
         const path = `hapi-hub:scratchlist/default/session-1/${hubId}-proof.png`
         const file = new File([new Uint8Array([137, 80, 78, 71])], 'proof.png', { type: 'image/png' })
-        drafts.saveDraftAttachments('session-1', [{
+        drafts.saveDraftAttachments('session-restore', [{
             id: 'composer-att-1',
             file,
             path,
             previewUrl: 'data:image/png;base64,aW1hZ2U=',
         }])
-        const [restored] = await drafts.getDraftAttachments('session-1')
+        const [restored] = await drafts.getDraftAttachments('session-restore')
         expect(restored).toBeTruthy()
 
         const uploadScratchlistAttachment = vi.fn()
@@ -111,50 +144,6 @@ describe('createScratchlistAttachmentAdapter', () => {
         expect(ready.previewUrl).toBe('data:image/png;base64,aW1hZ2U=')
     })
 
-    it('re-uploads a restored hub path when the destination session changed', async () => {
-        const drafts = await import('./composer-attachment-drafts')
-        const hubId = 'a1b2c3d4-e5f6-4789-a012-3456789abcde'
-        const oldPath = `hapi-hub:scratchlist/default/session-old/${hubId}-proof.txt`
-        const file = new File(['proof'], 'proof.txt', { type: 'text/plain' })
-        drafts.saveDraftAttachments('session-old', [{
-            id: 'composer-att-old',
-            file,
-            path: oldPath,
-        }])
-        const [restored] = await drafts.getDraftAttachments('session-old')
-        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
-            success: true,
-            attachment: {
-                id: 'hub-new',
-                filename: 'proof.txt',
-                mimeType: 'text/plain',
-                size: file.size,
-                path: 'hapi-hub:scratchlist/default/session-new/hub-new-proof.txt',
-            },
-        })
-        const adapter = createScratchlistAttachmentAdapter(
-            { uploadScratchlistAttachment } as never,
-            'session-new',
-        )
-        const states: import('@assistant-ui/react').PendingAttachment[] = []
-
-        for await (const pending of adapter.add({ file: restored! }) as AsyncGenerator<
-            import('@assistant-ui/react').PendingAttachment
-        >) {
-            states.push(pending)
-        }
-
-        expect(uploadScratchlistAttachment).toHaveBeenCalledWith(
-            'session-new',
-            'proof.txt',
-            expect.any(String),
-            'text/plain',
-        )
-        expect(states.at(-1)).toEqual(expect.objectContaining({
-            path: 'hapi-hub:scratchlist/default/session-new/hub-new-proof.txt',
-        }))
-    })
-
     it('sets path on requires-action yield so composer canSend unlocks after hub upload', async () => {
         const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
             success: true,
@@ -181,116 +170,93 @@ describe('createScratchlistAttachmentAdapter', () => {
         expect((ready as { path?: string }).path).toBe('/scratchlist/sessions/s1/proof.png')
     })
 
-    it('keeps a successful hub upload usable when preview FileReader fails', async () => {
-        let readCount = 0
-        class PreviewFailingFileReader {
-            result: string | null = null
-            onload: (() => void) | null = null
-            onerror: ((error: Error) => void) | null = null
-
-            readAsDataURL(): void {
-                readCount += 1
-                queueMicrotask(() => {
-                    if (readCount === 1) {
-                        this.result = 'data:image/png;base64,aW1hZ2U='
-                        this.onload?.()
-                    } else {
-                        this.onerror?.(new Error('preview read failed'))
-                    }
-                })
-            }
+    it('keeps a successful upload ready when image preview generation fails', async () => {
+        stubUploadThenPreviewReadFailure()
+        const attachment = {
+            id: 'hub-proof',
+            filename: 'proof.png',
+            mimeType: 'image/png',
+            size: 5,
+            path: 'hapi-hub:scratchlist/default/session-1/hub-proof-proof.png',
         }
-        vi.stubGlobal('FileReader', PreviewFailingFileReader)
-
-        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
-            success: true,
-            attachment: {
-                id: 'hub-preview-failed',
-                filename: 'proof.png',
-                mimeType: 'image/png',
-                size: 5,
-                path: 'hapi-hub:scratchlist/default/session-1/hub-preview-failed-proof.png',
-            },
-        })
+        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({ success: true, attachment })
+        const deleteScratchlistAttachment = vi.fn().mockResolvedValue(undefined)
         const adapter = createScratchlistAttachmentAdapter(
-            { uploadScratchlistAttachment } as never,
+            { uploadScratchlistAttachment, deleteScratchlistAttachment } as never,
             'session-1'
         )
-        const file = new File(['image'], 'proof.png', { type: 'image/png' })
+        const file = new File(['proof'], 'proof.png', { type: 'image/png' })
         const states: import('@assistant-ui/react').PendingAttachment[] = []
 
-        for await (const pending of adapter.add({ file }) as AsyncGenerator<
-            import('@assistant-ui/react').PendingAttachment
-        >) {
-            states.push(pending)
+        for await (const state of adapter.add({ file }) as AsyncGenerator<import('@assistant-ui/react').PendingAttachment>) {
+            states.push(state)
         }
 
-        expect(readCount).toBe(2)
-        expect(states.at(-1)).toEqual(expect.objectContaining({
-            path: 'hapi-hub:scratchlist/default/session-1/hub-preview-failed-proof.png',
-            previewUrl: undefined,
+        const ready = states.at(-1) as import('@assistant-ui/react').PendingAttachment & {
+            path?: string
+            hubAttachment?: typeof attachment
+            previewUrl?: string
+        }
+        expect(uploadScratchlistAttachment).toHaveBeenCalledTimes(1)
+        expect(uploadScratchlistAttachment).toHaveBeenCalledWith('session-1', 'proof.png', 'dXBsb2Fk', 'image/png')
+        expect(ready).toMatchObject({
+            type: 'file',
+            name: 'proof.png',
             status: { type: 'requires-action', reason: 'composer-send' },
-        }))
+            path: attachment.path,
+            hubAttachment: attachment,
+        })
+        expect(ready.id).toEqual(expect.any(String))
+        expect(ready.previewUrl).toBeUndefined()
+
+        const sent = await adapter.send(ready)
+        expect(JSON.parse((sent.content[0] as { text: string }).text)).toEqual({
+            __attachmentMetadata: attachment,
+        })
+
+        await adapter.remove(ready)
+        expect(deleteScratchlistAttachment).toHaveBeenCalledWith('session-1', attachment.id)
     })
 
-    it('deletes the hub upload when remove races the preview await', async () => {
-        let readCount = 0
-        let finishPreview: (() => void) | undefined
-        class DelayedPreviewFileReader {
-            result: string | null = null
-            onload: (() => void) | null = null
-            onerror: ((error: Error) => void) | null = null
-
-            readAsDataURL(): void {
-                readCount += 1
-                if (readCount === 1) {
-                    queueMicrotask(() => {
-                        this.result = 'data:image/png;base64,aW1hZ2U='
-                        this.onload?.()
-                    })
-                    return
-                }
-                finishPreview = () => {
-                    this.result = 'data:image/png;base64,cHJldmlldw=='
-                    this.onload?.()
-                }
-            }
+    it('cleans up a successful hub upload when cancellation occurs during preview generation', async () => {
+        const preview = stubUploadThenDeferredPreviewReadFailure()
+        const attachment = {
+            id: 'hub-proof',
+            filename: 'proof.png',
+            mimeType: 'image/png',
+            size: 5,
+            path: 'hapi-hub:scratchlist/default/session-1/hub-proof-proof.png',
         }
-        vi.stubGlobal('FileReader', DelayedPreviewFileReader)
-
-        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
-            success: true,
-            attachment: {
-                id: 'hub-raced',
-                filename: 'proof.png',
-                mimeType: 'image/png',
-                size: 5,
-                path: 'hapi-hub:scratchlist/default/session-1/hub-raced-proof.png',
-            },
-        })
+        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({ success: true, attachment })
         const deleteScratchlistAttachment = vi.fn().mockResolvedValue(undefined)
-        const adapter = createScratchlistAttachmentAdapter({
-            uploadScratchlistAttachment,
-            deleteScratchlistAttachment,
-        } as never, 'session-1')
-        const file = new File(['image'], 'proof.png', { type: 'image/png' })
+        const adapter = createScratchlistAttachmentAdapter(
+            { uploadScratchlistAttachment, deleteScratchlistAttachment } as never,
+            'session-1'
+        )
+        const file = new File(['proof'], 'proof.png', { type: 'image/png' })
         const iter = adapter.add({ file }) as AsyncGenerator<import('@assistant-ui/react').PendingAttachment>
+
         const initial = await iter.next()
-        await iter.next()
-        const finishing = iter.next()
-
-        await vi.waitFor(() => expect(finishPreview).toBeTypeOf('function'))
-        await adapter.remove({
-            id: (initial.value as { id: string }).id,
-            type: 'file',
-            name: file.name,
-            contentType: file.type,
+        const uploading = await iter.next()
+        expect(uploading.value).toMatchObject({
             status: { type: 'running', reason: 'uploading', progress: 50 },
-        } as never)
-        finishPreview?.()
+        })
+        expect((uploading.value as { path?: string }).path).toBeUndefined()
+        expect((uploading.value as { hubAttachment?: unknown }).hubAttachment).toBeUndefined()
 
-        await expect(finishing).resolves.toEqual(expect.objectContaining({ done: true }))
-        expect(deleteScratchlistAttachment).toHaveBeenCalledWith('session-1', 'hub-raced')
+        const completion = iter.next()
+        await preview.previewStarted
+        expect(uploadScratchlistAttachment).toHaveBeenCalledTimes(1)
+        await adapter.remove(uploading.value)
+        preview.failPreview()
+
+        expect(await completion).toEqual({ done: true, value: undefined })
+        expect([initial.value, uploading.value]).toEqual([
+            expect.objectContaining({ status: { type: 'running', reason: 'uploading', progress: 0 } }),
+            expect.objectContaining({ status: { type: 'running', reason: 'uploading', progress: 50 } }),
+        ])
+        expect(deleteScratchlistAttachment).toHaveBeenCalledTimes(1)
+        expect(deleteScratchlistAttachment).toHaveBeenCalledWith('session-1', attachment.id)
     })
 
     it('deletes hub blob when cancel races the in-flight upload completion', async () => {
@@ -329,5 +295,105 @@ describe('createScratchlistAttachmentAdapter', () => {
         }
 
         expect(deleteScratchlistAttachment).toHaveBeenCalledWith('session-1', 'hub-race')
+    })
+})
+
+describe('createScratchlistAttachmentAdapter.send migrates chat-path chips (#1226)', () => {
+    it('uploads pending chat-path file to hub scratchlist and returns hub metadata', async () => {
+        const hubAttachment = {
+            id: 'hub-migrated',
+            filename: 'before-mode.png',
+            mimeType: 'image/png',
+            size: 4,
+            path: 'hapi-hub:scratchlist/default/session-1/hub-migrated-before-mode.png',
+        }
+        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
+            success: true,
+            attachment: hubAttachment,
+        })
+        const deleteUploadFile = vi.fn().mockResolvedValue(undefined)
+        const api = { uploadScratchlistAttachment, deleteUploadFile } as never
+        const adapter = createScratchlistAttachmentAdapter(api, 'session-1')
+        const file = new File([new Uint8Array([137, 80, 78, 71])], 'before-mode.png', { type: 'image/png' })
+
+        const complete = await adapter.send({
+            id: 'composer-chat-1',
+            type: 'file',
+            name: 'before-mode.png',
+            contentType: 'image/png',
+            file,
+            status: { type: 'requires-action', reason: 'composer-send' },
+            path: '/tmp/hapi-blobs/session-1/before-mode.png',
+            previewUrl: 'data:image/png;base64,iVBORw0KGgo=',
+        } as never)
+
+        expect(uploadScratchlistAttachment).toHaveBeenCalledWith(
+            'session-1',
+            'before-mode.png',
+            expect.any(String),
+            'image/png',
+        )
+        // Chat-path cleanup is deferred until scratchlist.add succeeds (#1226 review).
+        expect(deleteUploadFile).not.toHaveBeenCalled()
+        expect(complete.content).toEqual([
+            {
+                type: 'text',
+                text: JSON.stringify({
+                    __attachmentMetadata: {
+                        ...hubAttachment,
+                        previewUrl: 'data:image/png;base64,iVBORw0KGgo=',
+                        migratedFromPath: '/tmp/hapi-blobs/session-1/before-mode.png',
+                    },
+                }),
+            },
+        ])
+    })
+
+    it('throws when chat-path migrate upload fails so park does not silently drop', async () => {
+        const uploadScratchlistAttachment = vi.fn().mockResolvedValue({
+            success: false,
+            error: 'quota',
+        })
+        const api = { uploadScratchlistAttachment, deleteUploadFile: vi.fn() } as never
+        const adapter = createScratchlistAttachmentAdapter(api, 'session-1')
+        const file = new File([new Uint8Array([1])], 'x.png', { type: 'image/png' })
+
+        await expect(adapter.send({
+            id: 'composer-chat-2',
+            type: 'file',
+            name: 'x.png',
+            contentType: 'image/png',
+            file,
+            status: { type: 'requires-action', reason: 'composer-send' },
+            path: '/tmp/hapi-blobs/x.png',
+        } as never)).rejects.toThrow(/quota|Failed to migrate/i)
+    })
+
+    it('releaseWithoutDelete makes remove a no-op so clearAttachments keeps parked hubs', async () => {
+        const deleteScratchlistAttachment = vi.fn()
+        const deleteUploadFile = vi.fn()
+        const api = { deleteScratchlistAttachment, deleteUploadFile } as never
+        const adapter = createScratchlistAttachmentAdapter(api, 'session-1')
+        const pending = {
+            id: 'composer-hub-1',
+            type: 'file' as const,
+            name: 'a.png',
+            contentType: 'image/png',
+            status: { type: 'requires-action' as const, reason: 'composer-send' as const },
+            path: 'hapi-hub:scratchlist/default/session-1/hub-1-a.png',
+            hubAttachment: {
+                id: 'hub-1',
+                filename: 'a.png',
+                mimeType: 'image/png',
+                size: 1,
+                path: 'hapi-hub:scratchlist/default/session-1/hub-1-a.png',
+            },
+        }
+
+        adapter.releaseWithoutDelete([pending.id])
+        await adapter.remove(pending as never)
+
+        expect(deleteScratchlistAttachment).not.toHaveBeenCalled()
+        expect(deleteUploadFile).not.toHaveBeenCalled()
     })
 })

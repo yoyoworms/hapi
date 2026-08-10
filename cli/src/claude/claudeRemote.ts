@@ -1,24 +1,17 @@
 import { EnhancedMode, PermissionMode } from "./loop";
-import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, type SDKResultMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { getProjectPath } from "./utils/path";
 import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
-import { systemPrompt } from "./utils/systemPrompt";
+import { getSystemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
 import { getHapiBlobsDir } from "@/constants/uploadPaths";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
 import { filterCatalogAffectingClaudeArgs } from "./sdk/metadataExtractor";
-
-const AUTONOMOUS_RESULT_MARKERS = ['<task-notification>', '<system-reminder>'];
-
-export function isAutonomousTurnResult(message: SDKResultMessage): boolean {
-    const result = (message as { result?: unknown }).result;
-    if (typeof result !== 'string' || !result) return false;
-    return AUTONOMOUS_RESULT_MARKERS.some((marker) => result.includes(marker));
-}
 
 export async function claudeRemote(opts: {
 
@@ -32,35 +25,29 @@ export async function claudeRemote(opts: {
     hookSettingsPath: string,
     signal?: AbortSignal,
     canCallTool: (toolName: string, input: unknown, mode: EnhancedMode, options: { signal: AbortSignal }) => Promise<PermissionResult>,
+    /** Session modes used to spawn Claude before the first fork child prompt. */
+    bootstrapMode?: EnhancedMode,
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
-    onReady: (autonomous: boolean) => void | Promise<void>,
+    onReady: () => void,
     isAborted: (toolCallId: string) => boolean,
 
     // Callbacks
-    onSessionFound: (id: string) => void,
+    onSessionFound: (id: string, extras?: { forkedFrom?: string }) => void,
     onThinkingChange?: (thinking: boolean) => void,
-    onMessage: (message: SDKMessage) => void | Promise<void>,
+    onMessage: (message: SDKMessage) => void,
     onFirstResult?: (initialMessage: string) => void,
     onCompletionEvent?: (message: string) => void,
-    onSessionReset?: () => void,
-    // Invoked when the SDK rejects our resume id and we're about to bail
-    // out. The launcher should re-queue the in-flight user message so the
-    // next iteration (with a fresh session) actually processes it instead
-    // of stranding the user with no reply.
-    onStaleResume?: (pending: { message: string; mode: EnhancedMode }) => void,
-    onUsage?: (usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
+    onSessionReset?: () => void
 }) {
     const debugPrefix = '[claudeRemote][async-debug]';
 
-    // Pass the persisted session id straight through to the SDK. If the file
-    // is missing or invalid, the SDK will start a new session and report the
-    // new id via the init message — we don't pre-validate the path here
-    // because path resolution depends on CLAUDE_CONFIG_DIR (and other
-    // custom-install layouts like ~/.ccs/instances/<name>/), and a silent
-    // null-out here drops context across launcher iterations.
+    // Check if session is valid
     let startFrom = opts.sessionId;
+    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+        startFrom = null;
+    }
 
     // Extract --resume from claudeArgs if present (for first spawn)
     if (!startFrom && opts.claudeArgs) {
@@ -96,72 +83,128 @@ export async function claudeRemote(opts: {
     }
     process.env.DISABLE_AUTOUPDATER = '1';
 
-    // Get initial message
-    let initial;
-    try {
-        initial = await opts.nextMessage();
-    } catch (e) {
-        if (e instanceof AbortError) {
-            logger.debug(`[claudeRemote] Aborted during initial message`);
-            return;
-        }
-        throw e;
+    // Message-level Fork current passes `--fork-session` via claudeArgs from the runner.
+    const forkSession = Boolean(opts.claudeArgs?.includes('--fork-session'));
+    if (forkSession) {
+        logger.debug(`[claudeRemote] --fork-session requested via claudeArgs`);
     }
-    if (!initial) { // No initial message - exit
-        logger.debug(`${debugPrefix} initial nextMessage returned null; exiting`);
-        return;
-    }
-    logger.debug(`${debugPrefix} initial message acquired`);
+    const forkedFrom = forkSession ? startFrom : null;
 
-    // Handle special commands
-    const specialCommand = parseSpecialCommand(initial.message);
-
-    // Handle /clear command
-    if (specialCommand.type === 'clear') {
-        if (opts.onCompletionEvent) {
-            opts.onCompletionEvent('Context was reset');
-        }
-        if (opts.onSessionReset) {
-            opts.onSessionReset();
-        }
-        return;
-    }
-
-    // Handle /compact command
-    let isCompactCommand = false;
+    // Mode starts from the persisted session for fork bootstrap; updated when
+    // the first child prompt arrives. plan/auto must be present at process start.
+    const bootstrapMode: EnhancedMode = opts.bootstrapMode ?? { permissionMode: 'default' };
+    let mode: EnhancedMode = bootstrapMode;
+    let initial: { message: string; mode: EnhancedMode } | null = null;
+    let specialCommand: ReturnType<typeof parseSpecialCommand> = { type: null };
     // Claude reports the /compact outcome on a `system`/`status` message that
     // arrives before the `result` message. Hold it here so the completion event
     // can report what actually happened. Stays null unless a failure is
     // reported, so an unseen or successful status keeps the success path.
+    let isCompactCommand = false;
     let compactFailure: string | null = null;
-    if (specialCommand.type === 'compact') {
-        logger.debug('[claudeRemote] /compact command detected - will process as normal but with compaction behavior');
-        isCompactCommand = true;
-        if (opts.onCompletionEvent) {
-            opts.onCompletionEvent('Compaction started');
-        }
-    }
+    let awaitingForkInit = forkSession;
 
-    // Prepare SDK options
-    let mode = initial.mode;
+    const messages = new PushableAsyncIterable<SDKUserMessage>();
+
+    const applyInitialTurn = async (): Promise<{ message: string; mode: EnhancedMode } | null> => {
+        let next: { message: string; mode: EnhancedMode } | null;
+        try {
+            next = await opts.nextMessage();
+        } catch (e) {
+            if (e instanceof AbortError) {
+                logger.debug(`[claudeRemote] Aborted during initial message`);
+                messages.end();
+                return null;
+            }
+            throw e;
+        }
+        if (!next) {
+            logger.debug(`${debugPrefix} initial nextMessage returned null; exiting`);
+            messages.end();
+            return null;
+        }
+        logger.debug(`${debugPrefix} initial message acquired`);
+
+        specialCommand = parseSpecialCommand(next.message);
+        if (specialCommand.type === 'clear') {
+            if (opts.onCompletionEvent) {
+                opts.onCompletionEvent('Context was reset');
+            }
+            if (opts.onSessionReset) {
+                opts.onSessionReset();
+            }
+            messages.end();
+            return null;
+        }
+        if (specialCommand.type === 'compact') {
+            logger.debug('[claudeRemote] /compact command detected - will process as normal but with compaction behavior');
+            isCompactCommand = true;
+            if (opts.onCompletionEvent) {
+                opts.onCompletionEvent('Compaction started');
+            }
+        }
+
+        mode = next.mode;
+        messages.push({
+            type: 'user',
+            message: {
+                role: 'user',
+                content: next.message,
+            },
+        });
+        return next;
+    };
+
+    // Prepare SDK options. For --fork-session, start query() before waiting for the
+    // first child prompt so the native fork materializes at the clicked source state.
+    const hapiSystemPrompt = getSystemPrompt();
     const sdkOptions: Options = {
         additionalArgs: filterCatalogAffectingClaudeArgs(opts.claudeArgs),
         cwd: opts.path,
         resume: startFrom ?? undefined,
+        forkSession,
         mcpServers: opts.mcpServers,
-        permissionMode: initial.mode.permissionMode,
-        model: initial.mode.model,
-        effort: initial.mode.effort,
-        fallbackModel: initial.mode.fallbackModel,
-        customSystemPrompt: initial.mode.customSystemPrompt ? initial.mode.customSystemPrompt + '\n\n' + systemPrompt : undefined,
-        appendSystemPrompt: initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt,
-        allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,
-        disallowedTools: initial.mode.disallowedTools,
+        permissionMode: bootstrapMode.permissionMode,
+        model: bootstrapMode.model,
+        effort: bootstrapMode.effort,
+        fallbackModel: bootstrapMode.fallbackModel,
+        customSystemPrompt: bootstrapMode.customSystemPrompt
+            ? bootstrapMode.customSystemPrompt + '\n\n' + hapiSystemPrompt
+            : undefined,
+        appendSystemPrompt: bootstrapMode.appendSystemPrompt
+            ? bootstrapMode.appendSystemPrompt + '\n\n' + hapiSystemPrompt
+            : hapiSystemPrompt,
+        allowedTools: bootstrapMode.allowedTools
+            ? bootstrapMode.allowedTools.concat(opts.allowedTools)
+            : opts.allowedTools,
+        disallowedTools: bootstrapMode.disallowedTools,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,
         pathToClaudeCodeExecutable: getDefaultClaudeCodePath(),
         settingsPath: opts.hookSettingsPath,
         additionalDirectories: [getHapiBlobsDir()],
+    }
+
+    if (!awaitingForkInit) {
+        const first = await applyInitialTurn();
+        if (!first) {
+            return;
+        }
+        initial = first;
+        sdkOptions.permissionMode = first.mode.permissionMode;
+        sdkOptions.model = first.mode.model;
+        sdkOptions.effort = first.mode.effort;
+        sdkOptions.fallbackModel = first.mode.fallbackModel;
+        sdkOptions.customSystemPrompt = first.mode.customSystemPrompt
+            ? first.mode.customSystemPrompt + '\n\n' + hapiSystemPrompt
+            : undefined;
+        sdkOptions.appendSystemPrompt = first.mode.appendSystemPrompt
+            ? first.mode.appendSystemPrompt + '\n\n' + hapiSystemPrompt
+            : hapiSystemPrompt;
+        sdkOptions.allowedTools = first.mode.allowedTools
+            ? first.mode.allowedTools.concat(opts.allowedTools)
+            : opts.allowedTools;
+        sdkOptions.disallowedTools = first.mode.disallowedTools;
     }
 
     // Track thinking state
@@ -175,16 +218,6 @@ export async function claudeRemote(opts: {
             }
         }
     };
-
-    // Push initial message
-    let messages = new PushableAsyncIterable<SDKUserMessage>();
-    messages.push({
-        type: 'user',
-        message: {
-            role: 'user',
-            content: initial.message,
-        },
-    });
 
     // Start the loop
     const response = query({
@@ -256,8 +289,8 @@ export async function claudeRemote(opts: {
             );
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
 
-            // Forward message to Hub
-            await opts.onMessage(message);
+            // Handle messages
+            opts.onMessage(message);
 
             // Handle special system messages
             if (message.type === 'system' && message.subtype === 'init') {
@@ -273,7 +306,20 @@ export async function claudeRemote(opts: {
                     const projectDir = getProjectPath(opts.path);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`));
                     logger.debug(`[claudeRemote] Session file found: ${systemInit.session_id} ${found}`);
-                    opts.onSessionFound(systemInit.session_id);
+                    const extras = forkedFrom && forkedFrom !== systemInit.session_id
+                        ? { forkedFrom }
+                        : undefined;
+                    opts.onSessionFound(systemInit.session_id, extras);
+                }
+
+                // Fork: only accept the first child prompt after the native branch exists.
+                if (awaitingForkInit) {
+                    awaitingForkInit = false;
+                    const first = await applyInitialTurn();
+                    if (!first) {
+                        return;
+                    }
+                    initial = first;
                 }
             }
 
@@ -294,44 +340,13 @@ export async function claudeRemote(opts: {
             // Handle result messages
             if (message.type === 'result') {
                 resultSeq += 1;
+                updateThinking(false);
                 logger.debug(
                     `${debugPrefix} result #${resultSeq} received; scheduling next user message ` +
                     `(nextInFlight=${nextMessageFetchInFlight}, inputEnded=${inputEnded})`
                 );
 
-                // Forward usage data
-                const resultMsg = message as SDKResultMessage;
-                if (opts.onUsage && resultMsg.usage) {
-                    opts.onUsage({
-                        totalCostUsd: resultMsg.total_cost_usd,
-                        totalInputTokens: resultMsg.usage.input_tokens,
-                        totalOutputTokens: resultMsg.usage.output_tokens
-                    });
-                }
-
-                // If the SDK rejected our resume id (Claude Code persisted the
-                // session somewhere we couldn't find), clear it so the next
-                // launcher iteration starts a fresh session instead of
-                // looping forever on the same bad id. Also hand the in-flight
-                // user message back to the launcher so it gets processed by
-                // the fresh session rather than stranded with no reply.
-                if (resultMsg.is_error && startFrom) {
-                    const errors = (resultMsg as { errors?: unknown }).errors
-                    const errorText = Array.isArray(errors) ? errors.join(' ') : ''
-                    if (errorText.includes('No conversation found with session ID')) {
-                        logger.debug(`[claudeRemote] SDK rejected resume id ${startFrom}; clearing session id and exiting stream`)
-                        if (resultSeq === 1 && opts.onStaleResume) {
-                            opts.onStaleResume({ message: initial.message, mode: initial.mode })
-                        }
-                        opts.onSessionReset?.()
-                        startFrom = null
-                        inputEnded = true
-                        messages.end()
-                        return
-                    }
-                }
-
-                if (resultSeq === 1 && specialCommand.type === null) {
+                if (resultSeq === 1 && specialCommand.type === null && initial) {
                     opts.onFirstResult?.(initial.message);
                 }
 
@@ -348,18 +363,9 @@ export async function claudeRemote(opts: {
                     compactFailure = null;
                 }
 
-                // Send ready event (await to ensure message queue is flushed first)
-                // IMPORTANT: flush messages before updating thinking state to prevent
-                // a race where the frontend sees thinking=false (via keepAlive) before
-                // all response messages have been stored in the hub, allowing the user
-                // to send a new message that gets a lower seq than the remaining response.
-                // Background tools (e.g. Monitor) inject task-notification turns that are
-                // echoed back into the result text. Surfacing those as "ready for input"
-                // pushes the user every time, so flag the turn as autonomous to suppress.
-                const autonomous = isAutonomousTurnResult(resultMsg);
-                await opts.onReady(autonomous);
-                updateThinking(false);
-                logger.debug(`${debugPrefix} onReady emitted for result #${resultSeq} autonomous=${autonomous}`);
+                // Send ready event
+                opts.onReady();
+                logger.debug(`${debugPrefix} onReady emitted for result #${resultSeq}`);
 
                 // Pull next user message without blocking response stream processing.
                 // Claude may emit autonomous async messages (e.g. scheduled tasks) after a result,

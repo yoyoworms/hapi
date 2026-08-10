@@ -1,9 +1,11 @@
+import { homedir } from 'node:os';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
 import { getErrorMessage } from './rpcResponses';
 
 export interface ListCodexModelsRequest {
     includeHidden?: boolean;
+    accountId?: string;
 }
 
 export type ListCodexModelsResponse = CodexModelsResponse;
@@ -80,8 +82,13 @@ function normalizeModel(entry: unknown): CodexModelSummary | null {
     };
 }
 
-export async function listCodexModels(includeHidden: boolean = false): Promise<CodexModelSummary[]> {
-    const client = new CodexAppServerClient();
+export async function listCodexModels(
+    includeHidden: boolean = false,
+    environment?: Record<string, string>
+): Promise<CodexModelSummary[]> {
+    // Model discovery is account-scoped. Never inherit a session/runner cwd:
+    // project config or a deleted worktree must not alter or break the catalog.
+    const client = new CodexAppServerClient({ cwd: homedir(), env: environment });
 
     try {
         await client.connect();

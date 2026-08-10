@@ -1,84 +1,68 @@
-import { describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-    applyHapiCodexContextCatalogPolicy,
-    buildCodexAppServerArgs,
-    HAPI_CODEX_CONTEXT_DEFAULTS
-} from './codexAppServerClient';
+const { execFileSyncMock, spawnMock } = vi.hoisted(() => ({
+    execFileSyncMock: vi.fn(() => 'codex-cli 1.0.0'),
+    spawnMock: vi.fn()
+}));
 
-describe('buildCodexAppServerArgs', () => {
-    it('applies the shared HAPI context policy before starting app-server', () => {
-        expect(HAPI_CODEX_CONTEXT_DEFAULTS).toEqual({
-            contextWindow: 372_000,
-            autoCompactTokenLimit: 330_000,
-            autoCompactTokenLimitScope: 'total'
-        });
-        expect(buildCodexAppServerArgs('/tmp/hapi model catalog.json')).toEqual([
-            '-c',
-            'model_catalog_json="/tmp/hapi model catalog.json"',
-            '-c',
-            'model_context_window=372000',
-            '-c',
-            'model_auto_compact_token_limit=330000',
-            '-c',
-            'model_auto_compact_token_limit_scope="total"',
-            'app-server'
-        ]);
-    });
-
-    it('keeps working without a prepared model catalog', () => {
-        expect(buildCodexAppServerArgs()).not.toContain('model_catalog_json');
-    });
+vi.mock('node:child_process', async () => {
+    const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    return {
+        ...actual,
+        execFileSync: execFileSyncMock,
+        spawn: spawnMock
+    };
 });
 
-describe('applyHapiCodexContextCatalogPolicy', () => {
-    it('raises the Sol catalog cap so Codex can honor the 372K override', () => {
-        const result = applyHapiCodexContextCatalogPolicy({
-            fetched_at: 'ignored-by-codex',
-            models: [{
-                slug: 'gpt-5.6-sol',
-                context_window: 272_000,
-                max_context_window: 272_000,
-                effective_context_window_percent: 95
-            }, {
-                slug: 'gpt-5.6-terra',
-                context_window: 272_000,
-                max_context_window: 272_000
-            }]
-        });
+vi.mock('node:fs', async () => {
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    return { ...actual, existsSync: vi.fn(() => false) };
+});
 
-        expect(result).toEqual({
-            fetched_at: 'ignored-by-codex',
-            models: [{
-                slug: 'gpt-5.6-sol',
-                context_window: 372_000,
-                max_context_window: 372_000,
-                effective_context_window_percent: 95
-            }, {
-                slug: 'gpt-5.6-terra',
-                context_window: 272_000,
-                max_context_window: 272_000
-            }]
-        });
+vi.mock('@/utils/process', () => ({
+    killProcessByChildProcess: vi.fn(async () => true)
+}));
+
+vi.mock('@/ui/logger', () => ({
+    logger: { debug: vi.fn() }
+}));
+
+import { CodexAppServerClient } from './codexAppServerClient';
+
+function fakeStream(): EventEmitter & { setEncoding: ReturnType<typeof vi.fn> } {
+    return Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+}
+
+function fakeChild() {
+    return Object.assign(new EventEmitter(), {
+        stdin: { end: vi.fn(), write: vi.fn() },
+        stdout: fakeStream(),
+        stderr: fakeStream()
+    });
+}
+
+describe('CodexAppServerClient process cwd', () => {
+    beforeEach(() => {
+        execFileSyncMock.mockClear();
+        spawnMock.mockReset();
     });
 
-    it('preserves a larger user-provided Sol catalog', () => {
-        const result = applyHapiCodexContextCatalogPolicy({
-            models: [{
-                slug: 'gpt-5.6-sol',
-                context_window: 1_000_000,
-                max_context_window: 1_000_000
-            }]
+    it('passes an explicit neutral cwd to the app-server process', async () => {
+        spawnMock.mockReturnValue(fakeChild());
+        const client = new CodexAppServerClient({
+            cwd: '/neutral-home',
+            env: { CODEX_HOME: '/tmp/hapi-codex-app-server-test-home' }
         });
 
-        expect(result?.models[0]).toMatchObject({
-            context_window: 1_000_000,
-            max_context_window: 1_000_000
-        });
-    });
+        await client.connect();
 
-    it('rejects malformed catalogs', () => {
-        expect(applyHapiCodexContextCatalogPolicy({ models: [null] })).toBeNull();
-        expect(applyHapiCodexContextCatalogPolicy({})).toBeNull();
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+        const [command, args, options] = spawnMock.mock.calls[0] ?? [];
+        expect(command).toBe('codex');
+        expect(args?.at(-1)).toBe('app-server');
+        expect(args).toContain('model_context_window=372000');
+        expect(options).toEqual(expect.objectContaining({ cwd: '/neutral-home' }));
+        await client.disconnect();
     });
 });

@@ -72,14 +72,18 @@ describe('machines routes', () => {
         expect(capturedPermissionMode).toBe('auto')
     })
 
-    it('forwards Codex account selection when spawning', async () => {
+    it('forwards typed Codex account and continuation fields when spawning', async () => {
         const machine = createMachine()
+        let capturedContinueLatest: boolean | undefined
         let capturedAccountId: string | undefined
+        let capturedSourceAccountId: string | undefined
         const engine = {
             getMachine: () => machine,
             getMachineByNamespace: () => machine,
             spawnSession: async (...args: unknown[]) => {
-                capturedAccountId = args[15] as string | undefined
+                capturedContinueLatest = args[17] as boolean | undefined
+                capturedAccountId = args[18] as string | undefined
+                capturedSourceAccountId = args[19] as string | undefined
                 return { type: 'success' as const, sessionId: 'session-1' }
             }
         } as Partial<SyncEngine>
@@ -97,12 +101,16 @@ describe('machines routes', () => {
             body: JSON.stringify({
                 directory: '/tmp/project',
                 agent: 'codex',
-                codexAccountId: 'account-1'
+                continueLatest: true,
+                codexAccountId: 'account-1',
+                codexSourceAccountId: 'account-0'
             })
         })
 
         expect(response.status).toBe(200)
+        expect(capturedContinueLatest).toBe(true)
         expect(capturedAccountId).toBe('account-1')
+        expect(capturedSourceAccountId).toBe('account-0')
     })
 
     it('proxies Codex account summaries from the runner', async () => {
@@ -222,15 +230,51 @@ describe('machines routes', () => {
 
     it('returns Codex models for an online machine', async () => {
         const machine = createMachine()
+        let capturedAccountId: string | undefined
         const engine = {
             getMachine: () => machine,
             getMachineByNamespace: () => machine,
-            listCodexModelsForMachine: async () => ({
-                success: true,
-                models: [
-                    { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
-                ]
-            })
+            listCodexModelsForMachine: async (_machineId: string, accountId?: string) => {
+                capturedAccountId = accountId
+                return {
+                    success: true,
+                    models: [
+                        { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
+                    ]
+                }
+            }
+        } as Partial<SyncEngine>
+
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const response = await app.request('/api/machines/machine-1/codex-models?accountId=managed-1')
+
+        expect(response.status).toBe(200)
+        expect(capturedAccountId).toBe('managed-1')
+        expect(await response.json()).toEqual({
+            success: true,
+            models: [
+                { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
+            ]
+        })
+    })
+
+    it('returns a stable code when the Codex machine RPC target is absent', async () => {
+        const machine = createMachine()
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            listCodexModelsForMachine: async () => {
+                throw new RpcTargetMissingError(
+                    'machine-1:listCodexModels',
+                    'handler-not-registered'
+                )
+            }
         } as Partial<SyncEngine>
 
         const app = new Hono<WebAppEnv>()
@@ -242,13 +286,91 @@ describe('machines routes', () => {
 
         const response = await app.request('/api/machines/machine-1/codex-models')
 
-        expect(response.status).toBe(200)
+        expect(response.status).toBe(503)
         expect(await response.json()).toEqual({
-            success: true,
-            models: [
-                { id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }
-            ]
+            success: false,
+            error: 'RPC handler not registered: machine-1:listCodexModels',
+            code: 'rpc_target_missing'
         })
+    })
+
+    it('forwards startingMode "pty" to SyncEngine.spawnSession in the startingMode slot', async () => {
+        const machine = createMachine()
+        let captured: unknown[] | null = null
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            spawnSession: async (...args: unknown[]) => {
+                captured = args
+                return { type: 'success', sessionId: 's-1' }
+            }
+        } as unknown as Partial<SyncEngine>
+
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const response = await app.request('/api/machines/machine-1/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ directory: '/tmp/x', startingMode: 'pty' })
+        })
+
+        expect(response.status).toBe(200)
+        expect(captured).not.toBeNull()
+        // startingMode is the last positional argument, after collaborationMode
+        // and copilotAgentMode.
+        expect(captured![15]).toBe('pty')
+        expect(captured![12]).toBeUndefined()
+    })
+
+    it('defaults AGY machine spawns to PTY mode', async () => {
+        const machine = createMachine()
+        let captured: unknown[] | null = null
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            spawnSession: async (...args: unknown[]) => {
+                captured = args
+                return { type: 'success', sessionId: 's-agy' }
+            }
+        } as unknown as Partial<SyncEngine>
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const response = await app.request('/api/machines/machine-1/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ directory: '/tmp/x', agent: 'agy' })
+        })
+
+        expect(response.status).toBe(200)
+        expect(captured![15]).toBe('pty')
+    })
+
+    it('rejects an explicit remote AGY machine spawn', async () => {
+        const machine = createMachine()
+        const spawnSession = () => { throw new Error('must not spawn') }
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            spawnSession,
+        } as unknown as Partial<SyncEngine>
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => { c.set('namespace', 'default'); await next() })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const response = await app.request('/api/machines/machine-1/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ directory: '/tmp/x', agent: 'agy', startingMode: 'remote' })
+        })
+
+        expect(response.status).toBe(400)
     })
 
     it('returns 400 when /opencode-models is called without cwd', async () => {

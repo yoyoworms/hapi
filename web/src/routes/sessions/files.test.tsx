@@ -8,6 +8,16 @@ import FilesPage from './files'
 const mocks = vi.hoisted(() => ({
     navigate: vi.fn(),
     fileSearch: vi.fn(),
+    transferComposerDraftThenNavigate: vi.fn(async (
+        _source: string,
+        _target: string,
+        navigate: () => void | Promise<void>,
+    ) => {
+        await navigate()
+    }),
+    sessionHeaderProps: null as null | {
+        onSessionReopened?: (newSessionId: string) => void | Promise<void>
+    },
     search: {
         tab: 'directories' as const,
         query: '感',
@@ -18,6 +28,10 @@ vi.mock('@tanstack/react-router', () => ({
     useNavigate: () => mocks.navigate,
     useParams: () => ({ sessionId: 'session-1' }),
     useSearch: () => mocks.search,
+}))
+
+vi.mock('@/lib/composer-draft-transfer', () => ({
+    transferComposerDraftThenNavigate: mocks.transferComposerDraftThenNavigate,
 }))
 
 vi.mock('@/lib/app-context', () => ({
@@ -64,7 +78,10 @@ vi.mock('@/hooks/queries/useSessionFileSearch', () => ({
 }))
 
 vi.mock('@/components/SessionHeader', () => ({
-    SessionHeader: () => null,
+    SessionHeader: (props: { onSessionReopened?: (newSessionId: string) => void | Promise<void> }) => {
+        mocks.sessionHeaderProps = props
+        return null
+    },
 }))
 
 vi.mock('@/components/SessionFiles/DirectoryTree', () => ({
@@ -99,6 +116,12 @@ describe('FilesPage search navigation', () => {
 
         const input = screen.getByRole('textbox')
         expect(input).toHaveValue('感')
+        const sortButton = screen.getByRole('button', { name: 'Sort files' })
+        const refreshButton = screen.getByRole('button', { name: 'Refresh filesystem view' })
+        expect(sortButton.parentElement?.parentElement).toBe(input.parentElement)
+        expect(input.parentElement?.nextElementSibling).toBe(refreshButton)
+        expect(sortButton).toHaveClass('w-10', 'self-stretch')
+        expect(refreshButton).toHaveClass('h-9', 'w-9')
         expect(mocks.fileSearch).toHaveBeenCalledWith(
             expect.anything(),
             'session-1',
@@ -133,6 +156,33 @@ describe('FilesPage search navigation', () => {
             to: '/sessions/$sessionId/files',
             params: { sessionId: 'session-1' },
             search: { tab: 'directories' },
+            replace: true,
+        })
+    })
+})
+
+describe('FilesPage reopen draft transfer', () => {
+    beforeEach(() => {
+        vi.clearAllMocks()
+        mocks.sessionHeaderProps = null
+        window.localStorage.clear()
+        window.sessionStorage.clear()
+    })
+
+    it('transfers the composer draft before navigating to a reopened files route', async () => {
+        renderFilesPage()
+        expect(mocks.sessionHeaderProps?.onSessionReopened).toEqual(expect.any(Function))
+
+        await mocks.sessionHeaderProps!.onSessionReopened!('session-reopened')
+
+        expect(mocks.transferComposerDraftThenNavigate).toHaveBeenCalledWith(
+            'session-1',
+            'session-reopened',
+            expect.any(Function),
+        )
+        expect(mocks.navigate).toHaveBeenCalledWith({
+            to: '/sessions/$sessionId/files',
+            params: { sessionId: 'session-reopened' },
             replace: true,
         })
     })

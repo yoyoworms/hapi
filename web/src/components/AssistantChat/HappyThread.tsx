@@ -19,10 +19,18 @@ import { useTerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
 import { useTranslation } from '@/lib/use-translation'
 import { CloseIcon } from '@/components/icons'
 import { ShareTurnDialog } from '@/components/AssistantChat/ShareTurnDialog'
-import { formatCodexReasoningLabel, shouldShowCodexReasoningLabel } from '@/lib/codexStatusLabels'
 import { getSessionModelLabel } from '@/lib/sessionModelLabel'
+import { getSessionTitle } from '@/lib/sessionTitle'
 import { isFastServiceTier } from '@/components/AssistantChat/codexFastMode'
 import type { OlderLoadOutcome } from '@/lib/message-window-store'
+import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
+import { useMachines } from '@/hooks/queries/useMachines'
+import { useMachineLabels } from '@/hooks/useMachineLabels'
+import { resolveSessionHeaderMachineLabel } from '@/components/SessionHeader'
+import { formatRelativeTime } from '@/lib/relativeTime'
+import { formatSessionHeaderTimestamp } from '@/lib/sessionHeaderTimestamp'
+import { getShareTurnReasoningLabel, selectShareTurnMetadata } from '@/lib/shareTurnMetadata'
+import { useMinuteTick } from '@/hooks/useMinuteTick'
 
 type ScrollAnchor = {
     id: string
@@ -51,7 +59,6 @@ type HistoryLoaderState = {
 type ShareTurnState = {
     id: number
     snapshots: ShareTurnSnapshot[]
-    title: string
     sourceContentWidth: number | null
 } | null
 
@@ -59,6 +66,16 @@ type ShareTurnSnapshot = {
     html: string
     text: string
     role?: 'user' | 'assistant'
+}
+
+export function isNestedScrollEvent(event: Event): boolean {
+    const target = event.target
+    const element = typeof Element !== 'undefined' && target instanceof Element
+        ? target
+        : typeof Node !== 'undefined' && target instanceof Node
+            ? target.parentElement
+            : null
+    return element?.closest('[data-hapi-nested-scroll="true"]') != null
 }
 
 function findNearestMessageElement(content: HTMLElement, clientY?: number): HTMLElement | null {
@@ -100,7 +117,10 @@ export function prependMissingUserSnapshot(
 }
 
 const MESSAGE_ANCHOR_SELECTOR = '.happy-thread-messages > [id]'
-const AUTO_SCROLL_RESUME_THRESHOLD_PX = 120
+// Resume tail-following only once the user has actually reached the bottom.
+// A wider proximity threshold makes a downward-reading user enter tail mode
+// early; the next content/layout update then snaps the viewport to the end.
+const AUTO_SCROLL_RESUME_THRESHOLD_PX = 1
 const MANUAL_SCROLL_EPSILON_PX = 1
 const INITIAL_SCROLL_SETTLE_MS = 1800
 const INITIAL_SCROLL_SETTLE_DELAYS_MS = [0, 16, 50, 120, 250, 500, 900, 1400, 1800] as const
@@ -117,6 +137,7 @@ const TOP_PULL_TRIGGER_PX = 64
 // run after its bounded retry budget is exhausted.
 const WHEEL_GESTURE_GAP_MS = 250
 const KEYBOARD_SCROLL_INTENT_WINDOW_MS = 750
+const POINTER_CANCEL_INTENT_WINDOW_MS = 750
 const UPWARD_SCROLL_KEYS = new Set(['ArrowUp', 'PageUp', 'Home'])
 
 export function getPullToLoadState(distancePx: number): PullToLoadState {
@@ -153,7 +174,7 @@ export function getScrollIntent(params: {
     const distanceFromBottom = params.scrollHeight - params.scrollTop - params.clientHeight
     return {
         distanceFromBottom,
-        isNearBottom: distanceFromBottom < thresholdPx,
+        isNearBottom: distanceFromBottom <= thresholdPx,
         isScrollingUp: params.scrollTop < params.previousScrollTop - MANUAL_SCROLL_EPSILON_PX
     }
 }
@@ -300,9 +321,10 @@ export function ConversationOutlinePanel(props: {
 
     return (
         <aside
-            className="absolute inset-y-0 right-0 z-30 flex w-full max-w-[24rem] flex-col border-l border-[var(--app-border)] bg-[var(--app-bg)] shadow-2xl sm:w-[24rem]"
+            className="absolute inset-y-0 right-0 z-30 flex w-full max-w-[24rem] flex-col bg-[var(--app-bg)] shadow-2xl sm:w-[24rem]"
             aria-label={t('session.outline.title')}
         >
+            <div aria-hidden="true" className="pointer-events-none absolute inset-y-0 -left-px w-px bg-[var(--app-border)]" />
             <div className="border-b border-[var(--app-border)] p-3">
                 <div className="flex items-center gap-2">
                     <div className="relative min-w-0 flex-1">
@@ -415,11 +437,16 @@ export function ConversationOutlinePanel(props: {
 export function HappyThread(props: {
     api: ApiClient
     session: Session
+    serviceTier?: string | null
     sessionId: string
     metadata: SessionMetadataSummary | null
     disabled: boolean
     onRefresh: () => void
     onRetryMessage?: (localId: string) => void
+    historyActionPending?: boolean
+    onForkConversation?: (messageLocalId?: string) => Promise<void>
+    onRewindConversation?: (messageLocalId: string) => Promise<void>
+    isLatestCompletedBoundary?: (messageId: string) => boolean
     onViewModeChange: (mode: 'tail' | 'history') => void
     isSyncingTail: boolean
     messagesWarning: string | null
@@ -438,14 +465,61 @@ export function HappyThread(props: {
     onOutlineOpenChange: (open: boolean) => void
     onOutlineItemClick?: (item: ConversationOutlineItem) => void
 }) {
-    const { t } = useTranslation()
+    const { t, locale } = useTranslation()
+    const { preferences: headerMetadata } = useSessionHeaderMetadata()
+    const { machines } = useMachines(props.api, true)
+    const machineLabelsById = useMachineLabels(machines)
+    const [shareTurn, setShareTurn] = useState<ShareTurnState>(null)
+    const shareDialogOpen = shareTurn !== null
+    const shareTitle = shareTurn ? getSessionTitle(props.session) : ''
+    const shareRelativeTimeTick = useMinuteTick(headerMetadata.lastActive && shareDialogOpen)
+    const shareMetadataItems = useMemo(() => {
+        const agentFlavor = props.session.metadata?.flavor ?? null
+        const agentLabel = agentFlavor?.trim() || null
+        const machineLabel = resolveSessionHeaderMachineLabel(props.session, machineLabelsById)
+        const modelLabel = getSessionModelLabel(props.session)
+        const reasoningLabel = getShareTurnReasoningLabel(
+            agentFlavor,
+            props.session.modelReasoningEffort,
+            props.session.effort,
+            headerMetadata.showLabels
+        )
+        const lastActiveAt = props.session.activeAt || props.session.updatedAt || props.session.createdAt
+        const lastActiveLabel = lastActiveAt > 0 ? formatRelativeTime(lastActiveAt, t) : null
+        const createdAtLabel = formatSessionHeaderTimestamp(props.session.createdAt, locale)
+        const updatedAtLabel = formatSessionHeaderTimestamp(props.session.updatedAt, locale)
+        const worktreeBranch = props.session.metadata?.worktree?.branch?.trim() || null
+        const showFastBadge = agentFlavor === 'codex'
+            && isFastServiceTier(props.serviceTier ?? props.session.serviceTier)
+
+        return selectShareTurnMetadata(headerMetadata, {
+            agent: agentLabel ? { text: agentLabel, flavor: agentFlavor } : undefined,
+            machine: machineLabel ? {
+                text: `${headerMetadata.showLabels ? `${t('session.item.machine')}: ` : ''}${machineLabel}`,
+            } : undefined,
+            lastActive: lastActiveLabel ? { text: lastActiveLabel } : undefined,
+            model: modelLabel ? {
+                text: `${headerMetadata.showLabels ? `${t(modelLabel.key)}: ` : ''}${modelLabel.value}`,
+            } : undefined,
+            reasoning: reasoningLabel ? { text: reasoningLabel } : undefined,
+            fastMode: showFastBadge ? { text: 'fast' } : undefined,
+            createdAt: createdAtLabel ? {
+                text: `${headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}${createdAtLabel}`,
+            } : undefined,
+            updatedAt: updatedAtLabel ? {
+                text: `${headerMetadata.showLabels ? `${t('session.header.updatedAt')}: ` : ''}${updatedAtLabel}`,
+            } : undefined,
+            worktree: worktreeBranch ? {
+                text: `${headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}${worktreeBranch}`,
+            } : undefined,
+        })
+    }, [headerMetadata, locale, machineLabelsById, props.serviceTier, props.session, shareDialogOpen, shareRelativeTimeTick, t])
     const { terminalToolDisplayMode } = useTerminalToolDisplayMode()
     const runtimeExtras = useAuiState((s) => s.thread.extras) as HappyRuntimeExtras | undefined
     const appliedMessagesVersion = runtimeExtras?.messagesVersion ?? props.messagesVersion
     const appliedHistoryVersion = runtimeExtras?.historyVersion ?? props.historyVersion
     const viewportRef = useRef<HTMLDivElement | null>(null)
     const contentRef = useRef<HTMLDivElement | null>(null)
-    const [shareTurn, setShareTurn] = useState<ShareTurnState>(null)
     const [pullToLoadState, setPullToLoadState] = useState<PullToLoadState>('idle')
     const pullToLoadStateRef = useRef<PullToLoadState>('idle')
     const shareTurnIdRef = useRef(0)
@@ -460,6 +534,7 @@ export function HappyThread(props: {
     const pendingLoadResolveRef = useRef<((value: OlderHistoryLoadResult) => void) | null>(null)
     const coverageCheckTimerRef = useRef<number | null>(null)
     const failureRetryTimerRef = useRef<number | null>(null)
+    const tailScrollInProgressRef = useRef(false)
     const historyLoaderRef = useRef<HistoryLoaderState>({
         runId: 0,
         phase: 'idle',
@@ -607,6 +682,7 @@ export function HappyThread(props: {
         }
 
         let pointerResumeActive = false
+        let pointerResumeUntil = 0
         let pointerResumeLatched = false
         let keyboardResumeUntil = 0
         let lastWheelAt = 0
@@ -616,6 +692,7 @@ export function HappyThread(props: {
         const hasExplicitUpwardIntent = (intent: ScrollIntent): boolean => {
             return intent.isScrollingUp && (
                 pointerResumeActive
+                || pointerResumeUntil >= Date.now()
                 || keyboardResumeUntil >= Date.now()
                 || wheelIntentUntil >= Date.now()
             )
@@ -625,7 +702,7 @@ export function HappyThread(props: {
             if (!hasExplicitUpwardIntent(intent)) {
                 return false
             }
-            if (pointerResumeActive && !pointerResumeLatched) {
+            if ((pointerResumeActive || pointerResumeUntil >= Date.now()) && !pointerResumeLatched) {
                 pointerResumeLatched = true
                 return true
             }
@@ -695,14 +772,24 @@ export function HappyThread(props: {
             }
 
             if (intent.isScrollingUp && intent.distanceFromBottom > MANUAL_SCROLL_EPSILON_PX) {
+                tailScrollInProgressRef.current = false
                 setAutoScrollMode(false)
                 setAtBottomMode(false)
                 return
             }
 
             if (intent.isNearBottom) {
+                tailScrollInProgressRef.current = false
                 setAutoScrollMode(true)
                 setAtBottomMode(true)
+                return
+            }
+
+            // An explicit jump-to-tail uses native smooth scrolling. Its
+            // intermediate scroll events are still far from the bottom and
+            // must not be mistaken for ordinary history browsing. Keep tail
+            // mode armed until the animation arrives or the user reverses it.
+            if (tailScrollInProgressRef.current) {
                 return
             }
 
@@ -724,6 +811,7 @@ export function HappyThread(props: {
         }
 
         const handleKeyDown = (event: KeyboardEvent) => {
+            if (isNestedScrollEvent(event)) return
             const target = event.target
             if (
                 event.defaultPrevented
@@ -745,20 +833,67 @@ export function HappyThread(props: {
             }
         }
 
-        const handlePointerDown = (event: PointerEvent) => {
-            if (event.button !== 0) {
-                return
-            }
+        const armPointerIntent = () => {
             pointerResumeActive = true
+            pointerResumeUntil = 0
             pointerResumeLatched = false
         }
 
-        const handlePointerEnd = () => {
+        const handlePointerDown = (event: PointerEvent) => {
+            if (isNestedScrollEvent(event) || event.button !== 0) {
+                return
+            }
+            armPointerIntent()
+        }
+
+        const isInsideViewport = (clientX: number, clientY: number) => {
+            const rect = viewport.getBoundingClientRect()
+            return clientX >= rect.left
+                && clientX <= rect.right
+                && clientY >= rect.top
+                && clientY <= rect.bottom
+        }
+
+        // Native scrollbar interaction may bypass the viewport's own event
+        // listeners. Capture pointer and mouse input at the window boundary,
+        // then scope it back to the chat viewport by coordinates.
+        const handleWindowPointerDown = (event: PointerEvent) => {
+            if (isNestedScrollEvent(event)) return
+            if (event.button === 0 && isInsideViewport(event.clientX, event.clientY)) {
+                armPointerIntent()
+            }
+        }
+
+        const handleWindowMouseDown = (event: MouseEvent) => {
+            if (isNestedScrollEvent(event)) return
+            if (event.button === 0 && isInsideViewport(event.clientX, event.clientY)) {
+                armPointerIntent()
+            }
+        }
+
+        const clearPointerIntent = () => {
             pointerResumeActive = false
+            pointerResumeUntil = 0
+            pointerResumeLatched = false
+        }
+
+        const handlePointerCancel = (event: PointerEvent) => {
+            if (isNestedScrollEvent(event)) return
+            const hadActivePointer = pointerResumeActive
+            pointerResumeActive = false
+            if (hadActivePointer && (event.pointerType === 'touch' || event.pointerType === 'pen')) {
+                // Native panning cancels the pointer before some mobile browsers
+                // dispatch the resulting scroll event. Retain that explicit input
+                // briefly so initial bottom-settling cannot reclaim the viewport.
+                pointerResumeUntil = Date.now() + POINTER_CANCEL_INTENT_WINDOW_MS
+                return
+            }
+            pointerResumeUntil = 0
             pointerResumeLatched = false
         }
 
         const handleWheel = (event: WheelEvent) => {
+            if (isNestedScrollEvent(event)) return
             if (event.deltaY >= 0) {
                 wheelIntentUntil = 0
                 return
@@ -781,6 +916,7 @@ export function HappyThread(props: {
         }
 
         const handleTouchStart = (event: TouchEvent) => {
+            if (isNestedScrollEvent(event)) return
             updatePullToLoadState('idle')
             pullStartY = (
                 viewport.scrollTop <= 0
@@ -794,6 +930,7 @@ export function HappyThread(props: {
         }
 
         const handleTouchMove = (event: TouchEvent) => {
+            if (isNestedScrollEvent(event)) return
             if (pullStartY === null) {
                 return
             }
@@ -808,7 +945,8 @@ export function HappyThread(props: {
             }
         }
 
-        const handleTouchEnd = () => {
+        const handleTouchEnd = (event: TouchEvent) => {
+            if (isNestedScrollEvent(event)) return
             const shouldLoad = pullStartY !== null
                 && pullToLoadStateRef.current === 'ready'
                 && viewport.scrollTop <= 0
@@ -819,7 +957,8 @@ export function HappyThread(props: {
             }
         }
 
-        const handleTouchCancel = () => {
+        const handleTouchCancel = (event: TouchEvent) => {
+            if (isNestedScrollEvent(event)) return
             pullStartY = null
             updatePullToLoadState('idle')
         }
@@ -832,9 +971,12 @@ export function HappyThread(props: {
         viewport.addEventListener('touchmove', handleTouchMove, { passive: true })
         viewport.addEventListener('touchend', handleTouchEnd, { passive: true })
         viewport.addEventListener('touchcancel', handleTouchCancel, { passive: true })
-        window.addEventListener('pointerup', handlePointerEnd, { passive: true })
-        window.addEventListener('pointercancel', handlePointerEnd, { passive: true })
-        window.addEventListener('blur', handlePointerEnd)
+        window.addEventListener('pointerdown', handleWindowPointerDown, { capture: true, passive: true })
+        window.addEventListener('mousedown', handleWindowMouseDown, { capture: true, passive: true })
+        window.addEventListener('pointerup', clearPointerIntent, { passive: true })
+        window.addEventListener('mouseup', clearPointerIntent, { passive: true })
+        window.addEventListener('pointercancel', handlePointerCancel, { passive: true })
+        window.addEventListener('blur', clearPointerIntent)
         return () => {
             viewport.removeEventListener('scroll', handleScroll)
             viewport.removeEventListener('keydown', handleKeyDown)
@@ -844,9 +986,12 @@ export function HappyThread(props: {
             viewport.removeEventListener('touchmove', handleTouchMove)
             viewport.removeEventListener('touchend', handleTouchEnd)
             viewport.removeEventListener('touchcancel', handleTouchCancel)
-            window.removeEventListener('pointerup', handlePointerEnd)
-            window.removeEventListener('pointercancel', handlePointerEnd)
-            window.removeEventListener('blur', handlePointerEnd)
+            window.removeEventListener('pointerdown', handleWindowPointerDown, true)
+            window.removeEventListener('mousedown', handleWindowMouseDown, true)
+            window.removeEventListener('pointerup', clearPointerIntent)
+            window.removeEventListener('mouseup', clearPointerIntent)
+            window.removeEventListener('pointercancel', handlePointerCancel)
+            window.removeEventListener('blur', clearPointerIntent)
         }
     }, []) // Stable: no dependencies, reads from refs
 
@@ -858,10 +1003,18 @@ export function HappyThread(props: {
         }
     }, [])
 
+    const handleNestedScrollFollowChange = useCallback((followLatest: boolean) => {
+        if (!followLatest) {
+            clearInitialScrollTimers()
+        }
+        autoScrollEnabledRef.current = followLatest && atBottomRef.current
+    }, [clearInitialScrollTimers])
+
     // Scroll to bottom handler for the indicator button
     const scrollToBottom = useCallback(() => {
         const viewport = viewportRef.current
         if (viewport) {
+            tailScrollInProgressRef.current = true
             viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
             lastScrollTopRef.current = viewport.scrollTop
         }
@@ -875,6 +1028,7 @@ export function HappyThread(props: {
     // Reset state when session changes
     useLayoutEffect(() => {
         autoScrollEnabledRef.current = true
+        tailScrollInProgressRef.current = false
         lastScrollTopRef.current = viewportRef.current?.scrollTop ?? 0
         atBottomRef.current = true
         onViewModeChangeRef.current('tail')
@@ -1362,7 +1516,6 @@ export function HappyThread(props: {
             setShareTurn({
                 id: ++shareTurnIdRef.current,
                 snapshots: fallbackSnapshot ? [fallbackSnapshot] : [],
-                title: props.metadata?.summary?.text ?? props.metadata?.name ?? props.metadata?.path ?? props.sessionId.slice(0, 8),
                 sourceContentWidth: sourceContentWidth > 0 ? sourceContentWidth : null,
             })
             return
@@ -1406,10 +1559,9 @@ export function HappyThread(props: {
         setShareTurn({
             id: ++shareTurnIdRef.current,
             snapshots: completeSnapshots,
-            title: props.metadata?.summary?.text ?? props.metadata?.name ?? props.metadata?.path ?? props.sessionId.slice(0, 8),
             sourceContentWidth: sourceContentWidth > 0 ? sourceContentWidth : null,
         })
-    }, [props.metadata, props.sessionId])
+    }, [props.session])
 
     return (
         <HappyChatProvider value={{
@@ -1420,10 +1572,15 @@ export function HappyThread(props: {
             disabled: props.disabled,
             onRefresh: props.onRefresh,
             onRetryMessage: props.onRetryMessage,
+            historyActionPending: props.historyActionPending,
+            onForkConversation: props.onForkConversation,
+            onRewindConversation: props.onRewindConversation,
+            isLatestCompletedBoundary: props.isLatestCompletedBoundary,
             onShareTurn: handleShareTurn,
             hasMoreMessages: props.hasMoreMessages,
             isSyncingTail: props.isSyncingTail,
             isLoadingMoreMessages: props.isLoadingMoreMessages,
+            onNestedScrollFollowChange: handleNestedScrollFollowChange,
             loadOlderMessagesPreservingScroll: loadOlderFromConsumer
         }}>
             <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col relative">
@@ -1508,17 +1665,8 @@ export function HappyThread(props: {
                 <ShareTurnDialog
                     key={shareTurn?.id ?? 'closed'}
                     isOpen={shareTurn !== null}
-                    title={shareTurn?.title ?? ''}
-                    flavor={props.session.metadata?.flavor ?? null}
-                    modelLabel={(() => {
-                        const label = getSessionModelLabel(props.session)
-                        return label ? `${t(label.key)}: ${label.value}` : null
-                    })()}
-                    reasoningLabel={shouldShowCodexReasoningLabel(props.session.metadata?.flavor ?? null)
-                        ? formatCodexReasoningLabel(props.session.modelReasoningEffort)
-                        : null}
-                    showFastBadge={props.session.metadata?.flavor === 'codex' && isFastServiceTier(props.session.serviceTier)}
-                    worktreeBranch={props.session.metadata?.worktree?.branch ?? null}
+                    title={shareTitle}
+                    metadataItems={shareMetadataItems}
                     sourceSnapshots={shareTurn?.snapshots ?? []}
                     sourceContentWidth={shareTurn?.sourceContentWidth ?? null}
                     onClose={() => setShareTurn(null)}

@@ -1,11 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { isPermissionModeAllowedForFlavor } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
-import type { CodexCollaborationMode, PermissionMode, SessionResponse, SessionsResponse } from '@/types/api'
+import type { CodexCollaborationMode, CopilotAgentMode, PermissionMode, SessionResponse, SessionsResponse } from '@/types/api'
 import type { ReopenSessionResponse } from '@hapi/protocol/apiTypes'
 import { queryKeys } from '@/lib/query-keys'
 import { clearMessageWindow } from '@/lib/message-window-store'
 import { isKnownFlavor } from '@hapi/protocol'
+
+export const sessionModelMutationKey = (sessionId: string) => ['session-model', sessionId] as const
 
 export function useSessionActions(
     api: ApiClient | null,
@@ -20,11 +22,13 @@ export function useSessionActions(
     resumeSession: (resumeWithSessionId?: string) => Promise<string>
     setPermissionMode: (mode: PermissionMode) => Promise<void>
     setCollaborationMode: (mode: CodexCollaborationMode) => Promise<void>
+    setCopilotAgentMode: (mode: CopilotAgentMode) => Promise<void>
     setModel: (model: { provider: string; modelId: string } | string | null) => Promise<void>
     setModelReasoningEffort: (modelReasoningEffort: string | null) => Promise<void>
     setEffort: (effort: string | null) => Promise<void>
     setServiceTier: (serviceTier: string | null) => Promise<void>
     renameSession: (name: string) => Promise<void>
+    setPinMode: (mode: 'none' | 'project' | 'global') => Promise<void>
     deleteSession: () => Promise<void>
     isPending: boolean
 } {
@@ -101,7 +105,14 @@ export function useSessionActions(
         },
         onSuccess: (result) => {
             void (async () => {
-                await invalidateSession()
+                // When reopen merges into a different id, the source detail may
+                // already be gone. Invalidating it while still on the source
+                // route races with draft handoff and flashes "Session unavailable".
+                if (result.sessionId === sessionId) {
+                    await invalidateSession()
+                } else {
+                    await queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
+                }
                 markSessionActiveInCache(result.sessionId)
             })()
         },
@@ -156,18 +167,30 @@ export function useSessionActions(
         onSuccess: () => void invalidateSession(),
     })
 
+    const copilotAgentModeMutation = useMutation({
+        mutationFn: async (mode: CopilotAgentMode) => {
+            if (!api || !sessionId) {
+                throw new Error('Session unavailable')
+            }
+            if (agentFlavor !== 'copilot') {
+                throw new Error('Agent mode is only supported for Copilot sessions')
+            }
+            await api.setCopilotAgentMode(sessionId, mode)
+        },
+        onSuccess: () => void invalidateSession(),
+    })
+
     const modelMutation = useMutation({
+        mutationKey: sessionModelMutationKey(sessionId ?? ''),
         mutationFn: async (model: { provider: string; modelId: string } | string | null) => {
             if (!api || !sessionId) {
                 throw new Error('Session unavailable')
             }
             await api.setModel(sessionId, model)
         },
-        onSuccess: () => {
-            void (async () => {
-                await invalidateSession()
-                await invalidateCursorModels()
-            })()
+        onSuccess: async () => {
+            await invalidateSession()
+            await invalidateCursorModels()
         },
     })
 
@@ -223,6 +246,14 @@ export function useSessionActions(
         onSuccess: () => void invalidateSession(),
     })
 
+    const pinMutation = useMutation({
+        mutationFn: async (mode: 'none' | 'project' | 'global') => {
+            if (!api || !sessionId) throw new Error('Session unavailable')
+            await api.setSessionPinMode(sessionId, mode)
+        },
+        onSuccess: () => void invalidateSession(),
+    })
+
     const deleteMutation = useMutation({
         mutationFn: async () => {
             if (!api || !sessionId) {
@@ -246,11 +277,13 @@ export function useSessionActions(
         resumeSession: resumeMutation.mutateAsync,
         setPermissionMode: permissionMutation.mutateAsync,
         setCollaborationMode: collaborationMutation.mutateAsync,
+        setCopilotAgentMode: copilotAgentModeMutation.mutateAsync,
         setModel: modelMutation.mutateAsync,
         setModelReasoningEffort: modelReasoningEffortMutation.mutateAsync,
         setEffort: effortMutation.mutateAsync,
         setServiceTier: serviceTierMutation.mutateAsync,
         renameSession: renameMutation.mutateAsync,
+        setPinMode: pinMutation.mutateAsync,
         deleteSession: deleteMutation.mutateAsync,
         isPending: abortMutation.isPending
             || archiveMutation.isPending
@@ -259,11 +292,13 @@ export function useSessionActions(
             || resumeMutation.isPending
             || permissionMutation.isPending
             || collaborationMutation.isPending
+            || copilotAgentModeMutation.isPending
             || modelMutation.isPending
             || modelReasoningEffortMutation.isPending
             || effortMutation.isPending
             || serviceTierMutation.isPending
             || renameMutation.isPending
+            || pinMutation.isPending
             || deleteMutation.isPending,
     }
 }

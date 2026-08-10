@@ -47,50 +47,41 @@ function renderInProviders(ui: ReactElement) {
 }
 
 function renderButtons(overrides: Partial<React.ComponentProps<typeof ComposerButtons>> = {}) {
+    const props = {
+        canSend: false,
+        controlsDisabled: false,
+        showSettingsButton: false,
+        onSettingsToggle: noop,
+        expanded: false,
+        onExpandedToggle: noop,
+        showTerminalButton: false,
+        terminalDisabled: false,
+        terminalLabel: 'Terminal',
+        onTerminal: noop,
+        showAbortButton: false,
+        abortDisabled: false,
+        isAborting: false,
+        onAbort: noop,
+        showSwitchButton: false,
+        switchDisabled: false,
+        isSwitching: false,
+        onSwitch: noop,
+        voiceEnabled: false,
+        voiceStatus: 'disconnected' as const,
+        onVoiceToggle: noop,
+        onSend: noop,
+        onSchedule: noop,
+        onScratchlistToggle: noop,
+        ...overrides,
+    } as React.ComponentProps<typeof ComposerButtons>
     return renderInProviders(
-        <ComposerButtons
-            canSend={false}
-            controlsDisabled={false}
-            showSettingsButton={false}
-            onSettingsToggle={noop}
-            showTerminalButton={false}
-            terminalDisabled={false}
-            terminalLabel="Terminal"
-            onTerminal={noop}
-            showAbortButton={false}
-            abortDisabled={false}
-            isAborting={false}
-            onAbort={noop}
-            showSwitchButton={false}
-            switchDisabled={false}
-            isSwitching={false}
-            onSwitch={noop}
-            voiceEnabled={false}
-            voiceStatus="disconnected"
-            onVoiceToggle={noop}
-            onSend={noop}
-            onSchedule={noop}
-            onScratchlistToggle={noop}
-            {...overrides}
-        />,
+        <ComposerButtons {...props} />,
     )
 }
 
 describe('ComposerButtons attachment invariants', () => {
     beforeEach(() => {
         vi.clearAllMocks()
-    })
-
-    it('disables the attachment entry point when the session has no adapter', () => {
-        renderButtons({ attachmentsSupported: false })
-        expect(screen.getByRole('button', { name: 'Attachments require an active session' })).toBeDisabled()
-    })
-
-    it('locks scratchlist destination changes while attachments exist', () => {
-        renderButtons({ hasAttachments: true, scratchlistToggleDisabled: true })
-        const toggle = screen.getByRole('button', { name: 'Scratchlist drawer' })
-        expect(toggle).toBeDisabled()
-        expect(toggle).toHaveAttribute('title', 'Remove attachments before switching destination')
     })
 
     it('closes an already-open schedule picker as soon as an attachment appears', () => {
@@ -106,6 +97,8 @@ describe('ComposerButtons attachment invariants', () => {
                     controlsDisabled={false}
                     showSettingsButton={false}
                     onSettingsToggle={noop}
+                    expanded={false}
+                    onExpandedToggle={noop}
                     showTerminalButton={false}
                     terminalDisabled={false}
                     terminalLabel="Terminal"

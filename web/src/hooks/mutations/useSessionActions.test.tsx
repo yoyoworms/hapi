@@ -95,4 +95,105 @@ describe('useSessionActions - reopenSession', () => {
             expect(result.current.isPending).toBe(false)
         })
     })
+
+    it('does not invalidate the source session detail when reopen returns a different id', async () => {
+        const reopen = vi.fn(async () => ({
+            ok: true as const,
+            sessionId: 'session-B',
+            resumed: true,
+        }))
+        const queryClient = new QueryClient({
+            defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+        })
+        const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+        const api = createMockApi(reopen)
+        const wrapper = ({ children }: { children: ReactNode }) => (
+            <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        )
+        const { result } = renderHook(
+            () => useSessionActions(api, 'session-A', 'cursor'),
+            { wrapper },
+        )
+
+        await act(async () => {
+            await result.current.reopenSession()
+        })
+
+        await waitFor(() => {
+            expect(invalidate).toHaveBeenCalledWith({ queryKey: ['sessions'] })
+        })
+        expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['session', 'session-A'] })
+    })
+
+    it('invalidates the source session detail when reopen returns the same id', async () => {
+        const reopen = vi.fn(async () => ({
+            ok: true as const,
+            sessionId: 'session-A',
+            resumed: true,
+        }))
+        const queryClient = new QueryClient({
+            defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+        })
+        const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+        const api = createMockApi(reopen)
+        const wrapper = ({ children }: { children: ReactNode }) => (
+            <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        )
+        const { result } = renderHook(
+            () => useSessionActions(api, 'session-A', 'cursor'),
+            { wrapper },
+        )
+
+        await act(async () => {
+            await result.current.reopenSession()
+        })
+
+        await waitFor(() => {
+            expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session', 'session-A'] })
+        })
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: ['sessions'] })
+    })
+})
+
+describe('useSessionActions - setModel', () => {
+    it('stays pending until the refreshed session detail is available', async () => {
+        let releaseSessionRefresh!: () => void
+        const sessionRefresh = new Promise<void>((resolve) => {
+            releaseSessionRefresh = resolve
+        })
+        const queryClient = new QueryClient({
+            defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+        })
+        const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockImplementation(async (filters) => {
+            if (JSON.stringify(filters?.queryKey) === JSON.stringify(['session', 'session-A'])) {
+                await sessionRefresh
+            }
+        })
+        const api = {
+            setModel: vi.fn(async () => undefined),
+        } as unknown as ApiClient
+        const wrapper = ({ children }: { children: ReactNode }) => (
+            <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        )
+        const { result } = renderHook(
+            () => useSessionActions(api, 'session-A', 'agy'),
+            { wrapper },
+        )
+
+        let settled = false
+        const change = result.current.setModel('gemini-3.5-flash-low').then(() => {
+            settled = true
+        })
+
+        await waitFor(() => expect(api.setModel).toHaveBeenCalled())
+        expect(result.current.isPending).toBe(true)
+        expect(settled).toBe(false)
+
+        releaseSessionRefresh()
+        await act(async () => await change)
+
+        expect(settled).toBe(true)
+        await waitFor(() => expect(result.current.isPending).toBe(false))
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session', 'session-A'] })
+    })
 })

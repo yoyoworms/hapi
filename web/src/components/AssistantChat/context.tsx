@@ -14,6 +14,10 @@ export type HappyChatContextValue = {
     disabled: boolean
     onRefresh: () => void
     onRetryMessage?: (localId: string) => void
+    historyActionPending?: boolean
+    onForkConversation?: (messageLocalId?: string) => Promise<void>
+    onRewindConversation?: (messageLocalId: string) => Promise<void>
+    isLatestCompletedBoundary?: (messageId: string) => boolean
     onShareTurn?: (
         messageElement: HTMLElement | string | null,
         clientY?: number,
@@ -22,6 +26,7 @@ export type HappyChatContextValue = {
     hasMoreMessages: boolean
     isSyncingTail: boolean
     isLoadingMoreMessages: boolean
+    onNestedScrollFollowChange?: (followLatest: boolean) => void
     loadOlderMessagesPreservingScroll: () => Promise<OlderHistoryLoadResult>
 }
 

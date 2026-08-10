@@ -4,28 +4,24 @@
 
 import { io, type Socket } from 'socket.io-client'
 import { readdir, realpath, stat } from 'node:fs/promises'
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { logger } from '@/ui/logger'
 import { configuration } from '@/configuration'
 import type { ClientToServerEvents, ServerToClientEvents, Update, UpdateMachineBody } from '@hapi/protocol'
 import {
-    AddCodexApiEndpointRequestSchema,
     ArchiveCodexSessionRpcRequestSchema,
-    CodexAccountLoginStatusResponseSchema,
-    CodexAccountsResponseSchema,
     ListCodexSessionsRpcRequestSchema,
+    ListPiSessionsRpcRequestSchema,
     type ArchiveCodexSessionRpcResponse,
-    type CodexAccountLoginStatusResponse,
-    type CodexAccountLoginStartResponse,
-    type CodexAccountsResponse,
     type ListCodexSessionsRpcResponse,
+    type ListPiSessionsRpcResponse,
     type MachineDirectoryEntry,
     type MachineListDirectoryResponse,
     type PathExistsResponse
 } from '@hapi/protocol/apiTypes'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import { RUNNER_CAPABILITIES } from '@hapi/protocol'
 import type { RunnerState, Machine, MachineMetadata } from './types'
 import { RunnerStateSchema, MachineMetadataSchema } from './types'
 import { backoff } from '@/utils/time'
@@ -42,18 +38,24 @@ import {
     type ListGrokModelsForCwdRequest,
     type ListGrokModelsForCwdResponse
 } from '../modules/common/grokModels'
+import {
+    listCopilotModelsForCwd,
+    type ListCopilotModelsForCwdRequest,
+    type ListCopilotModelsForCwdResponse
+} from '../modules/common/copilotModels'
 import type { SpawnSessionOptions, SpawnSessionResult } from '../modules/common/rpcTypes'
 import { applyVersionedAck } from './versionedUpdate'
 import { archiveLocalCodexSession, listLocalCodexSessionSummaries, listLocalCodexSessionsWithMessagesByIds } from '../modules/common/codexSessions'
+import { listLocalPiSessionSummaries, listLocalPiSessionsWithMessagesByIds } from '../modules/common/piSessions'
 import { buildSocketIoExtraHeaderOptions } from './hubExtraHeaders'
 import { collectMachineHealth } from '@/utils/machineHealth'
 import { inspectCursorChatStore } from '@/cursor/cursorChatStoreStatus'
+import { homedir } from 'node:os'
 import type { CursorChatStoreStatus } from '@hapi/protocol/apiTypes'
-import { codexAccountManager } from '@/codex/codexAccountManager'
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
-    stopSession: (sessionId: string) => boolean
+    stopSession: (sessionId: string) => Promise<'stopped' | 'already_gone' | 'still_alive'>
     requestShutdown: () => void
 }
 
@@ -63,16 +65,13 @@ interface PathExistsRequest {
 
 interface ListMachineDirectoryRequest {
     path: string
+    includeHidden?: boolean
 }
 
 interface CursorChatStoreStatusRequest {
     workspacePath: string
     cursorSessionId: string
     homeDir?: string
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-    return value && typeof value === 'object' ? value as Record<string, unknown> : null
 }
 
 export function normalizeWindowsDriveRoot(path: string): string {
@@ -113,149 +112,6 @@ function formatWorkspaceRoots(paths?: string[]): string {
     return paths?.length ? paths.join(', ') : '(none)'
 }
 
-type CachedOAuthUsage = { data: Record<string, unknown>; fetchedAt: number }
-
-let cachedOAuthUsage: CachedOAuthUsage | null = null
-const OAUTH_USAGE_CACHE_TTL_MS = 30 * 60 * 1000
-
-const MACOS_USAGE_CREDENTIALS_SERVICE = 'Claude Code-credentials'
-const CCSTATUSLINE_USAGE_CACHE_FILE = join(homedir(), '.cache', 'ccstatusline', 'usage.json')
-
-type UsageFetchResult = { ok: true; data: Record<string, unknown> } | { ok: false; retryable: boolean }
-
-function parseUsageAccessToken(raw: string | null): string | null {
-    if (!raw) return null
-    try {
-        const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown } }
-        const token = parsed.claudeAiOauth?.accessToken
-        return typeof token === 'string' && token.length > 0 ? token : null
-    } catch {
-        return null
-    }
-}
-
-function readMacKeychainSecret(service: string): string | null {
-    try {
-        const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
-        return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-            encoding: 'utf-8',
-            timeout: 5000,
-            stdio: ['pipe', 'pipe', 'ignore']
-        }).trim()
-    } catch {
-        return null
-    }
-}
-
-function listMacKeychainCredentialCandidates(): string[] {
-    if (process.platform !== 'darwin') return []
-    try {
-        const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
-        const rawDump = execFileSync('security', ['dump-keychain'], {
-            encoding: 'utf-8',
-            timeout: 8000,
-            maxBuffer: 8 * 1024 * 1024,
-            stdio: ['pipe', 'pipe', 'ignore']
-        })
-        const services: string[] = []
-        const seen = new Set<string>()
-        const re = /"svce"<blob>="([^"]+)"/g
-        let match: RegExpExecArray | null
-        while ((match = re.exec(rawDump)) !== null) {
-            const service = match[1]
-            if (!service.startsWith(MACOS_USAGE_CREDENTIALS_SERVICE)) continue
-            if (seen.has(service)) continue
-            seen.add(service)
-            services.push(service)
-        }
-        return services
-    } catch {
-        return []
-    }
-}
-
-function readUsageTokenFromCredentialsFile(): string | null {
-    const candidates = [
-        process.env.CLAUDE_CONFIG_DIR ? join(process.env.CLAUDE_CONFIG_DIR, '.credentials.json') : null,
-        join(homedir(), '.claude', '.credentials.json')
-    ].filter((path): path is string => Boolean(path))
-    for (const filePath of candidates) {
-        try {
-            if (!existsSync(filePath)) continue
-            const token = parseUsageAccessToken(readFileSync(filePath, 'utf-8'))
-            if (token) return token
-        } catch {}
-    }
-    return null
-}
-
-function getUsageTokens(): string[] {
-    const tokens: string[] = []
-    const seen = new Set<string>()
-    const add = (token: string | null) => {
-        if (!token || seen.has(token)) return
-        seen.add(token)
-        tokens.push(token)
-    }
-
-    if (process.platform === 'darwin') {
-        add(parseUsageAccessToken(readMacKeychainSecret(MACOS_USAGE_CREDENTIALS_SERVICE)))
-        for (const service of listMacKeychainCredentialCandidates()) {
-            add(parseUsageAccessToken(readMacKeychainSecret(service)))
-        }
-    }
-    add(readUsageTokenFromCredentialsFile())
-    return tokens
-}
-
-function readCcstatuslineUsageCache(): Record<string, unknown> | null {
-    try {
-        if (!existsSync(CCSTATUSLINE_USAGE_CACHE_FILE)) return null
-        const parsed = JSON.parse(readFileSync(CCSTATUSLINE_USAGE_CACHE_FILE, 'utf-8')) as Record<string, unknown>
-        const sessionUsage = typeof parsed.sessionUsage === 'number' ? parsed.sessionUsage : null
-        const sessionResetAt = typeof parsed.sessionResetAt === 'string' ? parsed.sessionResetAt : null
-        const weeklyUsage = typeof parsed.weeklyUsage === 'number' ? parsed.weeklyUsage : null
-        const weeklyResetAt = typeof parsed.weeklyResetAt === 'string' ? parsed.weeklyResetAt : null
-        if (sessionUsage === null && weeklyUsage === null) return null
-        return {
-            five_hour: sessionUsage === null ? null : { utilization: sessionUsage, resets_at: sessionResetAt },
-            seven_day: weeklyUsage === null ? null : { utilization: weeklyUsage, resets_at: weeklyResetAt },
-            seven_day_opus: null,
-            seven_day_sonnet: null,
-            extra_usage: {
-                is_enabled: typeof parsed.extraUsageEnabled === 'boolean' ? parsed.extraUsageEnabled : false,
-                monthly_limit: typeof parsed.extraUsageLimit === 'number' ? parsed.extraUsageLimit : null,
-                used_credits: typeof parsed.extraUsageUsed === 'number' ? parsed.extraUsageUsed : null,
-                utilization: typeof parsed.extraUsageUtilization === 'number' ? parsed.extraUsageUtilization : null
-            }
-        }
-    } catch {
-        return null
-    }
-}
-
-async function fetchOAuthUsageWithToken(token: string): Promise<UsageFetchResult> {
-    try {
-        const resp = await fetch('https://api.anthropic.com/api/oauth/usage', {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json',
-                'anthropic-beta': 'oauth-2025-04-20'
-            },
-            signal: AbortSignal.timeout(10_000)
-        })
-        if (!resp.ok) {
-            return { ok: false, retryable: resp.status === 401 || resp.status === 403 || resp.status === 429 }
-        }
-        const data = await resp.json()
-        if (!data || typeof data !== 'object') return { ok: false, retryable: true }
-        return { ok: true, data: data as Record<string, unknown> }
-    } catch {
-        return { ok: false, retryable: true }
-    }
-}
-
-
 export class ApiMachineClient {
     private socket!: Socket<ServerToClientEvents, ClientToServerEvents>
     private keepAliveInterval: NodeJS.Timeout | null = null
@@ -279,7 +135,7 @@ export class ApiMachineClient {
             logger: (msg, data) => logger.debug(msg, data)
         })
 
-        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd())
+        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd(), { codexModelsMachineScoped: true })
 
         this.rpcHandlerManager.registerHandler<PathExistsRequest, PathExistsResponse>(RPC_METHODS.PathExists, async (params) => {
             const rawPaths = Array.isArray(params?.paths) ? params.paths : []
@@ -298,39 +154,6 @@ export class ApiMachineClient {
             }))
 
             return { exists }
-        })
-
-        this.rpcHandlerManager.registerHandler('getOAuthUsage', async () => {
-            const now = Date.now()
-            if (cachedOAuthUsage && now - cachedOAuthUsage.fetchedAt < OAUTH_USAGE_CACHE_TTL_MS) {
-                return cachedOAuthUsage.data
-            }
-
-            try {
-                const tokens = getUsageTokens()
-                for (const token of tokens) {
-                    const result = await fetchOAuthUsageWithToken(token)
-                    if (result.ok) {
-                        const enriched = {
-                            ...result.data,
-                            accountLabel: null
-                        }
-                        cachedOAuthUsage = { data: enriched, fetchedAt: now }
-                        return enriched
-                    }
-                    if (!result.retryable) break
-                }
-
-                const ccstatuslineCache = readCcstatuslineUsageCache()
-                if (ccstatuslineCache) {
-                    cachedOAuthUsage = { data: ccstatuslineCache, fetchedAt: now }
-                    return ccstatuslineCache
-                }
-
-                return cachedOAuthUsage?.data ?? null
-            } catch {
-                return readCcstatuslineUsageCache() ?? cachedOAuthUsage?.data ?? null
-            }
         })
 
         this.rpcHandlerManager.registerHandler<CursorChatStoreStatusRequest, CursorChatStoreStatus>(
@@ -355,6 +178,8 @@ export class ApiMachineClient {
                 return { success: false, error: 'Path is required' }
             }
 
+            const includeHidden = params?.includeHidden === true
+
             const targetPath = await this.resolveForWorkspaceCheck(rawPath)
             if (!this.isWithinWorkspaceRoots(targetPath)) {
                 return { success: false, error: 'Path is outside workspace roots' }
@@ -370,7 +195,7 @@ export class ApiMachineClient {
                 const entries: MachineDirectoryEntry[] = []
 
                 await Promise.all(dirEntries.map(async (entry) => {
-                    if (entry.name.startsWith('.')) return
+                    if (!includeHidden && entry.name.startsWith('.')) return
 
                     const fullPath = join(targetPath, entry.name)
                     let type: 'file' | 'directory' | 'other' = 'other'
@@ -454,6 +279,21 @@ export class ApiMachineClient {
             }
         )
 
+        this.rpcHandlerManager.registerHandler<ListCopilotModelsForCwdRequest, ListCopilotModelsForCwdResponse>(
+            RPC_METHODS.ListCopilotModelsForCwd,
+            async (params) => {
+                const rawCwd = typeof params?.cwd === 'string' ? params.cwd.trim() : ''
+                if (!rawCwd) return { success: false, error: 'cwd is required' }
+
+                const resolvedCwd = await this.resolveForWorkspaceCheck(rawCwd)
+                if (!this.isWithinWorkspaceRoots(resolvedCwd)) {
+                    return { success: false, error: 'Path is outside workspace roots' }
+                }
+
+                return await listCopilotModelsForCwd(resolvedCwd)
+            }
+        )
+
         this.rpcHandlerManager.registerHandler<unknown, ListCodexSessionsRpcResponse>(
             RPC_METHODS.ListCodexSessions,
             async (params) => {
@@ -474,7 +314,7 @@ export class ApiMachineClient {
                     : listLocalCodexSessionSummaries()
                 const sessions = []
                 for (const session of allSessions) {
-                    if (await this.isCodexSessionWithinWorkspaceRoots(session)) {
+                    if (await this.isLocalSessionWithinWorkspaceRoots(session)) {
                         sessions.push(session)
                     }
                 }
@@ -489,79 +329,37 @@ export class ApiMachineClient {
                 if (!parsed.success) return { success: false, error: 'Invalid Codex archive request' }
                 const sessionId = parsed.data.sessionId.trim()
                 return await archiveLocalCodexSession(sessionId, {
-                    canArchive: (session) => this.isCodexSessionWithinWorkspaceRoots(session)
+                    canArchive: (session) => this.isLocalSessionWithinWorkspaceRoots(session)
                 })
             }
         )
 
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
-            RPC_METHODS.ListCodexAccounts,
-            async () => CodexAccountsResponseSchema.parse(await codexAccountManager.listAccounts())
-        )
-
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountLoginStartResponse>(
-            RPC_METHODS.StartCodexAccountLogin,
-            async () => await codexAccountManager.startLogin()
-        )
-
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountLoginStatusResponse>(
-            RPC_METHODS.GetCodexAccountLoginStatus,
+        this.rpcHandlerManager.registerHandler<unknown, ListPiSessionsRpcResponse>(
+            RPC_METHODS.ListPiSessions,
             async (params) => {
-                const attemptId = asRecord(params)?.attemptId
-                if (typeof attemptId !== 'string' || !attemptId.trim()) {
-                    return {
-                        success: false,
-                        status: 'not_found',
-                        error: 'Codex login attempt id is required'
+                const parsed = ListPiSessionsRpcRequestSchema.safeParse(params)
+                if (!parsed.success) return { success: false, error: 'Invalid Pi sessions request' }
+                const rawCwd = typeof parsed.data.cwd === 'string' ? parsed.data.cwd.trim() : ''
+                if (rawCwd) {
+                    const resolvedCwd = await this.resolveForWorkspaceCheck(rawCwd)
+                    if (!this.isWithinWorkspaceRoots(resolvedCwd)) {
+                        return { success: false, error: 'Path is outside workspace roots' }
                     }
                 }
-                return CodexAccountLoginStatusResponseSchema.parse(
-                    codexAccountManager.getLoginStatus(attemptId)
-                )
-            }
-        )
-
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
-            RPC_METHODS.AddCodexApiEndpoint,
-            async (params) => {
-                const parsed = AddCodexApiEndpointRequestSchema.safeParse(params)
-                if (!parsed.success) {
-                    throw new Error(parsed.error.issues[0]?.message ?? 'Invalid Codex API endpoint')
+                const requestedIds = parsed.data.sessionIds ? new Set(parsed.data.sessionIds) : null
+                const allSessions = requestedIds
+                    ? listLocalPiSessionsWithMessagesByIds(requestedIds)
+                    : listLocalPiSessionSummaries()
+                const sessions = []
+                for (const session of allSessions) {
+                    if (await this.isLocalSessionWithinWorkspaceRoots(session)) sessions.push(session)
                 }
-                return CodexAccountsResponseSchema.parse(
-                    await codexAccountManager.addApiEndpoint(parsed.data)
-                )
-            }
-        )
-
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
-            RPC_METHODS.SetDefaultCodexAccount,
-            async (params) => {
-                const accountId = asRecord(params)?.accountId
-                if (typeof accountId !== 'string' || !accountId.trim()) {
-                    throw new Error('Codex account id is required')
-                }
-                return CodexAccountsResponseSchema.parse(
-                    await codexAccountManager.setDefaultAccount(accountId)
-                )
-            }
-        )
-
-        this.rpcHandlerManager.registerHandler<unknown, CodexAccountsResponse>(
-            RPC_METHODS.RemoveCodexAccount,
-            async (params) => {
-                const accountId = asRecord(params)?.accountId
-                if (typeof accountId !== 'string' || !accountId.trim()) {
-                    throw new Error('Codex account id is required')
-                }
-                return CodexAccountsResponseSchema.parse(
-                    await codexAccountManager.removeAccount(accountId)
-                )
+                return { success: true, sessions }
             }
         )
     }
 
-    private async isCodexSessionWithinWorkspaceRoots(session: { cwd?: string | null }): Promise<boolean> {
+    private async isLocalSessionWithinWorkspaceRoots(session: { cwd?: string | null }): Promise<boolean> {
         if (!this.normalizedWorkspaceRoots?.length) return true
         const cwd = session.cwd?.trim()
         if (!cwd) return false
@@ -610,7 +408,7 @@ export class ApiMachineClient {
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
         this.rpcHandlerManager.registerHandler(RPC_METHODS.SpawnHappySession, async (params: any) => {
-            const { directory, sessionId, existingSessionId, resumeSessionId, continueLatest, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, codexAccountId, codexSourceAccountId, collaborationMode, token, sessionType, worktreeName, sandbox } = params || {}
+            const { directory, sessionId, existingSessionId, resumeSessionId, continueLatest, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, codexAccountId, codexSourceAccountId, collaborationMode, copilotAgentMode, token, sessionType, worktreeName, startingMode, forkSession, sandbox } = params || {}
 
             if (!directory) {
                 throw new Error('Directory is required')
@@ -639,10 +437,13 @@ export class ApiMachineClient {
                 codexAccountId,
                 codexSourceAccountId,
                 collaborationMode,
+                copilotAgentMode,
                 token,
                 sessionType,
                 worktreeName,
-                sandbox
+                startingMode,
+                forkSession: forkSession === true,
+                sandbox: sandbox === true
             })
 
             switch (result.type) {
@@ -655,18 +456,14 @@ export class ApiMachineClient {
             }
         })
 
-        this.rpcHandlerManager.registerHandler(RPC_METHODS.StopSession, (params: any) => {
+        this.rpcHandlerManager.registerHandler(RPC_METHODS.StopSession, async (params: any) => {
             const { sessionId } = params || {}
             if (!sessionId) {
                 throw new Error('Session ID is required')
             }
 
-            const success = stopSession(sessionId)
-            if (!success) {
-                throw new Error('Session not found or failed to stop')
-            }
-
-            return { message: 'Session stopped' }
+            const status = await stopSession(sessionId)
+            return { status }
         })
 
         this.rpcHandlerManager.registerHandler(RPC_METHODS.StopRunner, () => {
@@ -747,8 +544,7 @@ export class ApiMachineClient {
             auth: {
                 token: this.token,
                 clientType: 'machine-scoped' as const,
-                machineId: this.machine.id,
-                clientTime: Date.now()
+                machineId: this.machine.id
             },
             path: '/socket.io/',
             reconnection: true,
@@ -765,7 +561,8 @@ export class ApiMachineClient {
                 status: 'running',
                 pid: process.pid,
                 httpPort: this.machine.runnerState?.httpPort,
-                startedAt: Date.now()
+                startedAt: Date.now(),
+                capabilities: { ...RUNNER_CAPABILITIES }
             })).catch((error) => {
                 logger.debug('[API MACHINE] Failed to update runner state on connect', error)
             })

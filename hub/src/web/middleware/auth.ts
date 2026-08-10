@@ -67,7 +67,7 @@ function isSharePathAllowed(method: string, path: string, sid: string): boolean 
     return false
 }
 
-export function createAuthMiddleware(jwtSecret: Uint8Array, store: Store): MiddlewareHandler<WebAppEnv> {
+export function createAuthMiddleware(jwtSecret: Uint8Array, store?: Store): MiddlewareHandler<WebAppEnv> {
     return async (c, next) => {
         const path = c.req.path
         // Public: initial auth, telegram bind, and share-link redeem.
@@ -99,7 +99,7 @@ export function createAuthMiddleware(jwtSecret: Uint8Array, store: Store): Middl
                 if (!sid || !shareToken) {
                     return c.json({ error: 'Invalid share token payload' }, 401)
                 }
-                const share = store.shares.getShareByToken(shareToken)
+                const share = store?.shares.getShareByToken(shareToken)
                 if (!share || share.revoked || share.sessionId !== sid || share.namespace !== parsed.data.ns) {
                     return c.json({ error: 'Share link revoked or invalid' }, 401)
                 }

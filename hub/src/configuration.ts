@@ -17,7 +17,7 @@
  * - CORS_ORIGINS: Comma-separated CORS origins
  * - HAPI_AUTO_ARCHIVE_IDLE_HOURS: Archive safe, idle runner sessions after N hours (default: 48; 0 disables)
  * - HAPI_RELAY_API: Relay API domain for tunwg (default: relay.hapi.run)
- * - HAPI_RELAY_AUTH: Relay auth key for tunwg (default: hapi)
+ * - HAPI_RELAY_AUTH: Relay auth key override (default: per-hub key issued by the relay)
  * - HAPI_RELAY_FORCE_TCP: Force TCP relay mode when UDP is unavailable (true/1)
  * - VAPID_SUBJECT: Contact email or URL for Web Push (defaults to mailto:admin@hapi.run)
  * - HAPI_HOME: Data directory (default: ~/.hapi)
@@ -28,6 +28,7 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getOrCreateCliApiToken } from './config/cliApiToken'
+import { applyProviderCredentialsFromSettings } from './config/providerCredentials'
 import { getSettingsFile } from './config/settings'
 import { loadServerSettings, type ServerSettings, type ServerSettingsResult } from './config/serverSettings'
 
@@ -160,6 +161,10 @@ class Configuration {
         if (settingsResult.savedToFile) {
             console.log(`[Hub] Configuration saved to ${getSettingsFile(dataDir)}`)
         }
+
+        // 3b. Apply Settings-managed provider credentials into process.env
+        // (env vars set at process start still win; no restart needed for UI saves)
+        await applyProviderCredentialsFromSettings(dataDir)
 
         // 4. Create configuration instance
         const config = new Configuration(

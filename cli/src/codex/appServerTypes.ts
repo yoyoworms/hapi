@@ -207,7 +207,36 @@ export interface ThreadResumeResponse {
     [key: string]: unknown;
 }
 
+export type ThreadStatus =
+    | { type: 'notLoaded' }
+    | { type: 'idle' }
+    | { type: 'systemError' }
+    | { type: 'active'; activeFlags: string[] };
+
+export interface ThreadReadParams {
+    threadId: string;
+    includeTurns?: boolean;
+}
+
+export interface ThreadReadResponse {
+    thread: {
+        id: string;
+        status?: ThreadStatus;
+        turns?: Array<{
+            id?: string;
+            status?: string;
+            items?: ResponseItem[];
+        }>;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
 export interface ThreadForkParams extends Omit<ThreadResumeParams, 'history' | 'path'> {
+    /** Inclusive terminal turn for the fork (stable). */
+    lastTurnId?: string | null;
+    /** Exclusive: copy history strictly before this turn (experimental). */
+    beforeTurnId?: string | null;
 }
 
 export interface ThreadForkResponse {
@@ -216,26 +245,6 @@ export interface ThreadForkResponse {
         turns?: Array<{ items?: ResponseItem[] }>;
     };
     model?: string;
-    [key: string]: unknown;
-}
-
-export interface ThreadReadParams {
-    threadId: string;
-    includeTurns?: boolean;
-}
-
-export type ThreadStatus =
-    | { type: 'notLoaded' }
-    | { type: 'idle' }
-    | { type: 'systemError' }
-    | { type: 'active'; activeFlags: string[] };
-
-export interface ThreadReadResponse {
-    thread: {
-        id: string;
-        status: ThreadStatus;
-        [key: string]: unknown;
-    };
     [key: string]: unknown;
 }
 
@@ -310,6 +319,8 @@ export interface TurnStartParams {
     personality?: string;
     outputSchema?: unknown;
     collaborationMode?: CollaborationMode;
+    /** Optional client identity echoed back as userMessage.clientId. */
+    clientUserMessageId?: string;
 }
 
 export interface TurnStartResponse {

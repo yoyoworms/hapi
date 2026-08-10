@@ -18,6 +18,7 @@ describe('startHappyServer skill_lookup', () => {
     let workingDirectory: string
     let client: Client | null
     let stopServer: (() => void) | null
+    let sendAgentMessage: ReturnType<typeof vi.fn>
 
     beforeEach(async () => {
         sandboxDir = await mkdtemp(join(tmpdir(), 'hapi-skill-mcp-'))
@@ -41,9 +42,10 @@ describe('startHappyServer skill_lookup', () => {
     })
 
     async function connect(enableSkillLookup = true): Promise<Client> {
+        sendAgentMessage = vi.fn()
         const sessionClient = {
             updateMetadata: vi.fn(),
-            sendAgentMessage: vi.fn(),
+            sendAgentMessage,
             sendClaudeSessionMessage: vi.fn()
         } as unknown as ApiSessionClient
         const server = await startHappyServer(sessionClient, enableSkillLookup
@@ -108,9 +110,32 @@ describe('startHappyServer skill_lookup', () => {
         expect(tools.tools.map((tool) => tool.name)).toEqual([
             'change_title',
             'display_image',
+            'display_video',
+            'display_media',
             'ping_peer',
-            'inspect_peer'
+            'inspect_peer',
+            'list_peers'
         ])
+    })
+
+    it('displays audio through display_media and emits a generated media message', async () => {
+        const path = join(sandboxDir, 'sample.wav')
+        await writeFile(path, Buffer.from('RIFFxxxxWAVE'))
+        const mcp = await connect(false)
+
+        const result = await mcp.callTool({
+            name: 'display_media',
+            arguments: { path, title: 'sample.wav' }
+        }) as ToolResult
+
+        expect(result.isError).toBe(false)
+        expect(result.content?.[0]?.text).toContain('Displayed media: sample.wav')
+        expect(sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'generated-image',
+            fileName: 'sample.wav',
+            mimeType: 'audio/wav',
+            source: { ingress: 'mcp', toolName: 'display_media' }
+        }))
     })
 
     it('does not expose change_title when native ACP titles are enabled', async () => {
@@ -127,28 +152,37 @@ describe('startHappyServer skill_lookup', () => {
         await mcp.connect(new StreamableHTTPClientTransport(new URL(server.url)))
         const tools = await mcp.listTools()
 
-        expect(server.toolNames).toEqual(['display_image', 'ping_peer', 'inspect_peer'])
+        expect(server.toolNames).toEqual(['display_image', 'display_video', 'display_media', 'list_peers', 'ping_peer', 'inspect_peer'])
         expect(tools.tools.map((tool) => tool.name)).toEqual([
             'display_image',
+            'display_video',
+            'display_media',
             'ping_peer',
-            'inspect_peer'
+            'inspect_peer',
+            'list_peers'
         ])
     })
 
 })
 
 describe('toClaudeAllowedHapiMcpTools', () => {
-    it('keeps ping_peer and inspect_peer registered but out of Claude --allowedTools', () => {
+    it('keeps local-path and peer tools registered but out of Claude --allowedTools', () => {
         expect(toClaudeAllowedHapiMcpTools([
             'change_title',
             'display_image',
+            'display_video',
+            'display_media',
+            'list_peers',
             'ping_peer',
             'inspect_peer',
             'skill_lookup'
         ])).toEqual([
             'mcp__hapi__change_title',
             'mcp__hapi__display_image',
+            'mcp__hapi__list_peers',
             'mcp__hapi__skill_lookup'
         ])
+        expect(toClaudeAllowedHapiMcpTools(['display_video'])).not.toContain('mcp__hapi__display_video')
+        expect(toClaudeAllowedHapiMcpTools(['display_media'])).not.toContain('mcp__hapi__display_media')
     })
 })

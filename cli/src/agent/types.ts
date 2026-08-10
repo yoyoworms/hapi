@@ -1,4 +1,5 @@
 import type { AgentFlavor } from '@hapi/protocol';
+import type { InlineMediaSource } from '@/modules/common/inlineMediaSource';
 
 export type McpEnvVar = {
     name: string;
@@ -29,7 +30,7 @@ export type PlanItem = {
 };
 
 export type AgentMessage =
-    | { type: 'text'; text: string }
+    | { type: 'text'; text: string; id?: string; live?: boolean; streamSnapshot?: boolean }
     | { type: 'reasoning'; text: string; id?: string; live?: boolean }
     | {
         type: 'tool_call';
@@ -39,6 +40,7 @@ export type AgentMessage =
         status: 'pending' | 'in_progress' | 'completed' | 'failed';
         title?: string;
         kind?: string;
+        progress?: unknown;
     }
     | { type: 'tool_result'; id: string; output: unknown; status: 'completed' | 'failed' }
     | {
@@ -48,10 +50,12 @@ export type AgentMessage =
         totalTokens?: number;
         thoughtTokens?: number;
         cacheReadTokens?: number;
+        cacheCreationTokens?: number;
         contextTokens?: number;
         contextWindow?: number;
     }
     | { type: 'plan'; items: PlanItem[] }
+    | { type: 'generated_image'; imageId: string; fileName: string; mimeType: string; source?: InlineMediaSource }
     | { type: 'turn_complete'; stopReason: string }
     | { type: 'error'; message: string };
 

@@ -44,9 +44,15 @@ export function registerFileHandlers(rpcHandlerManager: RpcHandlerManager, worki
 
         try {
             const resolvedPath = resolve(workingDirectory, data.path)
+            const stats = await stat(resolvedPath)
             const buffer = await readFile(resolvedPath)
             const content = buffer.toString('base64')
-            return { success: true, content }
+            return {
+                success: true,
+                content,
+                size: stats.size,
+                modified: stats.mtime.getTime()
+            }
         } catch (error) {
             logger.debug('Failed to read file:', error)
             return rpcError(getErrorMessage(error, 'Failed to read file'))

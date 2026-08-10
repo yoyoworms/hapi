@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER } from '@hapi/protocol/usage';
 import { open, stat } from 'node:fs/promises';
 import { BaseSessionScanner, type SessionFileScanResult, type SessionFileScanStats } from '@/modules/common/session/BaseSessionScanner';
 import { logger } from '@/ui/logger';
@@ -65,7 +66,7 @@ function extractInputText(input: unknown): string | null {
  * Everything else (metadata, config.update, llm.request, usage.record,
  * step.begin, plan_mode.*, …) is ignored.
  */
-export function convertKimiWireEvent(event: KimiWireEvent): KimiWireConversion | null {
+export function convertKimiWireEvent(event: KimiWireEvent, model?: string | null): KimiWireConversion | null {
     if (event.type === 'turn.prompt' || event.type === 'turn.steer') {
         const origin = asRecord(event.origin);
         if (asString(origin?.kind) !== 'user') {
@@ -149,11 +150,14 @@ export function convertKimiWireEvent(event: KimiWireEvent): KimiWireConversion |
         return {
             message: {
                 type: 'token_count',
+                model: typeof model === 'string' && model.trim() ? model.trim() : null,
+                ...INCLUSIVE_INPUT_TOKEN_USAGE_MARKER,
                 info: {
                     total: {
                         inputTokens: inputOther + cacheRead + cacheCreation,
                         outputTokens: asFiniteNumber(usage.output) ?? 0,
-                        cachedInputTokens: cacheRead
+                        cachedInputTokens: cacheRead,
+                        cacheWriteInputTokens: cacheCreation
                     }
                 }
             }

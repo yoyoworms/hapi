@@ -44,7 +44,7 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-class Logger {
+export class Logger {
   private dangerouslyUnencryptedServerLoggingUrl: string | undefined
 
   constructor(
@@ -85,9 +85,15 @@ class Logger {
   ): void {
     if (!process.env.DEBUG) {
       this.debug(`In production, skipping message inspection`)
+      return
     }
 
-    // Some of our messages are huge, but we still want to show them in the logs
+    // Some of our messages are huge, but we still want to show them in the logs.
+    // Redact by key before truncating: truncation still leaks useful prefixes of
+    // bearer tokens, API keys, and passwords.
+    const isSensitiveKey = (key: string): boolean => (
+      /authorization|cookie|credential|password|secret|token|api[_-]?key/i.test(key)
+    )
     const truncateStrings = (obj: unknown): unknown => {
       if (typeof obj === 'string') {
         return obj.length > maxStringLength 
@@ -110,7 +116,7 @@ class Logger {
             // Drop usage, not generally useful for debugging
             continue
           }
-          result[key] = truncateStrings(value)
+          result[key] = isSensitiveKey(key) ? '[REDACTED]' : truncateStrings(value)
         }
         return result
       }

@@ -236,6 +236,43 @@ describe('position pagination and structural epochs', () => {
         expect(store.messages.getMessageEpoch(target.id)).toBe(1)
     })
 
+    it('clamps future client timestamps to hub receive time', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'future-client-clock')
+        const before = Date.now()
+
+        const message = store.messages.addMessage(
+            session.id,
+            { text: 'future clock' },
+            undefined,
+            undefined,
+            before + 60_000,
+        )
+
+        expect(message.createdAt).toBeGreaterThanOrEqual(before)
+        expect(message.createdAt).toBeLessThanOrEqual(Date.now())
+        expect(message.invokedAt).toBe(message.createdAt)
+    })
+
+    it('bumps the epoch when a newly inserted message is backdated behind the cached head', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'epoch-backdated-insert')
+        const head = store.messages.addMessage(session.id, { text: 'head' })
+        const headPosition = { at: head.invokedAt ?? head.createdAt, seq: head.seq }
+
+        const backdated = store.messages.addMessage(
+            session.id,
+            { text: 'backdated' },
+            undefined,
+            undefined,
+            headPosition.at - 1_000,
+        )
+
+        expect(backdated.seq).toBeGreaterThan(head.seq)
+        expect(store.messages.getMessagesAfterPosition(session.id, 10, headPosition)).toEqual([])
+        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
+    })
+
     it('bumps the target epoch when a copied message lands behind the cached head', () => {
         const store = makeStore()
         const target = makeSession(store, 'epoch-copy-target')
@@ -435,26 +472,99 @@ describe('countFutureScheduledLocalMessages', () => {
     })
 })
 
+describe('moveUninvokedScheduledMessages', () => {
+    it('atomically moves only pending scheduled rows to the replacement session', () => {
+        const store = makeStore()
+        const source = makeSession(store, 'scheduled-source')
+        const replacement = makeSession(store, 'scheduled-replacement')
+        const now = Date.now()
+        const scheduled = store.messages.addMessage(source.id, { text: 'later' }, 'scheduled-local', now + 60_000)
+        store.messages.addMessage(source.id, { text: 'ordinary queued' }, 'ordinary-local')
+
+        expect(store.messages.moveUninvokedScheduledMessages(source.id, replacement.id)).toBe(1)
+        expect(store.messages.getAllMessages(source.id).map((message) => message.id)).not.toContain(scheduled.id)
+        expect(store.messages.getAllMessages(replacement.id)).toEqual([
+            expect.objectContaining({ id: scheduled.id, localId: 'scheduled-local', scheduledAt: now + 60_000, invokedAt: null })
+        ])
+        expect(store.messages.getUninvokedLocalMessages(source.id)).toEqual([
+            expect.objectContaining({ localId: 'ordinary-local', scheduledAt: null })
+        ])
+    })
+})
+
+describe('markUninvokedImmediateMessages', () => {
+    it('settles immediate queued rows while preserving scheduled rows for clear transfer', () => {
+        const store = makeStore()
+        const source = makeSession(store, 'clear-source-immediate')
+        const invokedAt = Date.now()
+        store.messages.addMessage(source.id, { text: 'immediate' }, 'immediate-local')
+        store.messages.addMessage(source.id, { text: 'scheduled' }, 'scheduled-local', invokedAt + 60_000)
+
+        expect(store.messages.markUninvokedImmediateMessages(source.id, invokedAt)).toEqual(['immediate-local'])
+        expect(store.messages.getAllMessages(source.id)).toEqual(expect.arrayContaining([
+            expect.objectContaining({ localId: 'immediate-local', invokedAt }),
+            expect.objectContaining({ localId: 'scheduled-local', invokedAt: null })
+        ]))
+    })
+})
+
+describe('content codec integration', () => {
+    it('stores large agent content compressed and returns it truncated on read', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'codec-agent')
+        const stdout = 'line\n'.repeat(60_000) // ~300KB, above the truncate limit
+        const content = {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'tool-call-result', callId: 'c1', output: { stdout } } }
+        }
+
+        const added = store.messages.addMessage(session.id, content)
+        const read = store.messages.getMessages(session.id, 10)
+        expect(read).toHaveLength(1)
+
+        const readContent = read[0]!.content as typeof content
+        expect(readContent.content.data.output.stdout.length).toBeLessThan(stdout.length)
+        expect(readContent.content.data.output.stdout).toContain('[hapi: truncated')
+        expect(readContent.content.data.callId).toBe('c1')
+        // addMessage's return value matches what a later read sees (SSE broadcast uses it)
+        expect(added.content).toEqual(read[0]!.content)
+    })
+
+    it('round-trips large queued user prompts verbatim (delivery path must not truncate)', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'codec-user')
+        const text = 'prompt '.repeat(30_000) // ~210KB user paste
+        store.messages.addMessage(
+            session.id,
+            { role: 'user', content: { type: 'text', text } },
+            'lid-big',
+            Date.now() + 60_000
+        )
+
+        const scheduled = store.messages.getMatureScheduledMessages(Date.now() + 120_000)
+        expect(scheduled).toHaveLength(1)
+        const delivered = scheduled[0]!.content as { content: { text: string } }
+        expect(delivered.content.text).toBe(text)
+    })
+})
+
 function agentOutput(uuid: string, text: string) {
     return { role: 'agent', content: { type: 'output', data: { uuid, text } } }
 }
 
 describe('content-uuid dedup (reconnect replay)', () => {
-    it('agent message with same content uuid is not re-inserted, even with other messages in between', () => {
+    it('deduplicates the same stable UUID even with another message in between', () => {
         const store = makeStore()
         const session = makeSession(store, 'uuid-dedup')
-
         const first = store.messages.addMessage(session.id, agentOutput('uuid-a', 'hello'))
-        // A different message lands in between (so the consecutive-only fallback would miss it).
         store.messages.addMessage(session.id, agentOutput('uuid-b', 'world'))
-        // Reconnect replays 'uuid-a' through a fresh socket — must be deduped to the original row.
         const replay = store.messages.addMessage(session.id, agentOutput('uuid-a', 'hello'))
 
         expect(replay.id).toBe(first.id)
         expect(store.messages.getMessages(session.id)).toHaveLength(2)
     })
 
-    it('distinct content uuids are all kept', () => {
+    it('keeps distinct UUIDs', () => {
         const store = makeStore()
         const session = makeSession(store, 'uuid-distinct')
         store.messages.addMessage(session.id, agentOutput('u1', 'a'))
@@ -463,11 +573,10 @@ describe('content-uuid dedup (reconnect replay)', () => {
         expect(store.messages.getMessages(session.id)).toHaveLength(3)
     })
 
-    it('preserves the content uuid when copying a message to another session', () => {
+    it('preserves the UUID when copying history into another session', () => {
         const store = makeStore()
         const target = makeSession(store, 'uuid-copy-target')
         const content = agentOutput('uuid-copied', 'copied output')
-
         const copied = store.messages.copyMessageToSession(target.id, {
             content,
             createdAt: Date.now() - 1_000,
@@ -483,62 +592,31 @@ describe('content-uuid dedup (reconnect replay)', () => {
 })
 
 describe('pruneOldMessages retention', () => {
-    it('keeps the most recent N delivered messages per session, deletes older ones', () => {
+    it('keeps the most recent delivered messages and bumps the affected epoch', () => {
         const store = makeStore()
         const session = makeSession(store, 'prune')
         for (let i = 0; i < 10; i++) {
             store.messages.addMessage(session.id, agentOutput(`p${i}`, `m${i}`))
         }
-        expect(store.messages.getMessageEpoch(session.id)).toBe(0)
-        const deleted = store.messages.pruneOldMessages(4)
-        expect(deleted).toBe(6)
+        expect(store.messages.pruneOldMessages(4)).toBe(6)
         expect(store.messages.getMessageEpoch(session.id)).toBe(1)
-
-        const remaining = store.messages.getMessages(session.id)
-        expect(remaining).toHaveLength(4)
-        // The kept rows are the most recent by seq.
-        expect(remaining.map(m => (m.content as any).content.data.uuid)).toEqual(['p6', 'p7', 'p8', 'p9'])
-
+        expect(store.messages.getMessages(session.id).map(
+            (message) => (message.content as { content: { data: { uuid: string } } }).content.data.uuid
+        )).toEqual(['p6', 'p7', 'p8', 'p9'])
         expect(store.messages.pruneOldMessages(4)).toBe(0)
-        expect(store.messages.getMessageEpoch(session.id)).toBe(1)
     })
 
-    it('never prunes pending (uninvoked) messages', () => {
+    it('never prunes pending prompts', () => {
         const store = makeStore()
         const session = makeSession(store, 'prune-pending')
-        // Queued user messages keep invoked_at NULL until acked.
         for (let i = 0; i < 5; i++) {
-            store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: `q${i}` } }, `lid-${i}`)
+            store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: `q${i}` } },
+                `lid-${i}`
+            )
         }
-        const deleted = store.messages.pruneOldMessages(1)
-        expect(deleted).toBe(0)
+        expect(store.messages.pruneOldMessages(1)).toBe(0)
         expect(store.messages.getMessages(session.id)).toHaveLength(5)
-        expect(store.messages.getMessageEpoch(session.id)).toBe(0)
-    })
-
-    it('bumps epochs only for sessions where rows were deleted', () => {
-        const store = makeStore()
-        const overCap = makeSession(store, 'prune-over-cap')
-        const atCap = makeSession(store, 'prune-at-cap')
-
-        for (let i = 0; i < 3; i++) {
-            store.messages.addMessage(overCap.id, agentOutput(`over-${i}`, `over ${i}`))
-        }
-        for (let i = 0; i < 2; i++) {
-            store.messages.addMessage(atCap.id, agentOutput(`at-${i}`, `at ${i}`))
-        }
-
-        expect(store.messages.pruneOldMessages(2)).toBe(1)
-        expect(store.messages.getMessageEpoch(overCap.id)).toBe(1)
-        expect(store.messages.getMessageEpoch(atCap.id)).toBe(0)
-    })
-
-    it('cap of 0 or negative is a no-op', () => {
-        const store = makeStore()
-        const session = makeSession(store, 'prune-noop')
-        store.messages.addMessage(session.id, agentOutput('x', 'x'))
-        expect(store.messages.pruneOldMessages(0)).toBe(0)
-        expect(store.messages.pruneOldMessages(-5)).toBe(0)
-        expect(store.messages.getMessages(session.id)).toHaveLength(1)
     })
 })

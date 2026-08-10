@@ -1,6 +1,7 @@
 import {
     getClaudeModelLabel,
     getCodexCollaborationModeLabel,
+    getCopilotAgentModeLabel,
     getPermissionModeLabel,
     getPermissionModeTone,
     isPermissionModeAllowedForFlavor
@@ -8,20 +9,20 @@ import {
 import type { PermissionModeTone } from '@hapi/protocol'
 import * as Popover from '@radix-ui/react-popover'
 import { useEffect, useMemo, useState } from 'react'
-import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode, ThreadGoal } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
-import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import {
-    formatCodexReasoningLabel,
-    formatCompactCodexReasoningLabel,
-    shouldShowCodexReasoningLabel
+    formatReasoningLabel,
+    formatCompactReasoningLabel,
+    getReasoningEffortForFlavor,
+    shouldShowReasoningStatusLabel
 } from '@/lib/codexStatusLabels'
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
-import type { PlanProgress } from '@/chat/planProgress'
 import type { LatestUsage } from '@/chat/reducer'
+import type { PlanProgress } from '@/chat/planProgress'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -180,9 +181,6 @@ export function formatAccountLimit(limit: AgentAccountStatus['window'], now = Da
     const percentage = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
         ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
         : null
-    // Keep the reset countdown visible: the exact timestamp in `title` is not
-    // accessible on touch-only PWA clients. Parentheses distinguish the
-    // quota window (5h/7d) from the time remaining until that window resets.
     return duration && percentage ? `${percentage} (${duration})` : percentage ?? duration
 }
 
@@ -309,11 +307,13 @@ export function StatusBar(props: {
     contextModel?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
+    effort?: string | null
     serviceTier?: string | null
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     threadGoal?: ThreadGoal | null
     planProgress?: PlanProgress | null
+    copilotAgentMode?: import('@hapi/protocol').CopilotAgentMode
     agentFlavor?: string | null
     voiceStatus?: ConversationStatus
 }) {
@@ -352,9 +352,12 @@ export function StatusBar(props: {
     const contextUsedPercentage = contextUsageDetails?.usedPercentage ?? null
 
     const permissionMode = props.permissionMode
+    // Copilot always shows permission (including Default) so model=auto sessions
+    // still surface the bottom-right mode chip. Other flavors keep Codex-style
+    // "hide default" parity.
     const displayPermissionMode = permissionMode
-        && permissionMode !== 'default'
         && isPermissionModeAllowedForFlavor(permissionMode, props.agentFlavor)
+        && (permissionMode !== 'default' || props.agentFlavor === 'copilot')
         ? permissionMode
         : null
 
@@ -367,17 +370,34 @@ export function StatusBar(props: {
     const collaborationModeLabel = displayCollaborationMode
         ? getCodexCollaborationModeLabel(displayCollaborationMode)
         : null
+    const displayCopilotAgentMode = props.agentFlavor === 'copilot'
+        && props.copilotAgentMode
+        && props.copilotAgentMode !== 'interactive'
+        ? props.copilotAgentMode
+        : null
+    const copilotAgentModeLabel = displayCopilotAgentMode
+        ? getCopilotAgentModeLabel(displayCopilotAgentMode)
+        : null
+    const reasoningEffort = getReasoningEffortForFlavor(
+        props.agentFlavor,
+        props.modelReasoningEffort,
+        props.effort
+    )
+    const displaysReasoning = shouldShowReasoningStatusLabel(props.agentFlavor, reasoningEffort)
+    const reasoningLabel = displaysReasoning
+        ? formatReasoningLabel(reasoningEffort, headerMetadata.showLabels)
+        : null
+    const compactReasoningLabel = displaysReasoning
+        ? formatCompactReasoningLabel(reasoningEffort)
+        : null
+    const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
     const accountStatus = props.accountStatus ?? null
     const accountClock = useMinuteClock(Boolean(accountStatus), accountStatus?.updatedAt)
     const accountWindowText = accountStatus ? formatAccountLimit(accountStatus.window, accountClock) : null
     const accountWeeklyText = accountStatus ? formatAccountLimit(accountStatus.weekly, accountClock) : null
     const accountWindowLabel = accountWindowText ? t('status.accountWindow', { value: accountWindowText }) : null
     const accountWeeklyLabel = accountWeeklyText ? t('status.accountWeekly', { value: accountWeeklyText }) : null
-    const accountLimitText = accountStatus
-        ? [accountWindowLabel, accountWeeklyLabel]
-            .filter(Boolean)
-            .join(' · ')
-        : ''
+    const accountLimitText = [accountWindowLabel, accountWeeklyLabel].filter(Boolean).join(' · ')
     const accountTitle = accountStatus
         ? [
             accountStatus.accountLabel ? `Account: ${accountStatus.accountLabel}` : null,
@@ -386,24 +406,12 @@ export function StatusBar(props: {
         ].filter(Boolean).join('\n')
         : undefined
     const usageText = formatUsageText(props.usage, props.latestUsage)
-    const displaysCodexReasoning = shouldShowCodexReasoningLabel(props.agentFlavor)
-    const codexReasoningLabel = displaysCodexReasoning
-        ? formatCodexReasoningLabel(props.modelReasoningEffort, headerMetadata.showLabels)
-        : null
-    const compactCodexReasoningLabel = displaysCodexReasoning
-        ? formatCompactCodexReasoningLabel(props.modelReasoningEffort)
-        : null
-    const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
     const goalLabel = props.agentFlavor === 'codex' && props.threadGoal
         ? props.threadGoal.status === 'active'
             ? 'goal'
             : `goal ${props.threadGoal.status === 'budgetLimited' ? 'limited' : props.threadGoal.status}`
         : null
-    const planProgress = getVisibleCodexPlanProgress(
-        props.agentFlavor,
-        props.planProgress,
-        props.thinking
-    )
+    const planProgress = getVisibleCodexPlanProgress(props.agentFlavor, props.planProgress, props.thinking)
 
     return (
         <div className="flex min-w-0 items-baseline justify-between gap-2 px-2 pb-1">
@@ -505,17 +513,11 @@ export function StatusBar(props: {
                         ) : null}
                         {accountLimitText ? (
                             <>
-                                <span
-                                    data-testid="account-usage-mobile"
-                                    className="flex shrink-0 flex-col items-end leading-[11px] sm:hidden"
-                                >
+                                <span data-testid="account-usage-mobile" className="flex shrink-0 flex-col items-end leading-[11px] sm:hidden">
                                     {accountWindowLabel ? <span className="whitespace-nowrap">{accountWindowLabel}</span> : null}
                                     {accountWeeklyLabel ? <span className="whitespace-nowrap">{accountWeeklyLabel}</span> : null}
                                 </span>
-                                <span
-                                    data-testid="account-usage-desktop"
-                                    className="hidden shrink-0 whitespace-nowrap sm:inline"
-                                >
+                                <span data-testid="account-usage-desktop" className="hidden shrink-0 whitespace-nowrap sm:inline">
                                     {accountLimitText}
                                 </span>
                             </>
@@ -523,18 +525,14 @@ export function StatusBar(props: {
                     </span>
                 ) : null}
                 {usageText ? (
-                    <span
-                        data-testid="session-usage-status"
-                        className="hidden shrink-0 text-[10px] text-[var(--app-hint)] sm:inline"
-                        title={usageText.title}
-                    >
+                    <span data-testid="session-usage-status" className="hidden shrink-0 text-[10px] text-[var(--app-hint)] sm:inline" title={usageText.title}>
                         {usageText.text}
                     </span>
                 ) : null}
-                {codexReasoningLabel ? (
+                {reasoningLabel ? (
                     <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-hint)]`}>
-                        <span className="sm:hidden">{compactCodexReasoningLabel}</span>
-                        <span className="hidden sm:inline">{codexReasoningLabel}</span>
+                        <span className="sm:hidden">{compactReasoningLabel}</span>
+                        <span className="hidden sm:inline">{reasoningLabel}</span>
                     </span>
                 ) : null}
                 {codexFastMode ? (
@@ -555,6 +553,11 @@ export function StatusBar(props: {
                 {collaborationModeLabel ? (
                     <span className="whitespace-nowrap text-xs text-blue-500">
                         {collaborationModeLabel}
+                    </span>
+                ) : null}
+                {copilotAgentModeLabel ? (
+                    <span className="whitespace-nowrap text-xs text-blue-500">
+                        {copilotAgentModeLabel}
                     </span>
                 ) : null}
                 {displayPermissionMode ? (
