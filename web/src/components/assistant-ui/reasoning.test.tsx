@@ -240,4 +240,15 @@ describe('ReasoningGroup', () => {
 
         expect(onNestedScrollFollowChange.mock.calls).toEqual([[false], [true]])
     })
+
+    it('does not contain overscroll so the outer chat keeps scrolling past the panel boundary', () => {
+        // Scroll chaining is native browser behavior: once the panel reaches
+        // its bottom, the next wheel gesture must keep scrolling the outer
+        // chat viewport. overscroll-behavior-y: contain (Tailwind
+        // `overscroll-y-contain`) blocks exactly that — it was removed in
+        // #1264 and must not come back (regression from #1398).
+        const { container } = renderGroup()
+        const scroll = container.querySelector('.aui-reasoning-scroll') as HTMLDivElement
+        expect(scroll.className).not.toContain('overscroll-y-contain')
+    })
 })
