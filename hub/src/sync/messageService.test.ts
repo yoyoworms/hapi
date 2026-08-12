@@ -941,11 +941,12 @@ describe('MessageService.sendMessage with scheduledAt', () => {
         const futureMs = Date.now() + 60_000
 
         const service = new MessageService(store, io, publisher as any)
-        await service.sendMessage(session.id, {
+        const result = await service.sendMessage(session.id, {
             text: 'hello future',
             localId: 'local-sched',
             scheduledAt: futureMs
         })
+        expect(result.deliveredImmediately).toBe(false)
 
         // DB must have the message with scheduledAt set
         const msgs = store.messages.getUninvokedLocalMessages(session.id)
@@ -979,7 +980,8 @@ describe('MessageService.sendMessage with scheduledAt', () => {
         } as unknown as Server
 
         const service = new MessageService(store, io, publisher as any)
-        await service.sendMessage(session.id, { text: 'immediate', localId: 'local-imm' })
+        const result = await service.sendMessage(session.id, { text: 'immediate', localId: 'local-imm' })
+        expect(result.deliveredImmediately).toBe(true)
 
         // CLI must receive the message immediately
         expect(cliEmitted).toHaveLength(1)

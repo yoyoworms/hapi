@@ -31,6 +31,7 @@ import { SessionRowSummary } from '@/components/SessionRowSummary'
 import { Spinner } from '@/components/Spinner'
 import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { useToast } from '@/lib/toast-context'
+import { hasLiveSessionWork } from '@/lib/sessionWorkState'
 
 export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
 
@@ -52,12 +53,7 @@ const RUNNING_BUCKETS = [
 
 /** Active sessions that warrant the optional pinned In progress section. Quiet actives stay in directory groups. */
 function isPinnedInProgressSession(session: SessionSummary): boolean {
-    if (!session.active) {
-        return false
-    }
-    return session.thinking
-        || (session.backgroundTaskCount ?? 0) > 0
-        || (session.pendingRequestsCount ?? 0) > 0
+    return hasLiveSessionWork(session)
 }
 
 export type SessionTimeRange = {

@@ -12,6 +12,7 @@ import { getCodexImportedAt } from '@/lib/codexImportedSessions'
 import { getSessionTitle } from '@/lib/sessionTitle'
 import { useTranslation } from '@/lib/use-translation'
 import { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
+import { shouldShowSessionTasks } from '@/lib/sessionWorkState'
 
 function LoaderIcon(props: { className?: string }) {
     return (
@@ -59,6 +60,7 @@ const ATTENTION_DOT_CLASS = {
 function getTodoProgress(session: SessionSummary): { completed: number; total: number } | null {
     if (!session.todoProgress) return null
     if (session.todoProgress.completed === session.todoProgress.total) return null
+    if (!shouldShowSessionTasks(session.metadata?.flavor, session)) return null
     return session.todoProgress
 }
 

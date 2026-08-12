@@ -70,6 +70,43 @@ describe('buildSessionStatusData', () => {
         expect(buildSessionStatusData({ goal, tasks, blocks: [], messages: [] })).toMatchObject({ goal, tasks })
     })
 
+    it('hides a stale incomplete Codex plan after the turn becomes idle', () => {
+        const tasks = [
+            { id: '1', content: 'Research', priority: 'medium' as const, status: 'in_progress' as const },
+            { id: '2', content: 'Ship', priority: 'medium' as const, status: 'pending' as const }
+        ]
+
+        expect(buildSessionStatusData({
+            goal: null,
+            tasks,
+            blocks: [],
+            messages: [],
+            agentFlavor: 'codex',
+            active: true,
+            thinking: false,
+            backgroundTaskCount: 0,
+            pendingRequestsCount: 0
+        })).toBeNull()
+    })
+
+    it('keeps Codex plan progress while work or a user request is active', () => {
+        const tasks = [
+            { id: '1', content: 'Research', priority: 'medium' as const, status: 'in_progress' as const }
+        ]
+
+        expect(buildSessionStatusData({
+            goal: null,
+            tasks,
+            blocks: [],
+            messages: [],
+            agentFlavor: 'codex',
+            active: true,
+            thinking: false,
+            pendingRequestsCount: 1
+        })?.tasks).toEqual(tasks)
+    })
+
+
     it('lists only active or failed subagents', () => {
         const blocks: ChatBlock[] = [
             toolBlock({ name: 'CodexAgent', tool: { id: 'agent-1', state: 'running', input: { summary: 'Inspect API', activity: 'Reading files' } } }),

@@ -4,6 +4,7 @@ import type { ChatBlock, NormalizedMessage, ToolCallBlock } from '@/chat/types'
 import { isSubagentToolName } from '@/chat/subagentTool'
 import { getCodexAgentActivity, getCodexAgentSummary } from '@/components/ToolCard/codexAgents'
 import { getInputStringAny, truncate } from '@/lib/toolInputUtils'
+import { shouldShowSessionTasks } from '@/lib/sessionWorkState'
 
 export type SessionStatusSubagent = {
     id: string
@@ -153,6 +154,10 @@ export function buildSessionStatusData(args: {
     tasks: readonly TodoItem[] | null | undefined
     blocks: readonly ChatBlock[]
     messages: readonly NormalizedMessage[]
+    agentFlavor?: string | null
+    active?: boolean
+    thinking?: boolean
+    pendingRequestsCount?: number
     backgroundTaskCount?: number
 }): SessionStatusData | null {
     const tools = collectToolBlocks(args.blocks)
@@ -168,9 +173,15 @@ export function buildSessionStatusData(args: {
     const possibleTerminalCommands = undiscoveredTerminalCount > 0
         ? detectedTerminals.uncertain.map((terminal) => terminal.command)
         : []
+    const showTasks = shouldShowSessionTasks(args.agentFlavor, {
+        active: args.active ?? true,
+        thinking: args.thinking ?? false,
+        backgroundTaskCount: args.backgroundTaskCount,
+        pendingRequestsCount: args.pendingRequestsCount
+    })
     const data: SessionStatusData = {
         goal: args.goal ?? null,
-        tasks: args.tasks ? [...args.tasks] : [],
+        tasks: showTasks && args.tasks ? [...args.tasks] : [],
         subagents: tools
             .map(subagentFromBlock)
             .filter((subagent): subagent is SessionStatusSubagent => subagent !== null),

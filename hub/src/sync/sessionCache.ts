@@ -500,6 +500,18 @@ export class SessionCache {
         const preserveQueuedThinking = !requestedThinking && pendingThinkingUntil > hubNow
         const hasUnconsumedPrompt = preserveQueuedThinking
             && this.store.messages.getImmediateQueuedLocalMessages(session.id).length > 0
+        // Codex update_plan is scoped to one turn and is not guaranteed to
+        // receive a final all-completed update. A quiet heartbeat is the safe
+        // lifecycle boundary: unlike the volatile false -> true heartbeat it
+        // cannot race a reliable update_plan from the newly-started turn.
+        const hasPendingRequest = Object.keys(session.agentState?.requests ?? {}).length > 0
+        const hasBackgroundWork = (session.backgroundTaskCount ?? 0) > 0
+        const clearedTodos = !requestedThinking
+            && !preserveQueuedThinking
+            && !hasPendingRequest
+            && !hasBackgroundWork
+            ? this.clearCodexTurnTodos(session)
+            : null
 
         session.active = true
         session.activeAt = Math.max(session.activeAt, t)
@@ -575,6 +587,7 @@ export class SessionCache {
             || (wasThinking !== session.thinking)
             || turnBoundaryChanged
             || modeChanged
+            || clearedTodos !== null
             || (now - lastBroadcastAt > 10_000)
 
         if (shouldBroadcast) {
@@ -593,7 +606,11 @@ export class SessionCache {
                     effort: session.effort,
                     serviceTier: session.serviceTier,
                     collaborationMode: session.collaborationMode,
-                    copilotAgentMode: session.copilotAgentMode
+                    copilotAgentMode: session.copilotAgentMode,
+                    ...(clearedTodos ? {
+                        todos: clearedTodos,
+                        updatedAt: session.updatedAt
+                    } : {})
                 } satisfies SessionPatch
             })
         }
@@ -616,6 +633,31 @@ export class SessionCache {
         this.pendingThinkingUntilBySessionId.delete(sessionId)
     }
 
+    /** Clear a completed/idle Codex turn's plan without outranking future
+     * client timestamps. The one-step ratchet preserves stale-write rejection
+     * while avoiding a Hub Date.now watermark from a different clock. */
+    private clearCodexTurnTodos(session: Session): { version: number; value: [] } | null {
+        if (session.metadata?.flavor !== 'codex' || !session.todos?.length) {
+            return null
+        }
+
+        const version = (session.todosUpdatedAt ?? 0) + 1
+        const updated = this.store.sessions.setSessionTodos(
+            session.id,
+            [],
+            version,
+            session.namespace
+        )
+        if (!updated) {
+            return null
+        }
+
+        session.todos = []
+        session.todosUpdatedAt = version
+        session.updatedAt = Math.max(session.updatedAt, version)
+        return { version, value: [] }
+    }
+
     markMessageQueued(
         sessionId: string,
         time: number = Date.now(),
@@ -628,6 +670,9 @@ export class SessionCache {
         const nextTime = clampAliveTime(time) ?? Date.now()
         const wasThinking = session.thinking
         const previousUpdatedAt = session.updatedAt
+        const clearedTodos = !wasThinking
+            ? this.clearCodexTurnTodos(session)
+            : null
 
         session.thinking = true
         session.thinkingAt = nextTime
@@ -643,7 +688,8 @@ export class SessionCache {
                 data: {
                     thinking: true,
                     activeTurnStartedAt: session.activeTurnStartedAt,
-                    updatedAt: session.updatedAt
+                    updatedAt: session.updatedAt,
+                    ...(clearedTodos ? { todos: clearedTodos } : {})
                 } satisfies SessionPatch
             })
         }
@@ -857,13 +903,20 @@ export class SessionCache {
         session.thinkingAt = t
         session.activeTurnStartedAt = null
         session.backgroundTaskCount = 0
+        const clearedTodos = this.clearCodexTurnTodos(session)
         this.pendingThinkingUntilBySessionId.delete(session.id)
         this.lastAlivePayloadTimeBySessionId.delete(session.id)
 
         this.publisher.emit({
             type: 'session-updated',
             sessionId: session.id,
-            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: 0 } satisfies SessionPatch
+            data: {
+                active: false,
+                thinking: false,
+                activeTurnStartedAt: null,
+                backgroundTaskCount: 0,
+                ...(clearedTodos ? { todos: clearedTodos, updatedAt: session.updatedAt } : {})
+            } satisfies SessionPatch
         })
         return t
     }
@@ -1043,6 +1096,7 @@ export class SessionCache {
             session.thinkingAt = now
             session.activeTurnStartedAt = null
             session.backgroundTaskCount = 0
+            const clearedTodos = this.clearCodexTurnTodos(session)
             this.pendingThinkingUntilBySessionId.delete(session.id)
             this.lastAlivePayloadTimeBySessionId.delete(session.id)
             expired.push(session.id)
@@ -1053,7 +1107,8 @@ export class SessionCache {
                     active: false,
                     thinking: false,
                     activeTurnStartedAt: null,
-                    backgroundTaskCount: 0
+                    backgroundTaskCount: 0,
+                    ...(clearedTodos ? { todos: clearedTodos, updatedAt: session.updatedAt } : {})
                 } satisfies SessionPatch
             })
         }

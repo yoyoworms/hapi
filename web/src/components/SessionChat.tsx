@@ -1316,12 +1316,20 @@ function SessionChatInner(props: SessionChatProps) {
             tasks: props.session.todos,
             blocks: reconciled.blocks,
             messages: normalizedMessages,
+            agentFlavor,
+            active: props.session.active,
+            thinking: props.session.thinking,
+            pendingRequestsCount: Object.keys(props.session.agentState?.requests ?? {}).length,
             backgroundTaskCount: props.session.backgroundTaskCount
         }),
         [
             reduced.latestGoal,
             props.session.todos,
+            props.session.active,
+            props.session.thinking,
+            props.session.agentState?.requests,
             props.session.backgroundTaskCount,
+            agentFlavor,
             reconciled.blocks,
             normalizedMessages
         ]

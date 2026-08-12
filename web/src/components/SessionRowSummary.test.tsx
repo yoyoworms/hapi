@@ -57,3 +57,34 @@ describe('SessionRowSummary pin indicator', () => {
         expect(screen.queryByLabelText(/Pinned/)).toBeNull()
     })
 })
+
+describe('SessionRowSummary plan progress', () => {
+    it('hides an idle Codex plan snapshot that was not finalized', () => {
+        renderSummary(makeSession({
+            thinking: false,
+            todoProgress: { completed: 0, total: 6 }
+        }))
+
+        expect(screen.queryByText('0/6')).toBeNull()
+    })
+
+    it('shows Codex plan progress while the turn is working', () => {
+        renderSummary(makeSession({
+            thinking: true,
+            todoProgress: { completed: 0, total: 6 }
+        }))
+
+        expect(screen.getByText('0/6')).toBeInTheDocument()
+    })
+
+
+    it('keeps non-Codex durable todo progress visible while idle', () => {
+        renderSummary(makeSession({
+            metadata: { name: 'Claude task', path: '/work/hapi', flavor: 'claude' },
+            thinking: false,
+            todoProgress: { completed: 1, total: 3 }
+        }))
+
+        expect(screen.getByText('1/3')).toBeInTheDocument()
+    })
+})

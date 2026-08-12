@@ -71,6 +71,273 @@ describe('alive incremental events', () => {
         expect(update.data).toEqual(expect.objectContaining({ active: true }))
     })
 
+    it('clears a stale Codex plan when a queued prompt starts the next turn', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-queued-turn',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 500, thinking: false })
+        const planVersion = now - 1_000
+        store.sessions.setSessionTodos(session.id, [{
+            id: 'codex-plan-1',
+            content: 'Old turn',
+            status: 'in_progress',
+            priority: 'medium'
+        }], planVersion, session.namespace)
+        cache.refreshSession(session.id)
+        events.length = 0
+
+        cache.markMessageQueued(session.id, now, now)
+
+        expect(cache.getSession(session.id)?.todos).toEqual([])
+        expect(store.sessions.getSession(session.id)?.todos).toEqual([])
+        const update = events.find((event) => event.type === 'session-updated')
+        expect(update).toBeDefined()
+        if (!update || update.type !== 'session-updated') return
+        expect(update.data).toEqual(expect.objectContaining({
+            thinking: true,
+            activeTurnStartedAt: now,
+            todos: { version: planVersion + 1, value: [] }
+        }))
+    })
+
+    it('clears a stale Codex plan at the authoritative idle boundary', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-idle',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 1_500, thinking: true })
+        const planVersion = now - 1_000
+        const todos = [{
+            id: 'codex-plan-1',
+            content: 'Current turn',
+            status: 'pending',
+            priority: 'medium' as const
+        }]
+        store.sessions.setSessionTodos(session.id, todos, planVersion, session.namespace)
+        cache.refreshSession(session.id)
+        events.length = 0
+
+        cache.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+
+        const updated = cache.getSession(session.id)
+        expect(updated?.todos).toEqual([])
+        expect(updated?.todosUpdatedAt).toBe(planVersion + 1)
+        expect(store.sessions.getSession(session.id)?.todos).toEqual([])
+        const update = events.find((event) => event.type === 'session-updated')
+        expect(update).toBeDefined()
+        if (!update || update.type !== 'session-updated') return
+        expect(update.data).toEqual(expect.objectContaining({
+            thinking: false,
+            todos: { version: planVersion + 1, value: [] }
+        }))
+    })
+
+    it('does not erase a current Codex plan before the first true heartbeat', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-before-heartbeat',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 2_000, thinking: false })
+        const todos = [{
+            id: 'codex-plan-1',
+            content: 'Current turn arrived reliably',
+            status: 'in_progress' as const,
+            priority: 'medium' as const
+        }]
+        store.sessions.setSessionTodos(session.id, todos, now - 1_000, session.namespace)
+        cache.refreshSession(session.id)
+
+        // The first volatile thinking=true heartbeat may arrive after the
+        // reliable update_plan message. It must not clear that current plan.
+        cache.handleSessionAlive({ sid: session.id, time: now, thinking: true })
+
+        expect(cache.getSession(session.id)?.todos).toEqual(todos)
+        expect(store.sessions.getSession(session.id)?.todos).toEqual(todos)
+    })
+
+    it('keeps a Codex plan while an idle heartbeat is waiting on user input', () => {
+        const store = new Store(':memory:')
+        const cache = new SessionCache(store, createPublisher([]))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-pending-request',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            {
+                requests: {
+                    approval: {
+                        tool: 'request_user_input',
+                        arguments: {},
+                        createdAt: now - 1_000
+                    }
+                },
+                completedRequests: {}
+            },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 2_000, thinking: true })
+        const todos = [{
+            id: 'codex-plan-1',
+            content: 'Wait for answer',
+            status: 'in_progress' as const,
+            priority: 'medium' as const
+        }]
+        store.sessions.setSessionTodos(session.id, todos, now - 500, session.namespace)
+        cache.refreshSession(session.id)
+
+        cache.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+
+        expect(cache.getSession(session.id)?.todos).toEqual(todos)
+    })
+
+    it('keeps a Codex plan while background work continues', () => {
+        const store = new Store(':memory:')
+        const cache = new SessionCache(store, createPublisher([]))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-background-work',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 2_000, thinking: true })
+        cache.applyBackgroundTaskDelta(session.id, { started: 1, completed: 0 })
+        const todos = [{
+            id: 'codex-plan-1',
+            content: 'Wait for terminal',
+            status: 'in_progress' as const,
+            priority: 'medium' as const
+        }]
+        store.sessions.setSessionTodos(session.id, todos, now - 500, session.namespace)
+        cache.refreshSession(session.id)
+
+        cache.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+
+        expect(cache.getSession(session.id)?.todos).toEqual(todos)
+    })
+
+    it('preserves non-Codex todos at the idle boundary', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'claude-todos-idle',
+            { path: '/tmp/project', host: 'localhost', flavor: 'claude' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        const todos = [{
+            id: 'todo-1',
+            content: 'Durable task',
+            status: 'pending' as const,
+            priority: 'medium' as const
+        }]
+        store.sessions.setSessionTodos(session.id, todos, now - 1_000, session.namespace)
+        cache.refreshSession(session.id)
+        cache.handleSessionAlive({ sid: session.id, time: now - 500, thinking: true })
+
+        cache.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+
+        expect(cache.getSession(session.id)?.todos).toEqual(todos)
+    })
+
+    it('clears a Codex plan when its runtime ends without another idle heartbeat', () => {
+        const store = new Store(':memory:')
+        const events: SyncEvent[] = []
+        const cache = new SessionCache(store, createPublisher(events))
+        const now = Date.now()
+        const session = cache.getOrCreateSession(
+            'codex-plan-session-end',
+            { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+            { requests: {}, completedRequests: {} },
+            'default'
+        )
+        cache.handleSessionAlive({ sid: session.id, time: now - 1_000, thinking: true })
+        store.sessions.setSessionTodos(session.id, [{
+            id: 'codex-plan-1',
+            content: 'Last task',
+            status: 'in_progress',
+            priority: 'medium'
+        }], now - 500, session.namespace)
+        cache.refreshSession(session.id)
+        events.length = 0
+
+        cache.handleSessionEnd({ sid: session.id, time: now })
+
+        expect(cache.getSession(session.id)?.todos).toEqual([])
+        const update = events.find((event) => event.type === 'session-updated')
+        expect(update).toBeDefined()
+        if (!update || update.type !== 'session-updated') return
+        expect(update.data).toEqual(expect.objectContaining({
+            active: false,
+            todos: expect.objectContaining({ value: [] })
+        }))
+    })
+
+    it('does not start a turn or clear Codex progress for a future scheduled prompt', async () => {
+        const store = new Store(':memory:')
+        const io = {
+            of: () => ({
+                to: () => ({ emit() {} })
+            })
+        }
+        const engine = new SyncEngine(
+            store,
+            io as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        const now = Date.now()
+        try {
+            const session = engine.getOrCreateSession(
+                'codex-plan-future-schedule',
+                { path: '/tmp/project', host: 'localhost', flavor: 'codex' },
+                { requests: {}, completedRequests: {} },
+                'default'
+            )
+            engine.handleSessionAlive({ sid: session.id, time: now, thinking: false })
+            const todos = [{
+                id: 'codex-plan-1',
+                content: 'Existing progress',
+                status: 'in_progress' as const,
+                priority: 'medium' as const
+            }]
+            store.sessions.setSessionTodos(session.id, todos, now + 1, session.namespace)
+            ;(engine as unknown as { sessionCache: { refreshSession(id: string): unknown } })
+                .sessionCache.refreshSession(session.id)
+
+            await engine.sendMessage(session.id, {
+                text: 'Run this later',
+                localId: 'future-plan-prompt',
+                scheduledAt: now + 60_000
+            })
+
+            expect(engine.getSession(session.id)?.thinking).toBe(false)
+            expect(engine.getSession(session.id)?.todos).toEqual(todos)
+        } finally {
+            engine.stop()
+        }
+    })
+
     it('emits full active machine object on machine alive', () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []

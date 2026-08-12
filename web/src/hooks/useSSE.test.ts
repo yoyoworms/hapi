@@ -273,6 +273,14 @@ describe('applySessionDetailPatch (PR #897 review, Copilot keep-alive)', () => {
         expect(next?.activeAt).toBe(11_000)
     })
 
+    it('applies and clears the current turn boundary from SSE patches', () => {
+        const started = applySessionDetailPatch(session, { activeTurnStartedAt: 3_000 })
+        expect(started?.activeTurnStartedAt).toBe(3_000)
+
+        const cleared = applySessionDetailPatch(started ?? session, { activeTurnStartedAt: null })
+        expect(cleared?.activeTurnStartedAt).toBeNull()
+    })
+
     it('returns null for a keep-alive that only repeats the current Copilot mode', () => {
         expect(applySessionDetailPatch(session, {
             active: true,

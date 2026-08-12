@@ -1169,8 +1169,14 @@ async uploadScratchlistAttachment(
         // sequence number. This prevents a late assistant reply from sorting
         // after the next user prompt on another client.
         await this.rpcGateway.flushMessages(sessionId)
-        const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
-        this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
+        const {
+            actualSessionId,
+            createdAt: activeTurnStartedAt,
+            deliveredImmediately
+        } = await this.messageService.sendMessage(sessionId, payload)
+        if (deliveredImmediately) {
+            this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
+        }
         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
     }
 
