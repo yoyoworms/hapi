@@ -6,6 +6,7 @@ import {
     createRootRoute,
     createRoute,
     createRouter,
+    retainSearchParams,
     useLocation,
     useMatchRoute,
     useNavigate,
@@ -1041,14 +1042,33 @@ const rootRoute = createRootRoute({
 
 function ShareViewerPage() {
     const { sharedSessionId } = useAppContext()
+    const { token } = useParams({ from: '/s/$token' })
     if (sharedSessionId) {
-        return <Navigate to="/sessions/$sessionId" params={{ sessionId: sharedSessionId }} replace />
+        return <Navigate {...buildSharedSessionNavigation(sharedSessionId, token)} />
     }
     return (
         <div className="flex h-full items-center justify-center p-4">
             <LoadingState label="Opening shared session…" className="text-sm" />
         </div>
     )
+}
+
+/**
+ * Render a shared session through the normal session route while preserving the
+ * capability-bearing share URL in the browser. This makes refreshes and copied
+ * address-bar links redeemable in a fresh tab without exposing owner routes.
+ */
+export function buildSharedSessionNavigation(sessionId: string, token: string) {
+    return {
+        to: '/sessions/$sessionId' as const,
+        params: { sessionId },
+        search: { share: token },
+        mask: {
+            to: '/s/$token' as const,
+            params: { token },
+        },
+        replace: true,
+    }
 }
 
 const shareViewerRoute = createRoute({
@@ -1078,9 +1098,21 @@ const sessionsIndexRoute = createRoute({
 const sessionDetailRoute = createRoute({
     getParentRoute: () => sessionsRoute,
     path: '$sessionId',
-    validateSearch: (search: Record<string, unknown>): { outline?: boolean } => {
+    validateSearch: (search: Record<string, unknown>): { outline?: boolean; share?: string } => {
         const outline = search.outline === true || search.outline === 'true'
-        return outline ? { outline: true } : {}
+        const share = typeof search.share === 'string' && search.share.length > 0
+            ? search.share
+            : undefined
+        return {
+            ...(outline ? { outline: true } : {}),
+            ...(share ? { share } : {}),
+        }
+    },
+    search: {
+        // A share token is the capability that makes session URLs portable.
+        // Keep it through chat/files/file navigation instead of relying on
+        // sessionStorage from the tab that first opened the link.
+        middlewares: [retainSearchParams(['share'])],
     },
     component: SessionDetailRoute,
 })

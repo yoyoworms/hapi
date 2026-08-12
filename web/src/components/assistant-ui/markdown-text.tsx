@@ -26,6 +26,8 @@ import { CopyIcon, CheckIcon, WrapIcon } from '@/components/icons'
 import { useTranslation } from '@/lib/use-translation'
 import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 import { useOptionalHappyChatContext } from '@/components/AssistantChat/context'
+import { useOptionalAppContext } from '@/lib/app-context'
+import { getShareTokenFromPath, getShareTokenFromSearch } from '@/hooks/useAuthSource'
 import { decodeFileDownloadHref, decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
 import { remarkSessionPathLinks } from '@/lib/remark-session-path-links'
 import { buildSessionReferencePath, parseSessionPathHref } from '@/lib/sessionReference'
@@ -498,12 +500,19 @@ function Code(props: ComponentPropsWithoutRef<'code'>) {
 
 function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & { filePath: string; sessionId: string }) {
     const navigate = useNavigate()
+    const appContext = useOptionalAppContext()
     const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
-    const search = new URLSearchParams({
+    const hrefSearch = new URLSearchParams({
         path: encodeBase64(props.filePath),
         origin: 'chat',
-    }).toString()
-    const href = `/sessions/${encodeURIComponent(props.sessionId)}/file?${search}`
+    })
+    const shareToken = appContext?.sharedMode
+        ? getShareTokenFromPath() ?? getShareTokenFromSearch()
+        : null
+    if (shareToken) {
+        hrefSearch.set('share', shareToken)
+    }
+    const href = `/sessions/${encodeURIComponent(props.sessionId)}/file?${hrefSearch}`
 
     const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
         props.onClick?.(event)
