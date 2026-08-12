@@ -441,6 +441,7 @@ export function HappyThread(props: {
     sessionId: string
     metadata: SessionMetadataSummary | null
     disabled: boolean
+    machineDiscoveryEnabled?: boolean
     onRefresh: () => void
     onRetryMessage?: (localId: string) => void
     historyActionPending?: boolean
@@ -467,7 +468,9 @@ export function HappyThread(props: {
 }) {
     const { t, locale } = useTranslation()
     const { preferences: headerMetadata } = useSessionHeaderMetadata()
-    const { machines } = useMachines(props.api, true)
+    const machineDiscoveryEnabled = props.machineDiscoveryEnabled !== false
+    const { machines: ownerMachines } = useMachines(props.api, machineDiscoveryEnabled)
+    const machines = machineDiscoveryEnabled ? ownerMachines : []
     const machineLabelsById = useMachineLabels(machines)
     const [shareTurn, setShareTurn] = useState<ShareTurnState>(null)
     const shareDialogOpen = shareTurn !== null

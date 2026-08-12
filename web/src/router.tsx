@@ -342,7 +342,11 @@ function classifySendError(
 }
 
 function SessionPage() {
-    const { api } = useAppContext()
+    const { api, sharedMode } = useAppContext()
+    // A share token can read and interact with its scoped session, but it
+    // cannot use owner-wide discovery/RPC endpoints. Keep those hooks mounted
+    // with a null client so shared viewers never issue forbidden requests.
+    const ownerApi = sharedMode ? null : api
     const { t } = useTranslation()
     const goBack = useAppGoBack()
     const navigate = useNavigate()
@@ -355,11 +359,16 @@ function SessionPage() {
         error: sessionError,
         refetch: refetchSession,
     } = useSession(api, sessionId)
-    const {
-        status: cursorChatStoreStatus,
-        isApplicable: cursorChatStoreApplicable,
-        error: cursorChatStoreError,
-    } = useCursorChatStoreStatus({ api, session })
+    const cursorChatStore = useCursorChatStoreStatus({
+        api: ownerApi,
+        session,
+        enabled: !sharedMode,
+    })
+    // Disabled TanStack queries can still expose owner-cached data. Never use
+    // that data while rendering a share-scoped session.
+    const cursorChatStoreStatus = sharedMode ? undefined : cursorChatStore.status
+    const cursorChatStoreApplicable = !sharedMode && cursorChatStore.isApplicable
+    const cursorChatStoreError = sharedMode ? null : cursorChatStore.error
     const {
         messages,
         warning: messagesWarning,
@@ -480,7 +489,7 @@ function SessionPage() {
                 ? t('session.action.reopenCursorMissing')
                 : t('session.action.reopenCursorChecking')
         : undefined
-    const canOfferInactiveReopen = session
+    const canOfferInactiveReopen = !sharedMode && session
         ? inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)
         : false
     const rawSendError = sendErrors[sessionId] ?? null
@@ -512,6 +521,13 @@ function SessionPage() {
     const resolveSessionId = useCallback(async (currentSessionId: string) => {
         if (!api || !session || session.active) {
             return { sessionId: currentSessionId, resumed: false }
+        }
+        if (sharedMode) {
+            throw new ApiError(
+                t('chat.sendError.sessionInactive'),
+                409,
+                'session_inactive',
+            )
         }
         const cached = resolvedSessionRef.current
         if (cached?.source === currentSessionId) {
@@ -545,7 +561,7 @@ function SessionPage() {
                 'session_inactive',
             )
         }
-    }, [api, session, messages.length, cursorChatStoreStatus?.onDisk, t, addToast])
+    }, [api, session, messages.length, cursorChatStoreStatus?.onDisk, sharedMode, t, addToast])
 
     const handleSessionResolved = useCallback((resolvedSessionId: string) => {
         if (session) {
@@ -650,13 +666,15 @@ function SessionPage() {
     const {
         commands: slashCommands,
         getSuggestions: getSlashSuggestions,
-    } = useSlashCommands(api, sessionId, agentType)
+    } = useSlashCommands(ownerApi, sessionId, agentType)
     const {
         getSuggestions: getSkillSuggestions,
-    } = useSkills(api, sessionId)
+    } = useSkills(ownerApi, sessionId)
     // Same list + search matcher as sidebar / share picker (tiann/hapi#1213).
-    const { sessions: allSessions } = useSessions(api)
-    const { machines: mentionMachines } = useMachines(api, true)
+    const { sessions: ownerSessions } = useSessions(ownerApi)
+    const { machines: ownerMachines } = useMachines(ownerApi, !sharedMode)
+    const allSessions = sharedMode ? [] : ownerSessions
+    const mentionMachines = sharedMode ? [] : ownerMachines
     const mentionMachineLabelsById = useMachineLabels(mentionMachines)
     // Same fallbacks as share picker / SessionList search.
     const resolveMentionMachineLabel = useCallback((machineId: string | null) => {
@@ -675,25 +693,27 @@ function SessionPage() {
             // v1: plain-text expansion (same grammar as Copy reference) — #1213.
             // v2: segmented rich composer with inline session tokens — #1215.
             // Match via sessionMatchesQuery (share/sidebar); label/insert via getSessionTitle.
-            const sessionHits = matchSessionsForMention(allSessions, search, {
-                excludeId: sessionId,
-                limit: 20,
-                resolveMachineLabel: resolveMentionMachineLabel,
-            }).map((s) => {
-                const title = getSessionTitle(s)
-                const mentionText = buildSessionReferenceText(title, s.id)
-                const idPrefix = s.id.slice(0, 8)
-                return {
-                    key: `session:${s.id}`,
-                    text: mentionText,
-                    label: `@${title || idPrefix}`,
-                    description: s.active
-                        ? `Session · ${idPrefix} · active`
-                        : `Session · ${idPrefix}`,
-                    // Rich composer atom; textarea path still inserts `text` prose.
-                    sessionMention: { id: s.id, title: title || idPrefix },
-                }
-            })
+            const sessionHits = sharedMode
+                ? []
+                : matchSessionsForMention(allSessions, search, {
+                    excludeId: sessionId,
+                    limit: 20,
+                    resolveMachineLabel: resolveMentionMachineLabel,
+                }).map((s) => {
+                    const title = getSessionTitle(s)
+                    const mentionText = buildSessionReferenceText(title, s.id)
+                    const idPrefix = s.id.slice(0, 8)
+                    return {
+                        key: `session:${s.id}`,
+                        text: mentionText,
+                        label: `@${title || idPrefix}`,
+                        description: s.active
+                            ? `Session · ${idPrefix} · active`
+                            : `Session · ${idPrefix}`,
+                        // Rich composer atom; textarea path still inserts `text` prose.
+                        sessionMention: { id: s.id, title: title || idPrefix },
+                    }
+                })
 
             const fileHits: Suggestion[] = []
             if ((agentType === 'codex' || agentType === 'copilot') && api && sessionId) {
@@ -717,12 +737,15 @@ function SessionPage() {
             return [...sessionHits, ...fileHits]
         }
         if (query.startsWith('$')) {
+            if (sharedMode) return []
             return await getSkillSuggestions(query)
         }
+        if (sharedMode) return []
         return await getSlashSuggestions(query)
     }, [
         agentType,
         api,
+        sharedMode,
         sessionId,
         allSessions,
         resolveMentionMachineLabel,
@@ -801,7 +824,7 @@ function SessionPage() {
             onViewModeChange={setViewMode}
             onRetryMessage={retryMessage}
             autocompleteSuggestions={getAutocompleteSuggestions}
-            availableSlashCommands={slashCommands}
+            availableSlashCommands={sharedMode ? [] : slashCommands}
             sendError={sendError}
             onClearSendError={clearSendError}
             onSuppressSendErrorRestore={suppressSendErrorRestore}

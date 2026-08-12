@@ -62,6 +62,20 @@ export function useCodexModels(args: {
     })
     const query = useSessionFallback ? sessionQuery : machineQuery
 
+    // A disabled observer may still see data/error left in the shared React
+    // Query cache by an authenticated owner view. A null client means this
+    // caller has no catalog access (for example, a session-share viewer), so
+    // keep both cached capabilities and cached failures out of its result.
+    // Keep cached data available to ordinary owner views that are only
+    // temporarily disabled (for example while switching agent/machine).
+    if (!api) {
+        return {
+            models: [],
+            isLoading: false,
+            error: null,
+        }
+    }
+
     return {
         models: query.data?.models ?? [],
         isLoading: query.isLoading,

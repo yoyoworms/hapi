@@ -80,6 +80,7 @@ import {
     type AttachmentDraftInput,
 } from '@/lib/composer-attachment-drafts'
 import { useTranslation } from '@/lib/use-translation'
+import { useOptionalAppContext } from '@/lib/app-context'
 import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutations/useSendMessage'
 import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { SessionHeader } from '@/components/SessionHeader'
@@ -602,6 +603,8 @@ export function SessionChat(props: SessionChatProps) {
 function SessionChatInner(props: SessionChatProps) {
     const { haptic } = usePlatform()
     const { t } = useTranslation()
+    const sharedMode = useOptionalAppContext()?.sharedMode ?? false
+    const ownerApi = sharedMode ? null : props.api
     const { codexExplorationCollapsed } = useCodexExplorationCollapse()
     const navigate = useNavigate()
     const [historyActionPending, setHistoryActionPending] = useState(false)
@@ -626,7 +629,7 @@ function SessionChatInner(props: SessionChatProps) {
         }
     }, [props.api, props.onRefresh, props.session.id])
     const sessionInactive = !props.session.active
-    const inactiveCanResume = inactiveSessionCanResume(
+    const inactiveCanResume = !sharedMode && inactiveSessionCanResume(
         props.session,
         props.messages.length,
         props.cursorChatOnDisk
@@ -638,7 +641,7 @@ function SessionChatInner(props: SessionChatProps) {
     // misleadingly "connected" view. Matches the composer terminal button, which
     // is likewise gated on `session.active`.
     const canViewAgentTerminal =
-        props.session.metadata?.startingMode === 'pty' && props.session.active
+        !sharedMode && props.session.metadata?.startingMode === 'pty' && props.session.active
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
@@ -661,8 +664,12 @@ function SessionChatInner(props: SessionChatProps) {
     // after a later explicit variant click and overwrite it.
     const enqueueCursorModelApply = useMemo(() => createSerialAsyncQueue(), [])
     const lastSyncedCursorModelRef = useRef<string | null | undefined>(undefined)
-    const scratchlist = useHubScratchlist(props.session.id, props.api)
-    const { sessions: allSessions } = useSessions(props.api)
+    const scratchlist = useHubScratchlist(props.session.id, ownerApi)
+    const { sessions: ownerSessions } = useSessions(ownerApi)
+    // `enabled: false` does not hide an existing TanStack Query cache entry.
+    // Do not resolve cross-session mention metadata from an owner cache while
+    // rendering a share-scoped session.
+    const allSessions = sharedMode ? [] : ownerSessions
     const resolveSessionMentionTooltip = useCallback((id: string, title: string) => {
         const hit = allSessions.find((s) => s.id === id) ?? null
         if (!hit) {
@@ -878,13 +885,13 @@ function SessionChatInner(props: SessionChatProps) {
     )
     const agentFlavor = props.session.metadata?.flavor ?? null
     const controlledByUser = props.session.agentState?.controlledByUser === true
-    const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
+    const codexCollaborationModeSupported = !sharedMode && agentFlavor === 'codex' && !controlledByUser
     const codexModelsState = useCodexModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
         machineId: props.session.metadata?.machineId ?? null,
         accountId: props.session.metadata?.codexAccountId ?? null,
-        enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
+        enabled: !sharedMode && agentFlavor === 'codex' && props.session.active && !controlledByUser
     })
     const effectiveCodexServiceTier = agentFlavor === 'codex'
         ? getEffectiveCodexServiceTier(
@@ -918,14 +925,14 @@ function SessionChatInner(props: SessionChatProps) {
         [codexSupportedReasoningEfforts]
     )
     const opencodeModelsState = useOpencodeModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'opencode' && props.session.active
+        enabled: !sharedMode && agentFlavor === 'opencode' && props.session.active
     })
     const opencodeReasoningEffortState = useOpencodeReasoningEffortOptions({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'opencode' && props.session.active
+        enabled: !sharedMode && agentFlavor === 'opencode' && props.session.active
     })
     const opencodeModelOptions = useMemo(() => {
         if (agentFlavor !== 'opencode') {
@@ -938,14 +945,14 @@ function SessionChatInner(props: SessionChatProps) {
         }))
     }, [agentFlavor, opencodeModelsState.availableModels])
     const grokModelsState = useGrokModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'grok' && props.session.active && !controlledByUser
+        enabled: !sharedMode && agentFlavor === 'grok' && props.session.active && !controlledByUser
     })
     const grokEffortState = useGrokReasoningEffortOptions({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'grok' && props.session.active && !controlledByUser
+        enabled: !sharedMode && agentFlavor === 'grok' && props.session.active && !controlledByUser
     })
     const grokModelOptions = useMemo(() => (
         agentFlavor === 'grok'
@@ -959,9 +966,9 @@ function SessionChatInner(props: SessionChatProps) {
             : undefined
     ), [agentFlavor, grokModelsState.availableModels])
     const copilotModelsState = useCopilotModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'copilot' && props.session.active && !controlledByUser
+        enabled: !sharedMode && agentFlavor === 'copilot' && props.session.active && !controlledByUser
     })
     const copilotModelOptions = useMemo(() => (
         agentFlavor === 'copilot'
@@ -977,15 +984,15 @@ function SessionChatInner(props: SessionChatProps) {
             : undefined
     ), [agentFlavor, copilotModelsState.availableModels])
     const cursorModelsState = useCursorModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'cursor' && props.session.active
+        enabled: !sharedMode && agentFlavor === 'cursor' && props.session.active
     })
     const sessionMachineId = props.session.metadata?.machineId ?? null
     const machineCursorModelsState = useCursorModelsForMachine({
-        api: props.api,
+        api: ownerApi,
         machineId: sessionMachineId,
-        enabled: agentFlavor === 'cursor' && props.session.active && Boolean(sessionMachineId)
+        enabled: !sharedMode && agentFlavor === 'cursor' && props.session.active && Boolean(sessionMachineId)
     })
     const sessionCliModelSkus = useMemo(() => (
         mergeCursorCliModelSkus(
@@ -1014,9 +1021,9 @@ function SessionChatInner(props: SessionChatProps) {
         props.session.model
     ])
     const piModelsState = usePiModels({
-        api: props.api,
+        api: ownerApi,
         sessionId: props.session.id,
-        enabled: agentFlavor === 'pi' && props.session.active
+        enabled: !sharedMode && agentFlavor === 'pi' && props.session.active
     })
     // Fallback to cached models from metadata when session is inactive
     const piMetadata = props.session.metadata as Record<string, unknown> | null
@@ -1148,6 +1155,7 @@ function SessionChatInner(props: SessionChatProps) {
 
     // Register session store for voice client tools
     useEffect(() => {
+        if (sharedMode) return
         registerSessionStore({
             getSession: () => props.session as { agentState?: { requests?: Record<string, unknown> } } | null,
             sendMessage: (_sessionId: string, message: string) => props.onSend(message),
@@ -1160,20 +1168,25 @@ function SessionChatInner(props: SessionChatProps) {
                 props.onRefresh()
             }
         })
-    }, [props.session, props.api, props.onSend, props.onRefresh])
+    }, [props.session, props.api, props.onSend, props.onRefresh, sharedMode])
 
     useEffect(() => {
+        if (sharedMode) return
         registerVoiceHooksStore(
             (sessionId) => (sessionId === props.session.id ? props.session : null),
             (sessionId) => (sessionId === props.session.id ? props.messages : [])
         )
-    }, [props.session, props.messages])
+    }, [props.session, props.messages, sharedMode])
 
     // Track and report new messages to voice assistant
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
     const prevMessagesRef = useRef<DecryptedMessage[]>([])
 
     useEffect(() => {
+        if (sharedMode) {
+            prevMessagesRef.current = props.messages
+            return
+        }
         const prevIds = new Set(prevMessagesRef.current.map(m => m.id))
         const newMessages = props.messages.filter(m => !prevIds.has(m.id))
 
@@ -1182,20 +1195,24 @@ function SessionChatInner(props: SessionChatProps) {
         }
 
         prevMessagesRef.current = props.messages
-    }, [props.messages, props.session.id])
+    }, [props.messages, props.session.id, sharedMode])
 
     // Report ready event when thinking stops
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
     const prevThinkingRef = useRef(props.session.thinking)
 
     useEffect(() => {
+        if (sharedMode) {
+            prevThinkingRef.current = props.session.thinking
+            return
+        }
         // Detect transition: thinking → not thinking
         if (prevThinkingRef.current && !props.session.thinking) {
             voiceHooks.onReady(props.session.id)
         }
 
         prevThinkingRef.current = props.session.thinking
-    }, [props.session.thinking, props.session.id])
+    }, [props.session.thinking, props.session.id, sharedMode])
 
     // Report permission requests to voice assistant
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
@@ -1204,6 +1221,11 @@ function SessionChatInner(props: SessionChatProps) {
     useEffect(() => {
         const requests = props.session.agentState?.requests ?? {}
         const currentIds = new Set(Object.keys(requests))
+
+        if (sharedMode) {
+            prevRequestIdsRef.current = currentIds
+            return
+        }
 
         for (const [requestId, request] of Object.entries(requests)) {
             if (!prevRequestIdsRef.current.has(requestId)) {
@@ -1217,7 +1239,7 @@ function SessionChatInner(props: SessionChatProps) {
         }
 
         prevRequestIdsRef.current = currentIds
-    }, [props.session.agentState?.requests, props.session.id])
+    }, [props.session.agentState?.requests, props.session.id, sharedMode])
 
     const handleVoiceToggle = useCallback(async () => {
         if (!voice) return
@@ -1729,7 +1751,7 @@ function SessionChatInner(props: SessionChatProps) {
         onSendMessage: handleSend,
         onAbort: handleAbort,
         attachmentAdapter,
-        allowSendWhenInactive: true,
+        allowSendWhenInactive: !sharedMode,
         pendingScheduleRef,
         pendingSendIntentRef,
     })
@@ -1819,12 +1841,13 @@ function SessionChatInner(props: SessionChatProps) {
                         serviceTier={effectiveCodexServiceTier}
                         sessionId={props.session.id}
                         metadata={props.session.metadata}
-                        disabled={sessionInactive}
+                        disabled={sessionInactive || sharedMode}
+                        machineDiscoveryEnabled={!sharedMode}
                         onRefresh={props.onRefresh}
                         onRetryMessage={props.onRetryMessage}
                         historyActionPending={historyActionPending}
-                        onForkConversation={controlledByUser ? undefined : onForkConversation}
-                        onRewindConversation={controlledByUser ? undefined : onRewindConversation}
+                        onForkConversation={sharedMode || controlledByUser ? undefined : onForkConversation}
+                        onRewindConversation={sharedMode || controlledByUser ? undefined : onRewindConversation}
                         isLatestCompletedBoundary={isLatestCompletedBoundary}
                         onViewModeChange={props.onViewModeChange}
                         isSyncingTail={props.isSyncingTail}
@@ -1862,10 +1885,12 @@ function SessionChatInner(props: SessionChatProps) {
                          * Auto-renders nothing unless `migrationStatus ===
                          * 'completed'`.
                          */}
-                        <ScratchlistMigrationBanner
-                            migrationStatus={scratchlist.migrationStatus}
-                            onDismiss={scratchlist.dismissMigrationBanner}
-                        />
+                        {!sharedMode ? (
+                            <ScratchlistMigrationBanner
+                                migrationStatus={scratchlist.migrationStatus}
+                                onDismiss={scratchlist.dismissMigrationBanner}
+                            />
+                        ) : null}
 
                         <div className="px-3">
                             {/*
@@ -1875,7 +1900,7 @@ function SessionChatInner(props: SessionChatProps) {
                              * useScratchlist hook above (so the toolbar counter
                              * and the drawer share one source of truth).
                              */}
-                            {scratchlistMode ? (
+                            {!sharedMode && scratchlistMode ? (
                                 <ScratchlistDrawerHost
                                     sessionId={props.session.id}
                                     api={props.api}
@@ -1924,7 +1949,9 @@ function SessionChatInner(props: SessionChatProps) {
                         effort={props.session.effort}
                         agentFlavor={agentFlavor}
                         availableModelOptions={
-                            agentFlavor === 'codex'
+                            sharedMode
+                                ? undefined
+                                : agentFlavor === 'codex'
                                 ? codexModelOptions
                                 : agentFlavor === 'cursor'
                                     ? (
@@ -1948,22 +1975,24 @@ function SessionChatInner(props: SessionChatProps) {
                                         // so Pi model changes go through the dedicated picker only.
                                         : undefined
                         }
-                        piModels={piModels}
-                        piSelectedModel={agentFlavor === 'pi' ? piSelectedModel : undefined}
+                        piModels={sharedMode ? undefined : piModels}
+                        piSelectedModel={!sharedMode && agentFlavor === 'pi' ? piSelectedModel : undefined}
                         availableModelReasoningEffortOptions={
-                            agentFlavor === 'codex'
+                            sharedMode
+                                ? undefined
+                                : agentFlavor === 'codex'
                                 ? codexReasoningEffortOptions
                                 : agentFlavor === 'opencode' && opencodeReasoningEffortState.options.length > 0
                                     ? opencodeReasoningEffortState.options
                                     : undefined
                         }
                         availableEffortOptions={
-                            agentFlavor === 'grok' && grokEffortState.options.length > 0
+                            !sharedMode && agentFlavor === 'grok' && grokEffortState.options.length > 0
                                 ? grokEffortState.options
                                 : undefined
                         }
                         active={props.session.active}
-                        allowSendWhenInactive
+                        allowSendWhenInactive={!sharedMode}
                         onResumeStoredDraft={() => handleSend('', undefined, null)}
                         thinking={props.session.thinking}
                         agentState={props.session.agentState}
@@ -1977,32 +2006,33 @@ function SessionChatInner(props: SessionChatProps) {
                         contextModel={reduced.latestUsage?.model ?? props.session.model}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
-                            codexCollaborationModeSupported && props.session.active && !controlledByUser
+                            !sharedMode && codexCollaborationModeSupported && props.session.active && !controlledByUser
                                 ? handleCollaborationModeChange
                                 : undefined
                         }
                         onCopilotAgentModeChange={
-                            agentFlavor === 'copilot' && props.session.active && !controlledByUser
+                            !sharedMode && agentFlavor === 'copilot' && props.session.active && !controlledByUser
                                 ? handleCopilotAgentModeChange
                                 : undefined
                         }
                         onPermissionModeChange={
-                            agentFlavor === 'copilot' && controlledByUser
+                            sharedMode || (agentFlavor === 'copilot' && controlledByUser)
                                 ? undefined
                                 : handlePermissionModeChange
                         }
                         selectedModelBase={
-                            agentFlavor === 'cursor' && cursorPicker
+                            !sharedMode && agentFlavor === 'cursor' && cursorPicker
                                 ? cursorSelectedBaseValue
                                 : undefined
                         }
                         selectedModelVariant={
-                            agentFlavor === 'cursor' && !cursorCatalogPending
+                            !sharedMode && agentFlavor === 'cursor' && !cursorCatalogPending
                                 ? cursorVariantSelectValue
                                 : undefined
                         }
                         modelEffortOptions={
-                            agentFlavor === 'cursor'
+                            !sharedMode
+                                && agentFlavor === 'cursor'
                                 && !cursorCatalogPending
                                 && cursorPicker?.mode === 'dual'
                                 && cursorModelEffortOptions
@@ -2011,12 +2041,13 @@ function SessionChatInner(props: SessionChatProps) {
                                 : undefined
                         }
                         resolveModelVariantsForBase={
-                            agentFlavor === 'cursor' && cursorPicker?.mode === 'dual'
+                            !sharedMode && agentFlavor === 'cursor' && cursorPicker?.mode === 'dual'
                                 ? resolveCursorVariantsForBase
                                 : undefined
                         }
-                        onModelChange={
-                            agentFlavor === 'codex'
+                        onModelChange={sharedMode
+                            ? undefined
+                            : agentFlavor === 'codex'
                                 ? (props.session.active && !controlledByUser && !codexModelsState.error ? handleModelChange : undefined)
                                 : agentFlavor === 'cursor'
                                     ? (props.session.active
@@ -2040,7 +2071,8 @@ function SessionChatInner(props: SessionChatProps) {
                                         : handleModelChange
                         }
                         onModelEffortChange={
-                            agentFlavor === 'cursor'
+                            !sharedMode
+                                && agentFlavor === 'cursor'
                                 && props.session.active
                                 && !controlledByUser
                                 && !cursorCatalogPending
@@ -2049,15 +2081,17 @@ function SessionChatInner(props: SessionChatProps) {
                                 : undefined
                         }
                         onModelReasoningEffortChange={
-                            (agentFlavor === 'codex' || agentFlavor === 'opencode')
+                            !sharedMode
+                                && (agentFlavor === 'codex' || agentFlavor === 'opencode')
                                 && props.session.active
                                 && !controlledByUser
                                 && (agentFlavor !== 'opencode' || opencodeReasoningEffortState.options.length > 0)
                                 ? handleModelReasoningEffortChange
                                 : undefined
                         }
-                        onEffortChange={
-                            agentFlavor === 'grok'
+                        onEffortChange={sharedMode
+                            ? undefined
+                            : agentFlavor === 'grok'
                                 ? (props.session.active && !controlledByUser && grokEffortState.options.length > 0
                                     ? handleEffortChange
                                     : undefined)
@@ -2065,7 +2099,8 @@ function SessionChatInner(props: SessionChatProps) {
                         }
                         serviceTier={effectiveCodexServiceTier}
                         onServiceTierChange={
-                            agentFlavor === 'codex'
+                            !sharedMode
+                                && agentFlavor === 'codex'
                                 && props.session.active
                                 && !controlledByUser
                                 && !codexModelsState.error
@@ -2073,20 +2108,20 @@ function SessionChatInner(props: SessionChatProps) {
                                 ? handleServiceTierChange
                                 : undefined
                         }
-                        onSwitchToRemote={handleSwitchToRemote}
-                        onTerminal={props.session.active && terminalSupported ? handleViewTerminal : undefined}
-                        terminalUnsupported={props.session.active && !terminalSupported}
+                        onSwitchToRemote={sharedMode ? undefined : handleSwitchToRemote}
+                        onTerminal={!sharedMode && props.session.active && terminalSupported ? handleViewTerminal : undefined}
+                        terminalUnsupported={!sharedMode && props.session.active && !terminalSupported}
                         autocompleteSuggestions={props.autocompleteSuggestions}
-                        voiceStatus={voice?.status}
-                        voiceMicMuted={voice?.micMuted}
-                        onVoiceToggle={voice && voiceBackendReady ? handleVoiceToggle : undefined}
-                        onVoiceMicToggle={voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
-                        voiceTranscriptionApi={props.api}
-                        scratchlistMode={scratchlistMode}
-                        scratchlistCount={scratchlist.entries.length}
-                        onScratchlistToggle={handleScratchlistToggle}
-                        onParkScratchlist={onParkScratchlist}
-                        onScratchlistParkingChange={setIsScratchlistParking}
+                        voiceStatus={sharedMode ? undefined : voice?.status}
+                        voiceMicMuted={sharedMode ? undefined : voice?.micMuted}
+                        onVoiceToggle={!sharedMode && voice && voiceBackendReady ? handleVoiceToggle : undefined}
+                        onVoiceMicToggle={!sharedMode && voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
+                        voiceTranscriptionApi={sharedMode ? undefined : props.api}
+                        scratchlistMode={sharedMode ? undefined : scratchlistMode}
+                        scratchlistCount={sharedMode ? undefined : scratchlist.entries.length}
+                        onScratchlistToggle={sharedMode ? undefined : handleScratchlistToggle}
+                        onParkScratchlist={sharedMode ? undefined : onParkScratchlist}
+                        onScratchlistParkingChange={sharedMode ? undefined : setIsScratchlistParking}
                         sendError={props.sendError ?? null}
                         onClearSendError={handleClearSendError}
                         onSuppressSendErrorRestore={props.onSuppressSendErrorRestore}
@@ -2099,7 +2134,7 @@ function SessionChatInner(props: SessionChatProps) {
             </div>
 
             {/* Voice session component - renders nothing but initializes voice backend */}
-            {voice && (
+            {!sharedMode && voice && (
                 <VoiceBackendSession
                     api={props.api}
                     micMuted={voice.micMuted}

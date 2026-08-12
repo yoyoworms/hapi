@@ -21,6 +21,46 @@ function createQueryClient(): QueryClient {
 }
 
 describe('useCodexModels query scoping', () => {
+    it('returns an empty result without API access even if the owner catalog is cached', async () => {
+        const getMachineCodexModels = vi.fn(async () => ({
+            success: true,
+            models: [{ id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }]
+        }))
+        const getSessionCodexModels = vi.fn()
+        const api = {
+            getMachineCodexModels,
+            getSessionCodexModels
+        } as unknown as ApiClient
+        const queryClient = createQueryClient()
+        const sharedWrapper = wrapper(queryClient)
+
+        const owner = renderHook(() => useCodexModels({
+            api,
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            enabled: true
+        }), { wrapper: sharedWrapper })
+
+        await waitFor(() => {
+            expect(owner.result.current.models[0]?.id).toBe('gpt-5.5')
+        })
+
+        const viewer = renderHook(() => useCodexModels({
+            api: null,
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            enabled: false
+        }), { wrapper: sharedWrapper })
+
+        expect(viewer.result.current).toEqual({
+            models: [],
+            isLoading: false,
+            error: null
+        })
+        expect(getMachineCodexModels).toHaveBeenCalledTimes(1)
+        expect(getSessionCodexModels).not.toHaveBeenCalled()
+    })
+
     it('shares machine-backed discovery across sessions on the same machine', async () => {
         const getMachineCodexModels = vi.fn(async () => ({
             success: true,

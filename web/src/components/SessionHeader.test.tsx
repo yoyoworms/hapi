@@ -5,6 +5,7 @@ import type { Session } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { I18nProvider } from '@/lib/i18n-context'
 import { ToastProvider, useToast } from '@/lib/toast-context'
+import { AppContextProvider } from '@/lib/app-context'
 import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
 
 afterEach(() => {
@@ -82,6 +83,44 @@ describe('resolveSessionHeaderMachineLabel', () => {
 })
 
 describe('SessionHeader', () => {
+    it('does not query machines or expose owner actions in shared mode', async () => {
+        const getMachines = vi.fn().mockResolvedValue({ machines: [] })
+        const api = { getMachines } as unknown as ApiClient
+
+        render(
+            <QueryClientProvider client={new QueryClient()}>
+                <ToastProvider>
+                    <I18nProvider>
+                        <AppContextProvider value={{
+                            api,
+                            token: 'share-jwt',
+                            baseUrl: 'https://example.test',
+                            sharedMode: true,
+                            sharedSessionId: 'session-1',
+                        }}>
+                            <SessionHeader
+                                session={baseSession({
+                                    metadata: {
+                                        flavor: 'codex',
+                                        path: '/repo',
+                                        host: 'machine',
+                                        machineId: 'machine-1',
+                                    },
+                                })}
+                                onBack={vi.fn()}
+                                api={api}
+                            />
+                        </AppContextProvider>
+                    </I18nProvider>
+                </ToastProvider>
+            </QueryClientProvider>,
+        )
+
+        await Promise.resolve()
+        expect(getMachines).not.toHaveBeenCalled()
+        expect(screen.queryByRole('button', { name: /More/ })).not.toBeInTheDocument()
+    })
+
     it('uses only the canReopen-gated Reopen action for inactive sessions', () => {
         const api = {
             getMachines: vi.fn().mockResolvedValue({ machines: [] }),

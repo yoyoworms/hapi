@@ -187,7 +187,8 @@ export function SessionHeader(props: {
     const piSessionId = session.metadata?.flavor === 'pi'
         ? session.metadata.piSessionId?.trim() || null
         : null
-    const { machines } = useMachines(api, Boolean(api) && !sharedMode)
+    const { machines: ownerMachines } = useMachines(api, Boolean(api) && !sharedMode)
+    const machines = sharedMode ? [] : ownerMachines
     const machineLabelsById = useMachineLabels(machines)
     const machineLabel = useMemo(
         () => resolveSessionHeaderMachineLabel(session, machineLabelsById),
@@ -594,7 +595,7 @@ export function SessionHeader(props: {
                 api={api}
             />
 
-            {api && agentFlavor === 'codex' ? (
+            {!sharedMode && api && agentFlavor === 'codex' ? (
                 <CodexAccountSwitchDialog
                     isOpen={codexAccountSwitchOpen}
                     onClose={() => setCodexAccountSwitchOpen(false)}

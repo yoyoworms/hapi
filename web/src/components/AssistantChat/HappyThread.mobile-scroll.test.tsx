@@ -3,8 +3,10 @@ import type { PropsWithChildren } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '@/lib/i18n-context'
 
+const useMachinesMock = vi.fn((_api: ApiClient | null, _enabled: boolean) => ({ machines: [] }))
+
 vi.mock('@/hooks/queries/useMachines', () => ({
-    useMachines: () => ({ machines: [] })
+    useMachines: (api: ApiClient | null, enabled: boolean) => useMachinesMock(api, enabled)
 }))
 
 vi.mock('@assistant-ui/react', async (importOriginal) => {
@@ -81,6 +83,7 @@ function renderThread(onViewModeChange = vi.fn()) {
 }
 
 beforeEach(() => {
+    useMachinesMock.mockClear()
     vi.useFakeTimers()
     Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
         configurable: true,
@@ -105,6 +108,40 @@ afterEach(() => {
 })
 
 describe('mobile initial scroll settling', () => {
+    it('disables owner machine discovery when requested by a shared viewer', () => {
+        render(
+            <I18nProvider>
+                <HappyThread
+                    api={{} as ApiClient}
+                    session={{ metadata: {} } as Session}
+                    sessionId="shared-session"
+                    metadata={null}
+                    disabled={false}
+                    machineDiscoveryEnabled={false}
+                    onRefresh={vi.fn()}
+                    onViewModeChange={vi.fn()}
+                    isSyncingTail={false}
+                    messagesWarning={null}
+                    hasMoreMessages={false}
+                    isLoadingMoreMessages={false}
+                    onLoadMore={vi.fn().mockResolvedValue({ status: 'exhausted' })}
+                    onCancelLoadMore={vi.fn()}
+                    unseenCount={0}
+                    rawMessagesCount={0}
+                    normalizedMessagesCount={0}
+                    messagesVersion={0}
+                    historyVersion={0}
+                    forceScrollToken={0}
+                    outlineOpen={false}
+                    outlineItems={[]}
+                    onOutlineOpenChange={vi.fn()}
+                />
+            </I18nProvider>,
+        )
+
+        expect(useMachinesMock).toHaveBeenCalledWith(expect.anything(), false)
+    })
+
     it('does not snap back after pointer cancellation ends a touch swipe', () => {
         const { viewport, onViewModeChange } = renderThread()
         expect(viewport.scrollTop).toBe(702)

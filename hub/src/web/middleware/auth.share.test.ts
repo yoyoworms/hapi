@@ -57,9 +57,12 @@ describe('share-scoped auth middleware', () => {
         expect((await req(app, 'POST', `/api/sessions/${SID}/archive`, token)).status).toBe(403)
         expect((await req(app, 'DELETE', `/api/sessions/${SID}`, token)).status).toBe(403)
         expect((await req(app, 'POST', `/api/sessions/${SID}/share`, token)).status).toBe(403)
+        expect((await req(app, 'GET', `/api/sessions/${SID}/codex-models`, token)).status).toBe(403)
+        expect((await req(app, 'POST', `/api/sessions/${SID}/model`, token)).status).toBe(403)
         // Namespace-wide surfaces.
         expect((await req(app, 'GET', '/api/sessions', token)).status).toBe(403)
         expect((await req(app, 'GET', '/api/machines', token)).status).toBe(403)
+        expect((await req(app, 'GET', '/api/machines/machine-1/codex-models', token)).status).toBe(403)
     })
 
     it('rejects a revoked share on every request', async () => {
