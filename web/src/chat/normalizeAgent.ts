@@ -1058,6 +1058,28 @@ export function normalizeAgentRecord(
             }
         }
 
+        // Defensive parity with context_compacted above: a compact-summary
+        // arriving in the codex envelope (e.g. from an older import path or a
+        // future producer) must not be silently dropped by the codex-content
+        // filter — map it to the same agent-event the live pi wrapper emits
+        // so it renders as the dedicated chat block.
+        if (data.type === 'compact-summary' && typeof data.summary === 'string') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'compact-summary',
+                    summary: data.summary,
+                    tokensBefore: asNumber(data.tokensBefore) ?? undefined,
+                    estimatedTokensAfter: asNumber(data.estimatedTokensAfter) ?? undefined
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
         if (data.type === 'token_count') {
             const usage = normalizeCodexTokenUsage(data.info, data)
             return usage ? {

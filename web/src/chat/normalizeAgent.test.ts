@@ -209,3 +209,24 @@ describe('normalizeAgentRecord — agentTimestamp exposure', () => {
         expect(normalized).toMatchObject({ role: 'agent', agentTimestamp: null })
     })
 })
+
+describe('normalizeAgentRecord — imported pi compact-summary (codex envelope)', () => {
+    it('maps an imported compaction summary to the compact-summary agent event', () => {
+        const normalized = normalizeAgentRecord('pi-compact-1', null, 1, {
+            type: 'codex',
+            data: {
+                type: 'compact-summary',
+                summary: '## Goal\ncondensed context'
+            }
+        })
+
+        expect(normalized).toMatchObject({
+            role: 'event',
+            content: {
+                type: 'compact-summary',
+                summary: '## Goal\ncondensed context'
+            }
+        })
+        expect((normalized as { content: { tokensBefore?: number } }).content.tokensBefore).toBeUndefined()
+    })
+})
