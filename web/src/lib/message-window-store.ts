@@ -54,6 +54,7 @@ type InternalState = MessageWindowState & {
     newestPositionAt: number | null
     newestPositionSeq: number | null
     requiresLatestReset: boolean
+    preferLatestOnActivation: boolean
     syncGeneration: number
     olderGeneration: number
 }
@@ -73,6 +74,7 @@ type TailSyncController = {
     api: ApiClient
     running: Promise<void> | null
     trailingRequested: boolean
+    runningPrefersLatest: boolean
 }
 
 const states = new Map<string, InternalState>()
@@ -291,6 +293,7 @@ function createState(sessionId: string): InternalState {
         newestPositionAt: null,
         newestPositionSeq: null,
         requiresLatestReset: false,
+        preferLatestOnActivation: false,
         syncGeneration: 0,
         olderGeneration: 0
     }
@@ -444,6 +447,7 @@ function buildState(
         | 'newestPositionAt'
         | 'newestPositionSeq'
         | 'requiresLatestReset'
+        | 'preferLatestOnActivation'
         | 'syncGeneration'
         | 'olderGeneration'
         | 'historyVersion'
@@ -703,9 +707,11 @@ async function runTailSync(api: ApiClient, sessionId: string): Promise<void> {
     try {
         const initial = getState(sessionId)
         const initialCursor = getNewestCursor(initial)
+        const preferLatestOnActivation = initial.preferLatestOnActivation
         const canIncrement = initialCursor !== null
             && initial.epoch !== null
             && !initial.requiresLatestReset
+            && !preferLatestOnActivation
 
         if (!canIncrement) {
             const requestBaseline = new Map(getState(sessionId).messages.map((message) => [message.id, message]))
@@ -743,10 +749,13 @@ async function runTailSync(api: ApiClient, sessionId: string): Promise<void> {
             }
             updateState(sessionId, (previous) => {
                 if (previous.syncGeneration !== generation) return previous
-                return applyLatestResponse(previous, response, {
-                    replaceServerRows: initial.requiresLatestReset || response.page.reset,
+                const next = applyLatestResponse(previous, response, {
+                    replaceServerRows: initial.requiresLatestReset
+                        || preferLatestOnActivation
+                        || response.page.reset,
                     requestBaseline
                 })
+                return buildState(next, { preferLatestOnActivation: false })
             })
             finishTailSync(sessionId, generation, null)
             return
@@ -805,7 +814,12 @@ async function runTailSync(api: ApiClient, sessionId: string): Promise<void> {
             })
 
             const current = getState(sessionId)
-            if (current.requiresLatestReset || !response.page.hasMore || !nextAfter) {
+            if (
+                current.requiresLatestReset
+                || current.preferLatestOnActivation
+                || !response.page.hasMore
+                || !nextAfter
+            ) {
                 break
             }
             if (comparePosition(nextAfter, after) <= 0) {
@@ -826,13 +840,16 @@ async function runTailSync(api: ApiClient, sessionId: string): Promise<void> {
 }
 
 function startTailSync(sessionId: string, controller: TailSyncController): Promise<void> {
+    const runningPrefersLatest = getState(sessionId).preferLatestOnActivation
     const running = runTailSync(controller.api, sessionId)
     controller.running = running
+    controller.runningPrefersLatest = runningPrefersLatest
     const finish = () => {
         if (tailSyncControllers.get(sessionId) !== controller || controller.running !== running) {
             return
         }
         controller.running = null
+        controller.runningPrefersLatest = false
         if (!controller.trailingRequested) {
             return
         }
@@ -877,18 +894,51 @@ function enterTailMode(previous: InternalState): InternalState {
 }
 
 export function activateMessageWindow(sessionId: string): void {
+    let requestedLatest = false
     updateState(sessionId, (previous) => {
         const { kept } = trimPreservingQueued(previous.messages, VISIBLE_WINDOW_SIZE, 'append')
         const forceLatest = previous.requiresLatestReset
+        const hasUsableCursor = getNewestCursor(previous) !== null
+            && previous.epoch !== null
+            && !forceLatest
+        const preferLatestOnActivation = hasUsableCursor && kept.length > 0
+        requestedLatest = preferLatestOnActivation && !previous.preferLatestOnActivation
+        const invalidateRunningSync = requestedLatest && previous.isSyncingTail
+        const activationUpdates = preferLatestOnActivation
+            ? {
+                preferLatestOnActivation: true,
+                ...(invalidateRunningSync
+                    ? {
+                        syncGeneration: previous.syncGeneration + 1,
+                        olderGeneration: previous.olderGeneration + 1
+                    }
+                    : {})
+            }
+            : {}
+        // A persisted cursor may be many pages behind after another client
+        // has added messages. Fetch the current tail first on re-entry;
+        // `runTailSync` will reconcile the response through the same
+        // optimistic/concurrent-row preservation path as a reset response.
         if (
             previous.viewMode === 'tail'
             && kept.length === previous.messages.length
             && !forceLatest
         ) {
-            return previous
+            return preferLatestOnActivation
+                ? buildState(previous, activationUpdates)
+                : previous
         }
-        return enterTailMode(previous)
+        const next = enterTailMode(previous)
+        return preferLatestOnActivation
+            ? buildState(next, activationUpdates)
+            : next
     }, true)
+    if (requestedLatest) {
+        const controller = tailSyncControllers.get(sessionId)
+        if (controller?.running) {
+            controller.trailingRequested = true
+        }
+    }
 }
 
 export function syncTailMessages(
@@ -898,11 +948,23 @@ export function syncTailMessages(
 ): Promise<void> {
     let controller = tailSyncControllers.get(sessionId)
     if (!controller) {
-        controller = { api, running: null, trailingRequested: false }
+        controller = {
+            api,
+            running: null,
+            trailingRequested: false,
+            runningPrefersLatest: false
+        }
         tailSyncControllers.set(sessionId, controller)
     }
     controller.api = api
     if (!controller.running) {
+        return startTailSync(sessionId, controller)
+    }
+    if (getState(sessionId).preferLatestOnActivation) {
+        if (controller.runningPrefersLatest) {
+            return controller.running
+        }
+        controller.trailingRequested = false
         return startTailSync(sessionId, controller)
     }
     const observed = controller.running
