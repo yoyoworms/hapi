@@ -270,6 +270,110 @@ describe('message tail synchronization', () => {
         expect('pending' in getMessageWindowState(id)).toBe(false)
     })
 
+    it('refreshes a persisted window whose attachment previews were stripped', async () => {
+        const id = sessionId('rehydrate-stripped-preview')
+        const restoredPreviewUrl = 'data:image/jpeg;base64,dGh1bWJuYWls'
+        const messageWithoutPreview = {
+            ...makeUserMessage({ id: 'with-image', seq: 10, invokedAt: 1_000 }),
+            content: {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: 'with-image',
+                    attachments: [{
+                        id: 'attachment-1',
+                        filename: 'photo.jpg',
+                        mimeType: 'image/jpeg',
+                        size: 7_500,
+                        path: '/tmp/photo.jpg'
+                    }]
+                }
+            }
+        } as DecryptedMessage
+        const messageWithPreview = {
+            ...messageWithoutPreview,
+            content: {
+                ...(messageWithoutPreview.content as Record<string, unknown>),
+                content: {
+                    type: 'text',
+                    text: 'with-image',
+                    attachments: [{
+                        id: 'attachment-1',
+                        filename: 'photo.jpg',
+                        mimeType: 'image/jpeg',
+                        size: 7_500,
+                        path: '/tmp/photo.jpg',
+                        previewUrl: restoredPreviewUrl
+                    }]
+                }
+            }
+        } as DecryptedMessage
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [messageWithoutPreview],
+            hasMore: false,
+            oldestPositionAt: 1_000,
+            oldestPositionSeq: 10,
+            newestPositionAt: 1_000,
+            newestPositionSeq: 10,
+            epoch: 3,
+            attachmentPreviewsStripped: true
+        }))
+        const getMessages = vi.fn(async () => latestResponse([messageWithPreview], { epoch: 3 }))
+
+        await syncTailMessages(createApi(getMessages), id)
+
+        expect(getMessages).toHaveBeenCalledWith(id, { limit: 200 })
+        const restoredContent = getMessageWindowState(id).messages[0]?.content as {
+            content: { attachments: Array<{ previewUrl?: string }> }
+        }
+        expect(restoredContent.content.attachments[0]?.previewUrl).toBe(restoredPreviewUrl)
+    })
+
+    it('keeps the stripped-preview refresh marker while latest sync is pending or failed', async () => {
+        const id = sessionId('stripped-preview-refresh-retry')
+        const cached = makeUserMessage({ id: 'with-image', seq: 10, invokedAt: 1_000 })
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [cached],
+            hasMore: false,
+            oldestPositionAt: 1_000,
+            oldestPositionSeq: 10,
+            newestPositionAt: 1_000,
+            newestPositionSeq: 10,
+            epoch: 3,
+            attachmentPreviewsStripped: true
+        }))
+        const response = deferred<MessagesResponse>()
+        const getMessages = vi.fn(async () => await response.promise)
+        const setItem = vi.spyOn(Storage.prototype, 'setItem')
+        const syncing = syncTailMessages(createApi(getMessages), id)
+
+        await vi.waitFor(() => {
+            expect(setItem).toHaveBeenCalledWith(
+                `hapi:message-window:v2:${id}`,
+                expect.any(String)
+            )
+            const persisted = JSON.parse(
+                sessionStorage.getItem(`hapi:message-window:v2:${id}`) ?? '{}'
+            ) as { attachmentPreviewsStripped?: boolean }
+            expect(persisted.attachmentPreviewsStripped).toBe(true)
+        })
+
+        setItem.mockClear()
+        response.reject(new Error('offline'))
+        await syncing
+        await vi.waitFor(() => {
+            expect(setItem).toHaveBeenCalledWith(
+                `hapi:message-window:v2:${id}`,
+                expect.any(String)
+            )
+            const persisted = JSON.parse(
+                sessionStorage.getItem(`hapi:message-window:v2:${id}`) ?? '{}'
+            ) as { attachmentPreviewsStripped?: boolean }
+            expect(persisted.attachmentPreviewsStripped).toBe(true)
+        })
+        expect(getMessages).toHaveBeenCalledWith(id, { limit: 200 })
+    })
+
     it('preserves SSE rows that arrive while the latest snapshot is in flight', async () => {
         const id = sessionId('latest-sse-race')
         const response = deferred<MessagesResponse>()
@@ -1235,5 +1339,58 @@ describe('V2 persistence boundary', () => {
 
         expect(getMessageWindowState(id).messages[0]?.status).toBe('queued')
         expect(getQueuedReconcileCandidateLocalIds(id)).toEqual(['local-1'])
+    })
+
+    it('omits attachment previews from storage without changing the live message', async () => {
+        const id = sessionId('strip-attachment-preview')
+        const previewUrl = `data:image/png;base64,${'a'.repeat(10_000)}`
+        const message = {
+            ...makeUserMessage({ id: 'with-image', seq: 1, invokedAt: 1_000 }),
+            content: {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: 'with-image',
+                    attachments: [{
+                        id: 'attachment-1',
+                        filename: 'photo.png',
+                        mimeType: 'image/png',
+                        size: 7_500,
+                        path: '/tmp/photo.png',
+                        previewUrl
+                    }]
+                }
+            }
+        } as DecryptedMessage
+
+        ingestIncomingMessages(id, [message])
+        await vi.waitFor(() => {
+            expect(sessionStorage.getItem(`hapi:message-window:v2:${id}`)).not.toBeNull()
+        })
+
+        const raw = sessionStorage.getItem(`hapi:message-window:v2:${id}`)
+        const persisted = JSON.parse(raw!) as {
+            attachmentPreviewsStripped?: boolean
+            messages: Array<{
+                content: {
+                    content: {
+                        attachments: Array<Record<string, unknown>>
+                    }
+                }
+            }>
+        }
+        expect(persisted.messages[0]?.content.content.attachments).toEqual([{
+            id: 'attachment-1',
+            filename: 'photo.png',
+            mimeType: 'image/png',
+            size: 7_500,
+            path: '/tmp/photo.png'
+        }])
+        expect(persisted.attachmentPreviewsStripped).toBe(true)
+
+        const liveContent = getMessageWindowState(id).messages[0]?.content as {
+            content: { attachments: Array<{ previewUrl?: string }> }
+        }
+        expect(liveContent.content.attachments[0]?.previewUrl).toBe(previewUrl)
     })
 })

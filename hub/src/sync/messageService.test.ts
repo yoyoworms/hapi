@@ -11,7 +11,11 @@ import { describe, expect, it } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MessageService } from './messageService'
+import {
+    MessageService,
+    USER_ATTACHMENT_PREVIEW_MAX_CHARS,
+    sanitizeUserAttachmentPreviews,
+} from './messageService'
 import { Store } from '../store'
 import type { Server } from 'socket.io'
 import type { Session, SyncEvent } from '@hapi/protocol/types'
@@ -91,6 +95,185 @@ function makePublisher() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('sanitizeUserAttachmentPreviews', () => {
+    it('keeps bounded previews and strips only entries that exceed single or aggregate limits', () => {
+        const content = {
+            role: 'user',
+            content: {
+                type: 'text',
+                text: 'keep the prompt',
+                attachments: [
+                    { id: 'kept-1', path: '/tmp/kept-1.png', marker: 1, previewUrl: '12345' },
+                    { id: 'too-large', path: '/tmp/too-large.png', marker: 2, previewUrl: '123456' },
+                    { id: 'kept-2', path: '/tmp/kept-2.png', marker: 3, previewUrl: '123' },
+                    { id: 'over-total', path: '/tmp/over-total.png', marker: 4, previewUrl: 'x' },
+                    { id: 'no-preview', path: '/tmp/no-preview.png', marker: 5 },
+                ]
+            },
+            meta: { sentFrom: 'webapp' }
+        }
+
+        const sanitized = sanitizeUserAttachmentPreviews(content, {
+            maxPreviewChars: 5,
+            maxTotalPreviewChars: 8,
+        })
+
+        expect(sanitized).not.toBe(content)
+        expect(sanitized).toEqual({
+            role: 'user',
+            content: {
+                type: 'text',
+                text: 'keep the prompt',
+                attachments: [
+                    { id: 'kept-1', path: '/tmp/kept-1.png', marker: 1, previewUrl: '12345' },
+                    { id: 'too-large', path: '/tmp/too-large.png', marker: 2 },
+                    { id: 'kept-2', path: '/tmp/kept-2.png', marker: 3, previewUrl: '123' },
+                    { id: 'over-total', path: '/tmp/over-total.png', marker: 4 },
+                    { id: 'no-preview', path: '/tmp/no-preview.png', marker: 5 },
+                ]
+            },
+            meta: { sentFrom: 'webapp' }
+        })
+        // Read-path sanitization must not rewrite the persisted object in place.
+        expect(content.content.attachments[1]?.previewUrl).toBe('123456')
+        expect(content.content.attachments[3]?.previewUrl).toBe('x')
+    })
+
+    it('does not touch agent messages or clone already-bounded user messages', () => {
+        const agent = {
+            role: 'agent',
+            content: {
+                attachments: [{ path: '/tmp/agent.png', previewUrl: 'oversized-agent-preview' }]
+            }
+        }
+        const user = {
+            role: 'user',
+            content: {
+                text: 'bounded',
+                attachments: [{ path: '/tmp/user.png', previewUrl: 'ok' }]
+            }
+        }
+
+        expect(sanitizeUserAttachmentPreviews(agent, {
+            maxPreviewChars: 1,
+            maxTotalPreviewChars: 1,
+        })).toBe(agent)
+        expect(sanitizeUserAttachmentPreviews(user, {
+            maxPreviewChars: 2,
+            maxTotalPreviewChars: 2,
+        })).toBe(user)
+    })
+})
+
+describe('MessageService attachment preview bounds', () => {
+    const makeAttachment = (id: string, previewUrl?: string) => ({
+        id,
+        filename: `${id}.png`,
+        mimeType: 'image/png',
+        size: 42,
+        path: `/tmp/${id}.png`,
+        ...(previewUrl === undefined ? {} : { previewUrl })
+    })
+
+    function readAttachments(content: unknown): Array<Record<string, unknown>> {
+        if (!content || typeof content !== 'object') throw new Error('Expected message envelope')
+        const inner = (content as { content?: unknown }).content
+        if (!inner || typeof inner !== 'object') throw new Error('Expected message content')
+        const attachments = (inner as { attachments?: unknown }).attachments
+        if (!Array.isArray(attachments)) throw new Error('Expected attachments')
+        return attachments as Array<Record<string, unknown>>
+    }
+
+    it('sanitizes oversized previews when reading and exporting legacy rows without mutating storage', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'legacy-attachment-preview')
+        const oversizedPreview = 'p'.repeat(USER_ATTACHMENT_PREVIEW_MAX_CHARS + 1)
+        const stored = store.messages.addMessage(session.id, {
+            role: 'user',
+            content: {
+                type: 'text',
+                text: 'legacy prompt stays intact',
+                attachments: [makeAttachment('legacy', oversizedPreview)]
+            }
+        })
+        const service = new MessageService(store, makeIo(() => {}), makePublisher() as any)
+
+        const page = service.getMessagesPage(session.id, { limit: 10, before: null })
+        expect(page.messages).toHaveLength(1)
+        expect(page.messages[0]?.content).toMatchObject({
+            role: 'user',
+            content: { text: 'legacy prompt stays intact' }
+        })
+        expect(readAttachments(page.messages[0]?.content)[0]).toEqual(makeAttachment('legacy'))
+
+        const exported = service.getSessionExport(session.id, toProtocolSession(session))
+        expect(exported.type).toBe('success')
+        if (exported.type !== 'success') throw new Error('Expected successful export')
+        expect(readAttachments(exported.payload.messages[0]?.content)[0]).toEqual(makeAttachment('legacy'))
+
+        // Legacy cleanup is a response view; no production DB rewrite is required.
+        const raw = store.messages.getMessages(session.id, 10).find(message => message.id === stored.id)
+        expect(readAttachments(raw?.content)[0]?.previewUrl).toBe(oversizedPreview)
+    })
+
+    it('strips oversized previews before DB, CLI, and Web SSE while retaining attachment paths', async () => {
+        const store = makeStore()
+        const session = makeSession(store, 'new-attachment-preview')
+        const publisher = makePublisher()
+        const cliUpdates: unknown[] = []
+        const io = {
+            of: (namespace: string) => ({
+                to: (_room: string) => ({
+                    emit: (_event: string, data: unknown) => {
+                        if (namespace === '/cli') cliUpdates.push(data)
+                    },
+                    timeout: (_ms: number) => ({ emit: () => {} })
+                }),
+                adapter: { rooms: { get: () => undefined } }
+            })
+        } as unknown as Server
+        const service = new MessageService(store, io, publisher as any)
+        const smallPreview = 'data:image/png;base64,b2s='
+        const oversizedPreview = 'p'.repeat(USER_ATTACHMENT_PREVIEW_MAX_CHARS + 1)
+
+        await service.sendMessage(session.id, {
+            text: 'new prompt stays intact',
+            localId: 'local-with-previews',
+            attachments: [
+                makeAttachment('small', smallPreview),
+                makeAttachment('oversized', oversizedPreview),
+            ]
+        })
+
+        const storedContent = store.messages.getMessages(session.id, 10)[0]?.content
+        expect(storedContent).toMatchObject({
+            role: 'user',
+            content: { text: 'new prompt stays intact' }
+        })
+        expect(readAttachments(storedContent)).toEqual([
+            makeAttachment('small', smallPreview),
+            makeAttachment('oversized'),
+        ])
+
+        expect(cliUpdates).toHaveLength(1)
+        const cliContent = (cliUpdates[0] as {
+            body: { message: { content: unknown } }
+        }).body.message.content
+        expect(readAttachments(cliContent)).toEqual([
+            makeAttachment('small', smallPreview),
+            makeAttachment('oversized'),
+        ])
+
+        const received = publisher.events.find(event => event.type === 'message-received')
+        expect(received?.type).toBe('message-received')
+        if (!received || received.type !== 'message-received') throw new Error('Expected message-received')
+        expect(readAttachments(received.message.content)).toEqual([
+            makeAttachment('small', smallPreview),
+            makeAttachment('oversized'),
+        ])
+    })
+})
 
 describe('MessageService goal status filtering', () => {
     function redundantGoalStatusContent(message: string): unknown {

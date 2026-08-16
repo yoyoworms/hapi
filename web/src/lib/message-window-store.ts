@@ -66,6 +66,7 @@ type PersistedMessageWindowState = {
     newestPositionAt: number | null
     newestPositionSeq: number | null
     epoch: number | null
+    attachmentPreviewsStripped?: boolean
 }
 
 type TailSyncController = {
@@ -161,6 +162,50 @@ function shouldPersistState(state: InternalState): boolean {
         || state.newestPositionAt !== null
 }
 
+function stripAttachmentPreviewsForPersistence(message: DecryptedMessage): DecryptedMessage {
+    const outerContent = message.content
+    if (!outerContent || typeof outerContent !== 'object' || Array.isArray(outerContent)) {
+        return message
+    }
+    const innerContent = (outerContent as Record<string, unknown>).content
+    if (!innerContent || typeof innerContent !== 'object' || Array.isArray(innerContent)) {
+        return message
+    }
+    const attachments = (innerContent as Record<string, unknown>).attachments
+    if (!Array.isArray(attachments)) {
+        return message
+    }
+
+    let changed = false
+    const persistedAttachments = attachments.map((attachment) => {
+        if (
+            !attachment
+            || typeof attachment !== 'object'
+            || Array.isArray(attachment)
+            || typeof (attachment as Record<string, unknown>).previewUrl !== 'string'
+        ) {
+            return attachment
+        }
+        const { previewUrl: _previewUrl, ...metadata } = attachment as Record<string, unknown>
+        changed = true
+        return metadata
+    })
+    if (!changed) {
+        return message
+    }
+
+    return {
+        ...message,
+        content: {
+            ...outerContent,
+            content: {
+                ...innerContent,
+                attachments: persistedAttachments
+            }
+        }
+    }
+}
+
 function persistState(sessionId: string, state: InternalState): void {
     if (!isSessionStorageAvailable()) {
         return
@@ -170,14 +215,22 @@ function persistState(sessionId: string, state: InternalState): void {
             sessionStorage.removeItem(getStorageKey(sessionId))
             return
         }
+        const messages = state.messages.map(stripAttachmentPreviewsForPersistence)
+        // Preserve the marker while a required latest-page refresh is in
+        // flight or has failed. The hydrated messages no longer contain the
+        // previews, so recomputing from those messages alone would otherwise
+        // clear the marker before the authoritative response arrives.
+        const attachmentPreviewsStripped = state.requiresLatestReset
+            || messages.some((message, index) => message !== state.messages[index])
         const persisted: PersistedMessageWindowState = {
-            messages: state.messages,
+            messages,
             hasMore: state.hasMore,
             oldestPositionAt: state.oldestPositionAt,
             oldestPositionSeq: state.oldestPositionSeq,
             newestPositionAt: state.newestPositionAt,
             newestPositionSeq: state.newestPositionSeq,
-            epoch: state.epoch
+            epoch: state.epoch,
+            attachmentPreviewsStripped
         }
         sessionStorage.setItem(getStorageKey(sessionId), JSON.stringify(persisted))
     } catch {
@@ -279,7 +332,11 @@ function hydrateState(sessionId: string): InternalState | null {
             newestPositionAt: newest?.at ?? null,
             newestPositionSeq: newest?.seq ?? null,
             epoch,
-            requiresLatestReset: parsed.messages.length > 0 && (newest === null || epoch === null)
+            requiresLatestReset: parsed.messages.length > 0 && (
+                newest === null
+                || epoch === null
+                || parsed.attachmentPreviewsStripped === true
+            )
         })
     } catch {
         clearPersistedState(sessionId)

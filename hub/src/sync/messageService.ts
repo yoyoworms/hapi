@@ -19,6 +19,73 @@ import { EventPublisher } from './eventPublisher'
 type StoredMessageForDelivery = ReturnType<Store['messages']['getMessages']>[number]
 type MessagePosition = { at: number; seq: number }
 
+/** Persisted chat previews are display-only. Keep them small enough that one
+ * multi-image prompt cannot turn every history read into a tens-of-megabytes
+ * response. The Web client targets <= 256 KiB decoded thumbnails; 384 KiB of
+ * data-URL text leaves room for the MIME header and base64 rounding. */
+export const USER_ATTACHMENT_PREVIEW_MAX_CHARS = 384 * 1024
+export const USER_ATTACHMENT_PREVIEW_TOTAL_MAX_CHARS = 2 * 1024 * 1024
+
+type UserAttachmentPreviewLimits = {
+    maxPreviewChars: number
+    maxTotalPreviewChars: number
+}
+
+const DEFAULT_USER_ATTACHMENT_PREVIEW_LIMITS: UserAttachmentPreviewLimits = {
+    maxPreviewChars: USER_ATTACHMENT_PREVIEW_MAX_CHARS,
+    maxTotalPreviewChars: USER_ATTACHMENT_PREVIEW_TOTAL_MAX_CHARS,
+}
+
+/**
+ * Remove only oversized display previews from user attachment metadata.
+ *
+ * Attachment paths are the CLI delivery contract and must remain intact. The
+ * transformation is also applied when reading legacy rows, so an old full-size
+ * data URL cannot keep poisoning history responses after this guard ships.
+ * Agent messages and inputs that need no changes retain their original object.
+ */
+export function sanitizeUserAttachmentPreviews<T>(
+    value: T,
+    limits: UserAttachmentPreviewLimits = DEFAULT_USER_ATTACHMENT_PREVIEW_LIMITS,
+): T {
+    if (!isObject(value) || Array.isArray(value) || value.role !== 'user') return value
+    if (!isObject(value.content) || Array.isArray(value.content)) return value
+
+    const attachments = value.content.attachments
+    if (!Array.isArray(attachments)) return value
+
+    let retainedPreviewChars = 0
+    let sanitizedAttachments: unknown[] | null = null
+
+    for (let index = 0; index < attachments.length; index++) {
+        const attachment = attachments[index]
+        if (!isObject(attachment) || Array.isArray(attachment)) continue
+
+        const previewUrl = attachment.previewUrl
+        if (typeof previewUrl !== 'string') continue
+
+        const exceedsSingleLimit = previewUrl.length > limits.maxPreviewChars
+        const exceedsTotalLimit = previewUrl.length > limits.maxTotalPreviewChars - retainedPreviewChars
+        if (!exceedsSingleLimit && !exceedsTotalLimit) {
+            retainedPreviewChars += previewUrl.length
+            continue
+        }
+
+        sanitizedAttachments ??= attachments.slice()
+        const { previewUrl: _previewUrl, ...metadata } = attachment
+        sanitizedAttachments[index] = metadata
+    }
+
+    if (!sanitizedAttachments) return value
+    return {
+        ...value,
+        content: {
+            ...value.content,
+            attachments: sanitizedAttachments,
+        },
+    } as T
+}
+
 function messagePosition(message: StoredMessageForDelivery): MessagePosition {
     return {
         at: message.invokedAt ?? message.createdAt,
@@ -39,7 +106,7 @@ function toDecryptedMessage(message: StoredMessageForDelivery): DecryptedMessage
         id: message.id,
         seq: message.seq,
         localId: message.localId,
-        content: message.content,
+        content: sanitizeUserAttachmentPreviews(message.content),
         createdAt: message.createdAt,
         invokedAt: message.invokedAt,
         scheduledAt: message.scheduledAt
@@ -101,14 +168,15 @@ function getNormalizedDeliveryMode(
  * queue item so it cannot steer a later generation.
  */
 function contentForDeferredDelivery(content: unknown): unknown {
-    if (!isObject(content) || content.role !== 'user' || !isObject(content.meta)) {
-        return content
+    const sanitized = sanitizeUserAttachmentPreviews(content)
+    if (!isObject(sanitized) || sanitized.role !== 'user' || !isObject(sanitized.meta)) {
+        return sanitized
     }
-    if (content.meta.deliveryMode !== 'steer') return content
+    if (sanitized.meta.deliveryMode !== 'steer') return sanitized
     return {
-        ...content,
+        ...sanitized,
         meta: {
-            ...content.meta,
+            ...sanitized.meta,
             deliveryMode: 'queue' as const
         }
     }
@@ -629,7 +697,7 @@ export class MessageService {
             payload.scheduledAt
         )
 
-        const content = {
+        const content = sanitizeUserAttachmentPreviews({
             role: 'user',
             content: {
                 type: 'text',
@@ -640,7 +708,7 @@ export class MessageService {
                 sentFrom,
                 deliveryMode
             }
-        }
+        })
 
         const inserted = this.store.addMessageForCurrentSession(
             sessionId,
@@ -694,7 +762,9 @@ export class MessageService {
                 id: msg.id,
                 seq: msg.seq,
                 localId: msg.localId,
-                content: msg.content,
+                // A duplicate-localId retry can return a legacy row created
+                // before the write guard. Keep that SSE path bounded too.
+                content: sanitizeUserAttachmentPreviews(msg.content),
                 createdAt: msg.createdAt,
                 invokedAt: msg.invokedAt,
                 scheduledAt: msg.scheduledAt

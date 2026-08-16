@@ -1,5 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const NativeURL = globalThis.URL
+
+function stubObjectUrl(
+    createObjectURL: (blob: Blob) => string,
+    revokeObjectURL: (url: string) => void,
+): void {
+    class URLMock extends NativeURL {}
+    Object.defineProperties(URLMock, {
+        createObjectURL: { configurable: true, value: createObjectURL },
+        revokeObjectURL: { configurable: true, value: revokeObjectURL },
+    })
+    vi.stubGlobal('URL', URLMock)
+}
+
 async function collectAdditions(
     file: File,
     uploadFile = vi.fn(async () => ({ success: true, path: '/uploads/file' }))
@@ -13,19 +27,77 @@ async function collectAdditions(
         emitted.push(attachment)
     }
 
-    return { emitted, uploadFile }
+    return { adapter, emitted, uploadFile }
 }
 
+function setReportedFileSize(file: File, size: number): File {
+    Object.defineProperty(file, 'size', { configurable: true, value: size })
+    return file
+}
+
+function installThumbnailMocks(previewUrls: string[]) {
+    const createObjectURL = vi.fn(() => 'blob:thumbnail-source')
+    const revokeObjectURL = vi.fn()
+    stubObjectUrl(createObjectURL, revokeObjectURL)
+    vi.stubGlobal('Image', class {
+        naturalWidth = 2400
+        naturalHeight = 1600
+        width = 2400
+        height = 1600
+        onload: (() => void) | null = null
+        onerror: (() => void) | null = null
+
+        set src(_value: string) {
+            this.onload?.()
+        }
+    })
+
+    const context = {
+        fillStyle: '',
+        fillRect: vi.fn(),
+        drawImage: vi.fn(),
+    }
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+        .mockReturnValue(context as never)
+    const toDataURL = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL')
+    for (const previewUrl of previewUrls) {
+        toDataURL.mockReturnValueOnce(previewUrl)
+    }
+
+    return { context, createObjectURL, getContext, revokeObjectURL, toDataURL }
+}
+
+async function getSentAttachmentMetadata(
+    adapter: Awaited<ReturnType<typeof collectAdditions>>['adapter'],
+    attachment: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+    const sent = await adapter.send(attachment as never) as unknown as {
+        content?: Array<{ type: string; text?: string }>
+    }
+    const serialized = sent.content?.find((part) => part.type === 'text')?.text
+    expect(serialized).toBeTruthy()
+    const parsed = JSON.parse(serialized ?? '{}') as { __attachmentMetadata?: Record<string, unknown> }
+    expect(parsed.__attachmentMetadata).toBeDefined()
+    return parsed.__attachmentMetadata ?? {}
+}
+
+beforeEach(() => {
+    vi.stubGlobal('indexedDB', undefined)
+    // jsdom has no image decoder. Make ordinary tests deterministically
+    // exercise the small-file fallback; thumbnail-specific tests replace it.
+    stubObjectUrl(
+        vi.fn(() => { throw new Error('Image decoder unavailable') }),
+        vi.fn(),
+    )
+    vi.resetModules()
+})
+
+afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+})
+
 describe('attachmentAdapter', () => {
-    beforeEach(() => {
-        vi.stubGlobal('indexedDB', undefined)
-        vi.resetModules()
-    })
-
-    afterEach(() => {
-        vi.unstubAllGlobals()
-    })
-
     it('uses the assistant-ui wildcard sentinel so all files reach the adapter', async () => {
         const { createAttachmentAdapter } = await import('./attachmentAdapter')
         const adapter = createAttachmentAdapter({} as never, 'session-1')
@@ -61,6 +133,32 @@ describe('attachmentAdapter', () => {
             previewUrl: 'data:image/png;base64,aW1hZ2U=',
             status: { type: 'requires-action', reason: 'composer-send' },
         })])
+    })
+
+    it('does not re-persist an oversized preview restored from a legacy draft', async () => {
+        const drafts = await import('./composer-attachment-drafts')
+        const { createAttachmentAdapter } = await import('./attachmentAdapter')
+        const oversizedPreview = `data:image/png;base64,${'A'.repeat(349_528 + 4)}`
+        const file = new File(['image'], 'legacy.png', { type: 'image/png' })
+        drafts.saveDraftAttachments('session-1', [{
+            id: 'attachment-legacy',
+            file,
+            path: '/uploads/legacy.png',
+            previewUrl: oversizedPreview,
+        }])
+        const [restored] = await drafts.getDraftAttachments('session-1')
+        expect(restored).toBeDefined()
+
+        const adapter = createAttachmentAdapter({ uploadFile: vi.fn() } as never, 'session-1')
+        const emitted: Record<string, unknown>[] = []
+        for await (const attachment of adapter.add({ file: restored! }) as AsyncIterable<Record<string, unknown>>) {
+            emitted.push(attachment)
+        }
+        expect(emitted.at(-1)).toMatchObject({ previewUrl: oversizedPreview })
+
+        const metadata = await getSentAttachmentMetadata(adapter, emitted.at(-1) ?? {})
+        expect(metadata).not.toHaveProperty('previewUrl')
+        expect(metadata).toMatchObject({ filename: 'legacy.png', path: '/uploads/legacy.png' })
     })
 
     it('uploads an image when the initial preview read fails', async () => {
@@ -114,7 +212,88 @@ describe('attachmentAdapter image previews', () => {
             previewUrl: 'data:image/png;base64,aW1hZ2U=',
             status: { type: 'requires-action' }
         })
-        expect(readSpy).toHaveBeenCalledTimes(1)
+        // One read for the tiny persisted preview, one for the original upload.
+        expect(readSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('uploads original image bytes while persisting a bounded multi-pass thumbnail', async () => {
+        // First profile exceeds the 256 KiB decoded limit; the second profile
+        // succeeds and must be the only image bytes persisted in metadata.
+        const oversizedBase64 = 'A'.repeat(349_528 + 4)
+        const oversizedPreview = `data:image/jpeg;base64,${oversizedBase64}`
+        const thumbnailPreview = `data:image/jpeg;base64,${btoa('small-thumbnail')}`
+        const mocks = installThumbnailMocks([oversizedPreview, thumbnailPreview])
+        const originalText = 'full-resolution-original-image'
+        const file = setReportedFileSize(
+            new File([originalText], 'photo.png', { type: 'image/png' }),
+            300 * 1024,
+        )
+
+        const { adapter, emitted, uploadFile } = await collectAdditions(file)
+        const ready = emitted.at(-1)
+        expect(ready).toMatchObject({
+            previewUrl: thumbnailPreview,
+            status: { type: 'requires-action' },
+        })
+        expect(mocks.toDataURL).toHaveBeenCalledTimes(2)
+        expect(mocks.toDataURL).toHaveBeenNthCalledWith(1, 'image/jpeg', 0.76)
+        expect(mocks.toDataURL).toHaveBeenNthCalledWith(2, 'image/jpeg', 0.70)
+        expect(mocks.revokeObjectURL).toHaveBeenCalledWith('blob:thumbnail-source')
+
+        const originalBase64 = btoa(originalText)
+        expect(uploadFile).toHaveBeenCalledWith('session-1', 'photo.png', originalBase64, 'image/png')
+        expect(uploadFile).not.toHaveBeenCalledWith(
+            'session-1',
+            'photo.png',
+            thumbnailPreview.split(',')[1],
+            'image/png',
+        )
+
+        const metadata = await getSentAttachmentMetadata(adapter, ready ?? {})
+        expect(metadata).toMatchObject({
+            filename: 'photo.png',
+            previewUrl: thumbnailPreview,
+        })
+        const persistedPayload = (metadata.previewUrl as string).split(',')[1] ?? ''
+        expect(atob(persistedPayload).length).toBeLessThanOrEqual(256 * 1024)
+    })
+
+    it('does not fall back to a large original when thumbnail decoding fails', async () => {
+        stubObjectUrl(
+            vi.fn(() => 'blob:broken-thumbnail-source'),
+            vi.fn(),
+        )
+        vi.stubGlobal('Image', class {
+            naturalWidth = 2400
+            naturalHeight = 1600
+            width = 2400
+            height = 1600
+            onload: (() => void) | null = null
+            onerror: (() => void) | null = null
+
+            set src(_value: string) {
+                this.onerror?.()
+            }
+        })
+        const originalText = 'large-original-still-uploaded'
+        const file = setReportedFileSize(
+            new File([originalText], 'broken.png', { type: 'image/png' }),
+            300 * 1024,
+        )
+
+        const { adapter, emitted, uploadFile } = await collectAdditions(file)
+        expect(emitted).toHaveLength(3)
+        expect(emitted.every((attachment) => attachment.previewUrl === undefined)).toBe(true)
+        expect(uploadFile).toHaveBeenCalledWith(
+            'session-1',
+            'broken.png',
+            btoa(originalText),
+            'image/png',
+        )
+
+        const metadata = await getSentAttachmentMetadata(adapter, emitted.at(-1) ?? {})
+        expect(metadata).not.toHaveProperty('previewUrl')
+        expect(metadata).toMatchObject({ filename: 'broken.png', path: '/uploads/file' })
     })
 
     it('does not generate previews for non-image attachments', async () => {
