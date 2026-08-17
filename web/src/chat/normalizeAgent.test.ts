@@ -22,6 +22,25 @@ describe('normalizeAgentRecord — agentTimestamp exposure', () => {
         })
     })
 
+    it('normalizes the Codex agent message phase', () => {
+        const normalized = normalizeAgentRecord('message-row-phase', null, 1, {
+            type: 'codex',
+            data: {
+                type: 'message',
+                message: 'I am checking the tests.',
+                phase: 'Commentary'
+            }
+        })
+
+        expect(normalized).toMatchObject({
+            content: [{
+                type: 'text',
+                text: 'I am checking the tests.',
+                phase: 'commentary'
+            }]
+        })
+    })
+
     it('keeps legacy wire text messages without a stream id', () => {
         const normalized = normalizeAgentRecord('message-row-1', null, 1, {
             type: 'codex',

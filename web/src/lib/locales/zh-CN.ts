@@ -637,6 +637,7 @@ export default {
   'toolGroup.codex.list': '列出',
   'toolGroup.codex.search': '搜索',
   'toolGroup.codex.searchIn': '在 {path} 中搜索 {query}',
+  'toolGroup.codex.more': '另有 {n} 项',
 
   // Composer buttons
   'composer.settings': '设置',

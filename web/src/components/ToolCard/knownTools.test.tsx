@@ -201,7 +201,27 @@ describe('getToolPresentation — Codex agent tools', () => {
             metadata: null,
         })
 
-        expect(presentation.subtitle).toBe('reasoning low · Command finished: bun test')
+        expect(presentation.subtitle).toBe('reasoning low · Tests finished')
+    })
+
+    it('redacts raw legacy command activity from CodexAgent cards', () => {
+        const presentation = getToolPresentation({
+            toolName: 'CodexAgent',
+            input: {
+                summary: 'Check remote API',
+                agentStatus: 'running',
+                activity: 'Running command: curl -H "Authorization: Bearer top-secret" https://example.com',
+                reasoning_effort: 'low'
+            },
+            result: null,
+            childrenCount: 0,
+            description: null,
+            metadata: null,
+        })
+
+        expect(presentation.subtitle).toBe('reasoning low · Running command')
+        expect(presentation.subtitle).not.toContain('top-secret')
+        expect(presentation.subtitle).not.toContain('curl')
     })
 
     it('falls back to prompt-derived CodexAgent titles without exposing agent id', () => {

@@ -1,5 +1,5 @@
 import type { ChatBlock, ToolCallBlock } from '@/chat/types'
-import { getCodexCommandActions, isCodexExplorationTool } from '@/chat/codexCommandPresentation'
+import { isCodexExplorationTool } from '@/chat/codexCommandPresentation'
 import { isSubagentToolName } from '@/chat/subagentTool'
 import { isAskUserQuestionToolName } from '@/components/ToolCard/askUserQuestion'
 import { isRequestUserInputToolName } from '@/components/ToolCard/requestUserInput'
@@ -226,9 +226,6 @@ export function isEligibleForToolGrouping(block: ToolCallBlock): boolean {
     if (PLAN_TOOL_NAMES.has(block.tool.name)) return false
     if (MILESTONE_TOOL_NAMES.has(block.tool.name)) return false
     if (isInteractiveToolBlock(block)) return false
-    if (block.tool.name === 'CodexBash' && getCodexCommandActions(block).length > 0) {
-        return isCodexExplorationTool(block)
-    }
     return true
 }
 
@@ -295,7 +292,12 @@ export function buildVisibleChatBlocks(
             cursor += 1
         }
 
-        if (tools.length < 2 && groupingFamily !== 'codex-exploration') {
+        // Codex emits ordinary verification/build commands as individual
+        // commandExecution items. Keep even a singleton behind the same
+        // semantic, collapsed activity surface as exploration; otherwise each
+        // test/git/build step becomes a noisy raw Terminal card.
+        const isSingletonCodexCommand = tools.length === 1 && block.tool.name === 'CodexBash'
+        if (tools.length < 2 && groupingFamily !== 'codex-exploration' && !isSingletonCodexCommand) {
             visibleBlocks.push(block)
             continue
         }

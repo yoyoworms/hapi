@@ -180,4 +180,52 @@ describe('listLocalCodexSessionSummaries', () => {
         expect(sessions[0]?.messages).toHaveLength(1)
         rmSync(root, { recursive: true, force: true })
     })
+
+    it('preserves message phases while deduplicating mirrored text', () => {
+        const root = mkdtempSync(join(tmpdir(), 'codex-home-'))
+        process.env.CODEX_HOME = root
+        const sessionsDir = join(root, 'sessions', '2026', '06', '27')
+        mkdirSync(sessionsDir, { recursive: true })
+
+        writeFileSync(join(sessionsDir, 'phases.jsonl'), [
+            JSON.stringify({ type: 'session_meta', payload: { id: 'phase-session-id', cwd: '/tmp/project' } }),
+            JSON.stringify({
+                type: 'event_msg',
+                payload: {
+                    type: 'item_completed',
+                    item: {
+                        id: 'commentary-1',
+                        type: 'AgentMessage',
+                        phase: 'commentary',
+                        content: [{ type: 'Text', text: 'Checking tests' }]
+                    }
+                }
+            }),
+            JSON.stringify({
+                type: 'response_item',
+                payload: {
+                    type: 'message',
+                    role: 'assistant',
+                    phase: 'final_answer',
+                    content: [{ type: 'output_text', text: 'Checking tests' }]
+                }
+            })
+        ].join('\n'))
+
+        const sessions = listLocalCodexSessionsWithMessagesByIds(new Set(['phase-session-id']))
+
+        expect(sessions[0]?.messages).toHaveLength(1)
+        expect(sessions[0]?.messages[0]).toMatchObject({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'message',
+                    message: 'Checking tests',
+                    phase: 'commentary'
+                }
+            }
+        })
+        rmSync(root, { recursive: true, force: true })
+    })
 })

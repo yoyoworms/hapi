@@ -16,6 +16,7 @@ vi.mock('@/lib/use-translation', () => ({
                 'tool.trace.callsSuffix': 'calls',
                 'tool.input': 'Input',
                 'tool.result': 'Result',
+                'toolGroup.friendly.runCommands': 'Run project commands',
             }
             return map[key] ?? key
         },
@@ -348,7 +349,7 @@ describe('TraceSection', () => {
 
         expect(container.querySelector('button[aria-expanded="true"]')).not.toBeNull()
         expect(container.querySelector('.border-l')).toBeNull()
-        expect(container.textContent).toContain('Terminal')
+        expect(container.textContent).toContain('Run project commands')
         expect(container.textContent).toContain('file-c2.ts')
         expect(container.textContent).not.toContain('Input')
         expect(container.textContent).not.toContain('Result')

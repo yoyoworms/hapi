@@ -304,6 +304,7 @@ describe('reduceTimeline', () => {
                 text: 'first ',
                 uuid: 'text-row-1',
                 streamId: 'text-stream-1',
+                phase: 'commentary',
                 parentUUID: null
             }]
         })
@@ -314,6 +315,7 @@ describe('reduceTimeline', () => {
                 text: 'first second',
                 uuid: 'text-row-2',
                 streamId: 'text-stream-1',
+                phase: 'final_answer',
                 parentUUID: null
             }]
         })
@@ -333,7 +335,8 @@ describe('reduceTimeline', () => {
         expect(textBlocks).toHaveLength(2)
         expect(textBlocks[0]).toMatchObject({
             id: 'text-row-1:0',
-            text: 'first second'
+            text: 'first second',
+            phase: 'final_answer'
         })
         expect(textBlocks[1]).toMatchObject({
             id: 'text-row-3:0',

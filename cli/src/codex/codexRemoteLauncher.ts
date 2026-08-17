@@ -21,6 +21,7 @@ import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
 import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
 import type { AgentAccountStatus } from '@hapi/protocol/types';
+import { normalizeAgentMessagePhase } from '@hapi/protocol/messages';
 import { extractErrorInfo } from '@/utils/errorUtils';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import {
@@ -1861,16 +1862,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             if (msgType === 'agent_message') {
                 const message = asString(msg.message);
+                const phase = normalizeAgentMessagePhase(msg.phase);
                 if (message) {
-                    runtime.finalMessage = message;
+                    if (phase !== 'commentary') {
+                        runtime.finalMessage = message;
+                    }
                     emitAgentRunTraceMessage(agentId, {
                         type: 'message',
                         message,
+                        ...(phase ? { phase } : {}),
                         id: randomUUID()
                     });
                 }
                 if (runtime.terminal) {
-                    if (message) {
+                    if (message && phase !== 'commentary') {
                         emitAgentRunUpdate(agentId, {
                             status: 'completed',
                             statusText: 'Completed',
@@ -1898,18 +1903,17 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         input: inputs,
                         id: randomUUID()
                     });
-                    const command = normalizeCommand(inputs.command) ?? 'command';
                     if (!runtime.terminal) {
                         runtime.activeToolsByCallId.set(callId, {
                             name: 'CodexBash',
-                            label: command,
-                            activity: formatActivity('Running command', command),
+                            label: 'command',
+                            activity: 'Running command',
                             activityKind: 'running-command'
                         });
                         emitAgentRunUpdate(agentId, {
                             status: 'running',
-                            statusText: formatActivity('Running command', command),
-                            activity: formatActivity('Running command', command),
+                            statusText: 'Running command',
+                            activity: 'Running command',
                             activityKind: 'running-command'
                         });
                     }
@@ -1919,7 +1923,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'exec_command_end') {
                 const callId = asString(msg.call_id ?? msg.callId);
                 if (callId) {
-                    const activeTool = runtime.activeToolsByCallId.get(callId);
                     runtime.activeToolsByCallId.delete(callId);
                     const output: Record<string, unknown> = { ...msg };
                     delete output.type;
@@ -1934,10 +1937,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         is_error: Boolean(output.error),
                         id: randomUUID()
                     });
-                    const label = activeTool?.label ?? normalizeCommand(output.command) ?? 'command';
                     const isError = Boolean(output.error);
                     updateActivity(
-                        formatActivity(isError ? 'Command failed' : 'Command finished', label),
+                        isError ? 'Command failed' : 'Command finished',
                         isError ? 'command-failed' : 'command-completed'
                     );
                 }
@@ -3475,14 +3477,17 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'agent_message') {
                 const message = asString(msg.message);
                 if (message) {
+                    const phase = normalizeAgentMessagePhase(msg.phase);
                     emptyCompletionNoticeTracker.onConvertedMessage({
                         type: 'message',
                         message,
+                        ...(phase ? { phase } : {}),
                         id: randomUUID()
                     });
                     session.sendAgentMessage({
                         type: 'message',
                         message,
+                        ...(phase ? { phase } : {}),
                         id: randomUUID()
                     });
                 }

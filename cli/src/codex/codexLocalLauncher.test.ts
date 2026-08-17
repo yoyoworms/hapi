@@ -1129,6 +1129,7 @@ describe('codexLocalLauncher', () => {
             message: {
                 type: 'message',
                 message: 'visible final A',
+                phase: 'final_answer',
                 id: 'final-a'
             }
         }, {
@@ -1139,6 +1140,7 @@ describe('codexLocalLauncher', () => {
             message: {
                 type: 'message',
                 message: 'visible final B',
+                phase: 'final_answer',
                 id: 'final-b'
             }
         }]);
@@ -1236,10 +1238,12 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible 0.147 commentary',
+            phase: 'commentary',
             id: 'commentary-147'
         }, {
             type: 'message',
             message: 'visible 0.147 final answer',
+            phase: 'final_answer',
             id: 'final-147'
         }]);
     });
@@ -1287,6 +1291,7 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible answer at EOF',
+            phase: 'final_answer',
             id: 'final-at-eof'
         }]);
 
@@ -1296,6 +1301,7 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible answer at EOF',
+            phase: 'final_answer',
             id: 'final-at-eof'
         }]);
     });

@@ -1,5 +1,16 @@
 import { isObject } from './utils'
 
+export type AgentMessagePhase = 'commentary' | 'final_answer'
+
+/** Normalize Codex/app-server phase spellings without exposing wire drift. */
+export function normalizeAgentMessagePhase(value: unknown): AgentMessagePhase | null {
+    if (typeof value !== 'string') return null
+    const normalized = value.trim().toLowerCase().replace(/[\s_-]/g, '')
+    if (normalized === 'commentary') return 'commentary'
+    if (normalized === 'finalanswer') return 'final_answer'
+    return null
+}
+
 type RoleWrappedRecord = {
     role: string
     content: unknown

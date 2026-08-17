@@ -444,6 +444,7 @@ export function HappyThread(props: {
     metadata: SessionMetadataSummary | null
     disabled: boolean
     machineDiscoveryEnabled?: boolean
+    hubSettingsEnabled?: boolean
     onRefresh: () => void
     onRetryMessage?: (localId: string) => void
     historyActionPending?: boolean
@@ -523,7 +524,7 @@ export function HappyThread(props: {
     const hubSettingsQuery = useQuery({
         queryKey: queryKeys.hubSettings,
         queryFn: async () => props.api.getHubSettings(),
-        enabled: Boolean(props.api),
+        enabled: props.hubSettingsEnabled !== false && Boolean(props.api),
         staleTime: 30_000,
         refetchInterval: 30_000,
         retry: false,

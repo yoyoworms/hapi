@@ -53,6 +53,36 @@ describe('StatusBar context details popover', () => {
         expect(thinkingLabel.parentElement?.className.split(' ')).toContain('sm:top-0.5')
     })
 
+    it('shows meaningful Codex commentary instead of a random thinking label', () => {
+        const { rerender } = render(
+            <I18nProvider>
+                <StatusBar
+                    active
+                    thinking
+                    agentState={null}
+                    agentFlavor="codex"
+                    activityText="正在验证消息同步与折叠行为"
+                />
+            </I18nProvider>
+        )
+
+        expect(screen.getByText('正在验证消息同步与折叠行为')).toBeInTheDocument()
+
+        rerender(
+            <I18nProvider>
+                <StatusBar
+                    active
+                    thinking={false}
+                    agentState={null}
+                    agentFlavor="codex"
+                    activityText="已经过期的进度"
+                />
+            </I18nProvider>
+        )
+        expect(screen.queryByText('已经过期的进度')).not.toBeInTheDocument()
+        expect(screen.getByText('online')).toBeInTheDocument()
+    })
+
     it('uses an effort-only reasoning label on mobile and the full label on desktop', () => {
         render(
             <I18nProvider>

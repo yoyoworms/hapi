@@ -22,6 +22,7 @@ import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
 import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
 import { getLatestPlanProgress, getPersistedPlanProgress } from '@/chat/planProgress'
+import { getLatestCodexCommentaryProgress } from '@/chat/codexProgress'
 import { useUnseenBlockCount } from '@/hooks/useUnseenBlockCount'
 import { useCodexExplorationCollapse } from '@/hooks/useCodexExplorationCollapse'
 import { isQueuedForInvocation } from '@/lib/messages'
@@ -1373,18 +1374,27 @@ function SessionChatInner(props: SessionChatProps) {
         }),
         [reconciled.blocks, props.hasMoreMessages, codexExplorationCollapsed]
     )
-    const latestPlanProgress = useMemo(() => {
-        if (agentFlavor !== 'codex') return null
-        const currentTurnStartedAt = reconciled.blocks.reduce(
+    const currentTurnStartedAt = useMemo(
+        () => reconciled.blocks.reduce(
             (latest, block) => block.kind === 'user-text'
                 ? Math.max(latest, block.createdAt)
                 : latest,
             0
-        )
+        ),
+        [reconciled.blocks]
+    )
+    const latestPlanProgress = useMemo(() => {
+        if (agentFlavor !== 'codex') return null
         return getLatestPlanProgress(
             reconciled.blocks.filter((block) => block.createdAt >= currentTurnStartedAt)
         ) ?? getPersistedPlanProgress(props.session.todos)
-    }, [agentFlavor, props.session.todos, reconciled.blocks])
+    }, [agentFlavor, props.session.todos, reconciled.blocks, currentTurnStartedAt])
+    const codexActivityText = useMemo(
+        () => agentFlavor === 'codex' && props.session.thinking
+            ? getLatestCodexCommentaryProgress(reconciled.blocks, currentTurnStartedAt)
+            : null,
+        [agentFlavor, props.session.thinking, reconciled.blocks, currentTurnStartedAt]
+    )
 
     // Fork-current must compare against assistant-ui message ids (`kind:id`),
     // not raw hub message ids — MessageActions receive the rendered card id,
@@ -1846,6 +1856,7 @@ function SessionChatInner(props: SessionChatProps) {
                         metadata={props.session.metadata}
                         disabled={sessionInactive || sharedMode}
                         machineDiscoveryEnabled={!sharedMode}
+                        hubSettingsEnabled={!sharedMode}
                         onRefresh={props.onRefresh}
                         onRetryMessage={props.onRetryMessage}
                         historyActionPending={historyActionPending}
@@ -1951,6 +1962,7 @@ function SessionChatInner(props: SessionChatProps) {
                         modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
                         effort={props.session.effort}
                         agentFlavor={agentFlavor}
+                        activityText={codexActivityText}
                         availableModelOptions={
                             sharedMode
                                 ? undefined

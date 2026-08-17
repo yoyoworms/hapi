@@ -3,10 +3,20 @@ import {
     extractAssistantPlainText,
     extractNotifySummary,
     isRedundantGoalStatusEventContent,
+    normalizeAgentMessagePhase,
     splitNotifySummary,
     stripNotifySummaryFooter,
     type NotifySummary
 } from './messages'
+
+describe('normalizeAgentMessagePhase', () => {
+    test('normalizes supported Codex phase spellings', () => {
+        expect(normalizeAgentMessagePhase('commentary')).toBe('commentary')
+        expect(normalizeAgentMessagePhase('final_answer')).toBe('final_answer')
+        expect(normalizeAgentMessagePhase('FinalAnswer')).toBe('final_answer')
+        expect(normalizeAgentMessagePhase('unknown')).toBeNull()
+    })
+})
 
 describe('extractAssistantPlainText', () => {
     test('returns null for non-objects', () => {

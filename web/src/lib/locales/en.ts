@@ -638,6 +638,7 @@ export default {
   'toolGroup.codex.list': 'List',
   'toolGroup.codex.search': 'Search',
   'toolGroup.codex.searchIn': '{query} in {path}',
+  'toolGroup.codex.more': '+{n} more',
 
   // Composer buttons
   'composer.settings': 'Settings',

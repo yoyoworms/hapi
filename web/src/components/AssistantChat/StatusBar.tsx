@@ -56,6 +56,7 @@ function getConnectionStatus(
     agentState: AgentState | null | undefined,
     voiceStatus: ConversationStatus | undefined,
     backgroundTaskCount: number,
+    activityText: string | null | undefined,
     t: (key: string) => string
 ): { text: string; color: string; dotColor: string; isPulsing: boolean } {
     const hasPermissions = agentState?.requests && Object.keys(agentState.requests).length > 0
@@ -89,7 +90,8 @@ function getConnectionStatus(
     }
 
     if (thinking) {
-        const vibingMessage = VIBING_MESSAGES[Math.floor(Math.random() * VIBING_MESSAGES.length)].toLowerCase() + '…'
+        const vibingMessage = activityText
+            ?? VIBING_MESSAGES[Math.floor(Math.random() * VIBING_MESSAGES.length)].toLowerCase() + '…'
         return {
             text: vibingMessage,
             color: 'text-[#007AFF]',
@@ -315,13 +317,22 @@ export function StatusBar(props: {
     planProgress?: PlanProgress | null
     copilotAgentMode?: import('@hapi/protocol').CopilotAgentMode
     agentFlavor?: string | null
+    activityText?: string | null
     voiceStatus?: ConversationStatus
 }) {
     const { t } = useTranslation()
     const { preferences: headerMetadata } = useSessionHeaderMetadata()
     const connectionStatus = useMemo(
-        () => getConnectionStatus(props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount ?? 0, t),
-        [props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount, t]
+        () => getConnectionStatus(
+            props.active,
+            props.thinking,
+            props.agentState,
+            props.voiceStatus,
+            props.backgroundTaskCount ?? 0,
+            props.activityText,
+            t
+        ),
+        [props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount, props.activityText, t]
     )
 
     const contextHeuristicModel = props.contextModel ?? props.model
@@ -416,11 +427,14 @@ export function StatusBar(props: {
     return (
         <div className="flex min-w-0 items-baseline justify-between gap-2 px-2 pb-1">
             <div className="flex min-w-0 flex-1 items-baseline gap-2">
-                <div className="relative top-px sm:top-0.5 flex shrink-0 items-center gap-1.5">
+                <div className="relative top-px sm:top-0.5 flex min-w-0 items-center gap-1.5">
                     <span
-                        className={`h-2 w-2 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
+                        className={`h-2 w-2 shrink-0 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
                     />
-                    <span className={`whitespace-nowrap text-xs ${connectionStatus.color}`}>
+                    <span
+                        className={`max-w-[48vw] truncate whitespace-nowrap text-xs sm:max-w-96 ${connectionStatus.color}`}
+                        title={props.activityText ?? undefined}
+                    >
                         {connectionStatus.text}
                     </span>
                 </div>

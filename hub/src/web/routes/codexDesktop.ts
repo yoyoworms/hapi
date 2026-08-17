@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
 import type { CodexCollaborationMode } from '@hapi/protocol/types'
 import { Hono } from 'hono'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
@@ -285,9 +286,8 @@ function extractCodexText(value: unknown): string {
         return value
             .map((item) => {
                 const record = asRecord(item)
-                if (record?.type === 'text' && typeof record.text === 'string') return record.text
-                if (record?.type === 'input_text' && typeof record.text === 'string') return record.text
-                if (record?.type === 'output_text' && typeof record.text === 'string') return record.text
+                const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+                if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text
                 return null
             })
             .filter((part): part is string => Boolean(part))
@@ -295,13 +295,8 @@ function extractCodexText(value: unknown): string {
             .trim()
     }
     const record = asRecord(value)
-    if (record?.type === 'text' && typeof record.text === 'string') {
-        return record.text.trim()
-    }
-    if (record?.type === 'input_text' && typeof record.text === 'string') {
-        return record.text.trim()
-    }
-    if (record?.type === 'output_text' && typeof record.text === 'string') {
+    const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+    if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') {
         return record.text.trim()
     }
     return ''
@@ -655,7 +650,27 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
 
         if (eventType === 'agent_message') {
             const message = asString(payload.message)
-            return message ? buildImportedAgentMessage({ type: 'message', message, id: randomUUID() }) : null
+            const phase = normalizeAgentMessagePhase(payload.phase)
+            return message ? buildImportedAgentMessage({
+                type: 'message',
+                message,
+                ...(phase ? { phase } : {}),
+                id: randomUUID()
+            }) : null
+        }
+
+        if (eventType === 'item_completed') {
+            const item = asRecord(payload.item)
+            const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+            if (itemType !== 'agentmessage') return null
+            const message = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
+            return message ? buildImportedAgentMessage({
+                type: 'message',
+                message,
+                ...(phase ? { phase } : {}),
+                id: asString(item?.id) ?? randomUUID()
+            }) : null
         }
 
         if (eventType === 'agent_reasoning') {
@@ -692,7 +707,13 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
                 return shouldIgnoreInjectedResponseUserMessage(text) ? null : buildImportedUserMessage(text)
             }
             if (role === 'assistant') {
-                return buildImportedAgentMessage({ type: 'message', message: text, id: randomUUID() })
+                const phase = normalizeAgentMessagePhase(payload.phase)
+                return buildImportedAgentMessage({
+                    type: 'message',
+                    message: text,
+                    ...(phase ? { phase } : {}),
+                    id: randomUUID()
+                })
             }
             return null
         }
@@ -1056,6 +1077,16 @@ function normalizeComparableAgentData(value: unknown): unknown {
     const record = asRecord(value)
     if (!record) {
         return value
+    }
+
+    // `phase` is additive presentation metadata. A session imported before
+    // phase support must still be recognized as the same prefix when a newer
+    // transcript supplies commentary/final_answer for identical text.
+    if (record.type === 'message' && typeof record.message === 'string') {
+        return {
+            type: 'message',
+            message: record.message
+        }
     }
 
     const normalized = { ...record }

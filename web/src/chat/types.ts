@@ -1,6 +1,7 @@
 import type { AttachmentMetadata, MessageStatus } from '@/types/api'
 import type { ThreadGoal } from '@/types/api'
 import type { InlineMediaSource } from '@/chat/inlineMediaSource'
+import type { AgentMessagePhase } from '@hapi/protocol/messages'
 
 export type UsageData = {
     input_tokens: number
@@ -99,6 +100,7 @@ export type NormalizedAgentContent =
         text: string
         uuid: string
         streamId?: string
+        phase?: AgentMessagePhase
         parentUUID: string | null
     }
     | {
@@ -220,6 +222,7 @@ export type AgentTextBlock = {
     usage?: UsageData
     model?: string | null
     text: string
+    phase?: AgentMessagePhase
     meta?: unknown
 }
 

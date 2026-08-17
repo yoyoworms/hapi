@@ -728,6 +728,7 @@ vi.mock('./codexAppServerClient', () => {
                     item: {
                         id: 'child-msg-1',
                         type: 'agentMessage',
+                        phase: harness.emitSecondChildMessage ? 'commentary' : 'final_answer',
                         content: [{ type: 'text', text: childMessage }]
                     },
                     threadId: childThreadId,
@@ -741,6 +742,7 @@ vi.mock('./codexAppServerClient', () => {
                         item: {
                             id: 'child-msg-2',
                             type: 'agentMessage',
+                            phase: 'final_answer',
                             content: [{ type: 'text', text: secondChildMessage }]
                         },
                         threadId: childThreadId,
@@ -1036,6 +1038,7 @@ vi.mock('./codexAppServerClient', () => {
                     item: {
                         id: 'stale-retry-message',
                         type: 'agentMessage',
+                        phase: 'final_answer',
                         content: [{ type: 'text', text: 'done after retry' }]
                     },
                     threadId,
@@ -1957,7 +1960,8 @@ describe('codexRemoteLauncher', () => {
         expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'message',
-            message: 'done after retry'
+            message: 'done after retry',
+            phase: 'final_answer'
         }));
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(session.thinking).toBe(false);
@@ -2680,7 +2684,8 @@ describe('codexRemoteLauncher', () => {
             agentId: 'child-thread',
             message: expect.objectContaining({
                 type: 'message',
-                message: 'child output should stay hidden'
+                message: 'child output should stay hidden',
+                phase: 'final_answer'
             })
         }));
         expect(codexMessages).toContainEqual(expect.objectContaining({
@@ -2694,7 +2699,7 @@ describe('codexRemoteLauncher', () => {
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'agent-run-update',
             agentId: 'child-thread',
-            activity: 'Running command: echo child',
+            activity: 'Running command',
             activityKind: 'running-command'
         }));
         expect(codexMessages).toContainEqual(expect.objectContaining({
@@ -2757,6 +2762,24 @@ describe('codexRemoteLauncher', () => {
         expect(lastCompleted).toEqual(expect.objectContaining({
             result: 'final child output should win',
             activity: 'Completed: final child output should win'
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-trace',
+            agentId: 'child-thread',
+            message: expect.objectContaining({
+                type: 'message',
+                message: 'child output should stay hidden',
+                phase: 'commentary'
+            })
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-trace',
+            agentId: 'child-thread',
+            message: expect.objectContaining({
+                type: 'message',
+                message: 'final child output should win',
+                phase: 'final_answer'
+            })
         }));
     });
 

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
 import { isCodexSubagentSource } from '@/codex/utils/codexSessionMetadata'
 
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 200
@@ -57,16 +58,14 @@ function extractCodexText(value: unknown): string {
     if (Array.isArray(value)) {
         return value.map((item) => {
             const record = asRecord(item)
-            if (record?.type === 'text' && typeof record.text === 'string') return record.text
-            if (record?.type === 'input_text' && typeof record.text === 'string') return record.text
-            if (record?.type === 'output_text' && typeof record.text === 'string') return record.text
+            const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+            if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text
             return null
         }).filter((part): part is string => Boolean(part)).join(' ').trim()
     }
     const record = asRecord(value)
-    if (record?.type === 'text' && typeof record.text === 'string') return record.text.trim()
-    if (record?.type === 'input_text' && typeof record.text === 'string') return record.text.trim()
-    if (record?.type === 'output_text' && typeof record.text === 'string') return record.text.trim()
+    const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+    if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text.trim()
     return ''
 }
 
@@ -232,7 +231,21 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
         }
         if (eventType === 'agent_message') {
             const message = asString(payload.message)
-            return message ? buildImportedAgentMessage({ type: 'message', message, id: randomUUID() }) : null
+            const phase = normalizeAgentMessagePhase(payload.phase)
+            return message ? buildImportedAgentMessage({ type: 'message', message, ...(phase ? { phase } : {}), id: randomUUID() }) : null
+        }
+        if (eventType === 'item_completed') {
+            const item = asRecord(payload.item)
+            const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
+            if (itemType !== 'agentmessage') return null
+            const message = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
+            return message ? buildImportedAgentMessage({
+                type: 'message',
+                message,
+                ...(phase ? { phase } : {}),
+                id: asString(item?.id) ?? randomUUID()
+            }) : null
         }
         if (eventType === 'token_count') {
             const info = asRecord(payload.info)
@@ -247,7 +260,10 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
         const text = extractCodexText(payload.content)
         if (!text || shouldIgnoreSyntheticUserMessage(text)) return null
         if (role === 'user') return buildImportedUserMessage(text)
-        if (role === 'assistant') return buildImportedAgentMessage({ type: 'message', message: text, id: randomUUID() })
+        if (role === 'assistant') {
+            const phase = normalizeAgentMessagePhase(payload.phase)
+            return buildImportedAgentMessage({ type: 'message', message: text, ...(phase ? { phase } : {}), id: randomUUID() })
+        }
     }
     if (itemType === 'function_call') {
         const name = asString(payload.name)
@@ -280,6 +296,9 @@ function normalizeComparableContent(content: unknown): string | null {
     if (record.role === 'agent') {
         const body = asRecord(record.content)
         const data = asRecord(body?.data)
+        if (body?.type === AGENT_MESSAGE_PAYLOAD_TYPE && data?.type === 'message' && typeof data.message === 'string') {
+            return stableSerialize({ role: 'agent', type: 'message', message: data.message })
+        }
         const normalized = data ? { ...data } : body?.data
         if (data) delete (normalized as Record<string, unknown>).id
         return body?.type === AGENT_MESSAGE_PAYLOAD_TYPE ? stableSerialize({ role: 'agent', data: normalized }) : null

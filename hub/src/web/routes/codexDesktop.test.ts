@@ -92,13 +92,14 @@ function createMirroredAgentMessageTranscript(codexHome: string, sessionId: stri
         },
         {
             type: 'event_msg',
-            payload: { type: 'agent_message', message: 'duplicated assistant message' }
+            payload: { type: 'agent_message', phase: 'commentary', message: 'duplicated assistant message' }
         },
         {
             type: 'response_item',
             payload: {
                 type: 'message',
                 role: 'assistant',
+                phase: 'final_answer',
                 content: [{ type: 'output_text', text: 'duplicated assistant message' }]
             }
         }
@@ -482,6 +483,49 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
+    it('reuses a phase-less legacy import when the transcript now includes message phases', async () => {
+        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-phase-prefix-test-'))
+        const store = new Store(':memory:')
+        const codexSessionId = '13131313-1313-4131-8131-131313131313'
+        process.env.CODEX_HOME = codexHome
+
+        try {
+            createMirroredAgentMessageTranscript(codexHome, codexSessionId)
+            const legacy = store.sessions.getOrCreateSession(
+                'legacy-import-session',
+                { codexSessionId, lifecycleState: 'imported' },
+                {},
+                'default'
+            )
+            store.messages.addMessage(legacy.id, {
+                role: 'agent',
+                content: {
+                    type: AGENT_MESSAGE_PAYLOAD_TYPE,
+                    data: {
+                        type: 'message',
+                        message: 'duplicated assistant message',
+                        id: 'legacy-message-id'
+                    }
+                },
+                meta: { sentFrom: 'cli' }
+            })
+
+            const result = await importSelectedCodexSessions({
+                codexSessionIds: [codexSessionId],
+                store,
+                namespace: 'default',
+                getSyncEngine: () => null
+            })
+
+            expect(result.success).toBe(true)
+            expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(1)
+            expect(store.messages.getAllMessages(legacy.id)).toHaveLength(1)
+        } finally {
+            store.close()
+            rmSync(codexHome, { recursive: true, force: true })
+        }
+    })
+
     it('deduplicates mirrored event_msg and response_item user messages', async () => {
         const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-mirror-test-'))
         const store = new Store(':memory:')
@@ -547,6 +591,7 @@ describe('Codex Desktop import routes', () => {
                     data: {
                         type: 'message',
                         message: 'duplicated assistant message',
+                        phase: 'commentary',
                         id: expect.any(String)
                     }
                 },

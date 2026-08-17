@@ -115,37 +115,48 @@ afterEach(() => {
 
 describe('mobile initial scroll settling', () => {
     it('disables owner machine discovery when requested by a shared viewer', () => {
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false } }
+        })
+        const getHubSettings = vi.fn().mockResolvedValue({
+            sessionSummaryContract: false,
+            sessionSummaryInChat: false
+        })
         render(
-            <I18nProvider>
-                <HappyThread
-                    api={{} as ApiClient}
-                    session={{ metadata: {} } as Session}
-                    sessionId="shared-session"
-                    metadata={null}
-                    disabled={false}
-                    machineDiscoveryEnabled={false}
-                    onRefresh={vi.fn()}
-                    onViewModeChange={vi.fn()}
-                    isSyncingTail={false}
-                    messagesWarning={null}
-                    hasMoreMessages={false}
-                    isLoadingMoreMessages={false}
-                    onLoadMore={vi.fn().mockResolvedValue({ status: 'exhausted' })}
-                    onCancelLoadMore={vi.fn()}
-                    unseenCount={0}
-                    rawMessagesCount={0}
-                    normalizedMessagesCount={0}
-                    messagesVersion={0}
-                    historyVersion={0}
-                    forceScrollToken={0}
-                    outlineOpen={false}
-                    outlineItems={[]}
-                    onOutlineOpenChange={vi.fn()}
-                />
-            </I18nProvider>,
+            <QueryClientProvider client={queryClient}>
+                <I18nProvider>
+                    <HappyThread
+                        api={{ getHubSettings } as unknown as ApiClient}
+                        session={{ metadata: {} } as Session}
+                        sessionId="shared-session"
+                        metadata={null}
+                        disabled={false}
+                        machineDiscoveryEnabled={false}
+                        hubSettingsEnabled={false}
+                        onRefresh={vi.fn()}
+                        onViewModeChange={vi.fn()}
+                        isSyncingTail={false}
+                        messagesWarning={null}
+                        hasMoreMessages={false}
+                        isLoadingMoreMessages={false}
+                        onLoadMore={vi.fn().mockResolvedValue({ status: 'exhausted' })}
+                        onCancelLoadMore={vi.fn()}
+                        unseenCount={0}
+                        rawMessagesCount={0}
+                        normalizedMessagesCount={0}
+                        messagesVersion={0}
+                        historyVersion={0}
+                        forceScrollToken={0}
+                        outlineOpen={false}
+                        outlineItems={[]}
+                        onOutlineOpenChange={vi.fn()}
+                    />
+                </I18nProvider>
+            </QueryClientProvider>,
         )
 
         expect(useMachinesMock).toHaveBeenCalledWith(expect.anything(), false)
+        expect(getHubSettings).not.toHaveBeenCalled()
     })
 
     it('does not snap back after pointer cancellation ends a touch swipe', () => {

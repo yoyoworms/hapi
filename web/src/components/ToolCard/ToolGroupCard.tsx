@@ -12,7 +12,6 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
 import { formatDuration } from '@/chat/presentation'
-import { getInputStringAny } from '@/lib/toolInputUtils'
 
 const TIMING_INTERVAL_MS = 1000
 
@@ -157,6 +156,59 @@ function codexActionLabel(
     return { title: t('toolGroup.friendly.genericCommand'), detail: null }
 }
 
+export function formatCodexExplorationSummary(
+    tools: ToolCallBlock[],
+    t: (key: string, params?: Record<string, string | number>) => string
+): string | null {
+    const readTargets: string[] = []
+    const listTargets: string[] = []
+    const otherLabels: string[] = []
+    for (const tool of tools) {
+        for (const action of getCodexCommandActions(tool)) {
+            const label = codexActionLabel(action, t)
+            if (action.type === 'read' && label.detail) {
+                if (!readTargets.includes(label.detail)) readTargets.push(label.detail)
+                continue
+            }
+            if (action.type === 'listFiles' && label.detail) {
+                if (!listTargets.includes(label.detail)) listTargets.push(label.detail)
+                continue
+            }
+            const text = label.detail ? `${label.title} ${label.detail}` : label.title
+            if (!otherLabels.includes(text)) otherLabels.push(text)
+        }
+    }
+
+    const entries: Array<{ text: string; count: number; shownCount: number }> = []
+    if (readTargets.length > 0) {
+        const shown = readTargets.slice(0, 2)
+        entries.push({
+            text: `${t('toolGroup.codex.read')} ${shown.join(', ')}`,
+            count: readTargets.length,
+            shownCount: shown.length,
+        })
+    }
+    if (listTargets.length > 0) {
+        const shown = listTargets.slice(0, 2)
+        entries.push({
+            text: `${t('toolGroup.codex.list')} ${shown.join(', ')}`,
+            count: listTargets.length,
+            shownCount: shown.length,
+        })
+    }
+    entries.push(...otherLabels.map((text) => ({ text, count: 1, shownCount: 1 })))
+
+    if (entries.length === 0) return null
+    const selected = entries.slice(0, 2)
+    const hiddenCount = selected.reduce((count, entry) => count + entry.count - entry.shownCount, 0)
+        + entries.slice(selected.length).reduce((count, entry) => count + entry.count, 0)
+    const visible = selected.map((entry) => entry.text)
+    if (hiddenCount > 0) {
+        visible.push(t('toolGroup.codex.more', { n: hiddenCount }))
+    }
+    return visible.join(' · ')
+}
+
 function CodexExplorationRows(props: {
     tools: ToolCallBlock[]
     onSelect: (toolId: string) => void
@@ -286,32 +338,10 @@ export function ToolGroupCard(props: {
         }, t)
     }, [selectedTool, props.metadata, t])
 
-    const activeTool = useMemo(() => {
-        for (let index = props.block.tools.length - 1; index >= 0; index -= 1) {
-            const tool = props.block.tools[index]
-            if (tool.tool.state === 'running' || tool.tool.state === 'pending') return tool
-        }
-        return null
-    }, [props.block.tools])
-    const activePresentation = useMemo(() => {
-        if (!activeTool) return null
-        return getToolPresentation({
-            toolName: activeTool.tool.name,
-            input: activeTool.tool.input,
-            result: activeTool.tool.result,
-            childrenCount: activeTool.children.length,
-            description: activeTool.tool.nativeTitle ?? activeTool.tool.description,
-            metadata: props.metadata
-        }, t)
-    }, [activeTool, props.metadata, t])
-    const activeDetail = activeTool
-        ? getInputStringAny(activeTool.tool.input, ['command', 'cmd'])
-            ?? activePresentation?.subtitle
-            ?? activePresentation?.title
-            ?? null
-        : null
-
     const primaryTitle = formatGroupedHeaderTitle(props.block, t)
+    const activityDetail = props.block.presentationMode === 'codex-exploration'
+        ? formatCodexExplorationSummary(props.block.tools, t)
+        : null
     const subtitle = props.block.presentationMode === 'codex-exploration'
         ? null
         : formatGroupedHeaderSubtitle(props.block, t) ?? formatActionSummary(props.block, t)
@@ -339,9 +369,9 @@ export function ToolGroupCard(props: {
                                     {primaryTitle}
                                 </CardTitle>
                             </div>
-                            {activeDetail ? (
-                                <CardDescription className="truncate whitespace-nowrap font-mono text-xs text-[var(--app-tool-card-subtitle)]">
-                                    {activeDetail}
+                            {activityDetail ? (
+                                <CardDescription className="truncate whitespace-nowrap text-xs text-[var(--app-tool-card-subtitle)]">
+                                    {activityDetail}
                                 </CardDescription>
                             ) : null}
                             <ToolTimingSummary

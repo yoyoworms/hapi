@@ -160,7 +160,7 @@ describe('ToolGroupCard', () => {
         expect(screen.getByText('Duration')).toBeInTheDocument()
         expect(screen.queryByText('Finished')).not.toBeInTheDocument()
         expect(within(view.container).getByLabelText('Running')).toBeInTheDocument()
-        expect(screen.getByText('bun test')).toBeInTheDocument()
+        expect(screen.queryByText('bun test')).not.toBeInTheDocument()
     })
 
     it('shows final timing in the collapsed header after every tool finishes', () => {
@@ -211,7 +211,7 @@ describe('ToolGroupCard', () => {
         expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveClass('top-2')
     })
 
-    it('shows structured Codex exploration actions by default without a generic action count', () => {
+    it('shows a safe semantic Codex exploration summary without exposing raw commands', () => {
         const tools = [
             makeToolBlock('codex-read', 'CodexBash', {
                 command: 'cat package.json',
@@ -255,7 +255,74 @@ describe('ToolGroupCard', () => {
         expect(screen.getByText('package.json')).toBeInTheDocument()
         expect(screen.getByText('Search')).toBeInTheDocument()
         expect(screen.getByText('nativeTitle in web/src')).toBeInTheDocument()
+        expect(screen.getByText('Read package.json · Search nativeTitle in web/src')).toBeInTheDocument()
+        expect(screen.queryByText('cat package.json')).not.toBeInTheDocument()
+        expect(screen.queryByText('rg nativeTitle web/src')).not.toBeInTheDocument()
         expect(screen.queryByText('2 actions')).not.toBeInTheDocument()
+    })
+
+    it('keeps structured exploration details visible while the group stays collapsed', () => {
+        const tools = [makeToolBlock('codex-read', 'CodexBash', {
+            command: 'cat package.json',
+            command_actions: [{
+                type: 'read',
+                command: 'cat package.json',
+                name: 'package.json',
+                path: '/repo/package.json'
+            }]
+        })]
+        const view = renderCard(makeGroup({
+            tools,
+            presentationMode: 'codex-exploration',
+            summary: {
+                totalTools: 1,
+                countsByKind: { read: 0, search: 0, command: 1, mutation: 0, web: 0, other: 0 },
+                fileTargets: [],
+                commandTargets: ['cat package.json'],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 0,
+                pendingCount: 0,
+            }
+        }))
+
+        expect(within(view.container).getByRole('button', { name: /^explored\b/i })).toHaveAttribute('aria-expanded', 'false')
+        expect(screen.getByText('Read package.json')).toBeInTheDocument()
+        expect(screen.queryByText('cat package.json')).not.toBeInTheDocument()
+    })
+
+    it('merges and deduplicates read targets in the collapsed exploration summary', () => {
+        const names = ['a.ts', 'a.ts', 'b.ts', 'c.ts']
+        const tools = names.map((name, index) => makeToolBlock(`codex-read-${index}`, 'CodexBash', {
+            command: `cat ${name}`,
+            command_actions: [{
+                type: 'read',
+                command: `cat ${name}`,
+                name,
+                path: `/repo/${name}`
+            }]
+        }))
+        renderCard(makeGroup({
+            tools,
+            presentationMode: 'codex-exploration',
+            summary: {
+                totalTools: tools.length,
+                countsByKind: { read: 0, search: 0, command: tools.length, mutation: 0, web: 0, other: 0 },
+                fileTargets: [],
+                commandTargets: names.map((name) => `cat ${name}`),
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 0,
+                pendingCount: 0,
+            }
+        }))
+
+        expect(screen.getByText('Read a.ts, b.ts · +1 more')).toBeInTheDocument()
+        expect(screen.queryByText('cat a.ts')).not.toBeInTheDocument()
     })
 
     it('uses a neutral header for all-generic tool groups without duplicate counters', () => {

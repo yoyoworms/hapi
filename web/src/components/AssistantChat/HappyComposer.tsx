@@ -318,6 +318,7 @@ export function HappyComposer(props: {
     contextModel?: string | null
     controlledByUser?: boolean
     agentFlavor?: string | null
+    activityText?: string | null
     availableModelOptions?: Array<{ value: string | null; label: string }>
     /** Full Pi model data with thinkingLevelMap for provider grouping + thinking level filtering */
     piModels?: PiModelSummary[]
@@ -2264,6 +2265,7 @@ export function HappyComposer(props: {
                         planProgress={props.planProgress}
                         copilotAgentMode={copilotAgentMode}
                         agentFlavor={agentFlavor}
+                        activityText={props.activityText}
                         voiceStatus={effectiveVoiceStatus}
                     />
 

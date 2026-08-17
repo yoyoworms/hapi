@@ -134,9 +134,46 @@ function normalizeNonTerminalCodexAgentActivity(activity: string): string {
     return activity
 }
 
+function semanticCommandActivity(activity: string): string | null {
+    const match = activity.match(/^(Running command|Command (?:completed|finished|failed))\s*:\s*([\s\S]+)$/i)
+    if (!match) return null
+
+    const phase = match[1].toLowerCase()
+    const command = match[2]
+    const running = phase === 'running command'
+    const failed = phase === 'command failed'
+    const label = (active: string, complete: string, error: string) => running ? active : failed ? error : complete
+
+    if (/\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|cargo\s+test|go\s+test)\b/i.test(command)) {
+        return label('Running tests', 'Tests finished', 'Tests failed')
+    }
+    if (/\b(?:typecheck|lint|tsc|cargo\s+check)\b/i.test(command)) {
+        return label('Checking project', 'Checks finished', 'Checks failed')
+    }
+    if (/\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?build\b|\bcargo\s+build\b/i.test(command)) {
+        return label('Building project', 'Build finished', 'Build failed')
+    }
+    if (/\b(?:rg|grep|findstr|select-string)\b/i.test(command)) {
+        return label('Searching project', 'Search finished', 'Search failed')
+    }
+    if (/\b(?:cat|sed\s+-n|head|tail|get-content|ls|tree)\b/i.test(command)) {
+        return label('Inspecting files', 'File inspection finished', 'File inspection failed')
+    }
+    if (/\bgit\s+(?:status|diff|log)\b/i.test(command)) {
+        return label('Inspecting changes', 'Change inspection finished', 'Change inspection failed')
+    }
+
+    // Unknown commands may contain paths, prompts, credentials, or tokens.
+    // Preserve the phase only; exact input remains available in trace details.
+    return running ? 'Running command' : failed ? 'Command failed' : 'Command finished'
+}
+
 export function getCodexAgentActivity(input: unknown): string | null {
     const activity = getInputStringAny(input, ['activity', 'statusText', 'status_text', 'agentStatus'])
     if (!activity) return null
+
+    const semanticCommand = semanticCommandActivity(activity)
+    if (semanticCommand) return semanticCommand
 
     const status = getCodexAgentStatus(input)
     return isTerminalCodexAgentStatus(status)

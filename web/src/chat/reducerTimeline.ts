@@ -1,5 +1,6 @@
 import type { AgentReasoningBlock, AgentTextBlock, ChatBlock, CliOutputBlock, CodexReviewBlock, ToolCallBlock, ToolPermission } from '@/chat/types'
 import type { TracedMessage } from '@/chat/tracer'
+import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
 import { createCliOutputBlock, isCliOutputText, mergeCliOutputBlocks } from '@/chat/reducerCliOutput'
 import { parseMessageAsEvent } from '@/chat/reducerEvents'
 import { collectTitleChanges, ensureToolBlock, extractTitleFromChangeTitleInput, isChangeTitleToolName, type PermissionEntry } from '@/chat/reducerTools'
@@ -205,11 +206,18 @@ function normalizeTraceMessage(
     }
 
     if (data.type === 'message' && typeof data.message === 'string') {
+        const phase = normalizeAgentMessagePhase(data.phase)
         return [{
             ...base,
             id: traceId,
             role: 'agent',
-            content: [{ type: 'text', text: data.message, uuid: traceId, parentUUID: null }]
+            content: [{
+                type: 'text',
+                text: data.message,
+                uuid: traceId,
+                ...(phase ? { phase } : {}),
+                parentUUID: null
+            }]
         } as TracedMessage]
     }
 
@@ -772,6 +780,7 @@ export function reduceTimeline(
                         const existing = textBlocksByStreamId.get(streamId)
                         if (existing) {
                             existing.text = c.text
+                            existing.phase = c.phase
                             existing.usage = msg.usage
                             existing.model = msg.model
                             existing.meta = msg.meta
@@ -789,6 +798,7 @@ export function reduceTimeline(
                         usage: msg.usage,
                         model: msg.model,
                         text: c.text,
+                        phase: c.phase,
                         meta: msg.meta
                     }
                     blocks.push(block)

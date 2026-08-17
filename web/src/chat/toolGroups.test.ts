@@ -217,7 +217,7 @@ describe('buildVisibleChatBlocks', () => {
         expect(isToolGroupBlock(visible[0]) && visible[0].defaultOpen).toBe(true)
     })
 
-    it('keeps structured general Codex commands separate from exploration groups', () => {
+    it('keeps structured general Codex commands in collapsed activity groups between exploration groups', () => {
         const read = makeToolBlock('codex-read', 'CodexBash', {
             command: 'cat package.json',
             command_actions: [{
@@ -245,8 +245,23 @@ describe('buildVisibleChatBlocks', () => {
 
         expect(visible).toHaveLength(3)
         expect(isToolGroupBlock(visible[0]) && visible[0].presentationMode).toBe('codex-exploration')
-        expect(visible[1]).toBe(test)
+        expect(isToolGroupBlock(visible[1]) && visible[1].tools).toEqual([test])
+        expect(isToolGroupBlock(visible[1]) && visible[1].presentationMode).toBe('default')
         expect(isToolGroupBlock(visible[2]) && visible[2].presentationMode).toBe('codex-exploration')
+    })
+
+    it('collapses a single ordinary Codex command instead of rendering a raw Terminal card', () => {
+        const command = makeToolBlock('codex-test', 'CodexBash', {
+            command: '/bin/zsh -lc "bun test --filter chat"',
+            command_actions: [{ type: 'unknown', command: 'bun test --filter chat' }]
+        })
+
+        const visible = buildVisibleChatBlocks([command], { hasMoreMessages: false })
+
+        expect(visible).toHaveLength(1)
+        expect(isToolGroupBlock(visible[0])).toBe(true)
+        expect(isToolGroupBlock(visible[0]) && visible[0].tools).toEqual([command])
+        expect(isToolGroupBlock(visible[0]) && visible[0].defaultOpen).toBe(false)
     })
 
     it('groups contiguous eligible root tool cards', () => {

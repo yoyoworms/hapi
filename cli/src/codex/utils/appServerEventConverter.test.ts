@@ -210,6 +210,25 @@ describe('AppServerEventConverter', () => {
         expect(completed).toEqual([{ type: 'agent_message', message: 'Hello world' }]);
     });
 
+    it('preserves the completed agent message phase', () => {
+        const converter = new AppServerEventConverter();
+
+        const completed = converter.handleNotification('item/completed', {
+            item: {
+                id: 'msg-commentary',
+                type: 'agentMessage',
+                phase: 'commentary',
+                content: [{ type: 'text', text: 'Checking the implementation.' }]
+            }
+        });
+
+        expect(completed).toEqual([{
+            type: 'agent_message',
+            message: 'Checking the implementation.',
+            phase: 'commentary'
+        }]);
+    });
+
     it('preserves thread and turn scope on item events', () => {
         const converter = new AppServerEventConverter();
 
@@ -638,21 +657,21 @@ describe('AppServerEventConverter', () => {
         })]);
     });
 
-    it('maps reasoning deltas', () => {
+    it('ignores raw reasoning deltas', () => {
         const converter = new AppServerEventConverter();
 
         const events = converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'step' });
-        expect(events).toEqual([{ type: 'agent_reasoning_delta', delta: 'step' }]);
+        expect(events).toEqual([]);
     });
 
-    it('dedupes duplicate reasoning deltas', () => {
+    it('dedupes duplicate reasoning summary deltas', () => {
         const converter = new AppServerEventConverter();
 
-        expect(converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'Hello ' }))
+        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Hello ' }))
             .toEqual([{ type: 'agent_reasoning_delta', delta: 'Hello ' }]);
-        expect(converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'Hello ' }))
+        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Hello ' }))
             .toEqual([]);
-        converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'world' });
+        converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'world' });
 
         const completed = converter.handleNotification('item/completed', {
             item: { id: 'r1', type: 'reasoning' }
@@ -666,6 +685,72 @@ describe('AppServerEventConverter', () => {
 
         const events = converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'step' });
         expect(events).toEqual([{ type: 'agent_reasoning_delta', delta: 'step' }]);
+    });
+
+    it('keeps summary part boundaries in the completion fallback', () => {
+        const converter = new AppServerEventConverter();
+
+        converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Same' });
+        converter.handleNotification('item/reasoning/summaryPartAdded', { itemId: 'r1', summaryIndex: 1 });
+        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Same' }))
+            .toEqual([{ type: 'agent_reasoning_delta', delta: 'Same' }]);
+
+        expect(converter.handleNotification('item/completed', {
+            item: { id: 'r1', type: 'reasoning' }
+        })).toEqual([{ type: 'agent_reasoning', text: 'Same\nSame' }]);
+    });
+
+    it('keeps raw reasoning out of the readable summary buffer', () => {
+        const converter = new AppServerEventConverter();
+
+        expect(converter.handleNotification('item/reasoning/textDelta', {
+            itemId: 'r1',
+            delta: 'Readable summary'
+        })).toEqual([]);
+        expect(converter.handleNotification('item/reasoning/summaryTextDelta', {
+            itemId: 'r1',
+            delta: 'Readable summary'
+        })).toEqual([{ type: 'agent_reasoning_delta', delta: 'Readable summary' }]);
+
+        expect(converter.handleNotification('item/completed', {
+            item: { id: 'r1', type: 'reasoning' }
+        })).toEqual([{ type: 'agent_reasoning', text: 'Readable summary' }]);
+    });
+
+    it('prefers the official v2 reasoning summary and never exposes raw item content', () => {
+        const converter = new AppServerEventConverter();
+
+        expect(converter.handleNotification('item/completed', {
+            item: {
+                id: 'r1',
+                type: 'reasoning',
+                summary: ['Inspecting files', 'Checking tests'],
+                summary_text: ['Legacy summary'],
+                summaryText: ['Legacy camel summary'],
+                text: 'private raw text',
+                content: ['private raw content']
+            }
+        })).toEqual([{
+            type: 'agent_reasoning',
+            text: 'Inspecting files\nChecking tests'
+        }]);
+
+        expect(converter.handleNotification('item/completed', {
+            item: {
+                id: 'r2',
+                type: 'reasoning',
+                text: 'private raw text',
+                content: ['private raw content']
+            }
+        })).toEqual([]);
+    });
+
+    it('supports the legacy camel-case reasoning summary field', () => {
+        const converter = new AppServerEventConverter();
+
+        expect(converter.handleNotification('item/completed', {
+            item: { id: 'r1', type: 'reasoning', summaryText: ['Legacy summary'] }
+        })).toEqual([{ type: 'agent_reasoning', text: 'Legacy summary' }]);
     });
 
     it('deduplicates repeated reasoning completions for the same item', () => {
@@ -906,7 +991,7 @@ describe('AppServerEventConverter', () => {
     it('unwraps codex/event reasoning completion from summary text', () => {
         const converter = new AppServerEventConverter();
 
-        converter.handleNotification('codex/event/reasoning_content_delta', {
+        const rawDelta = converter.handleNotification('codex/event/reasoning_content_delta', {
             msg: { type: 'reasoning_content_delta', item_id: 'r1', delta: 'Plan' }
         });
         const completed = converter.handleNotification('codex/event/item_completed', {
@@ -917,6 +1002,7 @@ describe('AppServerEventConverter', () => {
             }
         });
 
+        expect(rawDelta).toEqual([]);
         expect(completed).toEqual([{ type: 'agent_reasoning', text: 'Plan done' }]);
     });
 

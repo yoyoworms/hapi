@@ -1,4 +1,5 @@
 import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER } from '@hapi/protocol/usage';
+import { normalizeAgentMessagePhase } from '@hapi/protocol/messages';
 import { logger } from '@/ui/logger';
 
 type ConvertedEvent = {
@@ -321,15 +322,14 @@ function extractItemText(item: Record<string, unknown>): string | null {
     return asString(item.text ?? item.message) ?? extractTextFromContent(item.content);
 }
 
-function extractReasoningText(item: Record<string, unknown>): string | null {
-    const direct = extractItemText(item);
-    if (direct) {
-        return direct;
-    }
+function extractReasoningSummary(item: Record<string, unknown>): string | null {
+    // App-server v2 deliberately separates the user-readable summary from raw
+    // reasoning content. Never fall back to item.content/item.text here: raw
+    // reasoning is hidden by default in the official Codex clients.
+    for (const value of [item.summary, item.summary_text, item.summaryText]) {
+        if (!Array.isArray(value)) continue;
 
-    const summary = item.summary_text ?? item.summaryText;
-    if (Array.isArray(summary)) {
-        const chunks = summary.filter((part): part is string => typeof part === 'string' && part.length > 0);
+        const chunks = value.filter((part): part is string => typeof part === 'string' && part.length > 0);
         if (chunks.length > 0) {
             return chunks.join('\n');
         }
@@ -688,7 +688,7 @@ function buildCollabAgentOutput(item: Record<string, unknown>, toolName: string)
 
 export class AppServerEventConverter {
     private readonly agentMessageBuffers = new Map<string, string>();
-    private readonly reasoningBuffers = new Map<string, string>();
+    private readonly reasoningSummaryBuffers = new Map<string, string>();
     private readonly commandOutputBuffers = new Map<string, string>();
     private readonly commandMeta = new Map<string, Record<string, unknown>>();
     private readonly fileChangeMeta = new Map<string, Record<string, unknown>>();
@@ -696,7 +696,7 @@ export class AppServerEventConverter {
     private readonly completedReasoningItems = new Set<string>();
     private readonly reasoningSectionBreakKeys = new Set<string>();
     private readonly lastAgentMessageDeltaByItemId = new Map<string, string>();
-    private readonly lastReasoningDeltaByItemId = new Map<string, string>();
+    private readonly lastReasoningSummaryDeltaByItemId = new Map<string, string>();
     private readonly lastCommandOutputDeltaByItemId = new Map<string, string>();
     private readonly rawAgentToolCallIds = new Set<string>();
     private readonly rawAgentToolNames = new Map<string, string>();
@@ -762,14 +762,19 @@ export class AppServerEventConverter {
             const itemId = asString(msg.item_id ?? msg.itemId ?? msg.id) ?? 'agent-message';
             const delta = asString(msg.delta ?? msg.text ?? msg.message);
             if (!delta) return [];
-            return this.handleNotification('item/agentMessage/delta', { itemId, delta, ...msgScope });
+            return this.handleNotification('item/agentMessage/delta', {
+                itemId,
+                delta,
+                phase: msg.phase,
+                ...msgScope
+            });
         }
 
         if (msgType === 'reasoning_content_delta') {
             const itemId = asString(msg.item_id ?? msg.itemId ?? msg.id) ?? 'reasoning';
             const delta = asString(msg.delta ?? msg.text ?? msg.message);
             if (!delta) return [];
-            return this.handleNotification('item/reasoning/summaryTextDelta', { itemId, delta, ...msgScope });
+            return this.handleNotification('item/reasoning/textDelta', { itemId, delta, ...msgScope });
         }
 
         if (msgType === 'agent_reasoning_section_break') {
@@ -1133,17 +1138,24 @@ export class AppServerEventConverter {
             return events;
         }
 
-        if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
+        if (method === 'item/reasoning/textDelta') {
+            // This is the raw reasoning channel, not the user-readable summary.
+            // Match the official client default: ignore it and, importantly, do
+            // not let it contaminate the summary buffer used at completion.
+            return events;
+        }
+
+        if (method === 'item/reasoning/summaryTextDelta') {
             const itemId = extractItemId(paramsRecord) ?? 'reasoning';
             const delta = asString(paramsRecord.delta ?? paramsRecord.text ?? paramsRecord.message);
             if (delta) {
-                const lastDelta = this.lastReasoningDeltaByItemId.get(itemId);
+                const lastDelta = this.lastReasoningSummaryDeltaByItemId.get(itemId);
                 if (lastDelta === delta) {
                     return events;
                 }
-                this.lastReasoningDeltaByItemId.set(itemId, delta);
-                const prev = this.reasoningBuffers.get(itemId) ?? '';
-                this.reasoningBuffers.set(itemId, prev + delta);
+                this.lastReasoningSummaryDeltaByItemId.set(itemId, delta);
+                const prev = this.reasoningSummaryBuffers.get(itemId) ?? '';
+                this.reasoningSummaryBuffers.set(itemId, prev + delta);
                 events.push(scoped({ type: 'agent_reasoning_delta', delta }));
             }
             return events;
@@ -1159,6 +1171,12 @@ export class AppServerEventConverter {
                 }
                 this.reasoningSectionBreakKeys.add(key);
             }
+            const bufferedSummary = this.reasoningSummaryBuffers.get(itemId);
+            if (bufferedSummary && !bufferedSummary.endsWith('\n')) {
+                this.reasoningSummaryBuffers.set(itemId, `${bufferedSummary}\n`);
+            }
+            // Identical text in adjacent summary parts is not a duplicate delta.
+            this.lastReasoningSummaryDeltaByItemId.delete(itemId);
             events.push(scoped({ type: 'agent_reasoning_section_break' }));
             return events;
         }
@@ -1213,7 +1231,12 @@ export class AppServerEventConverter {
                     }
                     const text = extractItemText(item) ?? this.agentMessageBuffers.get(itemId);
                     if (text) {
-                        events.push(scoped({ type: 'agent_message', message: text }));
+                        const phase = normalizeAgentMessagePhase(item.phase ?? paramsRecord.phase);
+                        events.push(scoped({
+                            type: 'agent_message',
+                            message: text,
+                            ...(phase ? { phase } : {})
+                        }));
                         this.completedAgentMessageItems.add(itemId);
                         this.agentMessageBuffers.delete(itemId);
                     }
@@ -1227,13 +1250,13 @@ export class AppServerEventConverter {
                     if (this.completedReasoningItems.has(itemId)) {
                         return events;
                     }
-                    const text = extractReasoningText(item) ?? this.reasoningBuffers.get(itemId);
+                    const text = extractReasoningSummary(item) ?? this.reasoningSummaryBuffers.get(itemId);
                     if (text) {
                         events.push(scoped({ type: 'agent_reasoning', text }));
                         this.completedReasoningItems.add(itemId);
-                        this.reasoningBuffers.delete(itemId);
+                        this.reasoningSummaryBuffers.delete(itemId);
                     }
-                    this.lastReasoningDeltaByItemId.delete(itemId);
+                    this.lastReasoningSummaryDeltaByItemId.delete(itemId);
                 }
                 return events;
             }
@@ -1417,7 +1440,7 @@ export class AppServerEventConverter {
 
     reset(): void {
         this.agentMessageBuffers.clear();
-        this.reasoningBuffers.clear();
+        this.reasoningSummaryBuffers.clear();
         this.commandOutputBuffers.clear();
         this.commandMeta.clear();
         this.fileChangeMeta.clear();
@@ -1425,7 +1448,7 @@ export class AppServerEventConverter {
         this.completedReasoningItems.clear();
         this.reasoningSectionBreakKeys.clear();
         this.lastAgentMessageDeltaByItemId.clear();
-        this.lastReasoningDeltaByItemId.clear();
+        this.lastReasoningSummaryDeltaByItemId.clear();
         this.lastCommandOutputDeltaByItemId.clear();
         this.rawAgentToolCallIds.clear();
         this.rawAgentToolNames.clear();
