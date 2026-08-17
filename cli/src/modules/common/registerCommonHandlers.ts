@@ -15,11 +15,17 @@ import { registerSlashCommandHandlers } from './handlers/slashCommands'
 import { registerSkillsHandlers } from './handlers/skills'
 import { registerUploadHandlers } from './handlers/uploads'
 import { registerAgentSessionHandlers } from './handlers/agentSessions'
+import { registerCodexAccountHandlers } from './handlers/codexAccounts'
+
+export interface RegisterCommonHandlerOptions {
+    codexModelsMachineScoped?: boolean
+    codexAccountsMachineScoped?: boolean
+}
 
 export function registerCommonHandlers(
     rpcHandlerManager: RpcHandlerManager,
     workingDirectory: string,
-    options?: { codexModelsMachineScoped?: boolean }
+    options?: RegisterCommonHandlerOptions
 ): void {
     registerAgyModelHandlers(rpcHandlerManager)
     registerBashHandlers(rpcHandlerManager, workingDirectory)
@@ -37,4 +43,7 @@ export function registerCommonHandlers(
     registerGitHandlers(rpcHandlerManager, workingDirectory)
     registerUploadHandlers(rpcHandlerManager)
     registerAgentSessionHandlers(rpcHandlerManager)
+    if (options?.codexAccountsMachineScoped === true) {
+        registerCodexAccountHandlers(rpcHandlerManager)
+    }
 }

@@ -135,7 +135,10 @@ export class ApiMachineClient {
             logger: (msg, data) => logger.debug(msg, data)
         })
 
-        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd(), { codexModelsMachineScoped: true })
+        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd(), {
+            codexModelsMachineScoped: true,
+            codexAccountsMachineScoped: true
+        })
 
         this.rpcHandlerManager.registerHandler<PathExistsRequest, PathExistsResponse>(RPC_METHODS.PathExists, async (params) => {
             const rawPaths = Array.isArray(params?.paths) ? params.paths : []

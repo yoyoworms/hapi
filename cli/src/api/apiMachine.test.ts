@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, mkdtempSync, rmSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 
 const ioMock = vi.hoisted(() => vi.fn())
 const listOpencodeModelsForCwdMock = vi.hoisted(() => vi.fn())
@@ -52,6 +53,15 @@ function makeMachine(id: string): Machine {
     }
 }
 
+const CODEX_ACCOUNT_METHODS = [
+    RPC_METHODS.ListCodexAccounts,
+    RPC_METHODS.StartCodexAccountLogin,
+    RPC_METHODS.GetCodexAccountLoginStatus,
+    RPC_METHODS.AddCodexApiEndpoint,
+    RPC_METHODS.SetDefaultCodexAccount,
+    RPC_METHODS.RemoveCodexAccount
+] as const
+
 describe('normalizeWindowsDriveRoot', () => {
     it('restores the trailing separator when Windows realpath returns a bare drive', () => {
         expect(normalizeWindowsDriveRoot('C:')).toBe('C:\\')
@@ -61,6 +71,23 @@ describe('normalizeWindowsDriveRoot', () => {
     it('leaves non-drive-root paths unchanged', () => {
         expect(normalizeWindowsDriveRoot('C:\\Users')).toBe('C:\\Users')
         expect(normalizeWindowsDriveRoot('/tmp/workspace')).toBe('/tmp/workspace')
+    })
+})
+
+describe('ApiMachineClient Codex account RPC wiring', () => {
+    it('registers all machine-scoped account-management handlers', () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('codex-account-machine'))
+        const manager = (client as unknown as {
+            rpcHandlerManager: { hasHandler: (method: string) => boolean }
+        }).rpcHandlerManager
+
+        try {
+            for (const method of CODEX_ACCOUNT_METHODS) {
+                expect(manager.hasHandler(method), method).toBe(true)
+            }
+        } finally {
+            client.shutdown()
+        }
     })
 })
 

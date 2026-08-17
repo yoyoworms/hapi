@@ -140,6 +140,35 @@ describe('CodexAccountSelector', () => {
         expect(onChange).not.toHaveBeenCalledWith('system')
     })
 
+    it('keeps the current session account when the runner account list cannot load', async () => {
+        const onChange = vi.fn()
+        const api = {
+            getMachineCodexAccounts: vi.fn().mockRejectedValue(new ApiError(
+                'Runner update required',
+                409,
+                'runner_update_required'
+            ))
+        } as unknown as ApiClient
+
+        render(
+            <I18nProvider>
+                <CodexAccountSelector
+                    api={api}
+                    machineId="machine-1"
+                    value="managed-1"
+                    currentAccountId="managed-1"
+                    isDisabled={false}
+                    onChange={onChange}
+                />
+            </I18nProvider>
+        )
+
+        expect(await screen.findByText(/runner does not support hapi account management/i))
+            .toBeInTheDocument()
+        expect(onChange).toHaveBeenLastCalledWith('managed-1')
+        expect(onChange).not.toHaveBeenCalledWith(null)
+    })
+
     it('can make the selected account the HAPI default', async () => {
         const setDefault = vi.fn().mockResolvedValue({
             success: true,

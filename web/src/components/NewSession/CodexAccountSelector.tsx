@@ -107,7 +107,7 @@ export function CodexAccountSelector(props: {
         } catch (loadError) {
             if (sequence !== loadSequenceRef.current) return
             setAccounts([])
-            props.onChange(null)
+            props.onChange(currentAccountId)
             if (requiresRunnerUpdate(loadError)) {
                 setRunnerUpdateRequired(true)
             } else {

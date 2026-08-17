@@ -103,7 +103,7 @@ export function CodexAccountSwitchDialog(props: {
                     <Button
                         type="button"
                         onClick={() => void handleSwitch()}
-                        disabled={!machineId || isSwitching || accountId === currentAccountId}
+                        disabled={!machineId || !accountId || isSwitching || accountId === currentAccountId}
                     >
                         {isSwitching
                             ? t('codexAccountSwitch.switching')
