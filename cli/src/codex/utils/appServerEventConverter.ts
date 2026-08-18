@@ -1,5 +1,5 @@
 import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER } from '@hapi/protocol/usage';
-import { normalizeAgentMessagePhase } from '@hapi/protocol/messages';
+import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages';
 import { logger } from '@/ui/logger';
 
 type ConvertedEvent = {
@@ -319,7 +319,8 @@ function extractTextFromContent(value: unknown): string | null {
 }
 
 function extractItemText(item: Record<string, unknown>): string | null {
-    return asString(item.text ?? item.message) ?? extractTextFromContent(item.content);
+    const text = asString(item.text ?? item.message) ?? extractTextFromContent(item.content);
+    return text ? (unwrapCodexResponseStepEnvelope(text) ?? text) : null;
 }
 
 function extractReasoningSummary(item: Record<string, unknown>): string | null {
@@ -1229,7 +1230,9 @@ export class AppServerEventConverter {
                     if (this.completedAgentMessageItems.has(itemId)) {
                         return events;
                     }
-                    const text = extractItemText(item) ?? this.agentMessageBuffers.get(itemId);
+                    const bufferedText = this.agentMessageBuffers.get(itemId);
+                    const text = extractItemText(item)
+                        ?? (bufferedText ? (unwrapCodexResponseStepEnvelope(bufferedText) ?? bufferedText) : null);
                     if (text) {
                         const phase = normalizeAgentMessagePhase(item.phase ?? paramsRecord.phase);
                         events.push(scoped({

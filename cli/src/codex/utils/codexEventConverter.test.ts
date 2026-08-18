@@ -32,6 +32,27 @@ describe('convertCodexEvent', () => {
         });
     });
 
+    it('unwraps response-step envelopes from agent_message events', () => {
+        const raw = JSON.stringify({
+            steps: [
+                { kind: 'output', value: 'Intro' },
+                { kind: 'tool_calls', value: [] },
+                { kind: 'output', value: '**Result**' },
+                { kind: 'execute_report', value: 'internal' }
+            ]
+        });
+        const result = convertCodexEvent({
+            type: 'event_msg',
+            payload: { type: 'agent_message', message: raw, phase: 'final_answer' }
+        });
+
+        expect(result?.messages?.[0]).toMatchObject({
+            type: 'message',
+            message: 'Intro\n\n**Result**',
+            phase: 'final_answer'
+        });
+    });
+
     it('converts user_message events', () => {
         const result = convertCodexEvent({
             type: 'event_msg',

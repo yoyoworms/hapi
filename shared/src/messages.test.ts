@@ -6,6 +6,7 @@ import {
     normalizeAgentMessagePhase,
     splitNotifySummary,
     stripNotifySummaryFooter,
+    unwrapCodexResponseStepEnvelope,
     type NotifySummary
 } from './messages'
 
@@ -15,6 +16,45 @@ describe('normalizeAgentMessagePhase', () => {
         expect(normalizeAgentMessagePhase('final_answer')).toBe('final_answer')
         expect(normalizeAgentMessagePhase('FinalAnswer')).toBe('final_answer')
         expect(normalizeAgentMessagePhase('unknown')).toBeNull()
+    })
+})
+
+describe('unwrapCodexResponseStepEnvelope', () => {
+    test('extracts visible output steps and drops protocol internals', () => {
+        const text = JSON.stringify({
+            steps: [
+                { kind: 'output', value: '查询完成。' },
+                { kind: 'tool_calls', value: [] },
+                { kind: 'output', value: '**统计周期**\n\n| 指标 | 数值 |\n|---|---:|\n| 消耗 | 173.79 |' },
+                { kind: 'execute_report', value: '采用最新报表数据。' }
+            ]
+        })
+
+        expect(unwrapCodexResponseStepEnvelope(text)).toBe(
+            '查询完成。\n\n**统计周期**\n\n| 指标 | 数值 |\n|---|---:|\n| 消耗 | 173.79 |'
+        )
+    })
+
+    test('preserves ordinary, malformed, and unknown JSON', () => {
+        expect(unwrapCodexResponseStepEnvelope('{"status":"ok"}')).toBeNull()
+        expect(unwrapCodexResponseStepEnvelope('{"steps":[')).toBeNull()
+        expect(unwrapCodexResponseStepEnvelope(JSON.stringify({
+            steps: [
+                { kind: 'output', value: 'visible' },
+                { kind: 'future_step', value: 'unknown' }
+            ]
+        }))).toBeNull()
+        expect(unwrapCodexResponseStepEnvelope(JSON.stringify({
+            steps: [{ kind: 'output', value: 'plain JSON requested by the user' }]
+        }))).toBeNull()
+    })
+
+    test('recovers only the first visible output from a truncated tool envelope', () => {
+        const truncated = '{"steps":[{"kind":"output","value":"正在检查\\n报表。"},{"kind":"tool_calls","value":[{"functions.exec":{"source":"unterminated"}}]},{"kind":"execute_report","value":"truncated'
+        expect(unwrapCodexResponseStepEnvelope(truncated)).toBe('正在检查\n报表。')
+
+        const lookalike = '{"steps":[{"kind":"output","value":"keep raw"},{"kind":"tool_calls","value":['
+        expect(unwrapCodexResponseStepEnvelope(lookalike)).toBeNull()
     })
 })
 
@@ -35,6 +75,24 @@ describe('extractAssistantPlainText', () => {
             }
         }
         expect(extractAssistantPlainText(content)).toBe('Hello there.')
+    })
+
+    test('extracts visible text from a Codex response-step envelope', () => {
+        const content = {
+            type: 'codex',
+            data: {
+                type: 'message',
+                message: JSON.stringify({
+                    steps: [
+                        { kind: 'output', value: 'First' },
+                        { kind: 'tool_calls', value: [] },
+                        { kind: 'output', value: 'Second' },
+                        { kind: 'execute_report', value: 'internal' }
+                    ]
+                })
+            }
+        }
+        expect(extractAssistantPlainText(content)).toBe('First\n\nSecond')
     })
 
     test('returns null for codex/tool-call (no text)', () => {

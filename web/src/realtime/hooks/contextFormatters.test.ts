@@ -83,6 +83,27 @@ describe('extractLastAssistantSpeakable', () => {
         expect(extractLastAssistantSpeakable(messages)).toBe('Indexed 5,018 items in the search database.')
     })
 
+    it('speaks visible output instead of a Codex response-step envelope', () => {
+        const raw = JSON.stringify({
+            steps: [
+                { kind: 'output', value: '查询完成。' },
+                { kind: 'tool_calls', value: [] },
+                { kind: 'output', value: '累计ROI为72.59%。' },
+                { kind: 'execute_report', value: 'internal' }
+            ]
+        })
+        const messages = [msg({
+            id: '1',
+            seq: 1,
+            content: {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: raw } }
+            }
+        })]
+
+        expect(extractLastAssistantSpeakable(messages)).toBe('查询完成。\n\n累计ROI为72.59%。')
+    })
+
     it('unwraps codex-style output envelopes', () => {
         const messages = [
             msg({

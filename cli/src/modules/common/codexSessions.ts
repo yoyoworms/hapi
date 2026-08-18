@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
-import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
+import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import { isCodexSubagentSource } from '@/codex/utils/codexSessionMetadata'
 
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 200
@@ -230,7 +230,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
             return text && !shouldIgnoreSyntheticUserMessage(text) ? buildImportedUserMessage(text) : null
         }
         if (eventType === 'agent_message') {
-            const message = asString(payload.message)
+            const rawMessage = asString(payload.message)
+            const message = rawMessage ? (unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage) : null
             const phase = normalizeAgentMessagePhase(payload.phase)
             return message ? buildImportedAgentMessage({ type: 'message', message, ...(phase ? { phase } : {}), id: randomUUID() }) : null
         }
@@ -238,7 +239,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
             const item = asRecord(payload.item)
             const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
             if (itemType !== 'agentmessage') return null
-            const message = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const rawMessage = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const message = unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage
             const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
             return message ? buildImportedAgentMessage({
                 type: 'message',
@@ -257,7 +259,10 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
     const itemType = asString(payload.type)
     if (itemType === 'message') {
         const role = asString(payload.role)
-        const text = extractCodexText(payload.content)
+        const rawText = extractCodexText(payload.content)
+        const text = role === 'assistant'
+            ? (unwrapCodexResponseStepEnvelope(rawText) ?? rawText)
+            : rawText
         if (!text || shouldIgnoreSyntheticUserMessage(text)) return null
         if (role === 'user') return buildImportedUserMessage(text)
         if (role === 'assistant') {
@@ -297,7 +302,11 @@ function normalizeComparableContent(content: unknown): string | null {
         const body = asRecord(record.content)
         const data = asRecord(body?.data)
         if (body?.type === AGENT_MESSAGE_PAYLOAD_TYPE && data?.type === 'message' && typeof data.message === 'string') {
-            return stableSerialize({ role: 'agent', type: 'message', message: data.message })
+            return stableSerialize({
+                role: 'agent',
+                type: 'message',
+                message: unwrapCodexResponseStepEnvelope(data.message) ?? data.message
+            })
         }
         const normalized = data ? { ...data } : body?.data
         if (data) delete (normalized as Record<string, unknown>).id

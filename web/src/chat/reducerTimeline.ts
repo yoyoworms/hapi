@@ -1,6 +1,6 @@
 import type { AgentReasoningBlock, AgentTextBlock, ChatBlock, CliOutputBlock, CodexReviewBlock, ToolCallBlock, ToolPermission } from '@/chat/types'
 import type { TracedMessage } from '@/chat/tracer'
-import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
+import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import { createCliOutputBlock, isCliOutputText, mergeCliOutputBlocks } from '@/chat/reducerCliOutput'
 import { parseMessageAsEvent } from '@/chat/reducerEvents'
 import { collectTitleChanges, ensureToolBlock, extractTitleFromChangeTitleInput, isChangeTitleToolName, type PermissionEntry } from '@/chat/reducerTools'
@@ -207,13 +207,14 @@ function normalizeTraceMessage(
 
     if (data.type === 'message' && typeof data.message === 'string') {
         const phase = normalizeAgentMessagePhase(data.phase)
+        const message = unwrapCodexResponseStepEnvelope(data.message) ?? data.message
         return [{
             ...base,
             id: traceId,
             role: 'agent',
             content: [{
                 type: 'text',
-                text: data.message,
+                text: message,
                 uuid: traceId,
                 ...(phase ? { phase } : {}),
                 parentUUID: null

@@ -1,7 +1,7 @@
 import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
 import { inlineMediaSourceFromWire } from '@/chat/inlineMediaSource'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
-import { isClaudeChatVisibleMessage, normalizeAgentMessagePhase } from '@hapi/protocol/messages'
+import { isClaudeChatVisibleMessage, normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import { parseAgentTimestampMs } from '@/chat/agentTimestamp'
 
 function normalizeToolResultPermissions(value: unknown): ToolResultPermission | undefined {
@@ -1008,7 +1008,8 @@ export function normalizeAgentRecord(
             const phase = normalizeAgentMessagePhase(data.phase)
             const isPiStreamSnapshot = data.streamSnapshot === true
                 || (streamId !== null && /^pi-.+-turn-\d+-message-\d+-text-\d+$/.test(streamId))
-            const review = isPiStreamSnapshot ? null : parseCodexReviewMessage(data.message)
+            const text = unwrapCodexResponseStepEnvelope(data.message) ?? data.message
+            const review = isPiStreamSnapshot ? null : parseCodexReviewMessage(text)
             if (review) {
                 return {
                     id: messageId,
@@ -1028,7 +1029,7 @@ export function normalizeAgentRecord(
                 isSidechain: false,
                 content: [{
                     type: 'text',
-                    text: data.message,
+                    text,
                     uuid: messageId,
                     ...(streamId !== null ? { streamId } : {}),
                     ...(phase ? { phase } : {}),

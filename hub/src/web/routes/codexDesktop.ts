@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
-import { normalizeAgentMessagePhase } from '@hapi/protocol/messages'
+import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import type { CodexCollaborationMode } from '@hapi/protocol/types'
 import { Hono } from 'hono'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
@@ -649,7 +649,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
         }
 
         if (eventType === 'agent_message') {
-            const message = asString(payload.message)
+            const rawMessage = asString(payload.message)
+            const message = rawMessage ? (unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage) : null
             const phase = normalizeAgentMessagePhase(payload.phase)
             return message ? buildImportedAgentMessage({
                 type: 'message',
@@ -663,7 +664,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
             const item = asRecord(payload.item)
             const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
             if (itemType !== 'agentmessage') return null
-            const message = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const rawMessage = extractCodexText(item?.content ?? item?.message ?? item?.text)
+            const message = unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage
             const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
             return message ? buildImportedAgentMessage({
                 type: 'message',
@@ -699,7 +701,10 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
 
         if (itemType === 'message') {
             const role = asString(payload.role)
-            const text = extractCodexText(payload.content)
+            const rawText = extractCodexText(payload.content)
+            const text = role === 'assistant'
+                ? (unwrapCodexResponseStepEnvelope(rawText) ?? rawText)
+                : rawText
             if (!text) {
                 return null
             }
@@ -791,7 +796,7 @@ function normalizeComparableAgentMessage(content: unknown): string | null {
     return stableSerialize({
         role: 'agent',
         type: 'message',
-        message: data.message
+        message: unwrapCodexResponseStepEnvelope(data.message) ?? data.message
     })
 }
 
@@ -1085,7 +1090,7 @@ function normalizeComparableAgentData(value: unknown): unknown {
     if (record.type === 'message' && typeof record.message === 'string') {
         return {
             type: 'message',
-            message: record.message
+            message: unwrapCodexResponseStepEnvelope(record.message) ?? record.message
         }
     }
 

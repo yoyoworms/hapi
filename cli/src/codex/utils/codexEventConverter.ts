@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER, type InclusiveInputTokenUsageMarker } from '@hapi/protocol/usage';
-import { normalizeAgentMessagePhase, type AgentMessagePhase } from '@hapi/protocol/messages';
+import { normalizeAgentMessagePhase, type AgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages';
 import { z } from 'zod';
 import { logger } from '@/ui/logger';
 
@@ -151,7 +151,8 @@ function extractTextContent(value: unknown): string {
 }
 
 function extractVisibleAssistantText(value: unknown): string {
-    return extractTextContent(value)
+    const text = extractTextContent(value);
+    return (unwrapCodexResponseStepEnvelope(text) ?? text)
         .replace(/(?:^|\n)<proposed_plan>[\s\S]*?<\/proposed_plan>(?=\n|$)/gi, '\n')
         .trim();
 }

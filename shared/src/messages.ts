@@ -2,6 +2,102 @@ import { isObject } from './utils'
 
 export type AgentMessagePhase = 'commentary' | 'final_answer'
 
+const CODEX_RESPONSE_STEP_PREFIX = '{"steps":[{"kind":"output","value":'
+const CODEX_TOOL_CALLS_STEP_MARKER = '{"kind":"tool_calls","value":'
+const CODEX_EXECUTE_REPORT_STEP_MARKER = '{"kind":"execute_report","value":'
+
+function unwrapTruncatedCodexResponseStepEnvelope(text: string): string | null {
+    if (!text.startsWith(CODEX_RESPONSE_STEP_PREFIX)) return null
+
+    const valueStart = CODEX_RESPONSE_STEP_PREFIX.length
+    if (text[valueStart] !== '"') return null
+
+    let escaped = false
+    for (let index = valueStart + 1; index < text.length; index += 1) {
+        const char = text[index]
+        if (escaped) {
+            escaped = false
+            continue
+        }
+        if (char === '\\') {
+            escaped = true
+            continue
+        }
+        if (char !== '"') continue
+
+        const remainder = text.slice(index + 1)
+        if (!remainder.startsWith('},')) return null
+        if (!remainder.includes(CODEX_TOOL_CALLS_STEP_MARKER)) return null
+        if (!remainder.includes(CODEX_EXECUTE_REPORT_STEP_MARKER)) return null
+
+        try {
+            const output: unknown = JSON.parse(text.slice(valueStart, index + 1))
+            return typeof output === 'string' && output.trim() ? output.trim() : null
+        } catch {
+            return null
+        }
+    }
+    return null
+}
+
+/**
+ * Some Codex gateways return the assistant turn as a JSON-encoded step
+ * envelope inside the otherwise plain-text agent message. The native client
+ * consumes that envelope, but older HAPI runners persisted it verbatim.
+ *
+ * Keep detection deliberately strict: ordinary JSON must remain visible. A
+ * recognized complete envelope contains only known step kinds, at least one
+ * non-empty output string, and at least one protocol marker (`tool_calls` or
+ * `execute_report`). Old persisted messages can be truncated inside a large
+ * tool-call payload; for that exact compact protocol prefix, both control-step
+ * markers are required and only the first complete output string is recovered.
+ * `null` means "not this envelope"; callers should preserve the original text.
+ */
+export function unwrapCodexResponseStepEnvelope(text: string): string | null {
+    const trimmed = text.trim()
+    if (!trimmed.startsWith('{"steps"')) return null
+    if (!trimmed.endsWith('}')) return unwrapTruncatedCodexResponseStepEnvelope(trimmed)
+
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(trimmed)
+    } catch {
+        return unwrapTruncatedCodexResponseStepEnvelope(trimmed)
+    }
+    if (!isObject(parsed) || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
+        return null
+    }
+
+    const outputs: string[] = []
+    let hasProtocolMarker = false
+    for (const value of parsed.steps) {
+        if (!isObject(value) || typeof value.kind !== 'string' || !('value' in value)) {
+            return null
+        }
+
+        if (value.kind === 'output') {
+            if (typeof value.value !== 'string') return null
+            const output = value.value.trim()
+            if (output) outputs.push(output)
+            continue
+        }
+        if (value.kind === 'tool_calls') {
+            if (!Array.isArray(value.value)) return null
+            hasProtocolMarker = true
+            continue
+        }
+        if (value.kind === 'execute_report') {
+            if (typeof value.value !== 'string') return null
+            hasProtocolMarker = true
+            continue
+        }
+        return null
+    }
+
+    if (!hasProtocolMarker || outputs.length === 0) return null
+    return outputs.join('\n\n')
+}
+
 /** Normalize Codex/app-server phase spellings without exposing wire drift. */
 export function normalizeAgentMessagePhase(value: unknown): AgentMessagePhase | null {
     if (typeof value !== 'string') return null
@@ -121,9 +217,8 @@ export function extractAssistantPlainText(content: unknown): string | null {
     if (content.type === 'codex') {
         const data = isObject(content.data) ? content.data : null
         if (!data || data.type !== 'message') return null
-        return typeof data.message === 'string' && data.message.length > 0
-            ? data.message
-            : null
+        if (typeof data.message !== 'string' || data.message.length === 0) return null
+        return unwrapCodexResponseStepEnvelope(data.message) ?? data.message
     }
 
     if (content.type === 'output') {

@@ -229,6 +229,33 @@ describe('AppServerEventConverter', () => {
         }]);
     });
 
+    it('unwraps response-step envelopes from completed agent messages', () => {
+        const converter = new AppServerEventConverter();
+        const raw = JSON.stringify({
+            steps: [
+                { kind: 'output', value: 'Intro' },
+                { kind: 'tool_calls', value: [] },
+                { kind: 'output', value: '| A | B |\n|---|---|\n| 1 | 2 |' },
+                { kind: 'execute_report', value: 'internal' }
+            ]
+        });
+
+        const completed = converter.handleNotification('item/completed', {
+            item: {
+                id: 'msg-steps',
+                type: 'agentMessage',
+                phase: 'final_answer',
+                content: [{ type: 'text', text: raw }]
+            }
+        });
+
+        expect(completed).toEqual([{
+            type: 'agent_message',
+            message: 'Intro\n\n| A | B |\n|---|---|\n| 1 | 2 |',
+            phase: 'final_answer'
+        }]);
+    });
+
     it('preserves thread and turn scope on item events', () => {
         const converter = new AppServerEventConverter();
 
