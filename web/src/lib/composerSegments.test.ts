@@ -207,10 +207,10 @@ describe('isRichComposerMentionsEnabled', () => {
         vi.unstubAllEnvs()
     })
 
-    it('defaults to ON', () => {
+    it('defaults to the native compatibility composer', () => {
         window.localStorage.removeItem('hapi.composer.richMentions')
         window.history.replaceState({}, '', window.location.pathname)
-        expect(isRichComposerMentionsEnabled()).toBe(true)
+        expect(isRichComposerMentionsEnabled()).toBe(false)
     })
 
     it.each(['1', 'true', 'TRUE'])('stays on with localStorage=%s', (value) => {
@@ -247,7 +247,7 @@ describe('isRichComposerMentionsEnabled', () => {
     it('ignores unrecognized values', () => {
         window.localStorage.setItem('hapi.composer.richMentions', 'yes')
         window.history.replaceState({}, '', `${window.location.pathname}?richMentions=on`)
-        expect(isRichComposerMentionsEnabled()).toBe(true)
+        expect(isRichComposerMentionsEnabled()).toBe(false)
     })
 })
 

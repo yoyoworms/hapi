@@ -243,6 +243,7 @@ export function ComposerExpandButton(props: {
     return (
         <button
             type="button"
+            onPointerDown={(event) => event.preventDefault()}
             aria-label={label}
             title={label}
             aria-pressed={props.expanded}
@@ -556,10 +557,14 @@ export function UnifiedButton(props: {
                 ? !props.canSend
                 : routesToScratchlist || !props.voiceEnabled
     )
+    const preservesEditorFocus = !isVoiceActive && props.canSend
 
     return (
         <button
             type="button"
+            onPointerDown={(event) => {
+                if (!isDisabled && preservesEditorFocus) event.preventDefault()
+            }}
             onClick={handleClick}
             disabled={isDisabled}
             aria-label={ariaLabel}

@@ -105,6 +105,7 @@ function editorTextNodes(editor: HTMLElement): Text[] {
 describe('HappyComposer per-session input history', () => {
     beforeEach(() => {
         window.localStorage.clear()
+        window.localStorage.setItem('hapi.composer.richMentions', '1')
         window.history.replaceState({}, '', window.location.pathname)
     })
 

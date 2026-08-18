@@ -727,7 +727,6 @@ export function useHappyRuntime(props: {
     viewMode?: 'tail' | 'history'
     isSyncingTail?: boolean
     isLoadingMore?: boolean
-    isSending: boolean
     isRunning?: boolean
     onSendMessage: (
         text: string,
@@ -931,7 +930,11 @@ export function useHappyRuntime(props: {
     // Memoize the adapter to avoid recreating on every render
     // useExternalStoreRuntime may use adapter identity for subscriptions
     const adapter = useMemo(() => ({
-        isDisabled: props.isSending || (!props.session.active && !props.allowSendWhenInactive),
+        // A short-lived send request must not disable the composer input. Doing
+        // so blurs native inputs/contenteditables and unregisters third-party
+        // IME text clients. useSendMessage already rejects concurrent sends;
+        // the composer UI separately disables send actions while pending.
+        isDisabled: !props.session.active && !props.allowSendWhenInactive,
         isRunning,
         messages: convertedMessages,
         extras,
@@ -941,7 +944,6 @@ export function useHappyRuntime(props: {
         unstable_capabilities: { copy: true }
     }), [
         props.session.active,
-        props.isSending,
         props.allowSendWhenInactive,
         isRunning,
         convertedMessages,

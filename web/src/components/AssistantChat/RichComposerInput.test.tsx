@@ -308,4 +308,158 @@ describe('RichComposerInput controlled synchronization', () => {
         expect(onKeyDown).not.toHaveBeenCalled()
         expect(serializeComposerSegments(segmentsFromEditor(editor))).toBe('hello')
     })
+
+    it('recovers when compositionend is dropped before the next input', () => {
+        const onValueChange = vi.fn()
+        const onEdit = vi.fn()
+        render(
+            <RichComposerInput
+                value=""
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+                onEdit={onEdit}
+            />
+        )
+
+        const editor = screen.getByTestId('rich-composer-input')
+        fireEvent.compositionStart(editor)
+        editor.textContent = '豆'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: true,
+        }))
+        expect(onValueChange).not.toHaveBeenCalled()
+
+        editor.textContent = '豆包'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: false,
+        }))
+
+        expect(onValueChange).toHaveBeenLastCalledWith('豆包')
+        expect(onEdit).toHaveBeenCalledTimes(1)
+    })
+
+    it('commits an unfinished composition on blur and resumes normal input', () => {
+        const onValueChange = vi.fn()
+        render(
+            <RichComposerInput
+                value=""
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+            />
+        )
+
+        const editor = screen.getByTestId('rich-composer-input')
+        fireEvent.compositionStart(editor)
+        editor.textContent = '豆包'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: true,
+        }))
+        expect(onValueChange).not.toHaveBeenCalled()
+
+        fireEvent.blur(editor)
+        expect(onValueChange).toHaveBeenLastCalledWith('豆包')
+
+        editor.textContent = '豆包输入'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: false,
+        }))
+        expect(onValueChange).toHaveBeenLastCalledWith('豆包输入')
+    })
+
+    it('commits an unfinished composition when refocused after a lost blur', () => {
+        const onValueChange = vi.fn()
+        render(
+            <RichComposerInput
+                value=""
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+            />
+        )
+
+        const editor = screen.getByTestId('rich-composer-input')
+        fireEvent.compositionStart(editor)
+        editor.textContent = '未提交'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: true,
+        }))
+
+        // A few mobile IMEs can lose both compositionend and the intervening
+        // blur notification. The next focus still forms a safe boundary.
+        fireEvent.focus(editor)
+        expect(onValueChange).toHaveBeenLastCalledWith('未提交')
+    })
+
+    it('does not forward an IME confirmation key reported as keyCode 229', () => {
+        const onKeyDown = vi.fn()
+        render(
+            <RichComposerInput
+                value="hello"
+                onValueChange={() => {}}
+                onMirrorChange={() => {}}
+                onKeyDown={onKeyDown}
+            />
+        )
+
+        const editor = screen.getByTestId('rich-composer-input')
+        fireEvent.keyDown(editor, { key: 'Enter', isComposing: false, keyCode: 229 })
+
+        expect(onKeyDown).not.toHaveBeenCalled()
+        expect(serializeComposerSegments(segmentsFromEditor(editor))).toBe('hello')
+    })
+
+    it('stays focused and contenteditable while read-only, then resumes input', () => {
+        const onValueChange = vi.fn()
+        const { rerender } = render(
+            <RichComposerInput
+                value="hello"
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+            />
+        )
+
+        const editor = screen.getByTestId('rich-composer-input')
+        editor.focus()
+        rerender(
+            <RichComposerInput
+                value="hello"
+                readOnly
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+            />
+        )
+
+        expect(document.activeElement).toBe(editor)
+        expect(editor).not.toHaveAttribute('contenteditable', 'false')
+        expect(editor).toHaveAttribute('aria-readonly', 'true')
+
+        const beforeInputAccepted = editor.dispatchEvent(new InputEvent('beforeinput', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: '!',
+        }))
+        expect(beforeInputAccepted).toBe(false)
+
+        rerender(
+            <RichComposerInput
+                value="hello"
+                onValueChange={onValueChange}
+                onMirrorChange={() => {}}
+            />
+        )
+        expect(document.activeElement).toBe(editor)
+        expect(editor).not.toHaveAttribute('aria-readonly')
+
+        editor.textContent = 'hello!'
+        editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            isComposing: false,
+        }))
+        expect(onValueChange).toHaveBeenLastCalledWith('hello!')
+    })
 })

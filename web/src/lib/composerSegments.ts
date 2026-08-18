@@ -2,6 +2,8 @@ import { buildSessionReferencePath, parseSessionPathHref } from '@/lib/sessionRe
 import { truncateGraphemes } from '@/lib/graphemes'
 import { findActiveWord } from '@/utils/findActiveWord'
 
+export { isRichComposerMentionsEnabled } from '@/lib/composerInputMode'
+
 /** Object Replacement Character — one mirror slot per session atom. */
 export const COMPOSER_MENTION_MIRROR_CHAR = '\uFFFC'
 
@@ -284,42 +286,6 @@ export function insertSegmentsInComposerSegments(
         segments: next,
         selection: { start: caret, end: caret },
     }
-}
-
-function parseExplicitBoolean(value: string | null | undefined): boolean | null {
-    if (value == null) return null
-    const normalized = value.trim().toLowerCase()
-    if (normalized === '1' || normalized === 'true') return true
-    if (normalized === '0' || normalized === 'false') return false
-    return null
-}
-
-/**
- * Rich segmented composer is the product default (same as v1 @ autocomplete:
- * no user opt-in). Emergency kill-switch only:
- *   localStorage `hapi.composer.richMentions=0|false`
- *   query `?richMentions=0|false`
- *   build `VITE_RICH_COMPOSER_MENTIONS=0|false`
- *
- * An explicit disable from any source wins over values from another source.
- */
-export function isRichComposerMentionsEnabled(): boolean {
-    const configuredValues: Array<boolean | null> = [
-        parseExplicitBoolean(import.meta.env.VITE_RICH_COMPOSER_MENTIONS),
-    ]
-
-    try {
-        if (typeof window !== 'undefined') {
-            configuredValues.push(
-                parseExplicitBoolean(window.localStorage.getItem('hapi.composer.richMentions')),
-                parseExplicitBoolean(new URLSearchParams(window.location.search).get('richMentions')),
-            )
-        }
-    } catch {
-        // ignore storage / URL access failures
-    }
-
-    return !configuredValues.includes(false)
 }
 
 /**

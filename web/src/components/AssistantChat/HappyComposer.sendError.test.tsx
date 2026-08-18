@@ -111,6 +111,7 @@ vi.mock('@/components/AssistantChat/StatusBar', () => ({ StatusBar: () => null }
 vi.mock('@/components/AssistantChat/ComposerButtons', () => ({
     ComposerButtons: (props: {
         onSend: () => void
+        controlsDisabled: boolean
         onSchedule: (pending: PendingSchedule) => void
         onClearSchedule: () => void
         pendingSchedule: PendingSchedule | null
@@ -121,7 +122,7 @@ vi.mock('@/components/AssistantChat/ComposerButtons', () => ({
         onModelValueToggle?: () => void
     }) => (
         <div>
-            <button type="button" onClick={props.onSend}>send</button>
+            <button type="button" disabled={props.controlsDisabled} onClick={props.onSend}>send</button>
             <button type="button" onClick={props.onExpandedToggle}>
                 {props.expanded ? 'collapse' : 'expand'}
             </button>
@@ -221,7 +222,7 @@ function ComposerHarness(props: {
             <HappyComposer
                 key={composerKey}
                 sessionId={composerKey}
-                disabled={isSending}
+                sendPending={isSending}
                 pendingSchedule={schedule}
                 sendAcceptance={sendAcceptance}
                 sendSettlement={sendSettlement}
@@ -306,6 +307,26 @@ describe('HappyComposer send-error atomic restore', () => {
     afterEach(() => {
         cleanup()
         runtime.setSnapshot = null
+    })
+
+    it('keeps the native editor focused but read-only while a send request is pending', () => {
+        const controls = renderComposer('message', null)
+        const editor = input()
+        editor.focus()
+
+        act(() => controls.current!.acceptSend())
+
+        expect(editor).not.toBeDisabled()
+        expect(editor).toHaveProperty('readOnly', true)
+        expect(document.activeElement).toBe(editor)
+        expect(screen.getByRole('button', { name: 'send' })).toBeDisabled()
+
+        act(() => controls.current!.settleSend())
+        expect(editor).toHaveProperty('readOnly', false)
+        expect(document.activeElement).toBe(editor)
+
+        fireEvent.change(editor, { target: { value: 'next draft' } })
+        expect(editor).toHaveValue('next draft')
     })
 
     it('collapses an expanded composer only after an accepted send succeeds', async () => {
@@ -574,6 +595,14 @@ describe('HappyComposer send intent gestures', () => {
 
         expect(runtime.sentIntents).toEqual(['default'])
         expect(runtime.pendingSendIntentRef?.current).toBe('default')
+    })
+
+    it('does not send on the WebKit IME keyCode 229 fallback event', () => {
+        renderComposer('正在输入', null, true)
+
+        fireEvent.keyDown(input(), { key: 'Enter', isComposing: false, keyCode: 229 })
+
+        expect(runtime.sentIntents).toEqual([])
     })
 
     it('consumes a restored queue retry mark before resetting the shared ref', () => {

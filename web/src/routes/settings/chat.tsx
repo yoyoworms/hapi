@@ -1,5 +1,6 @@
 import { useTranslation } from '@/lib/use-translation'
 import { getComposerEnterBehaviorOptions, useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
+import { getComposerInputModeOptions, useComposerInputMode } from '@/hooks/useComposerInputMode'
 import { getTerminalToolDisplayModeOptions, useTerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
 import { useCodexExplorationCollapse } from '@/hooks/useCodexExplorationCollapse'
 import { useReasoningCollapse } from '@/hooks/useReasoningCollapse'
@@ -49,6 +50,7 @@ function ChatSurfaceColorControl(props: {
 export default function SettingsChatPage() {
     const { t } = useTranslation()
     const { composerEnterBehavior, setComposerEnterBehavior } = useComposerEnterBehavior()
+    const { composerInputMode, setComposerInputMode } = useComposerInputMode()
     const { terminalToolDisplayMode, setTerminalToolDisplayMode } = useTerminalToolDisplayMode()
     const { codexExplorationCollapsed, setCodexExplorationCollapsed } = useCodexExplorationCollapse()
     const { reasoningCollapsed, setReasoningCollapsed } = useReasoningCollapse()
@@ -56,6 +58,12 @@ export default function SettingsChatPage() {
     return (
         <SettingsPageContent description={t('settings.chat.description')}>
             <SettingsSection title={t('settings.chat.input')}>
+                <SettingsChoiceGroup
+                    label={t('settings.chat.inputMode')}
+                    value={composerInputMode}
+                    options={getComposerInputModeOptions().map((option) => ({ value: option.value, label: t(option.labelKey) }))}
+                    onChange={setComposerInputMode}
+                />
                 <SettingsChoiceGroup
                     label={t('settings.chat.enterBehavior')}
                     value={composerEnterBehavior}

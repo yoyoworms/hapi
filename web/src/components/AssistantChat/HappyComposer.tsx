@@ -21,7 +21,6 @@ import {
 } from 'react'
 import { useNarrowViewport } from '@/hooks/useNarrowViewport'
 import {
-    isRichComposerMentionsEnabled,
     mirrorComposerSegments,
     parseComposerSegments,
     resolveComposerPlaceholderKey,
@@ -49,6 +48,7 @@ import { useComposerDraft } from '@/hooks/useComposerDraft'
 import type { AttachmentDraftInput } from '@/lib/composer-attachment-drafts'
 import { persistInactiveComposerAttachments, setComposerDraftSnapshot, updateComposerDraftTextSnapshot, attachmentDraftRevision, resetInactiveComposerAttachmentVisibility } from '@/lib/composer-draft-transfer'
 import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
+import { useComposerInputMode } from '@/hooks/useComposerInputMode'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
 import { StatusBar } from '@/components/AssistantChat/StatusBar'
@@ -304,6 +304,8 @@ export function HappyComposer(props: {
     effort?: string | null
     active?: boolean
     allowSendWhenInactive?: boolean
+    /** A send request is in flight. Actions pause; the text input stays mounted and focused. */
+    sendPending?: boolean
     thinking?: boolean
     agentState?: AgentState | null
     backgroundTaskCount?: number
@@ -415,6 +417,7 @@ export function HappyComposer(props: {
         effort: rawEffort,
         active = true,
         allowSendWhenInactive = false,
+        sendPending = false,
         thinking = false,
         agentState,
         backgroundTaskCount,
@@ -520,8 +523,14 @@ export function HappyComposer(props: {
         onScratchlistParkingChange?.(isParkingScratchlist)
     }, [isParkingScratchlist, onScratchlistParkingChange])
 
-    const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
-    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
+    const inactiveEditorDisabled = !active && !allowSendWhenInactive
+    const configurationControlsDisabled = inactiveEditorDisabled || isParkingScratchlist
+    const editorDisabled = disabled || threadIsDisabled || inactiveEditorDisabled
+    // Keep the focused text client mounted while the request settles. `disabled`
+    // blurs native inputs/contenteditables and can detach third-party IMEs;
+    // read-only preserves focus without opening a second-draft race.
+    const editorReadOnly = sendPending || isParkingScratchlist
+    const controlsDisabled = editorDisabled || editorReadOnly
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
     const hasAttachments = attachments.length > 0
@@ -601,9 +610,8 @@ export function HappyComposer(props: {
         userScheduleGeneration: number
         userAttachmentGeneration: number
     } | null>(null)
-    // Kill-switch only (?richMentions=0 / localStorage=0 / VITE=false). Mount-time
-    // read — hard reload required, so no per-keystroke localStorage/URL parse.
-    const [richMentionsEnabled] = useState(() => isRichComposerMentionsEnabled())
+    const { composerInputMode } = useComposerInputMode()
+    const richMentionsEnabled = composerInputMode === 'rich'
     const {
         status: richComposerFueStatus,
         engage: engageRichComposerFue,
@@ -627,6 +635,14 @@ export function HappyComposer(props: {
         if (!richMentionsEnabled) return
         engageRichComposerFue()
     }, [richMentionsEnabled, engageRichComposerFue])
+
+    // ComposerPrimitive.Input restores focus when a run starts. The custom
+    // contenteditable path must provide the same contract so pointer-clicking
+    // Send does not leave system IMEs without a focused text client.
+    useEffect(() => {
+        if (!richMentionsEnabled || editorDisabled) return
+        return api.on('thread.runStart', () => richInputRef.current?.focus())
+    }, [api, editorDisabled, richMentionsEnabled])
 
     const recordUserEdit = useCallback(() => {
         userEditGenerationRef.current += 1
@@ -885,13 +901,16 @@ export function HappyComposer(props: {
             direction: currentInput.selectionDirection,
         } : null
 
+        if (richMentionsEnabled) {
+            // Keep this inside the trusted pointer/keyboard activation. An
+            // asynchronous focus can update activeElement without reactivating
+            // a system or third-party IME.
+            richInputRef.current?.focus()
+        }
         setIsExpanded((expanded) => !expanded)
         haptic('light')
+        if (richMentionsEnabled) return
         setTimeout(() => {
-            if (richMentionsEnabled) {
-                richInputRef.current?.focus()
-                return
-            }
             const input = textareaRef.current
             if (!input) return
             try {
@@ -911,6 +930,7 @@ export function HappyComposer(props: {
     }, [haptic, richMentionsEnabled])
 
     const handleSuggestionSelect = useCallback((index: number) => {
+        if (editorReadOnly) return
         const suggestion = suggestions[index]
         if (!suggestion) return
         if (suggestion.text.startsWith('$')) {
@@ -934,9 +954,7 @@ export function HappyComposer(props: {
                     autocompletePrefixes
                 )
             }
-            setTimeout(() => {
-                richInputRef.current?.focus()
-            }, 0)
+            richInputRef.current.focus()
             haptic('light')
             return
         }
@@ -969,7 +987,7 @@ export function HappyComposer(props: {
         }, 0)
 
         haptic('light')
-    }, [api, suggestions, inputState, autocompletePrefixes, haptic, richMentionsEnabled, handleUserEdit])
+    }, [api, suggestions, inputState, autocompletePrefixes, haptic, richMentionsEnabled, handleUserEdit, editorReadOnly])
 
     const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
@@ -1255,10 +1273,11 @@ export function HappyComposer(props: {
     }, [handleSend])
 
     const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
+        if (editorReadOnly) return
         const key = e.key
 
         // Avoid intercepting IME composition keystrokes (Enter, arrows, etc.)
-        if (e.nativeEvent.isComposing) {
+        if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
             return
         }
 
@@ -1437,6 +1456,7 @@ export function HappyComposer(props: {
         sessionId,
         isExpanded,
         handleExpandedToggle,
+        editorReadOnly,
     ])
 
     useEffect(() => {
@@ -1459,13 +1479,14 @@ export function HappyComposer(props: {
     }, [model, onModelChange, haptic, agentFlavor, availableModelOptions])
 
     const handleChange = useCallback((e: ReactChangeEvent<HTMLTextAreaElement>) => {
+        if (editorReadOnly) return
         const selection = {
             start: e.target.selectionStart,
             end: e.target.selectionEnd
         }
         setInputState({ text: e.target.value, selection })
         handleUserEdit()
-    }, [handleUserEdit])
+    }, [editorReadOnly, handleUserEdit])
 
     const handleSelect = useCallback((e: ReactSyntheticEvent<HTMLTextAreaElement>) => {
         const target = e.target as HTMLTextAreaElement
@@ -1476,6 +1497,10 @@ export function HappyComposer(props: {
     }, [])
 
     const handlePaste = useCallback(async (e: ReactClipboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
+        if (editorReadOnly) {
+            e.preventDefault()
+            return
+        }
         const imageFiles = getClipboardImageFiles(e.clipboardData)
 
         if (imageFiles.length === 0) return
@@ -1506,7 +1531,7 @@ export function HappyComposer(props: {
                 console.error('Error adding pasted image:', error)
             }
         }
-    }, [api, pendingSchedule])
+    }, [api, editorReadOnly, pendingSchedule])
 
     const handleSettingsToggle = useCallback(() => {
         haptic('light')
@@ -2303,12 +2328,13 @@ export function HappyComposer(props: {
                                     <RichComposerInput
                                         ref={richInputRef}
                                         value={composerText}
-                                        autoFocus={!controlsDisabled && !isTouch}
+                                        autoFocus={!editorDisabled && !isTouch}
                                         placeholder={t(resolveComposerPlaceholderKey({
                                             richMentionsEnabled: true,
                                             showContinueHint,
                                         }))}
-                                        disabled={controlsDisabled}
+                                        disabled={editorDisabled}
+                                        readOnly={editorReadOnly}
                                         onValueChange={handleRichValueChange}
                                         onMirrorChange={handleRichMirrorChange}
                                         onKeyDown={handleKeyDown}
@@ -2329,7 +2355,7 @@ export function HappyComposer(props: {
                                 <ComposerPrimitive.Input
                                     asChild
                                     ref={textareaRef}
-                                    autoFocus={!controlsDisabled && !isTouch}
+                                    autoFocus={!editorDisabled && !isTouch}
                                     submitOnEnter={false}
                                     cancelOnEscape={false}
                                     onChange={handleChange}
@@ -2342,19 +2368,21 @@ export function HappyComposer(props: {
                                             richMentionsEnabled: false,
                                             showContinueHint,
                                         }))}
-                                        disabled={controlsDisabled}
+                                        disabled={editorDisabled}
+                                        readOnly={editorReadOnly}
                                         className="h-full min-h-0 flex-1 resize-none overflow-y-auto bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                                     />
                                 </ComposerPrimitive.Input>
                             ) : (
                                 <ComposerPrimitive.Input
                                     ref={textareaRef}
-                                    autoFocus={!controlsDisabled && !isTouch}
+                                    autoFocus={!editorDisabled && !isTouch}
                                     placeholder={t(resolveComposerPlaceholderKey({
                                         richMentionsEnabled: false,
                                         showContinueHint,
                                     }))}
-                                    disabled={controlsDisabled}
+                                    disabled={editorDisabled}
+                                    readOnly={editorReadOnly}
                                     maxRows={5}
                                     submitOnEnter={false}
                                     cancelOnEscape={false}

@@ -165,7 +165,7 @@ describe('UnifiedButton — default send intent', () => {
         fireEvent.touchEnd(button, { changedTouches: [{ clientX: 10, clientY: 10 }] })
         fireEvent.click(button)
 
-        fireEvent.mouseDown(button, { button: 0, clientX: 10, clientY: 10 })
+        const pointerDownWasNotPrevented = fireEvent.pointerDown(button, { button: 0, clientX: 10, clientY: 10 })
         act(() => vi.advanceTimersByTime(500))
         fireEvent.mouseUp(button, { button: 0, clientX: 10, clientY: 10 })
         fireEvent.click(button)
@@ -174,6 +174,7 @@ describe('UnifiedButton — default send intent', () => {
         expect(onSend).toHaveBeenCalledTimes(2)
         expect(onSend).toHaveBeenNthCalledWith(1, 'default')
         expect(onSend).toHaveBeenNthCalledWith(2, 'default')
+        expect(pointerDownWasNotPrevented).toBe(false)
         expect(contextMenuWasNotPrevented).toBe(true)
     })
 })

@@ -1798,7 +1798,6 @@ function SessionChatInner(props: SessionChatProps) {
         viewMode: props.viewMode,
         isSyncingTail: props.isSyncingTail,
         isLoadingMore: props.isLoadingMoreMessages,
-        isSending: props.isSending,
         isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
         onAbort: handleAbort,
@@ -1990,7 +1989,7 @@ function SessionChatInner(props: SessionChatProps) {
                             uploadDraftSnapshotRef.current = { text, attachments }
                         }}
                         resolveSessionMentionTooltip={resolveSessionMentionTooltip}
-                        disabled={props.isSending}
+                        sendPending={props.isSending}
                         pendingSchedule={pendingSchedule}
                         sendAcceptance={sendAcceptance}
                         sendSettlement={props.sendSettlement}
