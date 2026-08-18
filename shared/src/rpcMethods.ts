@@ -34,6 +34,7 @@ export const RPC_METHODS = {
     AddCodexApiEndpoint: 'addCodexApiEndpoint',
     SetDefaultCodexAccount: 'setDefaultCodexAccount',
     RemoveCodexAccount: 'removeCodexAccount',
+    ListPiModelsForMachine: 'listPiModelsForMachine',
     ListCodexSessions: 'listCodexSessions',
     ArchiveCodexSession: 'archiveCodexSession',
     ListCursorModels: 'listCursorModels',
@@ -48,6 +49,8 @@ export const RPC_METHODS = {
     ListCopilotModels: 'listCopilotModels',
     ListOpencodeReasoningEffortOptions: 'listOpencodeReasoningEffortOptions',
     ListAgyModels: 'listAgyModels',
+    /** Deliver one queued message into the active Pi turn (native steer). */
+    SteerQueuedMessage: 'steer-queued-message',
     ForkConversation: 'fork-conversation',
     RewindConversation: 'rewind-conversation',
 } as const

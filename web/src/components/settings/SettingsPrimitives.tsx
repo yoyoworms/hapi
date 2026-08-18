@@ -29,7 +29,7 @@ export function CheckIcon(props: { className?: string }) {
 
 export function SettingsPageContent(props: { description?: string; children: ReactNode }) {
     return (
-        <div className="mx-auto w-full max-w-[720px] space-y-5 px-3 py-4 lg:px-6 lg:py-6">
+        <div className="mx-auto w-full max-w-[720px] space-y-5 pl-3 pr-[10px] py-4 lg:px-6 lg:py-6">
             <div>
                 {props.description ? <p className="text-sm text-[var(--app-hint)]">{props.description}</p> : null}
             </div>

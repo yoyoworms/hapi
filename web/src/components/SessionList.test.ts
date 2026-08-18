@@ -4,7 +4,6 @@ import type { SessionSummary } from '@/types/api'
 import {
     deduplicateSessionsByAgentId,
     expandSelectedSessionCollapseOverrides,
-    getRecentSessions,
     filterActiveSessionsOnly,
     filterUnreadSessionsOnly,
     UNKNOWN_MACHINE_ID,
@@ -19,7 +18,6 @@ import {
     isSidebarEmptySessionStub,
     normalizeSearch,
     prepareSidebarSessions,
-    RECENT_SESSIONS_WINDOW_MS,
     sessionMatchesQuery,
     sessionMatchesTimeRange,
     shouldShowPinnedDivider,
@@ -238,76 +236,6 @@ describe('deduplicateSessionsByAgentId', () => {
     })
 })
 
-describe('getRecentSessions', () => {
-    const now = 1_000_000_000_000
-    const oneHour = 60 * 60 * 1000
-
-    it('keeps sessions updated within the 24h window', () => {
-        const sessions = [
-            makeSession({ id: 'within', updatedAt: now - 23 * oneHour }),
-            makeSession({ id: 'outside', updatedAt: now - 25 * oneHour })
-        ]
-        const result = getRecentSessions(sessions, now)
-        expect(result.map(s => s.id)).toEqual(['within'])
-    })
-
-    it('orders active sessions ahead of inactive within window, by recency', () => {
-        const sessions = [
-            makeSession({ id: 'idle-fresh', updatedAt: now - 1 * oneHour }),
-            makeSession({ id: 'active-old', active: true, updatedAt: now - 5 * oneHour }),
-            makeSession({ id: 'pending', active: true, pendingRequestsCount: 1, updatedAt: now - 8 * oneHour })
-        ]
-        const result = getRecentSessions(sessions, now)
-        expect(result.map(s => s.id)).toEqual(['pending', 'active-old', 'idle-fresh'])
-    })
-
-    it('exposes RECENT_SESSIONS_WINDOW_MS as 24 hours', () => {
-        expect(RECENT_SESSIONS_WINDOW_MS).toBe(24 * 60 * 60 * 1000)
-    })
-
-    it('dedupes by agentSessionId before sorting', () => {
-        const sessions = [
-            makeSession({ id: 'a', metadata: { path: '/p', agentSessionId: 'thread-1' }, updatedAt: now - 1 * oneHour }),
-            makeSession({ id: 'b', metadata: { path: '/p', agentSessionId: 'thread-1' }, updatedAt: now - 2 * oneHour })
-        ]
-        const result = getRecentSessions(sessions, now)
-        expect(result).toHaveLength(1)
-        expect(result[0].id).toBe('a')
-    })
-
-    it('keeps pinned sessions even outside the 24h window', () => {
-        const sessions = [
-            makeSession({ id: 'pinned-old', updatedAt: now - 48 * oneHour }),
-            makeSession({ id: 'fresh', updatedAt: now - 1 * oneHour }),
-            makeSession({ id: 'stale', updatedAt: now - 36 * oneHour })
-        ]
-        const result = getRecentSessions(sessions, now, new Set(['pinned-old']))
-        expect(result.map(s => s.id)).toEqual(['pinned-old', 'fresh'])
-    })
-
-    it('honors server project/global pins outside the 24h window', () => {
-        const sessions = [
-            makeSession({ id: 'project-pin', pinned: true, updatedAt: now - 48 * oneHour }),
-            makeSession({ id: 'global-pin', globalPinned: true, updatedAt: now - 72 * oneHour }),
-            makeSession({ id: 'fresh', updatedAt: now - oneHour })
-        ]
-        expect(getRecentSessions(sessions, now).map(s => s.id)).toEqual([
-            'global-pin',
-            'project-pin',
-            'fresh'
-        ])
-    })
-
-    it('orders pinned sessions ahead of unpinned regardless of activity', () => {
-        const sessions = [
-            makeSession({ id: 'unpinned-active', active: true, pendingRequestsCount: 1, updatedAt: now - 1 * oneHour }),
-            makeSession({ id: 'pinned-idle', updatedAt: now - 3 * oneHour })
-        ]
-        const result = getRecentSessions(sessions, now, new Set(['pinned-idle']))
-        expect(result.map(s => s.id)).toEqual(['pinned-idle', 'unpinned-active'])
-    })
-})
-
 
 describe('isSidebarEmptySessionStub', () => {
     it('treats inactive sessions without agent id or title as stubs', () => {
@@ -474,6 +402,23 @@ describe('session list search helpers', () => {
 
         expect(sessionMatchesQuery(session, normalizeSearch('sidebar-search'), 'desktop')).toBe(true)
         expect(sessionMatchesQuery(session, normalizeSearch('hapi-worktrees'), 'desktop')).toBe(true)
+    })
+
+    it('supports complete wildcard patterns without changing plain text matching', () => {
+        const session = makeSession({
+            id: 'session-123',
+            metadata: {
+                path: '/work/hapi',
+                name: 'Fix Bot Review',
+                flavor: 'codex'
+            }
+        })
+
+        expect(sessionMatchesQuery(session, normalizeSearch('*bot*'), 'desktop')).toBe(true)
+        expect(sessionMatchesQuery(session, normalizeSearch('Fix*Review'), 'desktop')).toBe(true)
+        expect(sessionMatchesQuery(session, normalizeSearch('session-???'), 'desktop')).toBe(true)
+        expect(sessionMatchesQuery(session, normalizeSearch('bot*review'), 'desktop')).toBe(false)
+        expect(sessionMatchesQuery(session, normalizeSearch('bot review'), 'desktop')).toBe(true)
     })
 })
 

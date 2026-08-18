@@ -7,7 +7,7 @@ import {
     type StorageUsageBytes,
     type StorageUsageSlice,
     type StorageUsageSliceKey,
-} from '@/components/settings/storageUsagePieData'
+} from '@/components/settings/storageUsageSlices'
 
 const SLICE_FILL: Record<StorageUsageSliceKey, string> = {
     database: 'var(--app-link)',

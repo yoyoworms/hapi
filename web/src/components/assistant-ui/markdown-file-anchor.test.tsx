@@ -64,6 +64,7 @@ describe('chat file anchors', () => {
                 path: encodeBase64(filePath),
                 origin: 'chat',
             },
+            resetScroll: false,
         })
     })
 

@@ -5,13 +5,14 @@ import { resolve } from 'node:path'
 import { ApiClient } from '@/api/api'
 import type { ApiSessionClient } from '@/api/apiSession'
 import type { AgentState, MachineMetadata, Metadata, Session } from '@/api/types'
-import { notifyRunnerSessionStarted } from '@/runner/controlClient'
+import { getInstalledCliMtimeMs, notifyRunnerSessionStarted } from '@/runner/controlClient'
 import { readSettings } from '@/persistence'
 import { configuration } from '@/configuration'
 import { logger } from '@/ui/logger'
 import { runtimePath } from '@/projectPath'
 import { getInvokedCwd } from '@/utils/invokedCwd'
 import { readWorktreeEnv } from '@/utils/worktreeEnv'
+import { CURRENT_MACHINE_CAPABILITIES } from '@hapi/protocol/runnerCapabilities'
 import { exportHapiSessionEnv } from '@/agent/hapiSessionEnv'
 import packageJson from '../../package.json'
 
@@ -41,15 +42,38 @@ export type SessionBootstrapResult = {
     workingDirectory: string
 }
 
-export function buildMachineMetadata(options?: { workspaceRoots?: string[] }): MachineMetadata {
-    return {
+export function buildMachineMetadata(options?: {
+    workspaceRoots?: string[]
+    startedCliMtimeMs?: number
+    /**
+     * Only the long-lived runner daemon may advertise machine RPC capabilities
+     * and CLI mtimes. Terminal/lazy/existing session bootstraps must omit this
+     * so a newer CLI session cannot paint an old connected runner as current
+     * (#1108 bot Major).
+     */
+    asRunner?: boolean
+}): MachineMetadata {
+    const installedCliMtimeMs = getInstalledCliMtimeMs()
+    const startedCliMtimeMs = options?.startedCliMtimeMs ?? installedCliMtimeMs
+    const base: MachineMetadata = {
         host: process.env.HAPI_HOSTNAME || os.hostname(),
         platform: os.platform(),
         happyCliVersion: packageJson.version,
         homeDir: os.homedir(),
         happyHomeDir: configuration.happyHomeDir,
         happyLibDir: runtimePath(),
-        workspaceRoots: options?.workspaceRoots
+        workspaceRoots: options?.workspaceRoots,
+    }
+    if (!options?.asRunner) {
+        return base
+    }
+    return {
+        ...base,
+        capabilities: [...CURRENT_MACHINE_CAPABILITIES],
+        ...(typeof startedCliMtimeMs === 'number' ? { startedCliMtimeMs } : {}),
+        ...(typeof installedCliMtimeMs === 'number' ? { installedCliMtimeMs } : {}),
+        // Always boolean so hub merge can clear a prior true on unsupervised restart.
+        supervisedRestart: process.env.HAPI_RUNNER_SUPERVISED === '1',
     }
 }
 

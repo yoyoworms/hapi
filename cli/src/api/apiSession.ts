@@ -9,7 +9,7 @@ import { apiValidationError } from '@/utils/errorUtils'
 import { AsyncLock } from '@/utils/lock'
 import type { RawJSONLines } from '@/claude/types'
 import { configuration } from '@/configuration'
-import { extractUserRequest } from '@/agy/utils/agySessionScanner'
+import { extractUserRequest } from '@/agy/utils/agyMessageText'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from "@hapi/protocol"
 import type { SessionEndReason } from '@hapi/protocol'
 import type { ClientToServerEvents, ServerToClientEvents, TerminalOutputPayload, Update } from '@hapi/protocol'
@@ -255,6 +255,7 @@ export class ApiSessionClient extends EventEmitter {
     private agentStateVersion: number
     private readonly socket: Socket<ServerToClientEvents, ClientToServerEvents>
     private pendingMessages: { message: UserMessage; localId?: string }[] = []
+    private pendingHubPromptEchoes: { text: string; localIds: string[] }[] = []
     private pendingMessageCallback: ((message: UserMessage, localId?: string) => void) | null = null
     private cancelQueuedMessageCallback: ((localId: string) => boolean) | null = null
     private readonly incomingFilter = new IncomingMessageFilter()
@@ -693,6 +694,62 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
+    /**
+     * Record the text Claude will actually see (after attachment/skill//plan
+     * formatting). Matching transcript rows then stamp isTranscriptEcho.
+     * Call this at the queue boundary, not on raw hub delivery.
+     */
+    notePendingHubPromptEcho(text: string, localId?: string | readonly string[]): void {
+        const normalized = text.trim()
+        if (!normalized) return
+        const localIds = (Array.isArray(localId) ? localId : localId ? [localId] : [])
+            .filter((id) => id.length > 0)
+        // Recoverable launch failure restores the original items; a later
+        // same-mode prompt can rebatch them under new delivered text. Drop
+        // the stale marker that still names those localIds so a later
+        // identical local prompt is not stamped isTranscriptEcho.
+        if (localIds.length > 0) {
+            const replacementIds = new Set(localIds)
+            this.pendingHubPromptEchoes = this.pendingHubPromptEchoes.filter(
+                (entry) => !entry.localIds.some((id) => replacementIds.has(id))
+            )
+        } else {
+            // SendMessageRequest allows omitting localId. One id-less delivery
+            // is in flight at a time; replace the previous nameless marker.
+            this.pendingHubPromptEchoes = this.pendingHubPromptEchoes.filter(
+                (entry) => entry.localIds.length > 0
+            )
+        }
+        if (this.pendingHubPromptEchoes.some((entry) => entry.text === normalized)) return
+        this.pendingHubPromptEchoes.push({ text: normalized, localIds })
+        if (this.pendingHubPromptEchoes.length > 32) {
+            this.pendingHubPromptEchoes.shift()
+        }
+    }
+
+    discardPendingHubPromptEcho(localId: string): void {
+        const index = this.pendingHubPromptEchoes.findIndex((entry) => entry.localIds.includes(localId))
+        if (index < 0) return
+        this.pendingHubPromptEchoes.splice(index, 1)
+    }
+
+    discardPendingHubPromptEchoText(text: string): void {
+        const normalized = text.trim()
+        if (!normalized) return
+        const index = this.pendingHubPromptEchoes.findIndex((entry) => entry.text === normalized)
+        if (index < 0) return
+        this.pendingHubPromptEchoes.splice(index, 1)
+    }
+
+    private consumePendingHubPromptEcho(text: string): boolean {
+        const normalized = text.trim()
+        if (!normalized) return false
+        const index = this.pendingHubPromptEchoes.findIndex((entry) => entry.text === normalized)
+        if (index < 0) return false
+        this.pendingHubPromptEchoes.splice(index, 1)
+        return true
+    }
+
     private handleIncomingMessage(message: { id?: string; seq?: number; localId?: string | null; content: unknown }): void {
         if (!this.incomingFilter.accept({ id: message.id, seq: message.seq })) {
             return
@@ -811,14 +868,17 @@ export class ApiSessionClient extends EventEmitter {
         let createdAt: number | undefined
 
         if (isExternalUserMessage(body)) {
+            const text = extractRawUserTextContent(body.message.content) ?? ''
+            const isTranscriptEcho = this.consumePendingHubPromptEcho(text)
             content = {
                 role: 'user',
                 content: {
                     type: 'text',
-                    text: extractRawUserTextContent(body.message.content) ?? ''
+                    text
                 },
                 meta: {
-                    sentFrom: 'cli'
+                    sentFrom: 'cli',
+                    ...(isTranscriptEcho ? { isTranscriptEcho: true } : {})
                 }
             }
         } else {
@@ -1010,6 +1070,13 @@ export class ApiSessionClient extends EventEmitter {
         // Carries the exact in-flight prompt text the web should restore.
         type: 'abort-restore'
         text: string
+    } | {
+        // Structured result of Pi's compact RPC: the web chat renders the
+        // summary as a dedicated block instead of a small status line.
+        type: 'compact-summary'
+        summary: string
+        tokensBefore?: number
+        estimatedTokensAfter?: number
     }, id?: string): void {
         const content = {
             role: 'agent',
@@ -1025,7 +1092,7 @@ export class ApiSessionClient extends EventEmitter {
                 sid: this.sessionId,
                 message: content
             })
-        }, event.type === 'message' || event.type === 'error' ? 'lossless' : 'droppable')
+        }, event.type === 'message' || event.type === 'error' || event.type === 'compact-summary' ? 'lossless' : 'droppable')
     }
 
     emitAgentTerminalOutput(data: string): void {

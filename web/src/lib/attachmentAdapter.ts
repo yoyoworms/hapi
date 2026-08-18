@@ -6,7 +6,8 @@ import { randomId } from '@/lib/randomId'
 import { getRestoredUploadMetadata } from '@/lib/composer-attachment-drafts'
 import type { AttachmentDraftHandoff } from '@/lib/composer-draft-transfer'
 
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+/** Composer / share upload ceiling — keep deep-link fetch in sync. */
+export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 const MAX_PREVIEW_BYTES = 5 * 1024 * 1024
 // Message previews are persisted inline, so a full-resolution data URL makes
 // every history fetch pay for the original image again. Keep the decoded

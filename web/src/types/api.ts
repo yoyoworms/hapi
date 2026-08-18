@@ -45,6 +45,7 @@ export type {
     SlashCommand,
     SlashCommandsResponse,
     SessionResponse,
+    SessionTitleSuggestionResponse,
     SessionsResponse,
     SpawnResponse,
     UploadFileResponse
@@ -104,6 +105,15 @@ export type SessionMetadataSummary = {
     conversationHistoryEntryIds?: Record<string, string>
     conversationHistoryDiverged?: boolean
     worktree?: WorktreeMetadata
+}
+
+export type HubHealthResponse = {
+    status: string
+    protocolVersion: number
+    capabilities?: {
+        workGraph?: boolean
+        titleSuggestion?: boolean
+    }
 }
 
 export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed' | 'paused'

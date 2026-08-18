@@ -1,5 +1,8 @@
 const FILE_PATH_HREF_PREFIX = 'hapi-file:'
 const FILE_DOWNLOAD_HREF_PREFIX = 'hapi-file-download:'
+// Encoded Windows abs handoff: raw `C:\…` is URI-normalized to `%5C` before <A>,
+// which breaks drive detection. Candidate scheme preserves the path through hast.
+const FILE_PATH_CANDIDATE_HREF_PREFIX = 'hapi-file-candidate:'
 
 const PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\.\/|[A-Za-z0-9_.-]+\/)[^\s`"\'<>]*?\.(?:[A-Za-z0-9]{1,12}|lock)(?::\d+(?::\d+)?)?|(?:[A-Za-z0-9_.-]+\.(?:[A-Za-z0-9]{1,12}|lock))(?::\d+(?::\d+)?)?/g
 
@@ -11,7 +14,7 @@ const TRAILING_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?'])
 // tabular data (csv/tsv), config/schema (ini/conf/env/proto/graphql/prisma),
 // and common languages not already covered. TLD-lookalikes (org/com/io/dev/co)
 // are deliberately excluded so URLs like "example.org" don't autolink.
-const COMMON_FILE_EXTENSIONS = new Set([
+export const COMMON_FILE_EXTENSIONS = new Set([
     'adoc', 'astro', 'avif', 'bat', 'bmp', 'c', 'cfg', 'cjs', 'conf', 'cpp', 'css', 'csv',
     'doc', 'docx', 'env', 'gif', 'go', 'gql', 'gradle', 'graphql', 'gz', 'h', 'hpp', 'html',
     'ico', 'ini', 'java', 'jpeg', 'jpg', 'js', 'json', 'jsx', 'kt', 'lock', 'md', 'mdx', 'mjs',
@@ -61,6 +64,35 @@ export function decodeFileDownloadHref(href: string): string | null {
     } catch {
         return null
     }
+}
+
+export function decodeFilePathCandidateHref(href: string): string | null {
+    // Decode scheme bypass spellings (`HAPI-FILE-CANDIDATE:`, percent-encoded)
+    // before extracting the payload. Empty payload → null (caller fails closed).
+    let value = href.trimStart()
+    for (let i = 0; i < 2; i++) {
+        try {
+            const next = decodeURIComponent(value)
+            if (next === value) break
+            value = next
+        } catch {
+            break
+        }
+    }
+    const match = /^hapi-file-candidate:(.*)$/i.exec(value)
+    if (!match) return null
+    const payload = match[1]
+    if (!payload) return null
+    try {
+        // Payload may already be decoded by the loop above; retry is a no-op.
+        return decodeURIComponent(payload)
+    } catch {
+        return payload
+    }
+}
+
+function createFileCandidateHref(path: string): string {
+    return `${FILE_PATH_CANDIDATE_HREF_PREFIX}${encodeURIComponent(path)}`
 }
 
 function splitTrailingPunctuation(value: string): { path: string; trailing: string } {
@@ -116,6 +148,8 @@ function shouldLinkPath(value: string): boolean {
     if (path.length < 3) return false
     if (path.startsWith('/') || path.startsWith('~/')) return false
     if (path.startsWith('../') || path.includes('/../')) return false
+    // Windows abs: autolink with the raw path (not hapi-file:) so <A> can
+    // apply workspace containment before painting FilePathAnchor.
     if (isWindowsAbsolutePath(path)) return hasKnownFileExtension(path)
     if (path.includes('/')) return hasKnownFileExtension(path)
     return hasKnownFileExtension(path)
@@ -159,6 +193,12 @@ function decodeExplicitLocalArtifactPath(value: string): string | null {
     return null
 }
 
+/** Autolink href: Windows abs uses candidate encoding so backslashes survive hast. */
+function createAutolinkHref(filePath: string): string {
+    if (isWindowsAbsolutePath(filePath)) return createFileCandidateHref(filePath)
+    return createFileHref(filePath)
+}
+
 function linkTextNode(node: MarkdownNode): MarkdownNode[] {
     const value = node.value ?? ''
     const parts: MarkdownNode[] = []
@@ -184,7 +224,7 @@ function linkTextNode(node: MarkdownNode): MarkdownNode[] {
         }
         parts.push({
             type: 'link',
-            url: createFileHref(filePath),
+            url: createAutolinkHref(filePath),
             title: null,
             children: [{ type: 'text', value: displayPath }]
         })
@@ -224,26 +264,29 @@ function linkInlineCodeNode(node: MarkdownNode): MarkdownNode | null {
 
     return {
         type: 'link',
-        url: createFileHref(filePath),
+        url: createAutolinkHref(filePath),
         title: null,
         children: [{ type: 'inlineCode', value: trimmed }]
     }
 }
 
-// Rewrite an explicit markdown link `[label](relative/file.ext)` whose target is
-// a repo-relative allowlisted file path into a `hapi-file:` href so it opens the
-// session file viewer instead of dead-ending in the SPA router.
+// Rewrite an explicit markdown link `[label](…file.ext)` into a `hapi-file:` href
+// so it opens the session file viewer instead of dead-ending in the SPA router.
 //
-// Security: reuses shouldLinkPath (rejects POSIX abs / `~/` / `../` / `scheme://`)
-// and rejects residual colons for non-Windows targets after the line-suffix strip,
-// so scheme-bearing urls (mailto:, obsidian://, foo:bar.md) are left for the
-// deny-scheme layer. Windows absolute paths are routed through the session file
-// viewer; the CLI still enforces that they stay inside the session workspace.
+// Accepts:
+// - repo-relative allowlisted paths (including `./` and `#fragment` / `:line` stripped)
+//
+// Still rejects: POSIX/Windows abs / `~/` (need session cwd — handled fail-closed in <A>),
+// `../`, scheme-bearing URLs, and non-file targets (`/settings`, `#section`).
 function rewriteFileLinkNode(node: MarkdownNode): void {
     if (node.type !== 'link') return
     const url = node.url
     if (!url) return
-    if (url.startsWith(FILE_PATH_HREF_PREFIX) || url.startsWith(FILE_DOWNLOAD_HREF_PREFIX)) return
+    if (
+        url.startsWith(FILE_PATH_HREF_PREFIX)
+        || url.startsWith(FILE_DOWNLOAD_HREF_PREFIX)
+        || url.startsWith(FILE_PATH_CANDIDATE_HREF_PREFIX)
+    ) return
 
     const artifactPath = decodeExplicitLocalArtifactPath(url)
     if (artifactPath) {
@@ -251,8 +294,28 @@ function rewriteFileLinkNode(node: MarkdownNode): void {
         return
     }
 
-    const target = stripLineSuffix(url)
-    if (!isWindowsAbsolutePath(target) && target.includes(':')) return
+    // Strip #fragment / ?query so `file.md#section` can still rewrite.
+    const hashIdx = url.indexOf('#')
+    const queryIdx = url.indexOf('?')
+    let cut = -1
+    if (hashIdx >= 0 && queryIdx >= 0) cut = Math.min(hashIdx, queryIdx)
+    else if (hashIdx >= 0) cut = hashIdx
+    else if (queryIdx >= 0) cut = queryIdx
+    const withoutMeta = cut >= 0 ? url.slice(0, cut) : url
+
+    const target = stripLineSuffix(withoutMeta)
+
+    // Absolute paths (POSIX or Windows) need chat workspace metadata for
+    // containment — leave POSIX for <A>; encode Windows as candidate so
+    // backslashes survive mdast→hast URI normalization.
+    if (isWindowsAbsolutePath(target)) {
+        if (!hasKnownFileExtension(target)) return
+        node.url = createFileCandidateHref(target)
+        return
+    }
+    if (target.startsWith('/') && !target.startsWith('//')) return
+    if (target.includes(':')) return
+
     if (!shouldLinkPath(target)) return
 
     node.url = createFileHref(target)

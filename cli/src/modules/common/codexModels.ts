@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
@@ -82,8 +83,69 @@ function normalizeModel(entry: unknown): CodexModelSummary | null {
     };
 }
 
+interface CacheEntry {
+    expiresAt: number;
+    models: CodexModelSummary[];
+}
+
+// The Codex catalog is account-scoped and changes rarely. Each uncached call
+// spawns a fresh `codex app-server` subprocess and validates the ChatGPT
+// session, which can take 2-30s when a token refresh or network round trip is
+// involved. Cache successful lists for 5 minutes (same shape as the opencode
+// model cache) and coalesce concurrent requests into a single spawn.
+const CACHE_TTL_MS = 5 * 60_000;
+const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<CodexModelSummary[]>>();
+
+function getCacheKey(includeHidden: boolean, environment?: Record<string, string>): string {
+    if (!environment) {
+        return `${includeHidden}:default`;
+    }
+
+    // Model availability is account-scoped. Hash the complete selected-account
+    // environment so cached catalogs cannot leak across account/API switches,
+    // while avoiding retaining credentials as plain-text Map keys.
+    const environmentFingerprint = createHash('sha256')
+        .update(JSON.stringify(Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))))
+        .digest('hex');
+    return `${includeHidden}:${environmentFingerprint}`;
+}
+
 export async function listCodexModels(
     includeHidden: boolean = false,
+    environment?: Record<string, string>
+): Promise<CodexModelSummary[]> {
+    const cacheKey = getCacheKey(includeHidden, environment);
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.models;
+    }
+
+    const existing = inflight.get(cacheKey);
+    if (existing) {
+        return existing;
+    }
+
+    const promise = fetchCodexModelsFromAppServer(includeHidden, environment)
+        .then((models) => {
+            if (models.length > 0) {
+                cache.set(cacheKey, {
+                    expiresAt: Date.now() + CACHE_TTL_MS,
+                    models
+                });
+            }
+            return models;
+        })
+        .finally(() => {
+            inflight.delete(cacheKey);
+        });
+
+    inflight.set(cacheKey, promise);
+    return promise;
+}
+
+async function fetchCodexModelsFromAppServer(
+    includeHidden: boolean,
     environment?: Record<string, string>
 ): Promise<CodexModelSummary[]> {
     // Model discovery is account-scoped. Never inherit a session/runner cwd:
@@ -103,14 +165,20 @@ export async function listCodexModels(
         });
 
         const response = await client.listModels({ includeHidden });
-        const models = Array.isArray(response.data)
+        return Array.isArray(response.data)
             ? response.data.map(normalizeModel).filter((model): model is CodexModelSummary => model !== null)
             : [];
-
-        return models;
     } catch (error) {
         throw new Error(getErrorMessage(error, 'Failed to list Codex models'));
     } finally {
         await client.disconnect().catch(() => undefined);
     }
+}
+
+/**
+ * Clear the in-process cache and any in-flight probe. Exposed for tests.
+ */
+export function _resetCodexModelsCacheForTests(): void {
+    cache.clear();
+    inflight.clear();
 }

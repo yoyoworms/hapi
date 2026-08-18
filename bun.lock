@@ -14,7 +14,7 @@
     },
     "cli": {
       "name": "@twsxtd/hapi",
-      "version": "0.27.2",
+      "version": "0.28.0",
       "bin": {
         "hapi": "bin/hapi.cjs",
       },
@@ -47,11 +47,11 @@
         "vitest": "^4.0.16",
       },
       "optionalDependencies": {
-        "@twsxtd/hapi-darwin-arm64": "0.27.2",
-        "@twsxtd/hapi-darwin-x64": "0.27.2",
-        "@twsxtd/hapi-linux-arm64": "0.27.2",
-        "@twsxtd/hapi-linux-x64": "0.27.2",
-        "@twsxtd/hapi-win32-x64": "0.27.2",
+        "@twsxtd/hapi-darwin-arm64": "0.28.0",
+        "@twsxtd/hapi-darwin-x64": "0.28.0",
+        "@twsxtd/hapi-linux-arm64": "0.28.0",
+        "@twsxtd/hapi-linux-x64": "0.28.0",
+        "@twsxtd/hapi-win32-x64": "0.28.0",
       },
     },
     "docs": {
@@ -1099,15 +1099,15 @@
 
     "@twsxtd/hapi": ["@twsxtd/hapi@workspace:cli"],
 
-    "@twsxtd/hapi-darwin-arm64": ["@twsxtd/hapi-darwin-arm64@0.27.2", "https://registry.npmmirror.com/@twsxtd/hapi-darwin-arm64/-/hapi-darwin-arm64-0.27.2.tgz", { "os": "darwin", "cpu": "arm64", "bin": { "hapi": "bin/hapi" } }, "sha512-+8PS3ZEtCcncWBGW4SOz9KB++DqtrZJuvLEFrN+hYZFA5qux2FnNfKv28C1Dd1U8+F6R7zPO/ztReRnizkCm1g=="],
+    "@twsxtd/hapi-darwin-arm64": ["@twsxtd/hapi-darwin-arm64@0.28.0", "https://registry.npmmirror.com/@twsxtd/hapi-darwin-arm64/-/hapi-darwin-arm64-0.28.0.tgz", { "os": "darwin", "cpu": "arm64", "bin": { "hapi": "bin/hapi" } }, "sha512-t1Yl+O23t2YrhPRE46B14ZNA109emOg0cKCDyWWM4CIBEYWWnsEA66tIR6fTxjmcbn9duhyn0asgv6BDftC08w=="],
 
-    "@twsxtd/hapi-darwin-x64": ["@twsxtd/hapi-darwin-x64@0.27.2", "https://registry.npmmirror.com/@twsxtd/hapi-darwin-x64/-/hapi-darwin-x64-0.27.2.tgz", { "os": "darwin", "cpu": "x64", "bin": { "hapi": "bin/hapi" } }, "sha512-7+fBzRn+5LNU3cTIqRx8eZw3VJ5gYZKvwoHXDbv8FLZ1CtsyzPmA1rx6RH7dWG2/+A061nfRH9Lkg5KJ8n7RhQ=="],
+    "@twsxtd/hapi-darwin-x64": ["@twsxtd/hapi-darwin-x64@0.28.0", "https://registry.npmmirror.com/@twsxtd/hapi-darwin-x64/-/hapi-darwin-x64-0.28.0.tgz", { "os": "darwin", "cpu": "x64", "bin": { "hapi": "bin/hapi" } }, "sha512-+Smx6GUTOk+/dsUJAhjN7xX6oFDqM0AErc16zPskQBY3KIMrn907+ZZEtuFJI/JYS4fR3yI+11M7x5+Qh98SZQ=="],
 
-    "@twsxtd/hapi-linux-arm64": ["@twsxtd/hapi-linux-arm64@0.27.2", "https://registry.npmmirror.com/@twsxtd/hapi-linux-arm64/-/hapi-linux-arm64-0.27.2.tgz", { "os": "linux", "cpu": "arm64", "bin": { "hapi": "bin/hapi" } }, "sha512-GmsYsZjDCApiaURXYpgdxFQjJ1rbgDNp1Ohu1xX+Pv5CBpM6vWoBgeR4pgnvYCbVbOKPqSEx5lZpbG4bmjsWeQ=="],
+    "@twsxtd/hapi-linux-arm64": ["@twsxtd/hapi-linux-arm64@0.28.0", "https://registry.npmmirror.com/@twsxtd/hapi-linux-arm64/-/hapi-linux-arm64-0.28.0.tgz", { "os": "linux", "cpu": "arm64", "bin": { "hapi": "bin/hapi" } }, "sha512-ARxkR2UPOsAWgmZItmzlqtJz5eoxlRVzgIdDxd3eV3l2qx++6QB12tjHHnWroJsW2h+Q6JUH//mFtgr/O7OJ5Q=="],
 
-    "@twsxtd/hapi-linux-x64": ["@twsxtd/hapi-linux-x64@0.27.2", "https://registry.npmmirror.com/@twsxtd/hapi-linux-x64/-/hapi-linux-x64-0.27.2.tgz", { "os": "linux", "cpu": "x64", "bin": { "hapi": "bin/hapi" } }, "sha512-IqjfbOUucPX8RpKHc/4dOx/j1mIkKG+eb3Y6CiJE9cdAp8Br48fHHvuI+8yWeqv3brP+3ZPB/YgRBxyMjyMkkQ=="],
+    "@twsxtd/hapi-linux-x64": ["@twsxtd/hapi-linux-x64@0.28.0", "https://registry.npmmirror.com/@twsxtd/hapi-linux-x64/-/hapi-linux-x64-0.28.0.tgz", { "os": "linux", "cpu": "x64", "bin": { "hapi": "bin/hapi" } }, "sha512-AekOE5SyYnVBFUDsoLEQ8tQwELQZ6n3/f3HUYMQXcdD2aHd/Xij3vF0vocUt1Zg1dPxhOzJD0gIuJvi/tPuKEQ=="],
 
-    "@twsxtd/hapi-win32-x64": ["@twsxtd/hapi-win32-x64@0.27.2", "https://registry.npmmirror.com/@twsxtd/hapi-win32-x64/-/hapi-win32-x64-0.27.2.tgz", { "os": "win32", "cpu": "x64", "bin": { "hapi": "bin/hapi.exe" } }, "sha512-koeAhuz9Ato9MbXdi45KHoPvV6Qo8MXn0jMHKpXqVMn3KShZeXk7cq5iO2UUATwr1IRK+bMi1OXjE8EcULOSoQ=="],
+    "@twsxtd/hapi-win32-x64": ["@twsxtd/hapi-win32-x64@0.28.0", "https://registry.npmmirror.com/@twsxtd/hapi-win32-x64/-/hapi-win32-x64-0.28.0.tgz", { "os": "win32", "cpu": "x64", "bin": { "hapi": "bin/hapi.exe" } }, "sha512-fvfpT9MkIjWd++PQX/TQEIioWKYOvCSe2prhNCVfTGjnI+oaoK0h1g0lmwvT0+EYM81X5HoxKXfe/OyJjtqE8A=="],
 
     "@types/aria-query": ["@types/aria-query@5.0.4", "https://registry.npmmirror.com/@types/aria-query/-/aria-query-5.0.4.tgz", {}, "sha512-rfT93uj5s0PRL7EzccGMs3brplhcrghnDoV26NqKhCAS1hVo+WdNsPvE/yb6ilfr5hi2MEk6d5EWJTKdxg8jVw=="],
 

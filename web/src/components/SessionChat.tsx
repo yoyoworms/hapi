@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { useNavigate } from '@tanstack/react-router'
+import { PRESERVE_SESSION_SIDEBAR_SCROLL } from '@/lib/sessionNavigation'
 import { AssistantRuntimeProvider, useAui, useAuiState } from '@assistant-ui/react'
 import { DragDropZone } from '@/components/AssistantChat/DragDropZone'
 import type { ApiClient } from '@/api/client'
@@ -59,6 +60,7 @@ import {
 import type { MessageDeliveryMode } from '@hapi/protocol'
 import type { OlderLoadOutcome } from '@/lib/message-window-store'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
+import { ShareSeedConsumer } from '@/components/ShareSeedConsumer'
 import {
     createScratchlistAttachmentAdapter,
     type ScratchlistAttachmentAdapter,
@@ -74,9 +76,6 @@ import {
 } from '@/lib/scratchlistAttachmentFlow'
 import type { ScratchlistEntry } from '@/lib/scratchlist'
 import { isHubScratchlistAttachmentPath } from '@hapi/protocol'
-import { consumeSharePendingTransfer } from '@/lib/sharePendingState'
-import { deleteShareTransfer, getShareTransfer } from '@/lib/shareTransfer'
-import { getDraft } from '@/lib/composer-drafts'
 import {
     type AttachmentDraftInput,
 } from '@/lib/composer-attachment-drafts'
@@ -230,6 +229,72 @@ export function isScratchlistHotkeyBlockedTarget(target: EventTarget | null): bo
 }
 
 /**
+ * True when a global select-all shortcut (Ctrl/Cmd+A) should be left to
+ * the browser default: focus is inside the rich composer
+ * (contentEditable), a textarea (the fallback composer), a single-line
+ * input/select, or a modal dialog. In every other case the app takes
+ * over the shortcut because Chromium's SelectAll collapses to an empty
+ * caret when the page contains a contenteditable (the rich composer)
+ * but focus is outside it — plain Ctrl+A would select nothing and
+ * Ctrl+C would copy nothing (see applyGlobalSelectAll).
+ *
+ * Deliberately differs from isScratchlistHotkeyBlockedTarget: textareas
+ * are blocked here (textarea select-all works natively) while the
+ * scratchlist hotkey must keep firing from the composer textarea.
+ *
+ * Pure / exported for unit tests.
+ */
+export function isSelectAllTargetBlocked(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false
+    if (target.closest('[role="dialog"]') !== null) return true
+    if (target instanceof HTMLInputElement) return true
+    if (target instanceof HTMLTextAreaElement) return true
+    if (target instanceof HTMLSelectElement) return true
+    // isContentEditable is the authoritative check in real browsers but
+    // jsdom doesn't implement it; the attribute fallback also covers
+    // `plaintext-only` composers, which is what the rich composer uses
+    // on modern Chromium.
+    if (target.isContentEditable === true) return true
+    const contenteditable = target.getAttribute('contenteditable')
+    return contenteditable !== null && contenteditable !== 'false'
+}
+
+/**
+ * Chromium quirk: when a page contains a contenteditable element (the
+ * rich composer), Ctrl/Cmd+A with focus OUTSIDE the editable collapses
+ * to an empty caret instead of selecting the page — Ctrl+C then copies
+ * nothing. Reproduced in headless and headed Chrome with both
+ * `contenteditable="true"` and `"plaintext-only"`; the bare presence of
+ * the editable root is what breaks SelectAll, while focus inside it
+ * selects the composer text correctly.
+ *
+ * This takes over Ctrl/Cmd+A whenever focus is outside the composer
+ * (see isSelectAllTargetBlocked) and selects the message thread
+ * manually, so select-all + copy restores the expected
+ * "select the conversation" behavior.
+ *
+ * Returns true when the keystroke was handled (preventDefault + range
+ * selection). Pure / exported for unit tests and the Playwright fixture.
+ */
+export function applyGlobalSelectAll(e: KeyboardEvent): boolean {
+    if (e.defaultPrevented || e.repeat) return false
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false
+    if (e.key !== 'a' && e.key !== 'A') return false
+    if (isSelectAllTargetBlocked(e.target)) return false
+    // The thread container is rendered by HappyThread; its class is the
+    // stable handle between the page-level shortcut and the message DOM.
+    const thread = document.querySelector<HTMLElement>('.happy-thread-messages')
+    if (!thread || !thread.textContent) return false
+    e.preventDefault()
+    const range = document.createRange()
+    range.selectNodeContents(thread)
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    return true
+}
+
+/**
  * Decide whether a submit should be routed to the per-session scratchlist
  * or to the regular chat send. Scratchlist entries support text and hub-
  * stored attachments; scheduled sends still fall through to chat.
@@ -256,97 +321,6 @@ export function shouldRouteToScratchlist(
 
 function isUninvokedScheduledMessage(message: DecryptedMessage): boolean {
     return message.invokedAt == null && message.scheduledAt != null
-}
-
-/**
- * Consumes a pending Web Share Target transfer once the assistant runtime
- * is mounted and the session is active enough to accept attachments.
- *
- * Lifecycle:
- *  - A mount effect reads the transfer id out of sessionStorage *once*
- *    via consumeSharePendingTransfer() (not during render — StrictMode
- *    would consume on the discarded pass). The id is stashed in a ref.
- *  - The actual seed (composer.setText + composer.addAttachment per file)
- *    runs once `props.sessionActive` is true. Inactive sessions disable
- *    the attachmentAdapter, so writing attachments while inactive would
- *    no-op and leak Blobs in IDB. The seed waits in a re-renderable
- *    effect for the active flip.
- *  - `consumedRef` gates the effect to a single seed per component
- *    instance — refs survive a StrictMode mount/cleanup/remount pair, so
- *    the second invoke early-returns and the first invoke's async chain
- *    completes naturally (we deliberately don't cancel on cleanup; the
- *    upload is idempotent and the only side effects on the composer are
- *    no-ops once the runtime is unmounted).
- *  - The IDB row is deleted after the seed completes so a back-button
- *    refresh of /sessions/:id doesn't re-attach the same payload.
- */
-function ShareSeedConsumer(props: { sessionId: string; sessionActive: boolean }) {
-    const assistantApi = useAui()
-    const composerText = useAuiState((s) => s.composer.text)
-    const composerTextRef = useRef(composerText)
-    const initRef = useRef(false)
-    const transferIdRef = useRef<string | null>(null)
-    const consumedRef = useRef(false)
-    const [transferReady, setTransferReady] = useState(false)
-
-    useEffect(() => {
-        composerTextRef.current = composerText
-    }, [composerText])
-
-    // Consume in an effect, not during render — React.StrictMode double-
-    // invokes render functions in dev; a render-time consume deletes the
-    // sessionStorage key on the discarded pass and the committed render
-    // then sees no transfer.
-    useEffect(() => {
-        if (initRef.current) return
-        initRef.current = true
-        transferIdRef.current = consumeSharePendingTransfer()
-        setTransferReady(true)
-    }, [])
-
-    useEffect(() => {
-        if (!transferReady) return
-        if (consumedRef.current) return
-        const transferId = transferIdRef.current
-        if (!transferId) return
-        if (!props.sessionActive) return
-        consumedRef.current = true
-
-        void (async () => {
-            try {
-                const payload = await getShareTransfer(transferId)
-                if (!payload) return
-                const seedText = [payload.title, payload.text, payload.url]
-                    .filter((part) => typeof part === 'string' && part.length > 0)
-                    .join('\n')
-                    .trim()
-                if (seedText.length > 0) {
-                    const existingText = composerTextRef.current.trim().length > 0
-                        ? composerTextRef.current
-                        : getDraft(props.sessionId)
-                    const nextText = [existingText.trim(), seedText]
-                        .filter((part) => part.length > 0)
-                        .join('\n\n')
-                    if (nextText.length > 0) {
-                        assistantApi.composer().setText(nextText)
-                    }
-                }
-                for (const file of payload.files) {
-                    const reconstructed = new File([file.blob], file.name, { type: file.type })
-                    try {
-                        await assistantApi.composer().addAttachment(reconstructed)
-                    } catch (err) {
-                        console.error('share-seed addAttachment failed', err)
-                    }
-                }
-                await deleteShareTransfer(transferId).catch(() => {})
-            } catch (err) {
-                console.error('share-seed pull failed', err)
-            }
-        })()
-    }, [transferReady, props.sessionActive, props.sessionId, assistantApi])
-
-    return null
 }
 
 /**
@@ -515,6 +489,27 @@ export function buildGoalStateMessages(
     return messages.filter((message) => !isUninvokedScheduledMessage(message))
 }
 
+/**
+ * Keep the latest completed fork boundary available while reading history.
+ * The history window can no longer contain the tail after older pages are
+ * loaded, so recomputing a boundary from that window would either hide the
+ * current Fork action or incorrectly mark an older message as current.
+ * A live tail revision invalidates the remembered boundary until tail view
+ * observes the authoritative current boundary again.
+ */
+export function resolveLatestCompletedBoundaryIdForView(
+    viewMode: 'tail' | 'history',
+    currentTailBoundaryId: string | null,
+    rememberedTailBoundary: { id: string | null; tailRevision: number } | null,
+    currentTailRevision: number
+): string | null {
+    if (viewMode === 'tail') return currentTailBoundaryId
+    if (!rememberedTailBoundary || rememberedTailBoundary.tailRevision !== currentTailRevision) {
+        return null
+    }
+    return rememberedTailBoundary.id
+}
+
 function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
     for (const block of blocks) {
         if (block.kind === 'tool-call') {
@@ -534,9 +529,11 @@ function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
 
 type SessionChatProps = {
     api: ApiClient
+    titleSuggestionAvailable?: boolean
     session: Session
     cursorChatOnDisk?: boolean
     reopenDisabledReason?: string
+    reopenHint?: string
     messages: DecryptedMessage[]
     messagesWarning: string | null
     hasMoreMessages: boolean
@@ -547,6 +544,7 @@ type SessionChatProps = {
     viewMode: 'tail' | 'history'
     messagesVersion: number
     historyVersion: number
+    tailRevision: number
     onBack: () => void
     onRefresh: () => void
     onLoadMore: (onBeforeApply?: (historyVersion: number) => boolean) => Promise<OlderLoadOutcome>
@@ -614,7 +612,11 @@ function SessionChatInner(props: SessionChatProps) {
         setHistoryActionPending(true)
         try {
             const result = await props.api.forkConversation(props.session.id, messageLocalId)
-            await navigate({ to: '/sessions/$sessionId', params: { sessionId: result.sessionId } })
+            await navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId: result.sessionId },
+                ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+            })
         } finally {
             setHistoryActionPending(false)
         }
@@ -646,6 +648,10 @@ function SessionChatInner(props: SessionChatProps) {
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
+    const [rememberedTailBoundary, setRememberedTailBoundary] = useState<{
+        id: string | null
+        tailRevision: number
+    } | null>(null)
     const [forceScrollToken, setForceScrollToken] = useState(0)
     const uploadDraftSnapshotRef = useRef<{ text: string; attachments: AttachmentDraftInput[] }>({
         text: '',
@@ -749,6 +755,16 @@ function SessionChatInner(props: SessionChatProps) {
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
     }, [isScratchlistParking])
+    /**
+     * Global select-all takeover: see applyGlobalSelectAll. Bound at
+     * window scope because the broken case is focus on the page body /
+     * message thread, which never routes keydown through the composer or
+     * the thread viewport.
+     */
+    useEffect(() => {
+        window.addEventListener('keydown', applyGlobalSelectAll)
+        return () => window.removeEventListener('keydown', applyGlobalSelectAll)
+    }, [])
     /**
      * onSend wrapper: when scratchlist mode is on AND the submission is
      * not scheduled, route to scratchlist (text and/or hub attachments).
@@ -1399,7 +1415,12 @@ function SessionChatInner(props: SessionChatProps) {
     // Fork-current must compare against assistant-ui message ids (`kind:id`),
     // not raw hub message ids — MessageActions receive the rendered card id,
     // and adjacent assistant blocks join under the first block's id.
-    const latestCompletedBoundaryId = useMemo(() => {
+    //
+    // Calculate the boundary from the tail window, then remember it while the
+    // operator reads history. Otherwise changing viewMode to `history` hides
+    // a valid current Fork action, and loading older pages can make the last
+    // visible historical message look like the current fork boundary.
+    const currentTailBoundaryId = useMemo(() => {
         if (props.viewMode !== 'tail') return null
         return findLatestCompletedBoundaryId(
             visibleBlocks,
@@ -1407,6 +1428,22 @@ function SessionChatInner(props: SessionChatProps) {
             props.session.activeTurnStartedAt ?? null
         )
     }, [props.viewMode, props.session.activeTurnStartedAt, props.session.thinking, visibleBlocks])
+
+    useEffect(() => {
+        if (props.viewMode !== 'tail') return
+        setRememberedTailBoundary((previous) => (
+            previous?.id === currentTailBoundaryId && previous.tailRevision === props.tailRevision
+                ? previous
+                : { id: currentTailBoundaryId, tailRevision: props.tailRevision }
+        ))
+    }, [currentTailBoundaryId, props.tailRevision, props.viewMode])
+
+    const latestCompletedBoundaryId = resolveLatestCompletedBoundaryIdForView(
+        props.viewMode,
+        currentTailBoundaryId,
+        rememberedTailBoundary,
+        props.tailRevision
+    )
 
     const isLatestCompletedBoundary = useCallback((messageId: string) => {
         return latestCompletedBoundaryId === messageId
@@ -1585,7 +1622,8 @@ function SessionChatInner(props: SessionChatProps) {
         setOutlineOpen(false)
         navigate({
             to: '/sessions/$sessionId/files',
-            params: { sessionId: props.session.id }
+            params: { sessionId: props.session.id },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, props.session.id])
 
@@ -1596,7 +1634,8 @@ function SessionChatInner(props: SessionChatProps) {
     const handleViewTerminal = useCallback(() => {
         navigate({
             to: '/sessions/$sessionId/terminal',
-            params: { sessionId: props.session.id }
+            params: { sessionId: props.session.id },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, props.session.id])
 
@@ -1795,8 +1834,10 @@ function SessionChatInner(props: SessionChatProps) {
                 onToggleTerminal={canViewAgentTerminal ? () => setTerminalVisible(v => !v) : undefined}
                 terminalActive={terminalVisible}
                 api={props.api}
+                titleSuggestionAvailable={props.titleSuggestionAvailable}
                 canReopen={inactiveCanResume}
                 reopenDisabledReason={props.reopenDisabledReason}
+                reopenHint={props.reopenHint}
                 onSessionDeleted={props.onBack}
                 onSessionReopened={async (newSessionId) => {
                     await transferComposerDraftThenNavigate(
@@ -1805,7 +1846,8 @@ function SessionChatInner(props: SessionChatProps) {
                         () => navigate({
                             to: '/sessions/$sessionId',
                             params: { sessionId: newSessionId },
-                            replace: true
+                            replace: true,
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
                         }),
                     )
                 }}
@@ -1936,6 +1978,7 @@ function SessionChatInner(props: SessionChatProps) {
                                     // Restore the schedule so the clock button re-activates
                                     updatePendingSchedule(restored)
                                 }}
+                                canSteer={agentFlavor === 'pi' && props.session.thinking && !controlledByUser}
                             />
                         </div>
 
@@ -1982,12 +2025,12 @@ function SessionChatInner(props: SessionChatProps) {
                                             ? grokModelOptions
                                         : agentFlavor === 'copilot'
                                             ? copilotModelOptions
-                                        // Pi uses its own provider-qualified picker (piModels prop).
-                                        // Feeding piModelOptions here would make the generic Ctrl/Cmd+M
+                                        // Pi gets its provider-qualified model list from the piModels prop;
+                                        // feeding piModelOptions here would make the generic Ctrl/Cmd+M
                                         // cycler (getNextModelForFlavor) post a bare modelId string,
                                         // which loses the provider and can pick the wrong cached
                                         // match or throw in runPi. undefined makes the shortcut a no-op
-                                        // so Pi model changes go through the dedicated picker only.
+                                        // so Pi model changes go through the settings sheet only.
                                         : undefined
                         }
                         piModels={sharedMode ? undefined : piModels}

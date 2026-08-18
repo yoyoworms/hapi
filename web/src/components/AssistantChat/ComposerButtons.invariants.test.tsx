@@ -15,7 +15,7 @@ vi.mock('@/hooks/useComposerToolbarLayout', () => ({
     useComposerToolbarLayout: () => ({
         layout: {
             mode: 'left',
-            left: ['attachment', 'piModel', 'piThinking', 'scratchlist', 'schedule'],
+            left: ['attachment', 'model', 'effort', 'scratchlist', 'schedule'],
             right: [],
         },
     }),
@@ -143,8 +143,8 @@ describe('ComposerButtons attachment invariants', () => {
 
     it('keeps the mobile toolbar horizontally scrollable without shrinking controls', () => {
         renderButtons({
-            piModelLabel: 'provider/extraordinarily-long-model-name',
-            piThinkingLabel: 'extraordinarily-long-thinking-level',
+            modelValueLabel: 'provider/extraordinarily-long-model-name',
+            effortValueLabel: 'extraordinarily-long-thinking-level',
         })
 
         const scroller = screen.getByTestId('composer-toolbar-scroll')

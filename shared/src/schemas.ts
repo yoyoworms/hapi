@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { COPILOT_AGENT_MODES, type CopilotAgentMode } from './copilotModes'
 import { CODEX_COLLABORATION_MODES, PERMISSION_MODES } from './modes'
+import { AgentConfigDescriptorSchema } from './agentConfig'
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES)
 export const CodexCollaborationModeSchema = z.enum(CODEX_COLLABORATION_MODES)
@@ -266,7 +267,14 @@ export const TeamStateSchema = z.object({
 
 export type TeamState = z.infer<typeof TeamStateSchema>
 
-export const ThreadGoalStatusSchema = z.enum(['active', 'paused', 'budgetLimited', 'complete'])
+export const ThreadGoalStatusSchema = z.enum([
+    'active',
+    'paused',
+    'budgetLimited',
+    'complete',
+    'blocked',
+    'usageLimited'
+])
 export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>
 
 export const ThreadGoalSchema = z.object({
@@ -467,7 +475,18 @@ export const MachineMetadataSchema = z.object({
     homeDir: z.string().optional(),
     happyHomeDir: z.string().optional(),
     happyLibDir: z.string().optional(),
-    workspaceRoots: z.array(z.string()).optional()
+    workspaceRoots: z.array(z.string()).optional(),
+    /** Machine-scoped RPC capability ids this runner registers (see runnerCapabilities). */
+    capabilities: z.array(z.string()).optional(),
+    /** CLI binary/package mtime when this runner process started. */
+    startedCliMtimeMs: z.number().optional(),
+    /** Current on-disk CLI binary/package mtime (may differ after upgrade). */
+    installedCliMtimeMs: z.number().optional(),
+    /**
+     * Runner is under systemd/pm2 (HAPI_RUNNER_SUPERVISED=1). Banner Restart
+     * may stop-runner; unsupervised detached runners must not use that path.
+     */
+    supervisedRestart: z.boolean().optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -477,7 +496,10 @@ export const RunnerStateSchema = z.object({
     pid: z.number().optional(),
     httpPort: z.number().optional(),
     startedAt: z.number().optional(),
-    capabilities: z.object({ piExistingSessionResume: z.literal(true).optional() }).optional(),
+    capabilities: z.object({
+        piExistingSessionResume: z.literal(true).optional(),
+        agentConfigs: z.array(AgentConfigDescriptorSchema).optional()
+    }).optional(),
     shutdownRequestedAt: z.number().optional(),
     shutdownSource: z.union([z.enum(['mobile-app', 'cli', 'os-signal', 'unknown']), z.string()]).optional(),
     lastSpawnError: z.object({
@@ -625,3 +647,11 @@ export const CancelMessageResponseSchema = z.discriminatedUnion('status', [
 ])
 
 export type CancelMessageResponse = z.infer<typeof CancelMessageResponseSchema>
+
+export const SteerQueuedMessageResponseSchema = z.discriminatedUnion('status', [
+    z.object({ status: z.literal('steered'), localId: z.string() }),
+    z.object({ status: z.literal('invoked'), message: DecryptedMessageSchema }),
+    z.object({ status: z.literal('failed'), error: z.string(), localId: z.string().nullable() }),
+])
+
+export type SteerQueuedMessageResponse = z.infer<typeof SteerQueuedMessageResponseSchema>

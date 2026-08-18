@@ -11,6 +11,7 @@ type AppContextValue = {
     sharedMode?: boolean
     /** The single session id a shared viewer is scoped to. */
     sharedSessionId?: string
+    titleSuggestionAvailable?: boolean
 }
 
 const AppContext = createContext<AppContextValue | null>(null)

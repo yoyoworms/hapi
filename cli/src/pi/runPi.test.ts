@@ -19,6 +19,8 @@ const harness = vi.hoisted(() => ({
         onCancelQueuedMessage: vi.fn(),
         emitMessagesConsumed: vi.fn(),
         sendSessionEvent: vi.fn(),
+        sendAgentMessage: vi.fn(),
+        updateAgentState: vi.fn(),
         updateMetadata: vi.fn(),
         getMetadata: vi.fn(() => null),
         emitSessionReady: vi.fn(),
@@ -1036,5 +1038,881 @@ describe('Pi prompt preparation', () => {
             if (outsidePath) await rm(outsidePath, { force: true });
             await rm(uploadDir, { recursive: true, force: true });
         }
+    });
+});
+
+describe('Pi steer-queued-message RPC', () => {
+    beforeEach(() => {
+        harness.sent.length = 0;
+        harness.throwOnGetCommands = false;
+        harness.onError = null;
+        harness.onEvent = null;
+        harness.rpcHandlers.clear();
+        harness.session.rpcHandlerManager.registerHandler.mockReset();
+        harness.session.rpcHandlerManager.registerHandler.mockImplementation(
+            (method: string, handler: (payload: unknown) => Promise<unknown>) => {
+                harness.rpcHandlers.set(method, handler);
+            }
+        );
+        harness.session.onUserMessage.mockReset();
+        harness.session.emitMessagesConsumed.mockReset();
+        harness.session.sendSessionEvent.mockReset();
+        harness.session.updateMetadata.mockReset();
+        harness.killCount = 0;
+        harness.cleanupCount = 0;
+        vi.useFakeTimers();
+    });
+
+    // Startup helper used by the flow tests. Mirrors the existing "establishes
+    // the history baseline" test: the 30s ready fallback establishes the
+    // baseline first, then get_state reports the streaming state and the native
+    // preparation probe completes. Advancing timers explicitly (instead of
+    // letting vi.waitFor auto-advance) keeps the fallback from re-firing mid-test.
+    async function startReadySession(streaming: boolean): Promise<{ running: Promise<void> }> {
+        const running = runPi({ workingDirectory: '/work' });
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(31_000);
+        await completeHistoryBaseline();
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-session', sessionFile: '/tmp/pi-session.jsonl', ...(streaming ? { isStreaming: true } : {}) },
+        });
+        await completeHistoryProbe();
+        await vi.advanceTimersByTimeAsync(0);
+        return { running };
+    }
+
+    it('registers the steer-queued-message RPC handler', async () => {
+        const { running } = await startReadySession(false);
+
+        expect(harness.rpcHandlers.has(RPC_METHODS.SteerQueuedMessage)).toBe(true);
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('requires a localId', async () => {
+        const { running } = await startReadySession(false);
+
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({});
+
+        expect(result).toEqual({ steered: false, error: 'localId is required' });
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('promotes a queued message into the active turn while Pi is streaming', async () => {
+        const { running } = await startReadySession(true);
+
+        // Pi reports a streaming turn: the prompt pump stays blocked, so the
+        // message waits in the queue instead of being sent as a prompt.
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (
+            message: { role: 'user'; content: { type: 'text'; text: string } },
+            localId: string
+        ) => void;
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'steer me' } }, 'steer-local');
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt', message: 'steer me' }));
+
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'steer-local' });
+
+        expect(result).toEqual({ steered: true });
+
+        // The native steer reaches Pi stdin and is acked once Pi confirms it.
+        await vi.advanceTimersByTimeAsync(0);
+        const steer = harness.sent.find((item) => (item as { type?: string }).type === 'steer') as
+            { id: string; message: string } | undefined;
+        expect(steer?.message).toBe('steer me');
+        harness.onEvent!({ type: 'response', id: steer!.id, command: 'steer', success: true });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['steer-local'], undefined);
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('rejects a steer when the message is not queued (already dispatched)', async () => {
+        const { running } = await startReadySession(false);
+
+        // Idle Pi: the pump dispatches the message as a normal prompt right away.
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (
+            message: { role: 'user'; content: { type: 'text'; text: string } },
+            localId: string
+        ) => void;
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'prompt me' } }, 'prompt-local');
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'prompt', message: 'prompt me' }));
+
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'prompt-local' });
+
+        expect(result).toEqual({ steered: false, error: 'Message not found or already dispatched' });
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'steer')).toHaveLength(0);
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('defers a steer requested while the message is still preparing, then steers after preparation', async () => {
+        const { running } = await startReadySession(true);
+
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (
+            message: { role: 'user'; content: { type: 'text'; text: string } },
+            localId: string
+        ) => void;
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+
+        // The handler registers the localId in preparingLocalIds synchronously;
+        // call the steer RPC before the preparation microtask completes so the
+        // message is still "preparing".
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'attach me' } }, 'attach-local');
+        const result = await handler({ localId: 'attach-local' });
+
+        expect(result).toEqual({ steered: true });
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'steer')).toHaveLength(0);
+
+        // Preparation completes and the pending steer is promoted into the turn.
+        await vi.advanceTimersByTimeAsync(0);
+        const steer = harness.sent.find((item) => (item as { type?: string }).type === 'steer') as
+            { id: string; message: string } | undefined;
+        expect(steer?.message).toBe('attach me');
+        harness.onEvent!({ type: 'response', id: steer!.id, command: 'steer', success: true });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['attach-local'], undefined);
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('steers into the generation captured at request time, not one that started mid-preparation', async () => {
+        const { running } = await startReadySession(true);
+
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (
+            message: { role: 'user'; content: { type: 'text'; text: string } },
+            localId: string
+        ) => void;
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+
+        // Request the steer while the message is still preparing (generation G1).
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'rollover me' } }, 'rollover-local');
+        const result = await handler({ localId: 'rollover-local' });
+        expect(result).toEqual({ steered: true });
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'steer')).toHaveLength(0);
+
+        // G1 ends and G2 starts while the message is still preparing.
+        const state = { sessionId: 'pi-session', sessionFile: '/tmp/pi-session.jsonl' };
+        harness.onEvent!({ type: 'response', command: 'get_state', success: true, data: { ...state, isStreaming: false } });
+        harness.onEvent!({ type: 'response', command: 'get_state', success: true, data: { ...state, isStreaming: true } });
+
+        // Preparation completes; the dispatcher sees generation G2 != captured
+        // G1 and degrades the message to the prompt FIFO instead of steering it.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'steer')).toHaveLength(0);
+        expect(harness.session.emitMessagesConsumed).not.toHaveBeenCalledWith(['rollover-local'], undefined);
+
+        // Once G2 settles, the FIFO delivers the message as a normal prompt.
+        harness.onEvent!({ type: 'response', command: 'get_state', success: true, data: { ...state, isStreaming: false } });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'prompt', message: 'rollover me' }));
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+
+    it('drops a deferred steer when the message is cancelled while preparing', async () => {
+        const { running } = await startReadySession(true);
+
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (
+            message: { role: 'user'; content: { type: 'text'; text: string } },
+            localId: string
+        ) => void;
+        const handler = harness.rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'cancel me' } }, 'cancel-local');
+        const result = await handler({ localId: 'cancel-local' });
+        expect(result).toEqual({ steered: true });
+
+        // Cancellation wins over the deferred steer (checked first in the chain).
+        const onCancelQueuedMessage = harness.session.onCancelQueuedMessage.mock.calls.at(-1)![0] as (localId: string) => boolean;
+        expect(onCancelQueuedMessage('cancel-local')).toBe(true);
+
+        // Preparation completes: the message is dropped — never steered, never
+        // sent as a prompt, never consumed (the hub deletes the row instead).
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'steer')).toHaveLength(0);
+        expect(harness.sent.filter((item) => (item as { type?: string }).type === 'prompt')).toHaveLength(0);
+        expect(harness.session.emitMessagesConsumed).not.toHaveBeenCalled();
+
+        harness.onError?.(new Error('stop test transport'));
+        await running;
+    });
+});
+
+describe('Pi built-in slash commands', () => {
+    beforeEach(() => {
+        vi.useRealTimers();
+        harness.sent.length = 0;
+        harness.throwOnGetCommands = false;
+        harness.onError = null;
+        harness.onEvent = null;
+        harness.rpcHandlers.clear();
+        harness.session.onUserMessage.mockReset();
+        harness.session.onCancelQueuedMessage.mockReset();
+        harness.session.emitMessagesConsumed.mockReset();
+        harness.session.sendSessionEvent.mockReset();
+        harness.session.updateMetadata.mockReset();
+        harness.cleanupCount = 0;
+        harness.killCount = 0;
+        harness.session.rpcHandlerManager.registerHandler.mockReset();
+        harness.session.rpcHandlerManager.registerHandler.mockImplementation((method: string, handler: (payload: unknown) => Promise<unknown>) => {
+            harness.rpcHandlers.set(method, handler);
+        });
+    });
+
+    async function startReadySession(commands: Array<Record<string, unknown>> = [
+        { name: 'test-extension', description: 'Test extension', source: 'extension' },
+        { name: 'skill:brave-search', description: 'Search the web', source: 'skill' },
+    ]): Promise<{
+        running: Promise<void>;
+        onUserMessage: (message: {
+            role: 'user';
+            content: { type: 'text'; text: string };
+            meta?: { deliveryMode?: 'queue' | 'steer' };
+        }, localId: string) => void;
+    }> {
+        const running = runPi({ workingDirectory: '/work' });
+        await vi.waitFor(() => expect(harness.onEvent).not.toBeNull());
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: false },
+        });
+        await completeHistoryInitialization();
+        // Warm the command cache: slash-message handling consults discovered
+        // commands to decide extension-vs-builtin precedence.
+        const getCommands = harness.sent.find((item) => (item as { type?: string }).type === 'get_commands') as { id: string };
+        harness.onEvent!({ type: 'response', id: getCommands.id, command: 'get_commands', success: true, data: { commands } });
+        const onUserMessage = harness.session.onUserMessage.mock.calls.at(-1)![0] as (message: {
+            role: 'user';
+            content: { type: 'text'; text: string };
+            meta?: { deliveryMode?: 'queue' | 'steer' };
+        }, localId: string) => void;
+        return { running, onUserMessage };
+    }
+
+    it('executes /compact via Pi RPC, reports the summary, and holds queued prompts until it completes', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({
+            role: 'user',
+            content: { type: 'text', text: '/compact focus on the API design' },
+        }, 'compact-id');
+
+        onUserMessage({
+            role: 'user',
+            content: { type: 'text', text: 'continue after compaction' },
+        }, 'after-id');
+
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'compact', customInstructions: 'focus on the API design',
+        })));
+        // The /compact row is consumed at dispatch: slash commands are
+        // executed by HAPI and never delivered to Pi as prompts, so they must
+        // not linger in the web queued bar for the duration of the command.
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['compact-id'], undefined));
+        // Compaction keeps working for minutes without a Pi streaming event,
+        // so the session reports thinking while the RPC is outstanding and
+        // clears it once the run settles.
+        await vi.waitFor(() => expect(harness.session.keepAlive).toHaveBeenCalledWith(true, expect.anything(), expect.anything()));
+        // While the compact RPC is outstanding, the FIFO must not release the
+        // following prompt — Pi rejects prompts during compaction.
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt' }));
+
+        const compact = harness.sent.find((item) => (item as { type?: string }).type === 'compact') as { id: string };
+        // The compact RPC holds the session in the thinking state for its
+        // whole duration (web would otherwise mark it idle after the hub's
+        // 15s queued-thinking grace).
+        const keepAliveCalls = harness.session.keepAlive.mock.calls;
+        expect(keepAliveCalls[keepAliveCalls.length - 1]?.[0]).toBe(true);
+        harness.onEvent!({
+            type: 'response', id: compact.id, command: 'compact', success: true,
+            data: { summary: 'API design focused summary', tokensBefore: 1000, estimatedTokensAfter: 120 },
+        });
+
+        // The summary lands as a structured event (the web renders it as a
+        // dedicated block), not as a plain status message. (The /compact row
+        // was already consumed at dispatch above.)
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith({
+            type: 'compact-summary',
+            summary: 'API design focused summary',
+            tokensBefore: 1000,
+            estimatedTokensAfter: 120,
+        }));
+        expect(harness.session.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Compaction summary'),
+        }));
+        await vi.waitFor(() => expect(harness.session.keepAlive).toHaveBeenCalledWith(false, expect.anything(), expect.anything()));
+
+        // The thinking state is released once the RPC completes.
+        await vi.waitFor(() => {
+            const calls = harness.session.keepAlive.mock.calls;
+            expect(calls[calls.length - 1]?.[0]).toBe(false);
+        });
+
+        // The queued prompt may only flow once compaction completed.
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'prompt', message: 'continue after compaction',
+        })));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('dispatches a head-of-line /compact even when delivered as a steer while streaming', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: true },
+        });
+        onUserMessage({
+            role: 'user',
+            content: { type: 'text', text: '/compact' },
+            meta: { deliveryMode: 'steer' },
+        }, 'steer-compact-id');
+
+        // /compact stays interruptible while streaming: Pi's compact() aborts
+        // the active generation itself, and the command must never degrade to
+        // a native steer.
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' })));
+        const compact = harness.sent.find((item) => (item as { type?: string }).type === 'compact') as { id: string; customInstructions?: string };
+        expect(compact.customInstructions).toBeUndefined();
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'steer' }));
+
+        harness.onEvent!({ type: 'response', id: compact.id, command: 'compact', success: true, data: {} });
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['steer-compact-id'], undefined));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('keeps non-compact commands queued while streaming (FIFO head rule)', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: true },
+        });
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/session' } }, 'session-id');
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'get_session_stats' }));
+
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: false },
+        });
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'get_session_stats' })));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('dispatches a prompt queued before /compact ahead of the command (FIFO)', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: true },
+        });
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'queued prompt B' } }, 'b-id');
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'compact-after-b-id');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt' }));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+        // Turn settles: prompt B is dispatched first; /compact must wait.
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: false },
+        });
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'prompt', message: 'queued prompt B',
+        })));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+        // Settle prompt B, then the queued /compact executes. The lifecycle
+        // fallback reads the append log before retiring the entry.
+        const promptB = harness.sent.find((item) => (item as { type?: string }).type === 'prompt') as { id: string };
+        vi.useFakeTimers();
+        harness.onEvent!({ type: 'response', id: promptB.id, command: 'prompt', success: true });
+        await vi.advanceTimersByTimeAsync(1_100);
+        const appendSync = harness.sent.filter((item) => (item as { type?: string }).type === 'get_entries').at(-1) as { id: string };
+        harness.onEvent!({ type: 'response', id: appendSync.id, command: 'get_entries', success: true, data: { entries: [], leafId: null } });
+        await vi.advanceTimersByTimeAsync(10);
+        vi.useRealTimers();
+        expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('reports compact failures as a visible message', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'fail-id');
+
+        const compact = await vi.waitFor(() => {
+            const found = harness.sent.find((item) => (item as { type?: string }).type === 'compact') as { id: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+        // Consumption happens at dispatch, before the command outcome is
+        // known: a failing /compact still leaves the queue immediately and
+        // surfaces its failure through the ⚠️ event message instead.
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['fail-id'], undefined));
+        harness.onEvent!({ type: 'response', id: compact.id, command: 'compact', success: false, error: 'no model selected' });
+
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: '⚠️ Compaction failed: no model selected',
+        })));
+        // The raw Pi error must not be emitted a second time by the common
+        // response handler (compact owns its failure reporting).
+        expect(harness.session.sendSessionEvent).not.toHaveBeenCalledWith({ type: 'message', message: 'no model selected' });
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('shows session stats for /session', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/session' } }, 'stats-id');
+
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'get_session_stats' })));
+        const statsCmd = harness.sent.find((item) => (item as { type?: string }).type === 'get_session_stats') as { id: string };
+        harness.onEvent!({
+            type: 'response', id: statsCmd.id, command: 'get_session_stats', success: true,
+            data: {
+                totalMessages: 42,
+                tokens: { input: 3000, output: 2000, total: 5000 },
+                cost: 0.1234,
+                contextUsage: { tokens: 4000, contextWindow: 200000, percent: 2 },
+            },
+        });
+
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Messages: 42'),
+        })));
+        expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Tokens: total 5000 · in 3000 · out 2000'),
+        }));
+        expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Cost: $0.1234'),
+        }));
+        expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Context: 4000 / 200000 tokens (2%)'),
+        }));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['stats-id'], { clearQueuedThinkingGrace: true }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('lists or switches the model for /model', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({ type: 'response', command: 'get_available_models', success: true, data: {
+            models: [
+                { id: 'gpt-5.2', provider: 'openai' },
+                { id: 'gpt-4.1', provider: 'openai' },
+            ],
+        } });
+        await vi.waitFor(() => expect(harness.session.updateMetadata).toHaveBeenCalled());
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model' } }, 'list-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Available: openai/gpt-5.2, openai/gpt-4.1'),
+        })));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['list-id'], { clearQueuedThinkingGrace: true }));
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model gpt-4.1' } }, 'switch-id');
+        const setModel = await vi.waitFor(() => {
+            const found = harness.sent.find((item) => (item as { type?: string }).type === 'set_model') as { id: string; provider?: string; modelId?: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+        expect(setModel).toMatchObject({ provider: 'openai', modelId: 'gpt-4.1' });
+        harness.onEvent!({ type: 'response', id: setModel.id, command: 'set_model', success: true });
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: 'Model switched to gpt-4.1',
+        })));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['switch-id'], { clearQueuedThinkingGrace: true }));
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model does-not-exist' } }, 'unknown-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: '⚠️ Unknown model: does-not-exist. Use /model to list available models.',
+        })));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('recovers /model from an empty model cache by retrying discovery', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        // No get_available_models was answered at startup: the cache is empty
+        // and the first /model must retry the discovery RPC instead of
+        // reporting the catalog as unknown.
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model' } }, 'retry-list-id');
+
+        const discovery = await vi.waitFor(() => {
+            // Pick the latest discovery request: the startup probe may also
+            // still be outstanding.
+            const found = harness.sent.filter((item) => (item as { type?: string }).type === 'get_available_models').at(-1) as { id: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+        harness.onEvent!({ type: 'response', id: discovery.id, command: 'get_available_models', success: true, data: {
+            models: [
+                { id: 'gpt-5.2', provider: 'openai' },
+                { id: 'gpt-4.1', provider: 'openai' },
+            ],
+        } });
+
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Available: openai/gpt-5.2, openai/gpt-4.1'),
+        })));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['retry-list-id'], { clearQueuedThinkingGrace: true }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('aborts an in-flight /compact directly instead of waiting on the mutation lease', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'abortable-id');
+
+        const compact = await vi.waitFor(() => {
+            const found = harness.sent.find((item) => (item as { type?: string }).type === 'compact') as { id: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+
+        // The Abort action must interrupt the compaction via the abort RPC —
+        // waiting for the runtime-mutation lease would exceed the 25s abort
+        // deadline while compaction may run for up to 120s.
+        const abort = harness.rpcHandlers.get(RPC_METHODS.Abort)!;
+        const abortPromise = abort({});
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'abort' })));
+        const abortRpc = harness.sent.find((item) => (item as { type?: string }).type === 'abort') as { id: string };
+        harness.onEvent!({ type: 'response', id: abortRpc.id, command: 'abort', success: true });
+        await abortPromise;
+        expect(harness.cleanupCount).toBe(0);
+
+        // Pi reports the cancellation through its lifecycle event; the RPC
+        // error is the same cancellation and must not double-report a failure.
+        harness.onEvent!({ type: 'response', id: compact.id, command: 'compact', success: false, error: 'Compaction cancelled' });
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['abortable-id'], undefined));
+        expect(harness.session.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Compaction failed'),
+        }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('cancels a /compact still queued on the runtime-mutation lock when Abort lands first', async () => {
+        const { running, onUserMessage } = await startReadySession();
+
+        // Hold the runtime-mutation lock open so the compact RPC cannot be
+        // issued before Abort arrives.
+        const { PiSession } = await import('./session');
+        const realRunRuntimeMutation = PiSession.prototype.runRuntimeMutation;
+        let gate: Promise<void> | null = null;
+        let releaseGate!: () => void;
+        const spy = vi.spyOn(PiSession.prototype, 'runRuntimeMutation').mockImplementation(async function (this: unknown, op, opts) {
+            if (gate) await gate;
+            return realRunRuntimeMutation.call(this, op, opts);
+        });
+        try {
+            gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+            onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'prestart-id');
+            await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+
+            const abort = harness.rpcHandlers.get(RPC_METHODS.Abort)!;
+            await abort({});
+
+            // No abort RPC may be sent: the compact RPC never started, so
+            // there is nothing on Pi's side to interrupt.
+            expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'abort' }));
+            expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+            // Release the lock: the compact RPC must be skipped entirely and
+            // the row still consumed.
+            releaseGate();
+            await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['prestart-id'], undefined));
+            expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+            expect(harness.cleanupCount).toBe(0);
+            expect(harness.session.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+                message: expect.stringContaining('Compaction'),
+            }));
+        } finally {
+            spy.mockRestore();
+        }
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('retires pending extension UI requests when /compact interrupts a streaming turn', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({
+            type: 'response', command: 'get_state', success: true,
+            data: { sessionId: 'pi-slash-session', sessionFile: '/tmp/pi-slash.jsonl', isStreaming: true },
+        });
+        harness.onEvent!({ type: 'extension_ui_request', id: 'ui-blocking', method: 'input', title: 'Need input' });
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'ui-compact-id');
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' })));
+
+        // The stale input card must be cancelled and removed from agent state
+        // exactly like the Abort path does, so the web is not stuck on it.
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'extension_ui_response', id: 'ui-blocking', cancelled: true,
+        })));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('fails closed when the direct compact-abort RPC times out', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'timeout-abort-id');
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' })));
+
+        vi.useFakeTimers();
+        const abort = harness.rpcHandlers.get(RPC_METHODS.Abort)!;
+        const abortPromise = abort({});
+        // Attach the settlement handler before advancing timers so the
+        // rejection is never observed as unhandled.
+        const settled = abortPromise.then(() => 'ok', () => 'failed');
+        await vi.advanceTimersByTimeAsync(10);
+        expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'abort' }));
+
+        // The abort RPC never answers: the compaction outcome is
+        // indeterminate (the compact RPC keeps the mutation lease for up to
+        // 120s), so the session must fail closed exactly like the ordinary
+        // Abort path and never release the prompt FIFO.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(await settled).toBe('failed');
+        expect(harness.cleanupCount).toBe(1);
+        vi.useRealTimers();
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('fails the session when compaction times out with a queued prompt', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        // Fake timers must be installed before the compact RPC is issued so
+        // its 120s timeout timer is mocked.
+        vi.useFakeTimers();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'timeout-id');
+        onUserMessage({ role: 'user', content: { type: 'text', text: 'queued behind compaction' } }, 'queued-id');
+        await vi.advanceTimersByTimeAsync(10);
+
+        expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' }));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt' }));
+
+        // The compact RPC never answers: the outcome is indeterminate and the
+        // runtime lease stays poisoned, so the session must be torn down and
+        // the prompt FIFO must never be reopened into a possibly-compacting Pi.
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(harness.cleanupCount).toBe(1);
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt' }));
+        vi.useRealTimers();
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('does not acknowledge cancellation while a special command is executing', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'in-flight-id');
+
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({ type: 'compact' })));
+
+        // The row is consumed at dispatch (the command executes out-of-band
+        // and is never delivered to Pi), so a cancel that lands while the
+        // compact RPC is in flight is not acknowledged — the entry is already
+        // gone from the queue.
+        const onCancelQueuedMessage = harness.session.onCancelQueuedMessage.mock.calls.at(-1)![0] as (localId: string) => boolean;
+        expect(onCancelQueuedMessage('in-flight-id')).toBe(false);
+
+        const compact = harness.sent.find((item) => (item as { type?: string }).type === 'compact') as { id: string };
+        harness.onEvent!({ type: 'response', id: compact.id, command: 'compact', success: true, data: { summary: 'done' } });
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['in-flight-id'], undefined));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('refuses ambiguous bare model IDs shared across providers and accepts qualified ones', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({ type: 'response', command: 'get_available_models', success: true, data: {
+            models: [
+                { id: 'gpt-5.2', provider: 'openai' },
+                { id: 'gpt-5.2', provider: 'azure' },
+            ],
+        } });
+        await vi.waitFor(() => expect(harness.session.updateMetadata).toHaveBeenCalled());
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model' } }, 'list-ambig-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('Available: openai/gpt-5.2, azure/gpt-5.2'),
+        })));
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model gpt-5.2' } }, 'ambig-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: '⚠️ Ambiguous model: gpt-5.2. Use openai/gpt-5.2, azure/gpt-5.2.',
+        })));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'set_model' }));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['ambig-id'], { clearQueuedThinkingGrace: true }));
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model azure/gpt-5.2' } }, 'qualified-id');
+        const setModel = await vi.waitFor(() => {
+            const found = harness.sent.find((item) => (item as { type?: string }).type === 'set_model') as { id: string; provider?: string; modelId?: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+        expect(setModel).toMatchObject({ provider: 'azure', modelId: 'gpt-5.2' });
+        harness.onEvent!({ type: 'response', id: setModel.id, command: 'set_model', success: true });
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: 'Model switched to azure/gpt-5.2',
+        })));
+        // The web picker prefers piSelectedModel metadata, so a
+        // provider-qualified switch must persist it (a bare keepalive model
+        // cannot represent the provider dimension).
+        await vi.waitFor(() => expect(harness.session.updateMetadata).toHaveBeenCalledWith(expect.any(Function)));
+        const metadataUpdater = harness.session.updateMetadata.mock.calls.at(-1)![0] as (meta: Record<string, unknown>) => Record<string, unknown>;
+        expect(metadataUpdater({})).toEqual({ piSelectedModel: { provider: 'azure', modelId: 'gpt-5.2' } });
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('reports a rejected model switch once, without the raw Pi error', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        harness.onEvent!({ type: 'response', command: 'get_available_models', success: true, data: {
+            models: [{ id: 'gpt-5.2', provider: 'openai' }],
+        } });
+        await vi.waitFor(() => expect(harness.session.updateMetadata).toHaveBeenCalled());
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/model gpt-5.2' } }, 'reject-id');
+        const setModel = await vi.waitFor(() => {
+            const found = harness.sent.find((item) => (item as { type?: string }).type === 'set_model') as { id: string } | undefined;
+            expect(found).toBeDefined();
+            return found!;
+        });
+        harness.onEvent!({ type: 'response', id: setModel.id, command: 'set_model', success: false, error: 'model rejected' });
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: '⚠️ Model switch failed: model rejected',
+        })));
+        expect(harness.session.sendSessionEvent).not.toHaveBeenCalledWith({ type: 'message', message: 'model rejected' });
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('shows help and flags terminal-only Pi builtins instead of passing them to the model', async () => {
+        const { running, onUserMessage } = await startReadySession();
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/help' } }, 'help-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('/compact [instructions]'),
+        })));
+
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/tree 42' } }, 'tree-id');
+        await vi.waitFor(() => expect(harness.session.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+            message: expect.stringContaining('/tree is a Pi terminal-only command'),
+        })));
+        await vi.waitFor(() => expect(harness.session.emitMessagesConsumed).toHaveBeenCalledWith(['tree-id'], { clearQueuedThinkingGrace: true }));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'prompt' }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('leaves unknown slash text on the normal prompt path', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/some-custom-thing arg' } }, 'custom-id');
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'prompt', message: '/some-custom-thing arg',
+        })));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('merges HAPI builtins with Pi extension commands in the slash-command list', async () => {
+        const { running } = await startReadySession();
+        const slashHandler = harness.rpcHandlers.get(RPC_METHODS.ListSlashCommands)!;
+
+        const result = await slashHandler({ agent: 'pi' });
+        const names = (result as { commands: Array<{ name: string }> }).commands.map((command) => command.name);
+        expect(names).toEqual(expect.arrayContaining(['compact', 'session', 'model', 'help', 'test-extension']));
+        // Skills stay out of slash completion; they surface via $ instead.
+        expect(names).not.toContain('skill:brave-search');
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('lets a discovered extension named compact override the builtin', async () => {
+        const { running, onUserMessage } = await startReadySession([
+            { name: 'compact', description: 'Custom compact', source: 'extension' },
+        ]);
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'ext-compact-id');
+
+        // The menu lists the extension over the builtin, so the message must
+        // reach Pi as an ordinary prompt instead of the HAPI compact RPC.
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'prompt', message: '/compact',
+        })));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('cancels a slash command canceled while command discovery is pending', async () => {
+        const { running, onUserMessage } = await startReadySession([]);
+        const onCancelQueuedMessage = harness.session.onCancelQueuedMessage.mock.calls.at(-1)![0] as (localId: string) => boolean;
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact' } }, 'discover-cancel-id');
+
+        // Discovery RPC is in flight (empty cache is not cached).
+        await vi.waitFor(() => expect(harness.sent.filter((item) => (item as { type?: string }).type === 'get_commands').length).toBeGreaterThan(1));
+        // Cancel while discovery is pending is acknowledged (reservation held)...
+        expect(onCancelQueuedMessage('discover-cancel-id')).toBe(true);
+
+        // ...and must still win once discovery resolves: no compact RPC, no
+        // consumption (the hub deletes the row instead).
+        const pending = harness.sent.filter((item) => (item as { type?: string }).type === 'get_commands').at(-1) as { id: string };
+        harness.onEvent!({ type: 'response', id: pending.id, command: 'get_commands', success: true, data: { commands: [{ name: 'ext', description: 'Ext', source: 'extension' }] } });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+        expect(harness.session.emitMessagesConsumed).not.toHaveBeenCalledWith(['discover-cancel-id'], expect.anything());
+
+        harness.onError?.(new Error('finish test'));
+        await running;
+    });
+
+    it('treats reserved-name path prefixes as ordinary prompts', async () => {
+        const { running, onUserMessage } = await startReadySession();
+        onUserMessage({ role: 'user', content: { type: 'text', text: '/compact.md notes' } }, 'path-id');
+        await vi.waitFor(() => expect(harness.sent).toContainEqual(expect.objectContaining({
+            type: 'prompt', message: '/compact.md notes',
+        })));
+        expect(harness.sent).not.toContainEqual(expect.objectContaining({ type: 'compact' }));
+
+        harness.onError?.(new Error('finish test'));
+        await running;
     });
 });

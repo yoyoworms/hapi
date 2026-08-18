@@ -1075,6 +1075,39 @@ describe('history view and older pagination', () => {
         expect(getMessageWindowState(id).messages.map((message) => message.id)).toContain('previous-prompt')
     })
 
+    it('advances the tail revision for live messages but not older-page loads', async () => {
+        const id = sessionId('tail-revision')
+        const latest = makeAgentMessage({ id: 'latest', seq: 10, at: 10_000 })
+        const older = makeAgentMessage({ id: 'older', seq: 9, at: 9_000 })
+        const getMessages = vi.fn()
+            .mockResolvedValueOnce(latestResponse([latest], {
+                epoch: 4,
+                hasMore: true,
+                nextBeforeAt: 10_000,
+                nextBeforeSeq: 10
+            }))
+            .mockResolvedValueOnce(beforeResponse([older], {
+                epoch: 4,
+                hasMore: false,
+                nextBeforeAt: 9_000,
+                nextBeforeSeq: 9
+            }))
+        const api = createApi(getMessages)
+
+        await syncTailMessages(api, id)
+        const afterTailSync = getMessageWindowState(id).tailRevision
+        setMessageViewMode(id, 'history')
+        await fetchOlderMessages(api, id)
+
+        expect(getMessageWindowState(id).tailRevision).toBe(afterTailSync)
+
+        ingestIncomingMessages(id, [
+            makeAgentMessage({ id: 'new-live', seq: 11, at: 11_000 })
+        ])
+
+        expect(getMessageWindowState(id).tailRevision).toBe(afterTailSync + 1)
+    })
+
     it('leaves the window unchanged when the final older-page apply check rejects', async () => {
         const id = sessionId('older-page-apply-rejected')
         const latest = makeAgentMessage({ id: 'latest', seq: 10, at: 10_000 })
@@ -1365,6 +1398,7 @@ describe('optimistic and queued-message operations', () => {
             makeAgentMessage({ id: 'agent', seq: 2, at: 2_000 })
         ])
 
+        const beforeConsumed = getMessageWindowState(id).tailRevision
         markMessagesConsumed(id, ['local-1'], 3_000)
 
         expect(getMessageWindowState(id).messages.at(-1)).toMatchObject({
@@ -1372,6 +1406,7 @@ describe('optimistic and queued-message operations', () => {
             status: 'sent',
             invokedAt: 3_000
         })
+        expect(getMessageWindowState(id).tailRevision).toBe(beforeConsumed + 1)
     })
 
     it('reconciles queued candidates without a secondary pending collection', () => {

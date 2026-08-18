@@ -1347,35 +1347,46 @@ export class SessionCache {
         throw new Error('Session was modified concurrently. Please try again.')
     }
 
-    async pinSession(sessionId: string, pinned: boolean): Promise<void> {
-        const session = this.sessions.get(sessionId)
-        if (!session) {
-            throw new Error('Session not found')
+    async updateSessionSummary(sessionId: string, text: string): Promise<void> {
+        // Keep the generated/native title separate from metadata.name. A
+        // manually chosen name must continue to win in the Web title helper,
+        // while the summary remains available as the agent-authored fallback.
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) {
+                throw new Error('Session not found')
+            }
+
+            const currentMetadata = session.metadata ?? { path: '', host: '' }
+            const newMetadata = {
+                ...currentMetadata,
+                summary: {
+                    text,
+                    updatedAt: Date.now()
+                }
+            }
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                newMetadata,
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'error') {
+                throw new Error('Failed to update session metadata')
+            }
+
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+
+            this.refreshSession(sessionId)
         }
 
-        const currentMetadata = session.metadata ?? { path: '', host: '' }
-        const { pinnedAt: _existing, ...rest } = currentMetadata as { pinnedAt?: number | null } & Record<string, unknown>
-        const newMetadata = pinned
-            ? { ...rest, pinnedAt: Date.now() }
-            : rest
-
-        const result = this.store.sessions.updateSessionMetadata(
-            sessionId,
-            newMetadata as typeof currentMetadata,
-            session.metadataVersion,
-            session.namespace,
-            { touchUpdatedAt: false }
-        )
-
-        if (result.result === 'error') {
-            throw new Error('Failed to update session metadata')
-        }
-
-        if (result.result === 'version-mismatch') {
-            throw new Error('Session was modified concurrently. Please try again.')
-        }
-
-        this.refreshSession(sessionId)
+        throw new Error('Session was modified concurrently. Please try again.')
     }
 
     /**
@@ -1592,6 +1603,11 @@ export class SessionCache {
         }
 
         const movedMessages = this.store.messages.mergeSessionMessages(oldSessionId, newSessionId)
+        // mergeSessions deletes the source. mergeSessionHistory keeps it alive
+        // with the original socket, so its notify chain must stay on that id.
+        if (options.deleteOldSession) {
+            this.store.workGraph.reassignNotifySession(namespace, oldSessionId, newSessionId)
+        }
         if (movedMessages.moved > 0) {
             this.store.usage.transferSession(oldSessionId, newSessionId)
             if (!options.deleteOldSession) {

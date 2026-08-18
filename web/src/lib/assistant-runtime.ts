@@ -15,7 +15,6 @@ import type { AgentEvent, ToolCallBlock } from '@/chat/types'
 import type { ToolGroupBlock, VisibleChatBlock } from '@/chat/toolGroups'
 import { visibleBlockRole } from '@/chat/toolGroups'
 import type { AttachmentMetadata, MessageStatus as HappyMessageStatus, Session } from '@/types/api'
-import { buildShareHiddenByMessageId } from '@/lib/shareTurnAvailability'
 
 /**
  * Aggregated metadata for a multi-turn response group, surfaced on the
@@ -31,7 +30,7 @@ export type AggregatedAssistantMeta = {
 }
 
 export type HappyChatMessageMetadata = {
-    kind: 'user' | 'assistant' | 'tool' | 'event' | 'cli-output' | 'codex-review'
+    kind: 'user' | 'assistant' | 'tool' | 'event' | 'cli-output' | 'codex-review' | 'compact-summary'
     status?: HappyMessageStatus
     localId?: string | null
     originalText?: string
@@ -55,8 +54,6 @@ export type HappyChatMessageMetadata = {
 export type HappyRuntimeExtras = Readonly<{
     messagesVersion: number
     historyVersion: number
-    runningSince: number
-    shareHiddenByMessageId: ReadonlySet<string>
 }>
 
 function formatCodexReviewText(review: CodexReview): string {
@@ -561,6 +558,25 @@ function toThreadMessageLike(
     }
 
     if (block.kind === 'agent-event') {
+        // Pi compaction summaries carry a real payload; surface them as a
+        // dedicated system message so the chat can render an independent
+        // block instead of a small status line.
+        if (block.event.type === 'compact-summary' && typeof block.event.summary === 'string') {
+            return {
+                role: 'system',
+                id: threadMessageId,
+                createdAt: new Date(timestamp),
+                content: [{ type: 'text', text: block.event.summary }],
+                metadata: {
+                    custom: {
+                        kind: 'compact-summary',
+                        event: block.event,
+                        invokedAt: block.invokedAt,
+                        model: block.model
+                    } satisfies HappyChatMessageMetadata
+                }
+            }
+        }
         return {
             role: 'system',
             id: threadMessageId,
@@ -907,17 +923,10 @@ export function useHappyRuntime(props: {
         await props.onAbort()
     }, [props.onAbort])
 
-    const runningSince = props.session.activeTurnStartedAt ?? 0
-    const shareHiddenByMessageId = useMemo(
-        () => buildShareHiddenByMessageId(convertedMessages, isRunning, runningSince),
-        [convertedMessages, isRunning, runningSince]
-    )
     const extras = useMemo<HappyRuntimeExtras>(() => ({
         messagesVersion: props.messagesVersion,
-        historyVersion: props.historyVersion,
-        runningSince,
-        shareHiddenByMessageId
-    }), [props.messagesVersion, props.historyVersion, runningSince, shareHiddenByMessageId])
+        historyVersion: props.historyVersion
+    }), [props.messagesVersion, props.historyVersion])
 
     // Memoize the adapter to avoid recreating on every render
     // useExternalStoreRuntime may use adapter identity for subscriptions

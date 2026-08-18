@@ -12,7 +12,7 @@ import { HoverTooltip } from '@/components/HoverTooltip'
 import { safeCopyToClipboard } from '@/lib/clipboard'
 import { buildSessionReferenceText } from '@/lib/sessionReference'
 import { usePlatform } from '@/hooks/usePlatform'
-import { CopyIcon, PinIcon } from '@/components/icons'
+import { CopyIcon } from '@/components/icons'
 
 type SessionActionMenuProps = {
     isOpen: boolean
@@ -33,6 +33,8 @@ type SessionActionMenuProps = {
     onArchive: () => void
     onReopen?: () => void
     reopenDisabledReason?: string
+    /** Soft-fail tip when reopen is allowed but chat-store probe could not verify. */
+    reopenHint?: string
     onDelete: () => void
     anchorPoint: { x: number; y: number }
     menuId?: string
@@ -88,6 +90,18 @@ function EditIcon(props: { className?: string }) {
         >
             <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
             <path d="m15 5 4 4" />
+        </svg>
+    )
+}
+
+function PinIcon(props: { className?: string; filled?: boolean }) {
+    return (
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+            fill={props.filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2"
+            strokeLinecap="round" strokeLinejoin="round" className={props.className}>
+            <path d="M12 17v5" />
+            <path d="M5 17h14" />
+            <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
         </svg>
     )
 }
@@ -227,6 +241,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         onArchive,
         onReopen,
         reopenDisabledReason,
+        reopenHint,
         onDelete,
         anchorPoint,
         menuId
@@ -317,6 +332,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         const openAbove = spaceBelow < menuRect.height + gap && spaceAbove > spaceBelow
 
         let top = openAbove ? anchorPoint.y - menuRect.height - gap : anchorPoint.y + gap
+        // Keep the menu centered on the trigger, then clamp it only when it would leave the viewport.
         let left = anchorPoint.x - menuRect.width / 2
         const transformOrigin = openAbove ? 'bottom center' : 'top center'
 
@@ -387,13 +403,15 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         }
         : undefined
 
+    // The left text inset includes the icon and gap; mirror it on the right so
+    // the text-to-border distance is symmetric without counting the icon twice.
     const baseItemClassName =
-        'flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]'
+        'flex w-full items-center gap-3 rounded-md py-2 pl-3 pr-[42px] text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]'
 
     return (
         <div
             ref={menuRef}
-            className="fixed z-50 max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-16px)] min-w-[200px] overflow-y-auto overscroll-contain rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
+            className="fixed z-50 box-border max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-16px)] w-max max-w-[calc(100vw-16px)] overflow-y-auto overscroll-contain rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
             style={menuStyle}
         >
             <div
@@ -436,7 +454,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                             className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
                             onClick={() => handleSetPinMode(sessionPinned ? 'none' : 'project')}
                         >
-                            <PinIcon filled={sessionPinned} className="h-[18px] w-[18px] text-[var(--app-hint)]" />
+                            <PinIcon filled={sessionPinned} className="text-[var(--app-hint)]" />
                             {t(sessionPinned ? 'session.action.unpinProject' : 'session.action.pinProject')}
                         </button>
                         <button
@@ -445,7 +463,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                             className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
                             onClick={() => handleSetPinMode(sessionGlobalPinned ? 'none' : 'global')}
                         >
-                            <PinIcon filled={sessionGlobalPinned} className="h-[18px] w-[18px] text-[var(--app-hint)]" />
+                            <PinIcon filled={sessionGlobalPinned} className="text-[var(--app-hint)]" />
                             {t(sessionGlobalPinned ? 'session.action.unpinGlobal' : 'session.action.pinGlobal')}
                         </button>
                     </>
@@ -535,7 +553,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     </button>
                 ) : (
                     <>
-                        {onReopen || reopenDisabledReason ? (
+                        {onReopen || reopenDisabledReason || reopenHint ? (
                             <HoverTooltip
                                 id={`${resolvedMenuId}-reopen-tooltip`}
                                 className="w-full [&>span:first-child]:w-full"
@@ -546,7 +564,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                                         type="button"
                                         role="menuitem"
                                         aria-disabled={reopenDisabledReason ? true : undefined}
-                                        aria-describedby={reopenDisabledReason ? `${resolvedMenuId}-reopen-tooltip` : undefined}
+                                        aria-describedby={
+                                            reopenDisabledReason || reopenHint
+                                                ? `${resolvedMenuId}-reopen-tooltip`
+                                                : undefined
+                                        }
                                         className={`${baseItemClassName} ${reopenDisabledReason
                                             ? 'cursor-not-allowed opacity-50'
                                             : 'hover:bg-[var(--app-subtle-bg)]'}`}
@@ -557,7 +579,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                                     </button>
                                 )}
                             >
-                                {reopenDisabledReason ?? t('session.action.reopen')}
+                                {reopenDisabledReason ?? reopenHint ?? t('session.action.reopen')}
                             </HoverTooltip>
                         ) : null}
                         <button

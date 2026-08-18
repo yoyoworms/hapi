@@ -1412,4 +1412,131 @@ describe('AcpSdkBackend', () => {
             { type: 'turn_complete', stopReason: 'end_turn' }
         ]);
     });
+
+    it('notifies agent-activity listener for sustained running + idle, not content/usage noise (#1470/#1502)', () => {
+        vi.useFakeTimers();
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        const activity: boolean[] = [];
+        backend.setAgentActivityListener((thinking) => {
+            activity.push(thinking);
+        });
+
+        const backendInternal = backend as unknown as {
+            handleSessionUpdate: (params: unknown) => void;
+        };
+
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+                content: { type: 'text', text: 'resumed' }
+            }
+        });
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.toolCallUpdate,
+                toolCallId: 'tc-bg',
+                status: 'in_progress'
+            }
+        });
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'usage_update', used: 1_000, size: 200_000 }
+        });
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.sessionInfoUpdate,
+                title: 'noise'
+            }
+        });
+        // Chatter: running then idle before debounce → no true bump (idle may clear)
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'running' }
+        });
+        vi.advanceTimersByTime(200);
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'idle' }
+        });
+        expect(activity.filter((v) => v === true)).toEqual([]);
+
+        // Sustained running commits after debounce
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'running' }
+        });
+        vi.advanceTimersByTime(750);
+        expect(activity.filter((v) => v === true)).toEqual([true]);
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'idle' }
+        });
+        expect(activity.at(-1)).toBe(false);
+        vi.useRealTimers();
+    });
+
+    it('ignores idle clears while a HAPI prompt turn is still draining', () => {
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        const activity: boolean[] = [];
+        backend.setAgentActivityListener((thinking) => {
+            activity.push(thinking);
+        });
+        const backendInternal = backend as unknown as {
+            handleSessionUpdate: (params: unknown) => void;
+            isProcessingMessage: boolean;
+        };
+        backendInternal.isProcessingMessage = true;
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'idle' }
+        });
+        expect(activity).toEqual([]);
+        backendInternal.isProcessingMessage = false;
+        backendInternal.handleSessionUpdate({
+            sessionId: 'session-1',
+            update: { sessionUpdate: 'state_update', state: 'idle' }
+        });
+        expect(activity).toEqual([false]);
+    });
+
+    it('notifies agent-activity listener when a permission request arrives (#1470)', async () => {
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        const activity: boolean[] = [];
+        backend.setAgentActivityListener((thinking) => {
+            activity.push(thinking);
+        });
+        backend.onPermissionRequest(() => {
+            // leave pending; we only care that activity fired first
+        });
+
+        const backendInternal = backend as unknown as {
+            handlePermissionRequest: (params: unknown, requestId: string) => Promise<unknown>;
+        };
+
+        const pending = backendInternal.handlePermissionRequest({
+            sessionId: 'session-1',
+            toolCall: {
+                toolCallId: 'tc-1',
+                title: 'Shell',
+                kind: 'execute',
+                status: 'pending'
+            },
+            options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+        }, 'req-1');
+
+        expect(activity).toEqual([true]);
+        // Cancel so the promise does not hang the suite.
+        await backend.respondToPermission('session-1', {
+            id: 'tc-1',
+            sessionId: 'session-1',
+            toolCallId: 'tc-1',
+            title: 'Shell',
+            kind: 'execute',
+            options: []
+        }, { outcome: 'cancelled' });
+        await pending;
+    });
 });

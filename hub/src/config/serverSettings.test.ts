@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +11,12 @@ function makeTempDir(): string {
 describe('loadServerSettings', () => {
     let dir: string | null = null
     const originalAutoArchiveIdleHours = process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS
+    const originalBackgroundOnly = process.env.SERVERCHAN_BACKGROUND_ONLY
+
+    beforeEach(() => {
+        delete process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS
+        delete process.env.SERVERCHAN_BACKGROUND_ONLY
+    })
 
     afterEach(() => {
         if (dir) {
@@ -21,6 +27,11 @@ describe('loadServerSettings', () => {
             delete process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS
         } else {
             process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS = originalAutoArchiveIdleHours
+        }
+        if (originalBackgroundOnly === undefined) {
+            delete process.env.SERVERCHAN_BACKGROUND_ONLY
+        } else {
+            process.env.SERVERCHAN_BACKGROUND_ONLY = originalBackgroundOnly
         }
     })
 
@@ -72,5 +83,48 @@ describe('loadServerSettings', () => {
         process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS = ''
 
         await expect(loadServerSettings(dir)).rejects.toThrow('HAPI_AUTO_ARCHIVE_IDLE_HOURS')
+    })
+
+    it('defaults ServerChan background-only mode to disabled', async () => {
+        dir = makeTempDir()
+
+        const result = await loadServerSettings(dir)
+
+        expect(result.settings.serverChanBackgroundOnly).toBe(false)
+        expect(result.sources.serverChanBackgroundOnly).toBe('default')
+    })
+
+    it('loads ServerChan background-only mode from settings.json', async () => {
+        dir = makeTempDir()
+        writeFileSync(join(dir, 'settings.json'), JSON.stringify({
+            serverChanBackgroundOnly: true
+        }))
+
+        const result = await loadServerSettings(dir)
+
+        expect(result.settings.serverChanBackgroundOnly).toBe(true)
+        expect(result.sources.serverChanBackgroundOnly).toBe('file')
+    })
+
+    it('loads ServerChan background-only mode with environment precedence', async () => {
+        dir = makeTempDir()
+        writeFileSync(join(dir, 'settings.json'), JSON.stringify({
+            serverChanBackgroundOnly: false
+        }))
+        process.env.SERVERCHAN_BACKGROUND_ONLY = 'true'
+
+        const result = await loadServerSettings(dir)
+
+        expect(result.settings.serverChanBackgroundOnly).toBe(true)
+        expect(result.sources.serverChanBackgroundOnly).toBe('env')
+    })
+
+    it('rejects a non-boolean ServerChan background-only setting', async () => {
+        dir = makeTempDir()
+        writeFileSync(join(dir, 'settings.json'), JSON.stringify({
+            serverChanBackgroundOnly: 'false'
+        }))
+
+        await expect(loadServerSettings(dir)).rejects.toThrow('serverChanBackgroundOnly must be a boolean')
     })
 })

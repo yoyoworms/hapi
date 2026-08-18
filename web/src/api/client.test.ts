@@ -93,6 +93,40 @@ describe('ApiClient error mapping', () => {
         expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session%20cursor/cursor-chat-store')
     })
 
+    it('generates a title and saves the summary through separate session endpoints', async () => {
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({ title: 'Generated title' }), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.suggestSessionTitle('session /?#')).resolves.toEqual({ title: 'Generated title' })
+        await api.updateSessionSummary('session /?#', 'Generated title')
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session%20%2F%3F%23/title-suggestion')
+        expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: 'POST' })
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/sessions/session%20%2F%3F%23/summary')
+        expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+            method: 'PATCH',
+            body: JSON.stringify({ text: 'Generated title' })
+        })
+    })
+
+    it('reads the Hub title suggestion capability', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            status: 'ok',
+            protocolVersion: 1,
+            capabilities: { titleSuggestion: true }
+        }), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.getHealth()).resolves.toEqual({
+            status: 'ok',
+            protocolVersion: 1,
+            capabilities: { titleSuggestion: true }
+        })
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/health')
+    })
+
     it('lists and imports Pi sessions through the selected machine', async () => {
         fetchMock
             .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, sessions: [], machineId: 'machine-1' }), { status: 200 }))
@@ -149,6 +183,22 @@ describe('ApiClient error mapping', () => {
                 deliveryMode: 'steer',
             })
         })
+    })
+
+    it('posts a steer for a queued message', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ status: 'steered', localId: 'local-1' }), { status: 200 })
+        )
+
+        const api = new ApiClient('test-token')
+        await expect(api.steerMessage('session /?#', 'msg-1')).resolves.toEqual({
+            status: 'steered',
+            localId: 'local-1',
+        })
+
+        const [url, init] = fetchMock.mock.calls[0] ?? []
+        expect(url).toBe('/api/sessions/session%20%2F%3F%23/messages/msg-1/steer')
+        expect(init).toMatchObject({ method: 'POST' })
     })
 
     it('requests usage buckets in the viewer IANA time zone', async () => {

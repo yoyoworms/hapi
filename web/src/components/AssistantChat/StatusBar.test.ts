@@ -4,6 +4,7 @@ import {
     formatCompactContextUsageLabel,
     formatContextUsageLabel,
     formatUsageText,
+    getContextWarning,
     getVisibleCodexPlanProgress,
     getContextUsageDetails,
     shouldShowCodexFastBadge
@@ -42,6 +43,22 @@ describe('account and session usage labels', () => {
             model: 'gpt-5.4',
             timestamp: 1
         })?.text).toBe('ctx 2k · 2k tok')
+    })
+})
+
+describe('context warning colors', () => {
+    it('keeps usage below 70% muted', () => {
+        expect(getContextWarning(69, 100).color).toBe('text-[var(--app-hint)]')
+    })
+
+    it('shows a warning from 70% through below 90%', () => {
+        expect(getContextWarning(70, 100).color).toBe('text-amber-500')
+        expect(getContextWarning(89, 100).color).toBe('text-amber-500')
+    })
+
+    it('shows danger at 90% and above', () => {
+        expect(getContextWarning(90, 100).color).toBe('text-red-500')
+        expect(getContextWarning(95, 100).color).toBe('text-red-500')
     })
 })
 

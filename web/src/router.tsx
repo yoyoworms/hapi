@@ -14,6 +14,10 @@ import {
     useSearch,
 } from '@tanstack/react-router'
 import { getScrollRestorationKey } from '@/lib/scrollRestorationKey'
+import {
+    getSessionListSelectionNavigation,
+    PRESERVE_SESSION_SIDEBAR_SCROLL,
+} from '@/lib/sessionNavigation'
 import { App } from '@/App'
 import { SessionChat } from '@/components/SessionChat'
 import { SessionList } from '@/components/SessionList'
@@ -47,11 +51,11 @@ import { clearDraftsAfterSend } from '@/lib/clearDraftsAfterSend'
 import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
 import { refreshSessionDetailPreservingActive } from '@/lib/session-detail-optimistic'
-import { inactiveSessionCanResume } from '@/lib/sessionResume'
+import { inactiveSessionCanResume, resolveCursorReopenGate } from '@/lib/sessionResume'
 import { initializeSessionLastSeen, markSessionSeen } from '@/lib/sessionLastSeen'
 import { useSessionBrowserTitle } from '@/hooks/useSessionBrowserTitle'
 import { clearCodexImportedSession } from '@/lib/codexImportedSessions'
-import { getSupersedingSessionId, shouldFollowSupersedingSession } from '@/routes/sessions/followSupersedingSession'
+import { getSupersedingSessionId, prepareFollowSupersedingSession, shouldFollowSupersedingSession } from '@/routes/sessions/followSupersedingSession'
 import { migrateSuppressedSendError } from '@/lib/suppressed-send-error'
 import FilesPage from '@/routes/sessions/files'
 import FilePage from '@/routes/sessions/file'
@@ -69,8 +73,8 @@ import SettingsAboutPage from '@/routes/settings/about'
 import SettingsStoragePage from '@/routes/settings/storage'
 import SettingsUsagePage from '@/routes/settings/usage'
 import SharePage from '@/routes/share'
-import { setSharePendingTransfer } from '@/lib/sharePendingState'
-import { deleteShareTransfer } from '@/lib/shareTransfer'
+import { retargetSharePendingTransfer, setSharePendingTransfer } from '@/lib/sharePendingState'
+import { deleteShareTransfer, parseShareSearch } from '@/lib/shareTransfer'
 
 
 function BackIcon(props: { className?: string }) {
@@ -165,7 +169,7 @@ function SessionsPage() {
 }
 
 function OwnerSessionsPage() {
-    const { api, baseUrl } = useAppContext()
+    const { api, baseUrl, titleSuggestionAvailable = false } = useAppContext()
     const navigate = useNavigate()
     const pathname = useLocation({ select: location => location.pathname })
     const matchRoute = useMatchRoute()
@@ -229,7 +233,8 @@ function OwnerSessionsPage() {
             to: '/sessions/new',
             search: args.machineId
                 ? { directory: args.directory, machineId: args.machineId }
-                : { directory: args.directory }
+                : { directory: args.directory },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate])
 
@@ -250,11 +255,11 @@ function OwnerSessionsPage() {
                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}
                         sessions={sessions}
                         selectedSessionId={selectedSessionId}
-                        onSelect={(sessionId) => navigate({
-                            to: '/sessions/$sessionId',
-                            params: { sessionId },
+                        onSelect={(sessionId) => navigate(getSessionListSelectionNavigation(sessionId))}
+                        onNewSession={() => navigate({
+                            to: '/sessions/new',
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
                         })}
-                        onNewSession={() => navigate({ to: '/sessions/new' })}
                         onNewSessionInDirectory={handleNewSessionInDirectory}
                         onBrowse={canBrowse ? () => navigate({ to: '/browse' }) : undefined}
                         onRefresh={handleRefresh}
@@ -282,7 +287,10 @@ function OwnerSessionsPage() {
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={() => navigate({ to: '/sessions/new' })}
+                                    onClick={() => navigate({
+                                        to: '/sessions/new',
+                                        ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+                                    })}
                                     className="session-list-new-button flex h-9 w-9 items-center justify-center rounded-full text-[var(--app-link)] transition-colors"
                                     title={t('sessions.new')}
                                 >
@@ -291,6 +299,7 @@ function OwnerSessionsPage() {
                             </div>
                         )}
                         api={api}
+                        titleSuggestionAvailable={titleSuggestionAvailable}
                         machineLabelsById={machineLabelsById}
                         machinesById={machinesById}
                     />
@@ -343,7 +352,7 @@ function classifySendError(
 }
 
 function SessionPage() {
-    const { api, sharedMode } = useAppContext()
+    const { api, sharedMode, titleSuggestionAvailable = false } = useAppContext()
     // A share token can read and interact with its scoped session, but it
     // cannot use owner-wide discovery/RPC endpoints. Keep those hooks mounted
     // with a null client so shared viewers never issue forbidden requests.
@@ -370,6 +379,7 @@ function SessionPage() {
     const cursorChatStoreStatus = sharedMode ? undefined : cursorChatStore.status
     const cursorChatStoreApplicable = !sharedMode && cursorChatStore.isApplicable
     const cursorChatStoreError = sharedMode ? null : cursorChatStore.error
+    const cursorChatStoreLoading = !sharedMode && cursorChatStore.isLoading
     const {
         messages,
         warning: messagesWarning,
@@ -382,6 +392,7 @@ function SessionPage() {
         viewMode: messagesViewMode,
         messagesVersion,
         historyVersion,
+        tailRevision,
         setViewMode,
     } = useMessages(api, sessionId)
 
@@ -459,13 +470,15 @@ function SessionPage() {
                 await queryClient.invalidateQueries({ queryKey: queryKeys.session(result.sessionId) })
                 await queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
                 if (result.sessionId && result.sessionId !== errorSessionId) {
+                    retargetSharePendingTransfer(errorSessionId, result.sessionId)
                     await transferComposerDraftThenNavigate(
                         errorSessionId,
                         result.sessionId,
                         () => navigate({
                             to: '/sessions/$sessionId',
                             params: { sessionId: result.sessionId },
-                            replace: true
+                            replace: true,
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
                         }),
                     )
                 }
@@ -483,12 +496,19 @@ function SessionPage() {
         })()
     }, [api, queryClient, navigate, addToast, t])
 
-    const cursorReopenDisabledReason = cursorChatStoreApplicable && cursorChatStoreStatus?.onDisk !== true
-        ? cursorChatStoreError
-            ? t('session.action.reopenCursorCheckFailed')
-            : cursorChatStoreStatus?.onDisk === false
-                ? t('session.action.reopenCursorMissing')
-                : t('session.action.reopenCursorChecking')
+    const cursorReopenGate = resolveCursorReopenGate({
+        applicable: cursorChatStoreApplicable,
+        onDisk: cursorChatStoreStatus?.onDisk,
+        error: cursorChatStoreError,
+        isLoading: cursorChatStoreLoading,
+    })
+    const cursorReopenDisabledReason = cursorReopenGate.disabledReason === 'missing'
+        ? t('session.action.reopenCursorMissing')
+        : cursorReopenGate.disabledReason === 'checking'
+            ? t('session.action.reopenCursorChecking')
+            : undefined
+    const cursorReopenUnverifiedHint = cursorReopenGate.probeUnverified
+        ? t('session.action.reopenCursorUnverified')
         : undefined
     const canOfferInactiveReopen = !sharedMode && session
         ? inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)
@@ -567,6 +587,7 @@ function SessionPage() {
     const handleSessionResolved = useCallback((resolvedSessionId: string) => {
         if (session) {
             if (resolvedSessionId !== session.id) {
+                retargetSharePendingTransfer(session.id, resolvedSessionId)
                 seedMessageWindowFromSession(session.id, resolvedSessionId)
             }
             queryClient.setQueryData(queryKeys.session(resolvedSessionId), (previous: { session?: typeof session } | undefined) => ({
@@ -577,7 +598,8 @@ function SessionPage() {
         navigate({
             to: '/sessions/$sessionId',
             params: { sessionId: resolvedSessionId },
-            replace: true
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
         if (api) {
             void refreshSessionDetailPreservingActive(
@@ -671,7 +693,7 @@ function SessionPage() {
     const {
         getSuggestions: getSkillSuggestions,
     } = useSkills(ownerApi, sessionId)
-    // Same list + search matcher as sidebar / share picker (tiann/hapi#1213).
+    // Shared viewers cannot query owner-wide session/machine inventories.
     const { sessions: ownerSessions } = useSessions(ownerApi)
     const { machines: ownerMachines } = useMachines(ownerApi, !sharedMode)
     const allSessions = sharedMode ? [] : ownerSessions
@@ -764,6 +786,7 @@ function SessionPage() {
             to: '/sessions/$sessionId',
             params: { sessionId },
             replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, sessionId])
 
@@ -802,9 +825,11 @@ function SessionPage() {
     return (
         <SessionChat
             api={api}
+            titleSuggestionAvailable={!sharedMode && titleSuggestionAvailable}
             session={session}
             cursorChatOnDisk={cursorChatStoreStatus?.onDisk}
             reopenDisabledReason={cursorReopenDisabledReason}
+            reopenHint={cursorReopenUnverifiedHint}
             messages={messages}
             messagesWarning={messagesWarning}
             hasMoreMessages={messagesHasMore}
@@ -815,6 +840,7 @@ function SessionPage() {
             viewMode={messagesViewMode}
             messagesVersion={messagesVersion}
             historyVersion={historyVersion}
+            tailRevision={tailRevision}
             onBack={goBack}
             onRefresh={refreshSelectedSession}
             onLoadMore={loadMoreMessages}
@@ -877,10 +903,12 @@ function SessionDetailRoute() {
         )
         observedSessionRef.current = { sessionId, supersedingSessionId }
         if (!shouldFollow || !supersedingSessionId) return
+        prepareFollowSupersedingSession(sessionId, supersedingSessionId)
         navigate({
             to: '/sessions/$sessionId',
             params: { sessionId: supersedingSessionId },
-            replace: true
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, session, sessionId, supersedingSessionId])
 
@@ -888,8 +916,12 @@ function SessionDetailRoute() {
         if (!sessionNotFound || sharedMode) {
             return
         }
-        navigate({ to: '/sessions', replace: true })
-    }, [navigate, sessionNotFound, sharedMode])
+        navigate({
+            to: '/sessions',
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
+    }, [navigate, sessionNotFound, sessionId, sharedMode])
 
     if (sessionNotFound) {
         return (
@@ -920,21 +952,29 @@ function NewSessionPage() {
         if (shareTransferId) {
             void deleteShareTransfer(shareTransferId)
         }
-        navigate({ to: '/sessions' })
+        navigate({
+            to: '/sessions',
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
     }, [navigate, shareTransferId])
 
     const handleSuccess = useCallback((sessionId: string) => {
         if (shareTransferId) {
-            setSharePendingTransfer(shareTransferId)
+            setSharePendingTransfer(shareTransferId, sessionId)
         }
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
         // Replace current page with /sessions to clear spawn flow from history
-        navigate({ to: '/sessions', replace: true })
+        navigate({
+            to: '/sessions',
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
         // Then navigate to new session
         requestAnimationFrame(() => {
             navigate({
                 to: '/sessions/$sessionId',
                 params: { sessionId },
+                ...PRESERVE_SESSION_SIDEBAR_SCROLL,
             })
         })
     }, [navigate, queryClient, shareTransferId])
@@ -1309,19 +1349,12 @@ const settingsUsageRoute = createRoute({
 // Web Share Target landing route. Service worker (`web/src/sw.ts`)
 // intercepts the manifest's `POST /share` and 303-redirects here with an
 // IDB transfer id. `error=ingest` is set when the SW failed to write IDB.
+// Native / deep-link clients open `/share#url=&text=&title=` (fragment, not
+// query) so shared content is never part of the HTTP request line.
 const shareRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/share',
-    validateSearch: (search: Record<string, unknown>): { id?: string; error?: string } => {
-        const result: { id?: string; error?: string } = {}
-        if (typeof search.id === 'string' && search.id) {
-            result.id = search.id
-        }
-        if (typeof search.error === 'string' && search.error) {
-            result.error = search.error
-        }
-        return result
-    },
+    validateSearch: (search: Record<string, unknown>) => parseShareSearch(search),
     component: SharePage,
 })
 
