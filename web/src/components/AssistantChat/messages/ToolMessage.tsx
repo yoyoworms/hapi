@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import type { ChatBlock } from '@/chat/types'
 import type { GeneratedImageBlock, ToolCallBlock } from '@/chat/types'
@@ -18,6 +18,7 @@ import { ImagePreview } from '@/components/ImagePreview'
 import { FileIcon } from '@/components/FileIcon'
 import { useTranslation } from '@/lib/use-translation'
 import { inlineMediaLabelKey, isInlineAudioMimeType, isInlineImageMimeType, isInlineVideoMimeType } from '@/lib/generatedInlineMedia'
+import { downloadBlobFile } from '@/lib/file-download'
 
 function isToolCallBlock(value: unknown): value is ToolCallBlock {
     if (!isObject(value)) return false
@@ -54,6 +55,16 @@ function isGeneratedImageBlock(value: unknown): value is GeneratedImageBlock {
 
 const MIN_INLINE_IMAGE_DIMENSION = 64
 
+type MediaBlobCache = {
+    key: string
+    blob: Blob
+}
+
+type MediaBlobRequest = {
+    key: string
+    promise: Promise<Blob>
+}
+
 /** Scale tiny icons up for readability without exploding skinny/tall images. */
 export function computeTinyImageScale(width: number, height: number): number {
     const maxDim = Math.max(width, height)
@@ -68,18 +79,52 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
     const ctx = useHappyChatContext()
     const { t } = useTranslation()
     const [objectUrl, setObjectUrl] = useState<string | null>(null)
-    const [error, setError] = useState<string | null>(null)
+    const [loadError, setLoadError] = useState<{ detail: string | null } | null>(null)
     const [imageStyle, setImageStyle] = useState<CSSProperties | undefined>(undefined)
     const [loadMedia, setLoadMedia] = useState(false)
+    const [isDownloading, setIsDownloading] = useState(false)
+    const [downloadError, setDownloadError] = useState<string | null>(null)
+    const [playbackError, setPlaybackError] = useState(false)
     const objectUrlRef = useRef<string | null>(null)
+    const blobRef = useRef<MediaBlobCache | null>(null)
+    const blobRequestRef = useRef<MediaBlobRequest | null>(null)
+    const mediaKeyRef = useRef('')
+    const loadMediaRef = useRef(loadMedia)
     const isVideo = isInlineVideoMimeType(props.block.mimeType)
     const isAudio = isInlineAudioMimeType(props.block.mimeType)
     const isImage = isInlineImageMimeType(props.block.mimeType)
     const isFile = !isVideo && !isAudio && !isImage
     const mediaLabel = t(inlineMediaLabelKey(props.block.mimeType))
     const mediaHeader = t('media.displayed.header', { label: mediaLabel, fileName: props.block.fileName })
+    const mediaKey = `${ctx.sessionId}:${props.block.imageId}`
+    mediaKeyRef.current = mediaKey
+    loadMediaRef.current = loadMedia
     // Non-image media can be tens of MB; wait for explicit user intent before downloading.
     const shouldFetch = isImage || loadMedia
+
+    const getMediaBlob = useCallback((): Promise<Blob> => {
+        if (blobRef.current?.key === mediaKey) {
+            return Promise.resolve(blobRef.current.blob)
+        }
+        if (blobRequestRef.current?.key === mediaKey) {
+            return blobRequestRef.current.promise
+        }
+
+        const request = ctx.api.getGeneratedImageBlob(ctx.sessionId, props.block.imageId)
+            .then((blob) => {
+                if (mediaKeyRef.current === mediaKey) {
+                    blobRef.current = { key: mediaKey, blob }
+                }
+                return blob
+            })
+            .finally(() => {
+                if (blobRequestRef.current?.promise === request) {
+                    blobRequestRef.current = null
+                }
+            })
+        blobRequestRef.current = { key: mediaKey, promise: request }
+        return request
+    }, [ctx.api, ctx.sessionId, mediaKey, props.block.imageId])
 
     useEffect(() => {
         return () => {
@@ -103,9 +148,10 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
         }
         setObjectUrl(null)
         setImageStyle(undefined)
-        setError(null)
+        setLoadError(null)
+        setPlaybackError(false)
 
-        void ctx.api.getGeneratedImageBlob(ctx.sessionId, props.block.imageId)
+        void getMediaBlob()
             .then((blob) => {
                 if (disposed) return
                 const nextObjectUrl = URL.createObjectURL(blob)
@@ -127,13 +173,38 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
             })
             .catch((err: unknown) => {
                 if (disposed) return
-                setError(err instanceof Error ? err.message : 'Failed to load inline media')
+                setLoadError({ detail: err instanceof Error ? err.message : null })
             })
 
         return () => {
             disposed = true
         }
-    }, [ctx.api, ctx.sessionId, props.block.imageId, isImage, shouldFetch])
+    }, [getMediaBlob, isImage, shouldFetch])
+
+    const handleDownload = async () => {
+        if (isDownloading) return
+
+        setIsDownloading(true)
+        setDownloadError(null)
+        let downloadedBlob: Blob | null = null
+        try {
+            downloadedBlob = await getMediaBlob()
+            downloadBlobFile(props.block.fileName, downloadedBlob)
+        } catch (err: unknown) {
+            setDownloadError(err instanceof Error ? err.message : '')
+        } finally {
+            // Download-only cards do not need to retain up to 25 MiB for the life of the chat.
+            // A loaded player keeps the keyed Blob so later downloads avoid another fetch.
+            const cached = blobRef.current
+            if (!loadMediaRef.current
+                && downloadedBlob
+                && cached?.key === mediaKey
+                && cached.blob === downloadedBlob) {
+                blobRef.current = null
+            }
+            setIsDownloading(false)
+        }
+    }
 
     return (
         <div className="max-w-[92%] rounded-2xl border border-[var(--app-border)] bg-[var(--app-tool-card-bg)] p-3">
@@ -142,13 +213,23 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
             </div>
             {objectUrl ? (
                 isVideo ? (
-                    <div className="flex min-h-32 min-w-[12rem] items-center justify-center rounded-xl bg-[var(--app-subtle-bg)]">
-                        <video
-                            src={objectUrl}
-                            controls
-                            playsInline
-                            className="max-h-[min(28rem,60vh)] max-w-full rounded-xl"
-                        />
+                    <div>
+                        <div className="flex min-h-32 min-w-[12rem] items-center justify-center rounded-xl bg-[var(--app-subtle-bg)]">
+                            <video
+                                src={objectUrl}
+                                controls
+                                playsInline
+                                aria-label={t('media.displayed.videoPlayer', { fileName: props.block.fileName })}
+                                onLoadedData={() => setPlaybackError(false)}
+                                onError={() => setPlaybackError(true)}
+                                className="max-h-[min(28rem,60vh)] max-w-full rounded-xl"
+                            />
+                        </div>
+                        {playbackError ? (
+                            <div role="alert" className="mt-2 text-sm text-[var(--app-badge-warning-text)]">
+                                {t('media.displayed.videoPlaybackUnavailable')}
+                            </div>
+                        ) : null}
                     </div>
                 ) : isAudio ? (
                     <audio
@@ -164,7 +245,7 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
                         className="flex items-center gap-3 rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-4 py-3 text-sm font-medium text-[var(--app-fg)]"
                     >
                         <FileIcon fileName={props.block.fileName} size={24} />
-                        <span className="min-w-0 truncate">Download {props.block.fileName}</span>
+                        <span className="min-w-0 truncate">{t('media.displayed.downloadNamed', { fileName: props.block.fileName })}</span>
                     </a>
                 ) : (
                     <div className="flex min-h-32 min-w-[12rem] items-center justify-center rounded-xl bg-[var(--app-subtle-bg)]">
@@ -178,9 +259,12 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
                         />
                     </div>
                 )
-            ) : error ? (
-                <div className="text-sm text-[var(--app-hint)]">
-                    {t('media.displayed.unavailable', { label: mediaLabel, error })}
+            ) : loadError ? (
+                <div role="alert" className="text-sm text-[var(--app-hint)]">
+                    {t('media.displayed.unavailable', {
+                        label: mediaLabel,
+                        error: loadError.detail ?? t('media.displayed.loadError')
+                    })}
                 </div>
             ) : !isImage && !loadMedia ? (
                 <button
@@ -188,11 +272,42 @@ export function GeneratedImageCard(props: { block: GeneratedImageBlock }) {
                     onClick={() => setLoadMedia(true)}
                     className="flex h-48 w-72 max-w-full items-center justify-center rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] text-sm font-medium text-[var(--app-fg)]"
                 >
-                    {isVideo ? 'Load video' : isAudio ? 'Load audio' : 'Prepare download'}
+                    {isVideo
+                        ? t('media.displayed.loadVideo')
+                        : isAudio
+                            ? t('media.displayed.loadAudio')
+                            : t('media.displayed.prepareDownload')}
                 </button>
             ) : (
-                <div className="h-48 w-72 max-w-full animate-pulse rounded-xl bg-[var(--app-subtle-bg)]" />
+                <div role="status" className="h-48 w-72 max-w-full">
+                    <span className="sr-only">{t('media.displayed.loading', { label: mediaLabel })}</span>
+                    <div aria-hidden="true" className="h-full w-full animate-pulse rounded-xl bg-[var(--app-subtle-bg)]" />
+                </div>
             )}
+            {isVideo ? (
+                <div className="mt-2" aria-live="polite">
+                    <button
+                        type="button"
+                        onClick={() => void handleDownload()}
+                        disabled={isDownloading}
+                        aria-busy={isDownloading}
+                        className="inline-flex max-w-full min-w-0 rounded-lg border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2 text-sm font-medium text-[var(--app-fg)] disabled:cursor-wait disabled:opacity-70"
+                    >
+                        <span className="min-w-0 truncate">
+                            {isDownloading
+                                ? t('media.displayed.downloading')
+                                : t('media.displayed.downloadNamed', { fileName: props.block.fileName })}
+                        </span>
+                    </button>
+                    {downloadError !== null ? (
+                        <div role="alert" className="mt-2 text-sm text-[var(--app-badge-error-text)]">
+                            {t('media.displayed.downloadError', {
+                                error: downloadError || t('media.displayed.downloadErrorDefault')
+                            })}
+                        </div>
+                    ) : null}
+                </div>
+            ) : null}
         </div>
     )
 }

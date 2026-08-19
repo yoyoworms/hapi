@@ -281,6 +281,7 @@ describe('markdown <A> component — remote session file download', () => {
         Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
         Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
         const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+        const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
 
         renderFileA({
             href: `hapi-file-download:${encodeURIComponent(filePath)}`,
@@ -296,7 +297,13 @@ describe('markdown <A> component — remote session file download', () => {
         })
         expect(createObjectUrl).toHaveBeenCalled()
         expect(anchorClick).toHaveBeenCalled()
-        expect(revokeObjectUrl).toHaveBeenCalledWith('blob:hapi-download')
+        expect(revokeObjectUrl).not.toHaveBeenCalled()
+        expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 1000)
+
+        for (const result of setTimeoutSpy.mock.results) {
+            if (result.type === 'return') window.clearTimeout(result.value)
+        }
+        setTimeoutSpy.mockRestore()
     })
 })
 

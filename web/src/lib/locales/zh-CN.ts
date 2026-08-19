@@ -576,6 +576,17 @@ export default {
   'media.displayed.file': '展示文件',
   'media.displayed.header': '{label}：{fileName}',
   'media.displayed.unavailable': '{label}不可用：{error}',
+  'media.displayed.loadVideo': '加载视频',
+  'media.displayed.loadAudio': '加载音频',
+  'media.displayed.prepareDownload': '准备下载',
+  'media.displayed.loading': '正在加载{label}…',
+  'media.displayed.loadError': '媒体加载失败。',
+  'media.displayed.videoPlayer': '{fileName} 视频播放器',
+  'media.displayed.videoPlaybackUnavailable': '当前浏览器无法播放此视频，请下载后使用其他播放器打开。',
+  'media.displayed.downloadNamed': '下载 {fileName}',
+  'media.displayed.downloading': '正在下载…',
+  'media.displayed.downloadError': '下载失败：{error}',
+  'media.displayed.downloadErrorDefault': '请重试。',
 
   // Tool card
   'tool.askQuestion': '其他',

@@ -16,5 +16,6 @@ export function downloadBlobFile(fileName: string, blob: Blob): void {
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
-    URL.revokeObjectURL(url)
+    // Safari/iOS PWA may consume the blob URL after the synthetic click returns.
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

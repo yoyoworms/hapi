@@ -577,6 +577,17 @@ export default {
   'media.displayed.file': 'Displayed file',
   'media.displayed.header': '{label}: {fileName}',
   'media.displayed.unavailable': '{label} is unavailable. {error}',
+  'media.displayed.loadVideo': 'Load video',
+  'media.displayed.loadAudio': 'Load audio',
+  'media.displayed.prepareDownload': 'Prepare download',
+  'media.displayed.loading': 'Loading {label}…',
+  'media.displayed.loadError': 'Failed to load media.',
+  'media.displayed.videoPlayer': 'Video player for {fileName}',
+  'media.displayed.videoPlaybackUnavailable': 'This video cannot be played in this browser. Download it to open it in another player.',
+  'media.displayed.downloadNamed': 'Download {fileName}',
+  'media.displayed.downloading': 'Downloading…',
+  'media.displayed.downloadError': 'Download failed. {error}',
+  'media.displayed.downloadErrorDefault': 'Please try again.',
 
   // Tool card
   'tool.askQuestion': 'Other',
