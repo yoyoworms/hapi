@@ -47,10 +47,11 @@ export type SpawnDeduplicator = ((options: SpawnSessionOptions) => Promise<Spawn
 }
 
 export function createSpawnDeduplicator(
-  spawnOnce: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
+  spawnOnce: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>,
+  isRecoveredChildGenerationCurrent?: (existingSessionId: string) => boolean
 ): SpawnDeduplicator {
   const completedOrInFlight = new Map<string, Promise<SpawnSessionResult>>();
-  const childState = new Map<string, 'alive' | 'stopping'>();
+  const childState = new Map<string, 'alive' | 'stopping' | 'recovered'>();
 
   const dedupe = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
     const key = options.existingSessionId;
@@ -59,7 +60,17 @@ export function createSpawnDeduplicator(
     }
     const existing = completedOrInFlight.get(key);
     if (existing) {
-      return await existing;
+      // Detached children recovered after a runner restart have no exit
+      // listener in this process. Reconcile that one durable generation
+      // synchronously so a Reopen cannot reuse a stale success until the
+      // next heartbeat. Normal/in-flight spawns always share their task.
+      if (childState.get(key) !== 'recovered'
+        || !isRecoveredChildGenerationCurrent
+        || isRecoveredChildGenerationCurrent(key)) {
+        return await existing;
+      }
+      childState.delete(key);
+      completedOrInFlight.delete(key);
     }
 
     const task = spawnOnce(options);
@@ -79,7 +90,7 @@ export function createSpawnDeduplicator(
     return await task;
   };
   dedupe.recoverChild = (existingSessionId: string, result: SpawnSessionResult) => {
-    childState.set(existingSessionId, 'alive');
+    childState.set(existingSessionId, 'recovered');
     completedOrInFlight.set(existingSessionId, Promise.resolve(result));
   };
   dedupe.markChildAlive = (existingSessionId: string) => {
@@ -114,8 +125,10 @@ export function releaseRecoveredSpawnDedupe(
 ): void {
   const existingSessionId = existingSessionIdByChildPid.get(pid);
   if (!existingSessionId) return;
-  spawnSession.onChildExited(existingSessionId);
   existingSessionIdByChildPid.delete(pid);
+  if (![...existingSessionIdByChildPid.values()].includes(existingSessionId)) {
+    spawnSession.onChildExited(existingSessionId);
+  }
 }
 
 export async function startRunner(options: { workspaceRoots?: string[] } = {}): Promise<void> {
@@ -381,6 +394,15 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       }
     }
     persistResumeProcesses();
+    // Stable references to the process generations inherited by this runner.
+    // Keeping this ledger separate from the live PID maps prevents PID reuse
+    // by another, newer child from making an old HAPI-row cache permanent.
+    const recoveredResumeProcessesBySessionId = new Map<string, PersistedResumeProcess[]>();
+    for (const record of persistedResumeProcesses.values()) {
+      const records = recoveredResumeProcessesBySessionId.get(record.requestedSessionId) ?? [];
+      records.push(record);
+      recoveredResumeProcessesBySessionId.set(record.requestedSessionId, records);
+    }
 
     // Webhook timeout tolerance. Opus 1M + --resume can legitimately take
     // longer than the default 15s to reach the "Session started" webhook
@@ -1005,7 +1027,59 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       }
     };
 
-    spawnSession = createSpawnDeduplicator(spawnSessionOnce);
+    const isRecoveredChildGenerationCurrent = (existingSessionId: string): boolean => {
+      const recoveredRecords = recoveredResumeProcessesBySessionId.get(existingSessionId);
+      if (!recoveredRecords?.length) {
+        // Missing durable evidence is ambiguous. Fail closed rather than risk
+        // starting a duplicate child.
+        return true;
+      }
+
+      const ownedExitedRecords: PersistedResumeProcess[] = [];
+      for (const record of recoveredRecords) {
+        const currentRecord = persistedResumeProcesses.get(record.pid);
+        if (currentRecord !== record) {
+          // The PID slot was already cleaned or replaced by a newer generation.
+          // The inherited generation is no longer current, but none of the new
+          // PID-keyed state belongs to us.
+          continue;
+        }
+        const alive = isProcessAlive(record.pid);
+        const generation = classifyRecoveredProcessGeneration(
+          alive,
+          alive ? getProcessStartMarker(record.pid) : null,
+          record.processStartMarker
+        );
+        if (generation !== 'exited') return true;
+        ownedExitedRecords.push(record);
+      }
+
+      // Every inherited generation for this HAPI row is now proven gone (or
+      // was already replaced). Clean only records still owned by this ledger;
+      // a reused PID may already hold unrelated live state.
+      for (const record of ownedExitedRecords) {
+        if (persistedResumeProcesses.get(record.pid) !== record) continue;
+        persistedResumeProcesses.delete(record.pid);
+        if (pidToRequestedSessionId.get(record.pid) === record.requestedSessionId) {
+          pidToRequestedSessionId.delete(record.pid);
+        }
+        if (record.confirmedSessionId
+          && pidToConfirmedSessionId.get(record.pid) === record.confirmedSessionId) {
+          pidToConfirmedSessionId.delete(record.pid);
+        }
+        if (existingSessionIdByChildPid.get(record.pid) === record.requestedSessionId) {
+          existingSessionIdByChildPid.delete(record.pid);
+        }
+        rememberVerifiedExit(record.requestedSessionId);
+        if (record.confirmedSessionId) rememberVerifiedExit(record.confirmedSessionId);
+      }
+      if (ownedExitedRecords.length > 0) persistResumeProcesses();
+      recoveredResumeProcessesBySessionId.delete(existingSessionId);
+      logger.debug(`[RUNNER RUN] Released exited recovered generation for session ${existingSessionId}`);
+      return false;
+    };
+
+    spawnSession = createSpawnDeduplicator(spawnSessionOnce, isRecoveredChildGenerationCurrent);
     for (const [pid, record] of persistedResumeProcesses) {
       const verified = pidToRequestedSessionId.get(pid) === record.requestedSessionId;
       existingSessionIdByChildPid.set(pid, record.requestedSessionId);
@@ -1099,6 +1173,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         const requestedSessionId = pidToRequestedSessionId.get(pid) ?? persisted?.requestedSessionId;
         const confirmedSessionId = pidToConfirmedSessionId.get(pid) ?? persisted?.confirmedSessionId;
         if (requestedSessionId !== sessionId && confirmedSessionId !== sessionId) continue;
+        const existingSessionId = existingSessionIdByChildPid.get(pid);
+        if (existingSessionId) spawnSession.markChildStopping(existingSessionId);
         if (isProcessAlive(pid)) {
           if (!persisted) return 'still_alive';
           const currentMarker = getProcessStartMarker(pid);
@@ -1150,11 +1226,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       if (confirmedSessionId) rememberVerifiedExit(confirmedSessionId);
       rememberVerifiedExit(`PID-${pid}`);
       logger.debug(`[RUNNER RUN] Removing exited process PID ${pid} from tracking`);
-      const existingSessionId = existingSessionIdByChildPid.get(pid);
-      if (existingSessionId) {
-        spawnSession.onChildExited(existingSessionId);
-        existingSessionIdByChildPid.delete(pid);
-      }
+      releaseRecoveredSpawnDedupe(pid, existingSessionIdByChildPid, spawnSession);
       pidToTrackedSession.delete(pid);
       pidToAwaiter.delete(pid);
       pidToErrorAwaiter.delete(pid);
@@ -1373,7 +1445,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           );
           if (generation === 'exited') {
             logger.debug(`[RUNNER RUN] Removing stale session with reused PID ${pid}`);
-            onChildExited(pid);
+            const inheritedRecords = recoveredResumeProcessesBySessionId.get(persisted.requestedSessionId);
+            if (inheritedRecords?.includes(persisted)) {
+              if (!isRecoveredChildGenerationCurrent(persisted.requestedSessionId)) {
+                spawnSession.onChildExited(persisted.requestedSessionId);
+              }
+            } else {
+              onChildExited(pid);
+            }
           } else if (generation === 'verified' && pidToRequestedSessionId.get(pid) !== persisted.requestedSessionId) {
             pidToRequestedSessionId.set(pid, persisted.requestedSessionId);
             if (persisted.confirmedSessionId) pidToConfirmedSessionId.set(pid, persisted.confirmedSessionId);

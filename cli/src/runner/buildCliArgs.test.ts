@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -397,6 +397,88 @@ describe('createSpawnDeduplicator', () => {
         expect(calls).toBe(0)
     })
 
+    it('spawns immediately when an inherited child exited before the heartbeat sweep', async () => {
+        let calls = 0
+        const generationProbe = vi.fn(() => false)
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'fresh-hapi-session' }
+        }, generationProbe)
+        dedupe.recoverChild('fresh-hapi-session', {
+            type: 'success',
+            sessionId: 'fresh-hapi-session'
+        })
+
+        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
+            type: 'success', sessionId: 'fresh-hapi-session'
+        })
+        expect(generationProbe).toHaveBeenCalledOnce()
+        expect(calls).toBe(1)
+    })
+
+    it('keeps an inherited child deduped when its generation is current or uncertain', async () => {
+        let calls = 0
+        const generationProbe = vi.fn(() => true)
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'duplicate' }
+        }, generationProbe)
+        dedupe.recoverChild('fresh-hapi-session', {
+            type: 'success',
+            sessionId: 'fresh-hapi-session'
+        })
+
+        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
+            type: 'success', sessionId: 'fresh-hapi-session'
+        })
+        expect(generationProbe).toHaveBeenCalledOnce()
+        expect(calls).toBe(0)
+    })
+
+    it('does not probe an inherited child while StopSession is in flight', async () => {
+        let calls = 0
+        const generationProbe = vi.fn(() => false)
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'duplicate' }
+        }, generationProbe)
+        dedupe.recoverChild('fresh-hapi-session', {
+            type: 'success',
+            sessionId: 'fresh-hapi-session'
+        })
+        dedupe.markChildStopping('fresh-hapi-session')
+
+        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
+            type: 'success', sessionId: 'fresh-hapi-session'
+        })
+        expect(generationProbe).not.toHaveBeenCalled()
+        expect(calls).toBe(0)
+    })
+
+    it('never probes a normal in-flight spawn after its PID is registered', async () => {
+        let calls = 0
+        const generationProbe = vi.fn(() => false)
+        let resolveSpawn: ((result: { type: 'success'; sessionId: string }) => void) | undefined
+        let dedupe!: ReturnType<typeof createSpawnDeduplicator>
+        dedupe = createSpawnDeduplicator(async (options) => {
+            calls += 1
+            dedupe.markChildAlive(options.existingSessionId!)
+            return await new Promise<{ type: 'success'; sessionId: string }>((resolve) => {
+                resolveSpawn = resolve
+            })
+        }, generationProbe)
+
+        const options = { directory: '/tmp', existingSessionId: 'fresh-hapi-session' }
+        const first = dedupe(options)
+        const concurrentRetry = dedupe(options)
+
+        expect(calls).toBe(1)
+        expect(generationProbe).not.toHaveBeenCalled()
+        resolveSpawn?.({ type: 'success', sessionId: 'fresh-hapi-session' })
+        await expect(first).resolves.toEqual({ type: 'success', sessionId: 'fresh-hapi-session' })
+        await expect(concurrentRetry).resolves.toEqual({ type: 'success', sessionId: 'fresh-hapi-session' })
+    })
+
     it('shares an in-flight spawn and its successful result while the child is alive', async () => {
         let calls = 0
         let resolveSpawn: ((result: { type: 'success'; sessionId: string }) => void) | undefined
@@ -503,5 +585,26 @@ describe('releaseRecoveredSpawnDedupe', () => {
 
         expect(calls).toBe(1)
         expect(recovered.has(123)).toBe(false)
+    })
+
+    it('keeps the same-row cache until every recovered PID has exited', async () => {
+        let calls = 0
+        const dedupe = createSpawnDeduplicator(async () => {
+            calls += 1
+            return { type: 'success' as const, sessionId: 'fresh-hapi-session' }
+        })
+        dedupe.recoverChild('fresh-hapi-session', { type: 'success', sessionId: 'fresh-hapi-session' })
+        const recovered = new Map([
+            [123, 'fresh-hapi-session'],
+            [456, 'fresh-hapi-session']
+        ])
+
+        releaseRecoveredSpawnDedupe(123, recovered, dedupe)
+        await dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })
+        expect(calls).toBe(0)
+
+        releaseRecoveredSpawnDedupe(456, recovered, dedupe)
+        await dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })
+        expect(calls).toBe(1)
     })
 })
