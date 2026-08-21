@@ -45,7 +45,14 @@ export function getAutoArchiveBlockReason(
     if (!metadata || (metadata.startedBy !== 'runner' && metadata.startedFromRunner !== true)) {
         return 'not-runner-session'
     }
-    if (metadata.lifecycleState !== 'running') {
+    // Rows created before lifecycle metadata was introduced can still be safe
+    // runner sessions.  Only treat the missing state as an eligible legacy
+    // row after Hub liveness has already marked the session inactive; an
+    // active legacy row remains fail-closed to avoid killing a live process.
+    if (
+        metadata.lifecycleState !== 'running'
+        && !(metadata.lifecycleState === undefined && session.active === false)
+    ) {
         return 'not-running'
     }
     if (session.pinned || session.globalPinned || metadata.pinnedAt != null) {

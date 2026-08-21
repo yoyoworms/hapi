@@ -24,6 +24,7 @@ type SessionAlivePayload = {
     collaborationMode?: CodexCollaborationMode
     runtimeId?: string
     runtimeGeneration?: number
+    clockOffset?: number
 }
 
 function getSessionRuntimeId(session: Pick<StoredSession, 'metadata'>): string | null {
@@ -66,6 +67,7 @@ type SessionEndPayload = {
     reason?: SessionEndReason
     runtimeId?: string
     runtimeGeneration?: number
+    clockOffset?: number
 }
 
 type SessionReadyPayload = {
@@ -94,8 +96,15 @@ export type CliHandlersDeps = {
         metadata: unknown
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }) => void
-    onSessionMetadataUpdateAllowed?: (payload: { sid: string; metadata: unknown; runtimeId: string; runtimeGeneration: number }) => boolean
+    onSessionMetadataUpdateAllowed?: (payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+        clockOffset?: number
+    }) => boolean
     onMachineAlive?: (payload: MachineAlivePayload) => void
     onWebappEvent?: (event: SyncEvent) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void

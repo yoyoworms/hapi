@@ -703,3 +703,56 @@ describe('alive incremental events', () => {
         expect(update.data).toEqual(expect.objectContaining({ thinking: false }))
     })
 })
+
+describe('runtime metadata lifecycle clock offset', () => {
+    function makeCache(): { cache: SessionCache; sessionId: string } {
+        const store = new Store(':memory:')
+        const cache = new SessionCache(store, createPublisher([]))
+        const session = cache.getOrCreateSession(
+            'runtime-metadata-clock-offset',
+            {
+                path: '/tmp/project',
+                host: 'localhost',
+                lifecycleState: 'archived',
+                lifecycleStateSince: 10_000,
+                runtimeId: 'runtime-ended'
+            },
+            null,
+            'default'
+        )
+        return { cache, sessionId: session.id }
+    }
+
+    const replacementMetadata = {
+        lifecycleState: 'running' as const,
+        // Local CLI clock is 2.6s behind Hub time; corrected value is 10.1s.
+        lifecycleStateSince: 7_500
+    }
+
+    it('accepts a replacement whose local lifecycle timestamp is behind by 2.6s', () => {
+        const { cache, sessionId } = makeCache()
+
+        expect(cache.isRuntimeMetadataUpdateAllowed({
+            sid: sessionId,
+            metadata: replacementMetadata,
+            runtimeId: 'runtime-next',
+            runtimeGeneration: 2,
+            clockOffset: 2_600
+        })).toBe(true)
+    })
+
+    it.each([
+        ['absent', undefined],
+        ['too large', 60_000]
+    ] as const)('keeps %s offset strict', (_label, clockOffset) => {
+        const { cache, sessionId } = makeCache()
+
+        expect(cache.isRuntimeMetadataUpdateAllowed({
+            sid: sessionId,
+            metadata: replacementMetadata,
+            runtimeId: 'runtime-next',
+            runtimeGeneration: 2,
+            ...(clockOffset === undefined ? {} : { clockOffset })
+        })).toBe(false)
+    })
+})

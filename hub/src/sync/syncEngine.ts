@@ -582,6 +582,7 @@ export class SyncEngine {
         copilotAgentMode?: CopilotAgentMode
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }): boolean {
         if (!this.sessionCache.handleSessionAlive(payload)) {
             return false
@@ -615,6 +616,7 @@ export class SyncEngine {
         reason?: SessionEndReason
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }, hubAuthoritative: boolean = false): boolean {
         const before = this.sessionCache.getSession(payload.sid)
         const ownsPiAttempt = before?.metadata?.piResumeAttempt !== undefined
@@ -722,6 +724,7 @@ export class SyncEngine {
         metadata: unknown
         runtimeId: string
         runtimeGeneration: number
+        clockOffset?: number
     }): boolean {
         return this.sessionCache.isRuntimeMetadataUpdateAllowed(payload)
     }
@@ -753,6 +756,7 @@ export class SyncEngine {
         metadata: unknown
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }): Promise<void> {
         const current = this.store.sessions.getSessionByNamespace(payload.sid, payload.namespace)
         if (!current) {
@@ -3434,6 +3438,27 @@ export class SyncEngine {
                         return { type: 'error', message: 'Pi resume failed and the child is still active', code: 'resume_failed', rollbackSafe: false }
                     }
                 }
+                if (resumedStartingMode !== 'pty' && !requiresPiNativeReady) {
+                    // A generic runner child may have been spawned
+                    // successfully even though its lifecycle
+                    // webhook/heartbeat never reached the Hub.  Do not leave
+                    // that child orphaned while reopen rolls the archived row
+                    // back.  The runner's stop response is not enough for
+                    // `stopped`: wait until the Hub observes the child as
+                    // inactive before allowing rollback.
+                    const stopped = await this.terminateFailedResumeChild(
+                        targetMachine.id,
+                        spawnResult.sessionId
+                    )
+                    if (!stopped) {
+                        return {
+                            type: 'error',
+                            message: 'Session failed to become active and the child is still active',
+                            code: 'resume_failed',
+                            rollbackSafe: false,
+                        }
+                    }
+                }
                 return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
             }
 
@@ -4053,6 +4078,39 @@ export class SyncEngine {
             return true
         }
         return this.sessionReadyIds.has(session.id)
+    }
+
+    /**
+     * Stop a generic resume child after it failed the Hub active-state
+     * barrier.  A successful runner stop is only rollback-safe once the Hub
+     * has observed the child as inactive; otherwise a late heartbeat could
+     * revive the row after reopen restores its archive metadata.
+     */
+    private async terminateFailedResumeChild(machineId: string, sessionId: string): Promise<boolean> {
+        let status: 'stopped' | 'already_gone' | 'still_alive'
+        try {
+            status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
+        } catch {
+            return false
+        }
+
+        if (status === 'still_alive') {
+            return false
+        }
+
+        // `already_gone` is a verified runner tombstone.  There may still be
+        // an active bit in the Hub cache waiting for its end event; reconcile
+        // it locally so the archive rollback can proceed without a dangling
+        // active row.
+        if (status === 'already_gone') {
+            const current = this.sessionCache.getSession(sessionId)
+            if (current?.active) {
+                this.handleSessionEnd({ sid: sessionId, time: Date.now(), reason: 'error' })
+            }
+            return !this.sessionCache.getSession(sessionId)?.active
+        }
+
+        return await this.waitForSessionInactive(sessionId)
     }
 
     private async terminateInPlacePiResume(

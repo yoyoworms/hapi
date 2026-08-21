@@ -49,6 +49,29 @@ describe('getAutoArchiveBlockReason', () => {
         expect(getAutoArchiveBlockReason(createSession(), NOW, IDLE_MS, false)).toBeNull()
     })
 
+    it('allows an inactive legacy runner session without lifecycle metadata', () => {
+        const metadata = { ...createSession().metadata! }
+        delete metadata.lifecycleState
+
+        expect(getAutoArchiveBlockReason(createSession({ active: false, metadata }), NOW, IDLE_MS, false)).toBeNull()
+    })
+
+    it('keeps an active legacy runner session without lifecycle metadata fail-closed', () => {
+        const metadata = { ...createSession().metadata! }
+        delete metadata.lifecycleState
+
+        expect(getAutoArchiveBlockReason(createSession({ active: true, metadata }), NOW, IDLE_MS, false)).toBe('not-running')
+    })
+
+    it('keeps a terminal session without lifecycle metadata out of auto-archive', () => {
+        const metadata = { ...createSession().metadata! }
+        delete metadata.lifecycleState
+        metadata.startedBy = 'terminal'
+        metadata.startedFromRunner = false
+
+        expect(getAutoArchiveBlockReason(createSession({ active: false, metadata }), NOW, IDLE_MS, false)).toBe('not-runner-session')
+    })
+
     it('uses lifecycle restart time as activity so reopened sessions are not immediately archived', () => {
         const session = createSession({
             metadata: {

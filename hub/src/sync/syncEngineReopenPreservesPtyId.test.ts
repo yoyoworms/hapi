@@ -174,6 +174,63 @@ describe('SyncEngine reopen/resume PTY session id preservation', () => {
         expect((engine.getSessionByNamespace(sessionId, NAMESPACE)?.metadata as any)?.ptyResumeAttempt).toBeUndefined()
     })
 
+    it('stops a generic resume child before rolling an archived row back', async () => {
+        const sessionId = insertSession(
+            'codex-session-active-timeout-cleanup',
+            baseMetadata({
+                flavor: 'codex',
+                codexSessionId: 'codex-native-1',
+                lifecycleState: 'archived',
+                archivedBy: 'hub',
+                archiveReason: 'inactivity',
+            }),
+            {}
+        ).id
+        ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'success', sessionId })
+        ;(engine as any).waitForSessionActive = async () => false
+        ;(engine as any).waitForSessionInactive = async () => true
+        let stoppedSessionId: string | undefined
+        ;(engine as any).rpcGateway.stopRunnerSession = async (_machineId: string, sid: string) => {
+            stoppedSessionId = sid
+            return 'stopped'
+        }
+
+        const result = await engine.reopenSession(sessionId, NAMESPACE)
+
+        expect(result).toMatchObject({ type: 'error', code: 'resume_failed' })
+        expect(result).not.toHaveProperty('rollbackSafe', false)
+        expect(stoppedSessionId).toBe(sessionId)
+        expect(engine.getSessionByNamespace(sessionId, NAMESPACE)?.metadata?.lifecycleState).toBe('archived')
+    })
+
+    it('keeps a generic resume row fail-closed when child termination is unconfirmed', async () => {
+        const sessionId = insertSession(
+            'codex-session-active-timeout-still-alive',
+            baseMetadata({
+                flavor: 'codex',
+                codexSessionId: 'codex-native-2',
+                lifecycleState: 'archived',
+                archivedBy: 'hub',
+                archiveReason: 'inactivity',
+            }),
+            {}
+        ).id
+        ;(engine as any).rpcGateway.spawnSession = async () => ({ type: 'success', sessionId })
+        ;(engine as any).waitForSessionActive = async () => false
+        ;(engine as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+
+        const result = await engine.reopenSession(sessionId, NAMESPACE)
+
+        expect(result).toMatchObject({
+            type: 'error',
+            code: 'resume_failed',
+            rollbackSafe: false,
+        })
+        // The child may still be alive, so restoring the archived snapshot
+        // would hide a process that can send late lifecycle events.
+        expect(engine.getSessionByNamespace(sessionId, NAMESPACE)?.metadata?.lifecycleState).not.toBe('archived')
+    })
+
     it('stops a same-id PTY child when readiness times out', async () => {
         const sessionId = insertSession(
             'pty-session-ready-timeout',

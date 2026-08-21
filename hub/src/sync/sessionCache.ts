@@ -7,6 +7,12 @@ import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
 import { extractBackgroundTaskDelta } from './backgroundTasks'
 
 const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
+// Lifecycle timestamps are authored by the CLI's wall clock.  A socket
+// handshake supplies the Hub-minus-CLI offset so a small host skew does not
+// reject a legitimate replacement runtime.  Keep the correction deliberately
+// bounded: clientTime is untrusted input and must never become an arbitrary
+// takeover tolerance.
+const MAX_RUNTIME_CLOCK_OFFSET_MS = 10_000
 // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
 // restoreSessionArchiveMetadata) retry on version-mismatch with a fresh cache
 // snapshot. Cap retries so genuine concurrent contention still surfaces to the
@@ -926,6 +932,7 @@ export class SessionCache {
         metadata: unknown
         runtimeId: string
         runtimeGeneration: number
+        clockOffset?: number
     }): boolean {
         const owner = this.runtimeOwnerBySessionId.get(payload.sid)
         if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
@@ -957,7 +964,7 @@ export class SessionCache {
                 // Both values are authored by CLI lifecycle code; comparison
                 // is limited to different-runtime takeover. Same-runtime
                 // liveness/config ordering remains entirely in Hub time.
-                if (!session || !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata)) {
+                if (!session || !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata, payload.clockOffset)) {
                     return false
                 }
             }
@@ -984,7 +991,7 @@ export class SessionCache {
             if (
                 durableRuntimeId
                 && durableRuntimeId !== payload.runtimeId
-                && !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata)
+                && !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata, payload.clockOffset)
             ) {
                 return false
             }
@@ -997,17 +1004,26 @@ export class SessionCache {
         return false
     }
 
-    private isStrictlyNewerRuntimeLifecycle(session: Session, metadata: unknown): boolean {
+    private isStrictlyNewerRuntimeLifecycle(
+        session: Session,
+        metadata: unknown,
+        clockOffset?: number
+    ): boolean {
         if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
             return false
         }
         const incomingSince = (metadata as Record<string, unknown>).lifecycleStateSince
         const durableSince = session.metadata?.lifecycleStateSince
+        const boundedClockOffset = typeof clockOffset === 'number'
+            && Number.isFinite(clockOffset)
+            && Math.abs(clockOffset) <= MAX_RUNTIME_CLOCK_OFFSET_MS
+            ? clockOffset
+            : 0
         return typeof incomingSince === 'number'
             && Number.isFinite(incomingSince)
             && typeof durableSince === 'number'
             && Number.isFinite(durableSince)
-            && incomingSince > durableSince
+            && incomingSince + boundedClockOffset > durableSince
     }
 
     /** Commit ownership only after update-metadata actually persisted. */

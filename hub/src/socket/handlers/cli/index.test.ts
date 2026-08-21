@@ -26,6 +26,7 @@ class FakeSocket {
             sessionId: string
             runtimeId?: string
             runtimeGeneration?: number
+            clockOffset?: number
         }
     ) {
         this.data = {
@@ -33,6 +34,9 @@ class FakeSocket {
             ...(options.runtimeId ? { runtimeId: options.runtimeId } : {}),
             ...(options.runtimeGeneration !== undefined
                 ? { runtimeGeneration: options.runtimeGeneration }
+                : {}),
+            ...(options.clockOffset !== undefined
+                ? { clockOffset: options.clockOffset }
                 : {})
         }
         this.handshake = { auth: { sessionId: options.sessionId } }
@@ -106,12 +110,21 @@ function register(
         thinking?: boolean
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }) => boolean,
     onSessionEnd?: (payload: {
         sid: string
         time: number
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
+    }) => boolean,
+    onSessionMetadataUpdateAllowed?: (payload: {
+        sid: string
+        metadata: unknown
+        runtimeId: string
+        runtimeGeneration: number
+        clockOffset?: number
     }) => boolean
 ): void {
     registerCliHandlers(socket as unknown as CliSocketWithData, {
@@ -120,7 +133,8 @@ function register(
         rpcRegistry,
         terminalRegistry: new TerminalRegistry({ idleTimeoutMs: 0 }),
         onSessionAlive,
-        onSessionEnd
+        onSessionEnd,
+        onSessionMetadataUpdateAllowed
     })
 }
 
@@ -349,6 +363,55 @@ describe('cli session runtime rooms', () => {
             lifecycleStateSince: 200
         }))
         expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['next']))
+    })
+
+    it('forwards the bounded clock offset with a replacement metadata claim', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'runtime-room-clock-offset',
+            {
+                lifecycleState: 'archived',
+                lifecycleStateSince: 10_000,
+                runtimeId: 'runtime-ended'
+            },
+            null,
+            'default'
+        )
+        const io = new FakeIo()
+        const next = new FakeSocket('next-clock-offset', io.cli, {
+            sessionId: session.id,
+            runtimeId: 'runtime-next',
+            runtimeGeneration: 2,
+            // The CLI's local lifecycle timestamp is 2.6s behind Hub time.
+            clockOffset: 2_600
+        })
+        let receivedOffset: number | undefined
+
+        register(next, io, store, new RpcRegistry(), undefined, undefined, (payload) => {
+            receivedOffset = payload.clockOffset
+            return payload.clockOffset === 2_600
+        })
+
+        let ack: unknown = null
+        next.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: {
+                lifecycleState: 'running',
+                // 7.5s + 2.6s = 10.1s, strictly newer than the durable 10s.
+                lifecycleStateSince: 7_500
+            }
+        }, (response: unknown) => {
+            ack = response
+        })
+
+        expect(receivedOffset).toBe(2_600)
+        expect(ack).toEqual(expect.objectContaining({ result: 'success' }))
+        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
+            runtimeId: 'runtime-next',
+            lifecycleState: 'running',
+            lifecycleStateSince: 7_500
+        }))
     })
 
     it('removes a socket from the prompt room when its alive claim is rejected', () => {

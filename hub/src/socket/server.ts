@@ -40,9 +40,9 @@ export type SocketServerDeps = {
     corsOrigins?: string[]
     getSession?: (sessionId: string) => { active: boolean; namespace: string } | null
     onWebappEvent?: (event: SyncEvent) => void
-    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote'; serviceTier?: string | null; runtimeId?: string; runtimeGeneration?: number }) => boolean | void
+    onSessionAlive?: (payload: { sid: string; time: number; thinking?: boolean; mode?: 'local' | 'remote'; serviceTier?: string | null; runtimeId?: string; runtimeGeneration?: number; clockOffset?: number }) => boolean | void
     onSessionReady?: (payload: { sid: string; time: number }) => void
-    onSessionEnd?: (payload: { sid: string; time: number; reason?: SessionEndReason; runtimeId?: string; runtimeGeneration?: number }) => boolean
+    onSessionEnd?: (payload: { sid: string; time: number; reason?: SessionEndReason; runtimeId?: string; runtimeGeneration?: number; clockOffset?: number }) => boolean
     onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
     onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
     onSessionMetadataUpdated?: (payload: {
@@ -51,8 +51,9 @@ export type SocketServerDeps = {
         metadata: unknown
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }) => void
-    onSessionMetadataUpdateAllowed?: (payload: { sid: string; metadata: unknown; runtimeId: string; runtimeGeneration: number }) => boolean
+    onSessionMetadataUpdateAllowed?: (payload: { sid: string; metadata: unknown; runtimeId: string; runtimeGeneration: number; clockOffset?: number }) => boolean
     onMachineAlive?: (payload: { machineId: string; time: number; health?: unknown }) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
     onSessionActivity?: (sessionId: string, updatedAt: number) => void

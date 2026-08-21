@@ -31,9 +31,15 @@ type SessionAlivePayload = {
 type SessionRuntimeSource = {
     runtimeId?: string
     runtimeGeneration?: number
+    /** Hub time minus the CLI wall clock, captured during the socket handshake. */
+    clockOffset?: number
 }
 
-type AuthoritativeSessionRuntimeSource = Required<SessionRuntimeSource>
+type AuthoritativeSessionRuntimeSource = {
+    runtimeId: string
+    runtimeGeneration: number
+    clockOffset?: number
+}
 
 type SessionEndPayload = {
     sid: string
@@ -121,7 +127,10 @@ function getAuthoritativeRuntimeSource(socket: CliSocketWithData): Authoritative
     }
     return {
         runtimeId: runtimeData.runtimeId,
-        runtimeGeneration: runtimeData.runtimeGeneration as number
+        runtimeGeneration: runtimeData.runtimeGeneration as number,
+        ...(typeof runtimeData.clockOffset === 'number' && Number.isFinite(runtimeData.clockOffset)
+            ? { clockOffset: runtimeData.clockOffset }
+            : {})
     }
 }
 
@@ -271,12 +280,14 @@ export type SessionHandlersDeps = {
         metadata: unknown
         runtimeId?: string
         runtimeGeneration?: number
+        clockOffset?: number
     }) => void
     onSessionMetadataUpdateAllowed?: (payload: {
         sid: string
         metadata: unknown
         runtimeId: string
         runtimeGeneration: number
+        clockOffset?: number
     }) => boolean
     onWebappEvent?: (event: SyncEvent) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
