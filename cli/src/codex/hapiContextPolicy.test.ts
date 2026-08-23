@@ -8,17 +8,17 @@ import {
 describe('buildCodexAppServerArgs', () => {
     it('applies the shared HAPI context policy before starting app-server', () => {
         expect(HAPI_CODEX_CONTEXT_DEFAULTS).toEqual({
-            contextWindow: 372_000,
-            autoCompactTokenLimit: 330_000,
+            contextWindow: 1_000_000,
+            autoCompactTokenLimit: 900_000,
             autoCompactTokenLimitScope: 'total'
         });
         expect(buildCodexAppServerArgs('/tmp/hapi model catalog.json')).toEqual([
             '-c',
             'model_catalog_json="/tmp/hapi model catalog.json"',
             '-c',
-            'model_context_window=372000',
+            'model_context_window=1000000',
             '-c',
-            'model_auto_compact_token_limit=330000',
+            'model_auto_compact_token_limit=900000',
             '-c',
             'model_auto_compact_token_limit_scope="total"',
             'app-server'
@@ -31,7 +31,7 @@ describe('buildCodexAppServerArgs', () => {
 });
 
 describe('applyHapiCodexContextCatalogPolicy', () => {
-    it('raises only the Sol catalog cap so Codex can honor the 372K override', () => {
+    it('raises only the Sol catalog cap so Codex can honor the 1M override', () => {
         const result = applyHapiCodexContextCatalogPolicy({
             fetched_at: 'preserved',
             models: [{
@@ -50,8 +50,8 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
             fetched_at: 'preserved',
             models: [{
                 slug: 'gpt-5.6-sol',
-                context_window: 372_000,
-                max_context_window: 372_000,
+                context_window: 1_000_000,
+                max_context_window: 1_000_000,
                 effective_context_window_percent: 95
             }, {
                 slug: 'gpt-5.6-terra',

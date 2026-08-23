@@ -162,8 +162,8 @@ describe('CodexAccountManager', () => {
         });
         expect(resolved.homeDir.startsWith(join(rootDir, 'codex-accounts'))).toBe(true);
         const managedConfig = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
-        expect(managedConfig).toContain('model_context_window = 372000');
-        expect(managedConfig).toContain('model_auto_compact_token_limit = 330000');
+        expect(managedConfig).toContain('model_context_window = 1000000');
+        expect(managedConfig).toContain('model_auto_compact_token_limit = 900000');
 
         const afterDefault = await manager.setDefaultAccount(login.accountId!);
         expect(afterDefault.defaultAccountId).toBe(login.accountId);
@@ -261,8 +261,8 @@ describe('CodexAccountManager', () => {
         const config = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
         expect(config).toContain('model_provider = "hapi_endpoint"');
         expect(config).toContain('wire_api = "responses"');
-        expect(config).toContain('model_context_window = 372000');
-        expect(config).toContain('model_auto_compact_token_limit = 330000');
+        expect(config).toContain('model_context_window = 1000000');
+        expect(config).toContain('model_auto_compact_token_limit = 900000');
         expect(config).not.toContain('secret-key');
         expect(await readFile(join(resolved.homeDir, 'api-key'), 'utf8')).toBe('secret-key');
         expect((await stat(join(resolved.homeDir, 'api-key'))).mode & 0o777).toBe(0o600);

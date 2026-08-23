@@ -13,8 +13,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 export const HAPI_CODEX_CONTEXT_DEFAULTS = {
-    contextWindow: 372_000,
-    autoCompactTokenLimit: 330_000,
+    // GPT-5.6 Sol's published model context is 1.05M tokens. Keep a small
+    // headroom below that model limit for Codex's effective-window reserve.
+    contextWindow: 1_000_000,
+    autoCompactTokenLimit: 900_000,
     autoCompactTokenLimitScope: 'total'
 } as const;
 
@@ -52,9 +54,10 @@ function atLeast(value: unknown, minimum: number): number {
 
 /**
  * Codex clamps `model_context_window` to the selected model catalog entry's
- * `max_context_window`. The account catalog currently advertises 272K for Sol,
- * so a CLI `-c model_context_window=372000` override alone still resolves to
- * 272K (258.4K after Codex's 95% effective-window reserve).
+ * `max_context_window`. The ChatGPT account catalog can advertise a smaller
+ * rollout cap than the model's published 1.05M context, so the CLI override
+ * alone may still resolve to that smaller cap (after Codex's effective-window
+ * reserve).
  *
  * Keep the complete account catalog and only raise metadata for models covered
  * by HAPI's explicit context policy. Larger user-provided values are preserved.
