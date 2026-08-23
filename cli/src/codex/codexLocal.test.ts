@@ -182,6 +182,26 @@ describe('codexLocal', () => {
         expect(spawnOptions.args).not.toContain('--model-reasoning-effort');
     });
 
+    it('maps the selectable Sol 1M variant to Codex model/config args', async () => {
+        const controller = new AbortController();
+
+        await codexLocal({
+            abort: controller.signal,
+            sessionId: null,
+            path: workspacePath,
+            model: 'gpt-5.6-sol[1m]',
+            onSessionFound: vi.fn()
+        });
+
+        const spawnOptions = spawnWithTerminalGuardMock.mock.calls[0][0] as {
+            args: string[];
+        };
+        expect(spawnOptions.args).toContain('--model');
+        expect(spawnOptions.args).toContain('gpt-5.6-sol');
+        expect(spawnOptions.args).toContain('model_context_window=1000000');
+        expect(spawnOptions.args).toContain('model_auto_compact_token_limit=900000');
+    });
+
     it('passes resume --last through while Codex is resolving the initial session', async () => {
         const controller = new AbortController();
 

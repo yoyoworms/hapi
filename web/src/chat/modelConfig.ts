@@ -16,6 +16,7 @@ const LARGE_CLAUDE_CONTEXT_WINDOW_TOKENS = 1_000_000
 // Fallback for Codex sessions when the server has not reported an explicit modelContextWindow.
 // HAPI configures a 372K raw window; Codex reports 95% as the effective input window.
 const DEFAULT_CODEX_CONTEXT_WINDOW_TOKENS = 353_400
+const LARGE_CODEX_CONTEXT_WINDOW_TOKENS = 1_000_000
 // Pi supports multiple providers with varying context windows. 200K is a
 // conservative default (most Claude/GPT-4 class models). When the server
 // reports an explicit modelContextWindow via usage events, that takes
@@ -49,6 +50,9 @@ function parseCursorWireContextWindow(model: string): number | null {
 
 export function getContextBudgetTokens(model: string | null | undefined, flavor?: string | null): number | null {
     if (flavor === 'codex') {
+        if (model?.trim() === 'gpt-5.6-sol[1m]') {
+            return Math.max(1, LARGE_CODEX_CONTEXT_WINDOW_TOKENS - CONTEXT_HEADROOM_TOKENS)
+        }
         return Math.max(1, DEFAULT_CODEX_CONTEXT_WINDOW_TOKENS - CONTEXT_HEADROOM_TOKENS)
     }
 

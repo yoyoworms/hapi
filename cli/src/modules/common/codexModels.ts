@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import { addHapiCodexModelVariants } from '@/codex/hapiContextPolicy';
 import { getErrorMessage } from './rpcResponses';
 
 export interface ListCodexModelsRequest {
@@ -165,9 +166,13 @@ async function fetchCodexModelsFromAppServer(
         });
 
         const response = await client.listModels({ includeHidden });
-        return Array.isArray(response.data)
-            ? response.data.map(normalizeModel).filter((model): model is CodexModelSummary => model !== null)
-            : [];
+        if (!Array.isArray(response.data)) {
+            return [];
+        }
+        const models = response.data
+            .map(normalizeModel)
+            .filter((model): model is CodexModelSummary => model !== null);
+        return addHapiCodexModelVariants(models);
     } catch (error) {
         throw new Error(getErrorMessage(error, 'Failed to list Codex models'));
     } finally {

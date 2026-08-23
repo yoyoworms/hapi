@@ -93,6 +93,10 @@ describe('listCodexModels cwd', () => {
             id: 'gpt-5.6-sol',
             displayName: 'GPT-5.6-Sol',
             isDefault: true
+        }), expect.objectContaining({
+            id: 'gpt-5.6-sol[1m]',
+            displayName: 'GPT-5.6-Sol (1M)',
+            isDefault: false
         })]);
         expect(second).toEqual(first);
         expect(constructorOptions).toHaveLength(1);
@@ -128,7 +132,7 @@ describe('listCodexModels cwd', () => {
         expect(constructorOptions).toHaveLength(1);
         expect(listModelsMock).toHaveBeenCalledTimes(1);
         expect(first).toEqual(second);
-        expect(first).toHaveLength(1);
+        expect(first).toHaveLength(2);
     });
 
     it('expires the cache after the TTL so a later call respawns the app-server', async () => {

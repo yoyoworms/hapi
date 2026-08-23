@@ -8,6 +8,7 @@ import {
     supportsReasoningSummary
 } from './appServerConfig';
 import { codexSystemPrompt } from './systemPrompt';
+import { HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID } from '../hapiContextPolicy';
 
 describe('appServerConfig', () => {
     const mcpServers = { hapi: { command: 'node', args: ['mcp'] } };
@@ -185,6 +186,41 @@ describe('appServerConfig', () => {
             },
             developer_instructions: codexSystemPrompt,
             model_reasoning_effort: 'ultra'
+        });
+    });
+
+    it('maps the selectable Sol 1M variant to upstream Sol with per-thread context config', () => {
+        const thread = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
+                collaborationMode: 'default'
+            },
+            mcpServers
+        });
+        expect(thread.model).toBe('gpt-5.6-sol');
+        expect(thread.config).toMatchObject({
+            model_context_window: 1_000_000,
+            model_auto_compact_token_limit: 900_000,
+            model_auto_compact_token_limit_scope: 'total'
+        });
+
+        const turn = buildTurnStartParams({
+            threadId: 'thread-1',
+            message: 'hello',
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
+                collaborationMode: 'default'
+            }
+        });
+        expect(turn.collaborationMode?.settings.model).toBe('gpt-5.6-sol');
+        expect(turn.config).toEqual({
+            model_context_window: 1_000_000,
+            model_auto_compact_token_limit: 900_000,
+            model_auto_compact_token_limit_scope: 'total'
         });
     });
 

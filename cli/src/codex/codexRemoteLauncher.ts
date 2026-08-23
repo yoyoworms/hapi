@@ -30,6 +30,7 @@ import {
     type RemoteLauncherExitReason
 } from '@/modules/common/remote/RemoteLauncherBase';
 import { CodexConversationHistory } from './conversationHistory';
+import { resolveHapiCodexModel } from './hapiContextPolicy';
 
 
 async function registerGeneratedImageFromPathWrapper(args: { id: string; path: string; fileName?: string | null }): Promise<Awaited<ReturnType<typeof registerGeneratedImageFromPath>> | null> {
@@ -765,14 +766,19 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             return false;
         };
 
-        const applyResolvedModel = (value: unknown): string | undefined => {
+        const applyResolvedModel = (value: unknown, requestedModel?: string | null): string | undefined => {
             const resolvedModel = asString(value) ?? undefined;
             if (!resolvedModel) {
                 return undefined;
             }
-            session.setModel(resolvedModel);
-            logger.debug(`[Codex] Resolved app-server model: ${resolvedModel}`);
-            return resolvedModel;
+            const requested = requestedModel?.trim();
+            const requestedSpec = resolveHapiCodexModel(requested);
+            const selectedModel = requested && requestedSpec?.model === resolvedModel
+                ? requested
+                : resolvedModel;
+            session.setModel(selectedModel);
+            logger.debug(`[Codex] Resolved app-server model: ${resolvedModel} (selected=${selectedModel})`);
+            return selectedModel;
         };
 
         const buildMcpToolName = (server: unknown, tool: unknown): string | null => {
@@ -4160,7 +4166,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const resumeRecord = asRecord(resumeResponse);
                 const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                 const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                applyResolvedModel(resumeRecord?.model);
+                applyResolvedModel(resumeRecord?.model, mode.model);
                 this.currentThreadId = threadId;
                 this.conversationHistory.setThreadId(threadId);
                 void this.conversationHistory.probeCapabilities().catch(() => {});
@@ -4227,7 +4233,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     const resumeRecord = asRecord(resumeResponse);
                     const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                     const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                    applyResolvedModel(resumeRecord?.model);
+                    applyResolvedModel(resumeRecord?.model, mode.model);
                     this.currentThreadId = threadId;
                     this.conversationHistory.setThreadId(threadId);
                     void this.conversationHistory.probeCapabilities().catch(() => {});
@@ -4257,7 +4263,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadRecord = asRecord(threadResponse);
                 const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                 const threadId = asString(thread?.id);
-                applyResolvedModel(threadRecord?.model);
+                applyResolvedModel(threadRecord?.model, mode.model);
                 if (!threadId) {
                     throw new Error('app-server thread/start did not return thread.id');
                 }
@@ -4545,7 +4551,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             const responseRecord = asRecord(response);
                             const responseThread = responseRecord ? asRecord(responseRecord.thread) : null;
                             threadId = asString(responseThread?.id) ?? resumeCandidate;
-                            applyResolvedModel(responseRecord?.model);
+                            applyResolvedModel(responseRecord?.model, message.mode.model);
                             logger.debug(shouldForkImportedSource
                                 ? `[Codex] Forked imported app-server thread ${resumeCandidate} -> ${threadId}`
                                 : `[Codex] Resumed app-server thread ${threadId}`);
@@ -4573,7 +4579,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         const threadRecord = asRecord(threadResponse);
                         const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                         threadId = asString(thread?.id);
-                        applyResolvedModel(threadRecord?.model);
+                        applyResolvedModel(threadRecord?.model, message.mode.model);
                         if (!threadId) {
                             throw new Error('app-server thread/start did not return thread.id');
                         }

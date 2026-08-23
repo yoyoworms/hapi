@@ -24,6 +24,10 @@ describe('getContextBudgetTokens', () => {
         expect(getContextBudgetTokens('gpt-5.4', 'codex')).toBe(343_400)
     })
 
+    it('uses the large Codex budget for the selectable Sol 1M variant', () => {
+        expect(getContextBudgetTokens('gpt-5.6-sol[1m]', 'codex')).toBe(990_000)
+    })
+
     it('parses context budget from Cursor wire ids', () => {
         expect(getContextBudgetTokens('composer-2.5-fast[context=300k]', 'cursor')).toBe(290_000)
     })

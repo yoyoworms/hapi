@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { logger } from '@/ui/logger';
+import type { CodexModelSummary } from '@hapi/protocol/apiTypes';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== 'object') {
@@ -13,15 +14,23 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 export const HAPI_CODEX_CONTEXT_DEFAULTS = {
-    // GPT-5.6 Sol's published model context is 1.05M tokens. Keep a small
-    // headroom below that model limit for Codex's effective-window reserve.
+    // Keep the existing HAPI default. The 1M Sol variant is an explicit
+    // picker option and is applied per thread/turn rather than globally.
+    contextWindow: 372_000,
+    autoCompactTokenLimit: 330_000,
+    autoCompactTokenLimitScope: 'total'
+} as const;
+
+export const HAPI_CODEX_SOL_MODEL_ID = 'gpt-5.6-sol';
+export const HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID = 'gpt-5.6-sol[1m]';
+export const HAPI_CODEX_SOL_ONE_MILLION_CONTEXT = {
     contextWindow: 1_000_000,
     autoCompactTokenLimit: 900_000,
     autoCompactTokenLimitScope: 'total'
 } as const;
 
 const HAPI_CODEX_CONTEXT_CATALOG_MODELS = new Set([
-    'gpt-5.6-sol'
+    HAPI_CODEX_SOL_MODEL_ID
 ]);
 
 type CodexModelCatalog = {
@@ -52,15 +61,89 @@ function atLeast(value: unknown, minimum: number): number {
         : minimum;
 }
 
+export type HapiCodexModelSpec = {
+    model: string;
+    contextWindow?: number;
+    autoCompactTokenLimit?: number;
+    autoCompactTokenLimitScope?: 'total';
+};
+
+/**
+ * Resolve HAPI-only model variants to the upstream Codex model id and the
+ * per-thread context settings that should accompany the request.
+ */
+export function resolveHapiCodexModel(model: string | null | undefined): HapiCodexModelSpec | null {
+    const normalized = model?.trim();
+    if (!normalized) {
+        return null;
+    }
+    if (normalized === HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID) {
+        return {
+            model: HAPI_CODEX_SOL_MODEL_ID,
+            contextWindow: HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.contextWindow,
+            autoCompactTokenLimit: HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.autoCompactTokenLimit,
+            autoCompactTokenLimitScope: HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.autoCompactTokenLimitScope
+        };
+    }
+    return {
+        model: normalized,
+        contextWindow: HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow,
+        autoCompactTokenLimit: HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit,
+        autoCompactTokenLimitScope: HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope
+    };
+}
+
+/** Add the selectable 1M Sol row without inventing an upstream model id. */
+export function addHapiCodexModelVariants(models: readonly CodexModelSummary[]): CodexModelSummary[] {
+    if (!models.some((model) => model.id === HAPI_CODEX_SOL_MODEL_ID)
+        || models.some((model) => model.id === HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID)) {
+        return [...models];
+    }
+
+    const sol = models.find((model) => model.id === HAPI_CODEX_SOL_MODEL_ID)!;
+    const variant: CodexModelSummary = {
+        ...sol,
+        id: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
+        displayName: `${sol.displayName} (1M)`,
+        isDefault: false
+    };
+    const solIndex = models.indexOf(sol);
+    return [
+        ...models.slice(0, solIndex + 1),
+        variant,
+        ...models.slice(solIndex + 1)
+    ];
+}
+
+export function buildHapiCodexModelContextConfig(model: string | null | undefined): Record<string, unknown> {
+    const spec = resolveHapiCodexModel(model);
+    if (!spec?.contextWindow) {
+        return {};
+    }
+    return {
+        model_context_window: spec.contextWindow,
+        model_auto_compact_token_limit: spec.autoCompactTokenLimit,
+        model_auto_compact_token_limit_scope: spec.autoCompactTokenLimitScope
+    };
+}
+
+export function buildHapiCodexModelContextArgs(model: string | null | undefined): string[] {
+    const config = buildHapiCodexModelContextConfig(model);
+    return Object.entries(config).flatMap(([key, value]) => [
+        '-c',
+        `${key}=${typeof value === 'string' ? JSON.stringify(value) : String(value)}`
+    ]);
+}
+
 /**
  * Codex clamps `model_context_window` to the selected model catalog entry's
- * `max_context_window`. The ChatGPT account catalog can advertise a smaller
- * rollout cap than the model's published 1.05M context, so the CLI override
- * alone may still resolve to that smaller cap (after Codex's effective-window
- * reserve).
+ * `max_context_window`. Keep the regular catalog rows at HAPI's historical
+ * 372K default, while giving Sol enough max-capacity for the explicit 1M
+ * picker variant. The `context_window` field remains the default for the base
+ * model; the variant supplies its 1M override in thread/turn config.
  *
- * Keep the complete account catalog and only raise metadata for models covered
- * by HAPI's explicit context policy. Larger user-provided values are preserved.
+ * Keep the complete account catalog. Larger user-provided values are preserved,
+ * while smaller rows are raised to HAPI's historical default floor.
  */
 export function applyHapiCodexContextCatalogPolicy(value: unknown): CodexModelCatalog | null {
     const catalog = parseCodexModelCatalog(value);
@@ -70,12 +153,6 @@ export function applyHapiCodexContextCatalogPolicy(value: unknown): CodexModelCa
     return {
         ...catalog,
         models: catalog.models.map((model) => {
-            if (
-                typeof model.slug !== 'string'
-                || !HAPI_CODEX_CONTEXT_CATALOG_MODELS.has(model.slug)
-            ) {
-                return model;
-            }
             return {
                 ...model,
                 context_window: atLeast(
@@ -84,7 +161,9 @@ export function applyHapiCodexContextCatalogPolicy(value: unknown): CodexModelCa
                 ),
                 max_context_window: atLeast(
                     model.max_context_window,
-                    HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
+                    HAPI_CODEX_CONTEXT_CATALOG_MODELS.has(model.slug as string)
+                        ? HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.contextWindow
+                        : HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
                 )
             };
         })

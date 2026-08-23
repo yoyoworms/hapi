@@ -10,7 +10,11 @@ import { getCodexSystemPrompt } from './utils/systemPrompt';
 import type { ReasoningEffort } from './appServerTypes';
 import { resolveCodexCommand } from './utils/codexExecutable';
 import type { McpServersConfig } from './utils/buildHapiMcpBridge';
-import { prepareHapiCodexContextArgs } from './hapiContextPolicy';
+import {
+    buildHapiCodexModelContextArgs,
+    prepareHapiCodexContextArgs,
+    resolveHapiCodexModel
+} from './hapiContextPolicy';
 
 export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
     if (!sessionMatchToken) return instructions;
@@ -138,8 +142,9 @@ export async function codexLocal(opts: {
         opts.onSessionFound(opts.sessionId);
     }
 
-    if (opts.model) {
-        args.push('--model', opts.model);
+    const modelSpec = resolveHapiCodexModel(opts.model);
+    if (modelSpec?.model) {
+        args.push('--model', modelSpec.model);
     }
 
     if (opts.modelReasoningEffort) {
@@ -182,9 +187,10 @@ export async function codexLocal(opts: {
     const codexCommand = resolveCodexCommand();
     const contextArgs = prepareHapiCodexContextArgs(codexCommand, process.env);
 
+    const modelContextArgs = buildHapiCodexModelContextArgs(opts.model);
     await spawnWithTerminalGuard({
         command: codexCommand.command,
-        args: [...codexCommand.args, ...contextArgs, ...args],
+        args: [...codexCommand.args, ...contextArgs, ...modelContextArgs, ...args],
         cwd: opts.path,
         env: process.env,
         signal: opts.abort,

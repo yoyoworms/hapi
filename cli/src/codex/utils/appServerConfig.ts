@@ -12,6 +12,10 @@ import type {
     UserInput
 } from '../appServerTypes';
 import { resolveCodexPermissionModeConfig } from './permissionModeConfig';
+import {
+    buildHapiCodexModelContextConfig,
+    resolveHapiCodexModel
+} from '../hapiContextPolicy';
 
 export const codexCollaborationSpawnAgentInstructions = [
     'Codex sub-agent spawning rules:',
@@ -209,10 +213,12 @@ export function buildThreadStartParams(args: {
         baseInstructions,
         developerInstructions: resolvedDeveloperInstructions
     } = resolveInstructions(args);
+    const modelSpec = resolveHapiCodexModel(args.mode.model);
     const configWithInstructions = {
         ...config,
         developer_instructions: resolvedDeveloperInstructions,
-        ...(args.mode.modelReasoningEffort ? { model_reasoning_effort: args.mode.modelReasoningEffort } : {})
+        ...(args.mode.modelReasoningEffort ? { model_reasoning_effort: args.mode.modelReasoningEffort } : {}),
+        ...buildHapiCodexModelContextConfig(args.mode.model)
     };
 
     const params: ThreadStartParams = {
@@ -224,8 +230,8 @@ export function buildThreadStartParams(args: {
         ...(Object.keys(configWithInstructions).length > 0 ? { config: configWithInstructions } : {})
     };
 
-    if (args.mode.model) {
-        params.model = args.mode.model;
+    if (modelSpec?.model) {
+        params.model = modelSpec.model;
     }
     if (args.mode.personality) {
         params.personality = args.mode.personality;
@@ -285,7 +291,8 @@ export function buildTurnStartParams(args: {
     const collaborationMode = args.overrides?.suppressCollaborationMode
         ? undefined
         : args.mode?.collaborationMode;
-    const model = args.overrides?.model ?? args.mode?.model;
+    const requestedModel = args.overrides?.model ?? args.mode?.model;
+    const model = resolveHapiCodexModel(requestedModel)?.model;
     const modelReasoningEffort = args.mode?.modelReasoningEffort;
 
     if (modelReasoningEffort) {
@@ -311,6 +318,11 @@ export function buildTurnStartParams(args: {
         };
     } else if (model) {
         params.model = model;
+    }
+
+    const modelConfig = buildHapiCodexModelContextConfig(requestedModel);
+    if (Object.keys(modelConfig).length > 0) {
+        params.config = modelConfig;
     }
 
     const turnServiceTier = toAppServerServiceTier(args.mode?.serviceTier);
