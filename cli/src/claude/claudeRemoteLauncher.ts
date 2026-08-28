@@ -11,8 +11,10 @@ import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { PLAN_FAKE_REJECT } from "./sdk/prompts";
 import { EnhancedMode } from "./loop";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
-import type { ClaudePermissionMode } from "@hapi/protocol/types";
+import type { AgentAccountStatus, ClaudePermissionMode } from "@hapi/protocol/types";
 import { applySessionTitleFallback } from './utils/sessionTitleFallback';
+import { ClaudeAccountStatusTracker } from './utils/claudeAccountStatus';
+import { CLAUDE_USAGE_REFRESH_INTERVAL_MS, fetchClaudeUsage } from './utils/claudeUsage';
 import {
     RemoteLauncherBase,
     type RemoteLauncherDisplayContext,
@@ -159,10 +161,62 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
         let planModeToolCalls = new Set<string>();
         let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
+        const accountStatusTracker = new ClaudeAccountStatusTracker();
+        let publishedAccountStatus: AgentAccountStatus | null = null;
+        const mergeAccountLimit = (
+            previous: AgentAccountStatus['window'] | undefined,
+            next: AgentAccountStatus['window'] | undefined
+        ): AgentAccountStatus['window'] => {
+            if (!next) return previous ?? null;
+            return { ...previous, ...next };
+        };
+        const publishAccountStatus = (accountStatus: AgentAccountStatus): void => {
+            // SDK rate-limit events often contain only one bucket. Preserve
+            // the other bucket already fetched from the OAuth usage endpoint.
+            const merged: AgentAccountStatus = {
+                ...publishedAccountStatus,
+                ...accountStatus,
+                accountLabel: accountStatus.accountLabel ?? publishedAccountStatus?.accountLabel,
+                window: mergeAccountLimit(publishedAccountStatus?.window, accountStatus.window),
+                weekly: mergeAccountLimit(publishedAccountStatus?.weekly, accountStatus.weekly),
+                updatedAt: accountStatus.updatedAt
+            };
+            publishedAccountStatus = merged;
+            session.client.sendSessionEvent({
+                type: 'account-status',
+                accountStatus: merged
+            });
+        };
+        let usageRefreshInFlight = false;
+        const refreshClaudeUsage = async (): Promise<void> => {
+            if (usageRefreshInFlight || this.exitReason) return;
+            usageRefreshInFlight = true;
+            try {
+                const accountStatus = await fetchClaudeUsage(session.claudeEnvVars?.CLAUDE_CONFIG_DIR);
+                if (accountStatus) {
+                    publishAccountStatus(accountStatus);
+                }
+            } catch (error) {
+                // Usage is supplementary; Claude operation must continue when
+                // the private OAuth endpoint is unavailable.
+                logger.debug(`[remote]: Claude usage refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+            } finally {
+                usageRefreshInFlight = false;
+            }
+        };
+        void refreshClaudeUsage();
+        const usageRefreshTimer = setInterval(() => {
+            void refreshClaudeUsage();
+        }, CLAUDE_USAGE_REFRESH_INTERVAL_MS);
 
         function onMessage(message: SDKMessage) {
             formatClaudeMessageForInk(message, messageBuffer);
             permissionHandler.onMessage(message);
+
+            const accountStatus = accountStatusTracker.update(message);
+            if (accountStatus) {
+                publishAccountStatus(accountStatus);
+            }
 
             if (message.type === 'assistant') {
                 let umessage = message as SDKAssistantMessage;
@@ -657,6 +711,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 }
             }
         } finally {
+            clearInterval(usageRefreshTimer);
             if (this.permissionHandler) {
                 this.permissionHandler.reset();
             }
