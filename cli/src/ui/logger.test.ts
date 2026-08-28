@@ -55,3 +55,19 @@ describe('Logger.debugLargeJson', () => {
         expect(contents).not.toContain('sentinel-')
     })
 })
+
+describe('Logger.debug', () => {
+    it('serializes errors and circular values without throwing', () => {
+        const { logger, path } = createLogger()
+        const details: { self?: unknown } = {}
+        details.self = details
+        const error = new Error('codex model discovery failed', { cause: details })
+
+        expect(() => logger.debug('Codex failure', error, details, 1n)).not.toThrow()
+
+        const contents = readFileSync(path, 'utf8')
+        expect(contents).toContain('codex model discovery failed')
+        expect(contents).toContain('[Circular]')
+        expect(contents).toContain('"1"')
+    })
+})
