@@ -5,6 +5,7 @@ REMOTE_HOST="${REMOTE_HOST:-ubuntu@liuxinhapi.1to10.cn}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/hapi-liuxin-src}"
 REMOTE_PM2_APP="${REMOTE_PM2_APP:-hapi-hub-liuxin}"
 REMOTE_BUN="${REMOTE_BUN:-/home/ubuntu/.bun/bin/bun}"
+REMOTE_BUN_REGISTRY="${REMOTE_BUN_REGISTRY:-https://registry.npmjs.org}"
 PUBLIC_URL="${PUBLIC_URL:-https://liuxinhapi.1to10.cn}"
 BACKUP_DIR="${BACKUP_DIR:-/home/ubuntu}"
 SSH_OPTS="${SSH_OPTS:-}"
@@ -36,6 +37,7 @@ Environment overrides:
   REMOTE_DIR=$REMOTE_DIR
   REMOTE_PM2_APP=$REMOTE_PM2_APP
   REMOTE_BUN=$REMOTE_BUN
+  REMOTE_BUN_REGISTRY=$REMOTE_BUN_REGISTRY
   PUBLIC_URL=$PUBLIC_URL
   SSH_OPTS="$SSH_OPTS"
   SMOKE_ATTEMPTS=$SMOKE_ATTEMPTS
@@ -201,7 +203,7 @@ run rsync "${RSYNC_ARGS[@]}" ./ "$REMOTE_HOST:$REMOTE_DIR/"
 
 if [[ "$SKIP_INSTALL" != "1" ]]; then
     log "Installing locked dependencies on remote"
-    remote "set -e; export PATH=\"$(dirname "$REMOTE_BUN"):\$PATH\"; cd '$REMOTE_DIR'; if [ -d node_modules/.bun ] || [ -d web/node_modules/.bun ] || [ -d hub/node_modules/.bun ] || [ -d cli/node_modules/.bun ]; then echo 'mixed Bun dependency layout detected; reinstalling all workspaces cleanly'; rm -rf node_modules web/node_modules hub/node_modules cli/node_modules shared/node_modules website/node_modules docs/node_modules; fi; '$REMOTE_BUN' install --frozen-lockfile"
+    remote "set -e; export PATH=\"$(dirname "$REMOTE_BUN"):\$PATH\"; cd '$REMOTE_DIR'; if [ -d node_modules/.bun ] || [ -d web/node_modules/.bun ] || [ -d hub/node_modules/.bun ] || [ -d cli/node_modules/.bun ]; then echo 'mixed Bun dependency layout detected; reinstalling all workspaces cleanly'; rm -rf node_modules web/node_modules hub/node_modules cli/node_modules shared/node_modules website/node_modules docs/node_modules; fi; '$REMOTE_BUN' install --frozen-lockfile --registry '$REMOTE_BUN_REGISTRY'"
 else
     warn "Skipping remote bun install"
 fi

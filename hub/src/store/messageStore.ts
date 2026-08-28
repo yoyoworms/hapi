@@ -5,7 +5,9 @@ import {
     addMessage,
     addImportedMessage,
     cancelQueuedMessage,
+    deleteLiveReasoningSnapshots,
     deleteQueuedMessageById,
+    claimIndeterminateMessage,
     lookupQueuedMessage,
     getMessages,
     getFirstMessages,
@@ -25,6 +27,8 @@ import {
     countMessages,
     pruneOldMessages,
     markMessagesInvoked,
+    markMessagesIndeterminate,
+    setMessagesDeliveryState,
     markUninvokedImmediateMessages,
     mergeSessionMessages,
     moveUninvokedScheduledMessages,
@@ -52,13 +56,17 @@ export class MessageStore {
         return addMessage(this.db, sessionId, content, localId, scheduledAt, createdAt)
     }
 
+    deleteLiveReasoningSnapshots(sessionId: string, streamId: string, keepMessageId?: string): number {
+        return deleteLiveReasoningSnapshots(this.db, sessionId, streamId, keepMessageId)
+    }
+
     addImportedMessage(sessionId: string, content: unknown, localId: string, createdAt: number): { message: StoredMessage; inserted: boolean } {
         return addImportedMessage(this.db, sessionId, content, localId, createdAt)
     }
 
     copyMessageToSession(
         sessionId: string,
-        message: Pick<StoredMessage, 'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt'>
+        message: Pick<StoredMessage, 'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt' | 'deliveryState'>
     ): StoredMessage {
         // 中文注释：重复会话合并时需要保留源消息的时间戳和排队信息，因此走专门的复制入口而不是普通 addMessage。
         return copyStoredMessageToSession(this.db, sessionId, message)
@@ -66,7 +74,7 @@ export class MessageStore {
 
     copyMessagesToSession(
         sessionId: string,
-        messages: Array<Pick<StoredMessage, 'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt'>>
+        messages: Array<Pick<StoredMessage, 'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt' | 'deliveryState'>>
     ): number {
         return copyStoredMessagesToSession(this.db, sessionId, messages)
     }
@@ -124,8 +132,8 @@ export class MessageStore {
         return getLocalMessageStates(this.db, sessionId, localIds)
     }
 
-    getUninvokedLocalMessages(sessionId: string): StoredMessage[] {
-        return getUninvokedLocalMessages(this.db, sessionId)
+    getUninvokedLocalMessages(sessionId: string, options?: { deliverableOnly?: boolean }): StoredMessage[] {
+        return getUninvokedLocalMessages(this.db, sessionId, options)
     }
 
     getMatureScheduledMessages(beforeTime: number): StoredMessage[] {
@@ -168,8 +176,20 @@ export class MessageStore {
         return deleteQueuedMessageById(this.db, sessionId, messageId)
     }
 
+    claimIndeterminateMessage(sessionId: string, messageId: string): StoredMessage | null {
+        return claimIndeterminateMessage(this.db, sessionId, messageId)
+    }
+
     markMessagesInvoked(sessionId: string, localIds: string[], invokedAt: number): number {
         return markMessagesInvoked(this.db, sessionId, localIds, invokedAt)
+    }
+
+    markMessagesIndeterminate(sessionId: string, localIds: string[]): number {
+        return markMessagesIndeterminate(this.db, sessionId, localIds)
+    }
+
+    setMessagesDeliveryState(sessionId: string, localIds: string[], state: 'queued' | 'dispatching' | 'indeterminate'): number {
+        return setMessagesDeliveryState(this.db, sessionId, localIds, state)
     }
 
     markUninvokedImmediateMessages(sessionId: string, invokedAt: number): string[] {

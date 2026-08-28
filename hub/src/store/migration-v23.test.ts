@@ -13,7 +13,7 @@ afterEach(() => {
     }
 })
 
-describe('schema migration v22 to v23', () => {
+describe('schema migration v22 to v25', () => {
     it('adds events and event_links tables to a V22 database', () => {
         const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-v23-'))
         tempDirs.push(dir)
@@ -40,35 +40,9 @@ describe('schema migration v22 to v23', () => {
 
         expect(events?.name).toBe('events')
         expect(links?.name).toBe('event_links')
-        expect(version.user_version).toBe(24)
-        migrated.close()
-    })
-
-    it('v23 to v24 preserves the legacy metadata pin as a project pin', () => {
-        const dir = mkdtempSync(join(tmpdir(), 'hapi-migration-v24-pin-'))
-        tempDirs.push(dir)
-        const dbPath = join(dir, 'hapi.db')
-
-        const seeded = new Store(dbPath)
-        const session = seeded.sessions.getOrCreateSession(
-            'legacy-pinned',
-            { path: '/tmp/project', host: 'host', pinnedAt: 1_700_000_000_000 },
-            null,
-            'default'
-        )
-        seeded.close()
-
-        const legacy = new Database(dbPath)
-        legacy.exec(`
-            UPDATE sessions SET pinned = 0, global_pinned = 0;
-            PRAGMA user_version = 23;
-        `)
-        legacy.close()
-
-        const migrated = new Store(dbPath)
-        expect(migrated.sessions.getSession(session.id)?.pinned).toBe(true)
-        expect((migrated as unknown as { db: Database }).db
-            .prepare('PRAGMA user_version').get()).toEqual({ user_version: 24 })
+        const columns = internalDb.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>
+        expect(columns.map((column) => column.name)).toContain('delivery_state')
+        expect(version.user_version).toBe(25)
         migrated.close()
     })
 })

@@ -1,7 +1,11 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
     addHapiCodexModelVariants,
     applyHapiCodexContextCatalogPolicy,
+    codexEndpointNeedsInlineTools,
     buildHapiCodexModelContextArgs,
     buildHapiCodexModelContextConfig,
     buildCodexAppServerArgs,
@@ -123,6 +127,101 @@ describe('HAPI Sol model variant', () => {
             model_context_window: 372_000,
             model_auto_compact_token_limit: 330_000,
             model_auto_compact_token_limit_scope: 'total'
+        });
+    });
+});
+
+describe('inline tool fallback for third-party Codex endpoints', () => {
+    const writeCodexHome = (configToml: string): string => {
+        const home = mkdtempSync(join(tmpdir(), 'hapi-codex-home-'));
+        writeFileSync(join(home, 'config.toml'), configToml, 'utf8');
+        return home;
+    };
+
+    it('detects a relay endpoint that cannot inject server-side tools', () => {
+        const home = writeCodexHome([
+            'model = "gpt-5.6-sol"',
+            'model_provider = "hapi_endpoint"',
+            '',
+            '[model_providers.hapi_endpoint]',
+            'base_url = "https://relay.example.com/v1"',
+            'wire_api = "responses"'
+        ].join('\n'));
+
+        expect(codexEndpointNeedsInlineTools(home)).toBe(true);
+    });
+
+    it('leaves the official endpoint on the responses-lite path', () => {
+        const official = writeCodexHome([
+            'model_provider = "openai"',
+            '',
+            '[model_providers.openai]',
+            'base_url = "https://api.openai.com/v1"'
+        ].join('\n'));
+        const defaultProvider = writeCodexHome('model = "gpt-5.6-sol"');
+
+        expect(codexEndpointNeedsInlineTools(official)).toBe(false);
+        expect(codexEndpointNeedsInlineTools(defaultProvider)).toBe(false);
+        expect(codexEndpointNeedsInlineTools(join(tmpdir(), 'hapi-codex-home-missing'))).toBe(false);
+    });
+
+    it('ignores a base_url that belongs to an unselected provider', () => {
+        const home = writeCodexHome([
+            'model_provider = "openai"',
+            '',
+            '[model_providers.relay]',
+            'base_url = "https://relay.example.com/v1"'
+        ].join('\n'));
+
+        expect(codexEndpointNeedsInlineTools(home)).toBe(false);
+    });
+
+    it('forces inline instructions and tools for the GPT-5.6 family', () => {
+        const result = applyHapiCodexContextCatalogPolicy({
+            models: [{
+                slug: 'gpt-5.6-sol',
+                context_window: 272_000,
+                max_context_window: 272_000,
+                use_responses_lite: true,
+                tool_mode: 'code_mode_only'
+            }, {
+                slug: 'gpt-5.5',
+                context_window: 272_000,
+                max_context_window: 272_000,
+                use_responses_lite: false,
+                tool_mode: null
+            }]
+        }, { inlineTools: true });
+
+        expect(result?.models).toEqual([{
+            slug: 'gpt-5.6-sol',
+            context_window: 372_000,
+            max_context_window: 1_000_000,
+            use_responses_lite: false,
+            tool_mode: null
+        }, {
+            slug: 'gpt-5.5',
+            context_window: 372_000,
+            max_context_window: 372_000,
+            use_responses_lite: false,
+            tool_mode: null
+        }]);
+    });
+
+    it('leaves the catalog request shape untouched by default', () => {
+        const result = applyHapiCodexContextCatalogPolicy({
+            models: [{
+                slug: 'gpt-5.6-sol',
+                context_window: 272_000,
+                max_context_window: 272_000,
+                use_responses_lite: true,
+                tool_mode: 'code_mode_only'
+            }]
+        });
+
+        expect(result?.models[0]).toMatchObject({
+            use_responses_lite: true,
+            tool_mode: 'code_mode_only'
         });
     });
 });
