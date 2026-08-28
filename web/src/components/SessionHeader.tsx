@@ -31,6 +31,7 @@ import { useMinuteTick } from '@/hooks/useMinuteTick'
 import { useOptionalAppContext } from '@/lib/app-context'
 import { seedMessageWindowFromSession, syncTailMessages } from '@/lib/message-window-store'
 import { CodexAccountSwitchDialog } from '@/components/CodexAccountSwitchDialog'
+import { markSessionUnread } from '@/lib/sessionLastSeen'
 
 /** Same preference order as session-list chips: display label → host → short id. */
 export function resolveSessionHeaderMachineLabel(
@@ -556,6 +557,7 @@ export function SessionHeader(props: {
                 sessionPinned={Boolean(session.pinned)}
                 sessionGlobalPinned={Boolean(session.globalPinned)}
                 onRename={() => setRenameOpen(true)}
+                onMarkUnread={() => markSessionUnread(session.id, session.updatedAt)}
                 onSetPinMode={api ? (mode) => void handleSetPinMode(mode) : undefined}
                 onRestart={api ? () => setRestartOpen(true) : undefined}
                 onExport={() => setExportOpen(true)}

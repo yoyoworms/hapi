@@ -6,6 +6,7 @@
  */
 
 import { AsyncLock } from '@/utils/lock';
+import { isClaudeChatVisibleMessage } from './chatVisibility';
 
 interface QueueItem {
     id: number;                    // Incremental ID for ordering
@@ -114,10 +115,10 @@ export class OutgoingMessageQueue {
         const toSend: QueueItem[] = [];
         for (const item of this.queue) {
             if (!item.released) {
-                continue;
+                break;
             }
             if (!item.sent) {
-                if (item.logMessage.type !== 'system' && !item.logMessage.isMeta && !item.logMessage.isCompactSummary) {
+                if (isClaudeChatVisibleMessage(item.logMessage) && !item.logMessage.isMeta && !item.logMessage.isCompactSummary) {
                     toSend.push(item);
                 }
                 item.sent = true;
@@ -130,11 +131,9 @@ export class OutgoingMessageQueue {
         if (toSend.length > 0) {
             const promises: Promise<void>[] = [];
             for (const item of toSend) {
-                if (item.logMessage.type !== 'system') {
-                    const result = this.sendFunction(item.logMessage);
-                    if (result instanceof Promise) {
-                        promises.push(result);
-                    }
+                const result = this.sendFunction(item.logMessage);
+                if (result instanceof Promise) {
+                    promises.push(result);
                 }
             }
             if (promises.length > 0) {
@@ -176,7 +175,7 @@ export class OutgoingMessageQueue {
             const promises: Promise<void>[] = [];
             for (const item of this.queue) {
                 if (!item.sent) {
-                    if (item.logMessage.type === 'system' || item.logMessage.isMeta || item.logMessage.isCompactSummary) {
+                    if (!isClaudeChatVisibleMessage(item.logMessage) || item.logMessage.isMeta || item.logMessage.isCompactSummary) {
                         item.sent = true;
                         continue;
                     }

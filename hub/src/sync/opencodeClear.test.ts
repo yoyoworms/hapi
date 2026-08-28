@@ -632,6 +632,12 @@ describe('SyncEngine.clearOpenCodeSession', () => {
                 undefined,
                 undefined,
                 // startingMode — not applicable to an OpenCode clear replacement
+                undefined,
+                // forkSession, sandbox, continueLatest, and Codex account fields
+                undefined,
+                undefined,
+                undefined,
+                undefined,
                 undefined
             )
             expect(engine.getSessionByNamespace(replacementSessionId, 'default')?.metadata).toMatchObject({

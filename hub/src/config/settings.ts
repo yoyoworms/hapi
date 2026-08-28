@@ -24,6 +24,16 @@ export interface Settings {
     publicUrl?: string
     corsOrigins?: string[]
     autoArchiveIdleHours?: number
+    // Push delivery (FCM + iOS/APNs) — persisted from env like the rest of
+    // this section; interpreted by fcmConfig.ts / iosPushConfig.ts.
+    fcmServiceAccountPath?: string
+    iosPushMode?: string
+    iosPushRelayUrl?: string
+    apnsKeyP8Path?: string
+    apnsKeyId?: string
+    apnsTeamId?: string
+    apnsBundleId?: string
+    apnsEnv?: string
     /** Per-hub relay auth key issued by the relay server (/issue) */
     relayAuthKey?: string
     /**

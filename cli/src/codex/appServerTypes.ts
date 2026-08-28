@@ -341,6 +341,8 @@ export interface TurnSteerParams {
      * completed or changed before the request arrived.
      */
     expectedTurnId: string;
+    /** Optional client identity echoed back as userMessage.clientId. */
+    clientUserMessageId?: string | null;
 }
 
 export interface TurnSteerResponse {
