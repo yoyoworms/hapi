@@ -31,7 +31,10 @@ import {
     type RemoteLauncherExitReason
 } from '@/modules/common/remote/RemoteLauncherBase';
 import { CodexConversationHistory } from './conversationHistory';
-import { resolveHapiCodexModel } from './hapiContextPolicy';
+import {
+    HAPI_CODEX_CONTEXT_DEFAULTS,
+    resolveHapiCodexModel
+} from './hapiContextPolicy';
 
 
 async function registerGeneratedImageFromPathWrapper(args: { id: string; path: string; fileName?: string | null }): Promise<Awaited<ReturnType<typeof registerGeneratedImageFromPath>> | null> {
@@ -4262,16 +4265,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             session.sendSessionEvent({ type: 'ready' });
         };
 
-        await appServerClient.connect();
-        await appServerClient.initialize({
-            clientInfo: {
-                name: 'hapi-codex-client',
-                version: '1.0.0'
-            },
-            capabilities: {
-                experimentalApi: true
-            }
-        });
+        const initializeAppServer = async () => {
+            await appServerClient.connect();
+            await appServerClient.initialize({
+                clientInfo: {
+                    name: 'hapi-codex-client',
+                    version: '1.0.0'
+                },
+                capabilities: {
+                    experimentalApi: true
+                }
+            });
+        };
+
+        await initializeAppServer();
 
         const publishConversationHistoryCapabilities = async () => {
             const conversationHistory = this.conversationHistory.getCapabilitiesForMetadata()?.conversationHistory;
@@ -4344,6 +4351,80 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         let hasThread = false;
         let pending: QueuedMessage | null = null;
         let suppressReadyForAdminCommand = false;
+        let appliedContextProfile: string | null = null;
+
+        const contextProfileForModel = (model: string | null | undefined): string => {
+            const spec = resolveHapiCodexModel(model);
+            return JSON.stringify({
+                contextWindow: spec?.contextWindow ?? HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow,
+                autoCompactTokenLimit: spec?.autoCompactTokenLimit ?? HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit,
+                autoCompactTokenLimitScope: spec?.autoCompactTokenLimitScope
+                    ?? HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope
+            });
+        };
+
+        const markAppliedContextProfile = (mode: EnhancedMode) => {
+            appliedContextProfile = contextProfileForModel(mode.model);
+        };
+
+        const ensureContextProfile = async (mode: EnhancedMode): Promise<void> => {
+            if (!hasThread || !this.currentThreadId) {
+                return;
+            }
+            const desiredProfile = contextProfileForModel(mode.model);
+            if (appliedContextProfile === null) {
+                // Every thread created/resumed by this launcher receives the
+                // current context config. This guard only covers legacy paths
+                // that attached a thread before profile tracking existed.
+                appliedContextProfile = desiredProfile;
+                return;
+            }
+            if (appliedContextProfile === desiredProfile) {
+                return;
+            }
+
+            const threadId = this.currentThreadId;
+            const threadParams = buildThreadStartParams({
+                cwd: session.path,
+                mode,
+                mcpServers,
+                cliOverrides: session.codexCliOverrides
+            });
+
+            // app-server 0.150 accepts arbitrary `config` only on thread
+            // lifecycle methods. turn/start ignores it, and thread/resume on
+            // an already-loaded thread merely rejoins without rebuilding its
+            // context settings. Restart the idle transport, then resume the
+            // same durable thread with the requested context profile.
+            logger.debug(
+                `[Codex] Restarting app-server to apply context profile; ` +
+                `threadId=${threadId} model=${mode.model ?? 'auto'}`
+            );
+            await appServerClient.disconnect();
+            await initializeAppServer();
+            const resumeResponse = await appServerClient.resumeThread({
+                threadId,
+                ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
+                    ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
+                    : {}),
+                ...threadParams
+            }, {
+                signal: this.abortController.signal
+            });
+            const resumeRecord = asRecord(resumeResponse);
+            const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
+            const resumedThreadId = asString(resumeThread?.id) ?? threadId;
+            if (resumedThreadId !== threadId) {
+                throw new Error(
+                    `Codex resumed unexpected thread ${resumedThreadId} while applying context profile to ${threadId}`
+                );
+            }
+            applyResolvedModel(resumeRecord?.model, mode.model);
+            this.currentThreadId = threadId;
+            this.conversationHistory.setThreadId(threadId);
+            session.onSessionFound(threadId);
+            appliedContextProfile = desiredProfile;
+        };
 
         this.cancelActiveRecovery = () => {
             if (!recoveryInFlight || turnInFlight) {
@@ -4525,6 +4606,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
+                markAppliedContextProfile(mode);
                 logger.debug(`[Codex] Resumed app-server thread ${threadId} for /compact`);
                 return threadId;
             } catch (error) {
@@ -4592,6 +4674,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
+                    markAppliedContextProfile(mode);
                     return threadId;
                 } catch (error) {
                     logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate} for /goal`, error);
@@ -4625,6 +4708,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
+                markAppliedContextProfile(mode);
                 return threadId;
             }
 
@@ -4953,6 +5037,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
+                    markAppliedContextProfile(message.mode);
                 } else {
                     if (!this.currentThreadId) {
                         logger.debug('[Codex] Missing thread id; restarting app-server thread');
@@ -4966,6 +5051,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     ...message.mode,
                     model: session.getModel() ?? message.mode.model
                 };
+                await ensureContextProfile(mode);
                 usageModel = typeof mode.model === 'string' && mode.model.trim()
                     ? mode.model.trim()
                     : null;
