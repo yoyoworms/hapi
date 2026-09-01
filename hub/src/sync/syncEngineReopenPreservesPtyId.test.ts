@@ -203,6 +203,42 @@ describe('SyncEngine reopen/resume PTY session id preservation', () => {
         expect(engine.getSessionByNamespace(sessionId, NAMESPACE)?.metadata?.lifecycleState).toBe('archived')
     })
 
+    it('retries a generic reopen once after a stale runner spawn acknowledgement', async () => {
+        const sessionId = insertSession(
+            'codex-session-stale-runner-generation',
+            baseMetadata({
+                flavor: 'codex',
+                codexSessionId: 'codex-native-stale-generation',
+                lifecycleState: 'archived',
+                archivedBy: 'hub',
+                archiveReason: 'inactivity',
+            }),
+            {}
+        ).id
+        let spawnCalls = 0
+        let activeChecks = 0
+        let stopCalls = 0
+        ;(engine as any).rpcGateway.spawnSession = async () => {
+            spawnCalls += 1
+            return { type: 'success', sessionId }
+        }
+        ;(engine as any).waitForSessionActive = async () => {
+            activeChecks += 1
+            return activeChecks === 2
+        }
+        ;(engine as any).rpcGateway.stopRunnerSession = async () => {
+            stopCalls += 1
+            return 'already_gone'
+        }
+
+        const result = await engine.reopenSession(sessionId, NAMESPACE)
+
+        expect(result).toEqual({ type: 'success', sessionId, resumed: true })
+        expect(spawnCalls).toBe(2)
+        expect(activeChecks).toBe(2)
+        expect(stopCalls).toBe(1)
+    })
+
     it('keeps a generic resume row fail-closed when child termination is unconfirmed', async () => {
         const sessionId = insertSession(
             'codex-session-active-timeout-still-alive',

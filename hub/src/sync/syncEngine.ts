@@ -3336,30 +3336,31 @@ export class SyncEngine {
             this.sessionReadyIds.delete(access.sessionId)
         }
         let piResumeSucceeded = false
+        const spawnResumeChild = () => this.rpcGateway.spawnSession(
+            targetMachine.id,
+            directory,
+            flavor,
+            session.model ?? undefined,
+            session.modelReasoningEffort ?? undefined,
+            undefined,
+            undefined,
+            undefined,
+            resumeToken,
+            session.effort ?? undefined,
+            preferredPermissionMode,
+            session.serviceTier ?? undefined,
+            access.sessionId,
+            session.collaborationMode ?? undefined,
+            session.copilotAgentMode ?? undefined,
+            resumedStartingMode,
+            undefined,
+            undefined,
+            useContinue || undefined,
+            targetCodexAccountId,
+            switchingCodexAccount ? sourceCodexAccountId : undefined
+        )
         try {
-            const spawnResult = await this.rpcGateway.spawnSession(
-                targetMachine.id,
-                directory,
-                flavor,
-                session.model ?? undefined,
-                session.modelReasoningEffort ?? undefined,
-                undefined,
-                undefined,
-                undefined,
-                resumeToken,
-                session.effort ?? undefined,
-                preferredPermissionMode,
-                session.serviceTier ?? undefined,
-                access.sessionId,
-                session.collaborationMode ?? undefined,
-                session.copilotAgentMode ?? undefined,
-                resumedStartingMode,
-                undefined,
-                undefined,
-                useContinue || undefined,
-                targetCodexAccountId,
-                switchingCodexAccount ? sourceCodexAccountId : undefined
-            )
+            let spawnResult = await spawnResumeChild()
 
             if (spawnResult.type !== 'success') {
                 if (requiresPiNativeReady) {
@@ -3397,7 +3398,7 @@ export class SyncEngine {
                 }
             }
 
-            const becameActive = await this.waitForSessionActive(spawnResult.sessionId)
+            let becameActive = await this.waitForSessionActive(spawnResult.sessionId)
             if (!becameActive) {
                 if (resumedStartingMode === 'pty') {
                     const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
@@ -3433,11 +3434,11 @@ export class SyncEngine {
                     // back.  The runner's stop response is not enough for
                     // `stopped`: wait until the Hub observes the child as
                     // inactive before allowing rollback.
-                    const stopped = await this.terminateFailedResumeChild(
+                    const termination = await this.terminateFailedResumeChild(
                         targetMachine.id,
                         spawnResult.sessionId
                     )
-                    if (!stopped) {
+                    if (termination === 'unconfirmed') {
                         return {
                             type: 'error',
                             message: 'Session failed to become active and the child is still active',
@@ -3445,8 +3446,42 @@ export class SyncEngine {
                             rollbackSafe: false,
                         }
                     }
+
+                    // A runner restored after restart can briefly retain the
+                    // previous generation's successful spawn acknowledgement.
+                    // In that case no new child is launched, the Hub active
+                    // barrier expires, and stop-session answers `already_gone`
+                    // from its verified-exit tombstone. The stop reconciles and
+                    // releases that stale generation, so one bounded retry is
+                    // safe and makes Reopen remain a one-click action. Do not
+                    // retry a child that was actually started and stopped: an
+                    // immediate crash is a real launch failure, not stale dedupe.
+                    if (termination === 'already_gone') {
+                        const retrySpawnResult = await spawnResumeChild()
+                        if (retrySpawnResult.type !== 'success') {
+                            return { type: 'error', message: retrySpawnResult.message, code: 'resume_failed' }
+                        }
+                        spawnResult = retrySpawnResult
+                        becameActive = await this.waitForSessionActive(spawnResult.sessionId)
+                        if (!becameActive) {
+                            const retryTermination = await this.terminateFailedResumeChild(
+                                targetMachine.id,
+                                spawnResult.sessionId
+                            )
+                            if (retryTermination === 'unconfirmed') {
+                                return {
+                                    type: 'error',
+                                    message: 'Session failed to become active and the child is still active',
+                                    code: 'resume_failed',
+                                    rollbackSafe: false,
+                                }
+                            }
+                        }
+                    }
                 }
-                return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
+                if (!becameActive) {
+                    return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
+                }
             }
 
             const needsReadyBeforeSuccess = resumedStartingMode === 'pty'
@@ -4073,16 +4108,19 @@ export class SyncEngine {
      * has observed the child as inactive; otherwise a late heartbeat could
      * revive the row after reopen restores its archive metadata.
      */
-    private async terminateFailedResumeChild(machineId: string, sessionId: string): Promise<boolean> {
+    private async terminateFailedResumeChild(
+        machineId: string,
+        sessionId: string
+    ): Promise<'stopped' | 'already_gone' | 'unconfirmed'> {
         let status: 'stopped' | 'already_gone' | 'still_alive'
         try {
             status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
         } catch {
-            return false
+            return 'unconfirmed'
         }
 
         if (status === 'still_alive') {
-            return false
+            return 'unconfirmed'
         }
 
         // `already_gone` is a verified runner tombstone.  There may still be
@@ -4094,10 +4132,12 @@ export class SyncEngine {
             if (current?.active) {
                 this.handleSessionEnd({ sid: sessionId, time: Date.now(), reason: 'error' })
             }
-            return !this.sessionCache.getSession(sessionId)?.active
+            return this.sessionCache.getSession(sessionId)?.active
+                ? 'unconfirmed'
+                : 'already_gone'
         }
 
-        return await this.waitForSessionInactive(sessionId)
+        return await this.waitForSessionInactive(sessionId) ? 'stopped' : 'unconfirmed'
     }
 
     private async terminateInPlacePiResume(

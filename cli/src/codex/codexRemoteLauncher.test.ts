@@ -7,6 +7,8 @@ const harness = vi.hoisted(() => ({
     dispatchNotification: null as ((method: string, params: unknown) => void) | null,
     registerRequestCalls: [] as string[],
     requestHandlers: new Map<string, (params: unknown) => Promise<unknown> | unknown>(),
+    connectCalls: 0,
+    disconnectCalls: 0,
     initializeCalls: [] as unknown[],
     setFeatureEnablementCalls: [] as unknown[],
     failSetFeatureEnablement: false,
@@ -164,7 +166,9 @@ vi.mock('./codexAppServerClient', () => {
         private notificationHandler: ((method: string, params: unknown) => void) | null = null;
         private stderrHandler: ((text: string) => void) | null = null;
 
-        async connect(): Promise<void> {}
+        async connect(): Promise<void> {
+            harness.connectCalls += 1;
+        }
 
         isConnected(): boolean {
             return true;
@@ -220,7 +224,10 @@ vi.mock('./codexAppServerClient', () => {
             const id = `thread-${harness.startThreadIds.length + 1}`;
             harness.startThreadIds.push(id);
             harness.startThreadParams.push(params ?? {});
-            return { thread: { id }, model: 'gpt-5.4' };
+            return {
+                thread: { id },
+                model: typeof params?.model === 'string' ? params.model : 'gpt-5.4'
+            };
         }
 
         async resumeThread(
@@ -250,7 +257,10 @@ vi.mock('./codexAppServerClient', () => {
             if (harness.failResumeThreadIds.includes(id)) {
                 throw new Error('resume failed');
             }
-            return { thread: { id }, model: 'gpt-5.4' };
+            return {
+                thread: { id },
+                model: typeof params?.model === 'string' ? params.model : 'gpt-5.4'
+            };
         }
 
         async readThread(params: { threadId: string; includeTurns?: boolean }): Promise<unknown> {
@@ -1210,7 +1220,9 @@ vi.mock('./codexAppServerClient', () => {
             return { thread: { id: threadId } };
         }
 
-        async disconnect(): Promise<void> {}
+        async disconnect(): Promise<void> {
+            harness.disconnectCalls += 1;
+        }
     }
 
     return {
@@ -1534,6 +1546,8 @@ describe('codexRemoteLauncher', () => {
         harness.dispatchNotification = null;
         harness.registerRequestCalls = [];
         harness.requestHandlers = new Map();
+        harness.connectCalls = 0;
+        harness.disconnectCalls = 0;
         harness.initializeCalls = [];
         harness.setFeatureEnablementCalls = [];
         harness.failSetFeatureEnablement = false;
@@ -1672,6 +1686,55 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(thinkingChanges).toContain(true);
         expect(session.thinking).toBe(false);
+    });
+
+    it('restarts and resumes the same thread when switching context profiles', async () => {
+        const baseMode = createMode();
+        const oneMillionMode: EnhancedMode = {
+            ...baseMode,
+            model: 'gpt-5.6-sol[1m]'
+        };
+        const { session } = createSessionStub(['base turn'], baseMode, false, false);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1']));
+
+        session.setModel(oneMillionMode.model!);
+        session.queue.push('large-context turn', oneMillionMode);
+
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1']));
+        session.setModel(baseMode.model!);
+        session.queue.push('base-context turn', baseMode);
+
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1', 'thread-1']));
+        session.queue.close();
+        await running;
+
+        expect(harness.connectCalls).toBe(3);
+        expect(harness.initializeCalls).toHaveLength(3);
+        expect(harness.resumeThreadIds).toEqual(['thread-1', 'thread-1']);
+        expect(harness.resumeThreadParams[0]).toMatchObject({
+            threadId: 'thread-1',
+            model: 'gpt-5.6-sol',
+            config: {
+                model_context_window: 1_000_000,
+                model_auto_compact_token_limit: 900_000,
+                model_auto_compact_token_limit_scope: 'total'
+            }
+        });
+        expect(harness.resumeThreadParams[1]).toMatchObject({
+            threadId: 'thread-1',
+            model: 'gpt-5.4',
+            config: {
+                model_context_window: 372_000,
+                model_auto_compact_token_limit: 330_000,
+                model_auto_compact_token_limit_scope: 'total'
+            }
+        });
+        expect(harness.startThreadIds).toEqual(['thread-1']);
+        expect(harness.startTurnParams[1]).not.toHaveProperty('config');
+        expect(harness.startTurnParams[2]).not.toHaveProperty('config');
+        expect(harness.disconnectCalls).toBe(3);
     });
 
     it('uses the native skill catalog for completion and structured turn input', async () => {

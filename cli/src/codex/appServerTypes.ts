@@ -319,8 +319,6 @@ export interface TurnStartParams {
     personality?: string;
     outputSchema?: unknown;
     collaborationMode?: CollaborationMode;
-    /** Optional config overrides that become defaults for subsequent turns. */
-    config?: Record<string, unknown>;
     /** Optional client identity echoed back as userMessage.clientId. */
     clientUserMessageId?: string;
 }

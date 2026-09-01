@@ -261,6 +261,7 @@ describe('CodexAccountManager', () => {
         const config = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
         expect(config).toContain('model_provider = "hapi_endpoint"');
         expect(config).toContain('wire_api = "responses"');
+        expect(config).toContain('requires_openai_auth = true');
         expect(config).toContain('model_context_window = 372000');
         expect(config).toContain('model_auto_compact_token_limit = 330000');
         expect(config).not.toContain('secret-key');

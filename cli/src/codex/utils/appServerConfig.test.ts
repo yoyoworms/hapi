@@ -217,11 +217,10 @@ describe('appServerConfig', () => {
             }
         });
         expect(turn.collaborationMode?.settings.model).toBe('gpt-5.6-sol');
-        expect(turn.config).toEqual({
-            model_context_window: 1_000_000,
-            model_auto_compact_token_limit: 900_000,
-            model_auto_compact_token_limit_scope: 'total'
-        });
+        // Codex app-server only accepts arbitrary config overrides on the
+        // thread lifecycle APIs. turn/start silently ignores unknown config,
+        // so a context-tier change must resume the thread on a fresh server.
+        expect(turn).not.toHaveProperty('config');
     });
 
     it('translates Fast to the advertised app-server tier (priority) in thread params', () => {

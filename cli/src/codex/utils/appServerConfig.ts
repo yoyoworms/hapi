@@ -320,11 +320,6 @@ export function buildTurnStartParams(args: {
         params.model = model;
     }
 
-    const modelConfig = buildHapiCodexModelContextConfig(requestedModel);
-    if (Object.keys(modelConfig).length > 0) {
-        params.config = modelConfig;
-    }
-
     const turnServiceTier = toAppServerServiceTier(args.mode?.serviceTier);
     if (turnServiceTier !== undefined) {
         params.serviceTier = turnServiceTier;

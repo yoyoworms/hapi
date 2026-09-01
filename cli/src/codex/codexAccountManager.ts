@@ -394,6 +394,7 @@ export class CodexAccountManager {
                     `base_url = ${escapeTomlString(normalizedBaseUrl)}`,
                     `env_key = ${escapeTomlString(API_KEY_ENV)}`,
                     'wire_api = "responses"',
+                    'requires_openai_auth = true',
                     ''
                 ].join('\n'),
                 { encoding: 'utf8', mode: 0o600 }
