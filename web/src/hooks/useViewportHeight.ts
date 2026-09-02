@@ -1,6 +1,41 @@
 import { useEffect } from 'react'
 import { isTelegramApp } from '@/hooks/useTelegram'
 
+const NON_KEYBOARD_INPUT_TYPES = new Set([
+    'button',
+    'checkbox',
+    'color',
+    'file',
+    'hidden',
+    'image',
+    'radio',
+    'range',
+    'reset',
+    'submit',
+])
+
+export function isVirtualKeyboardTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false
+    const contentEditable = target.getAttribute('contenteditable')
+    if (target.isContentEditable || contentEditable === 'true' || contentEditable === 'plaintext-only') return true
+    if (target instanceof HTMLTextAreaElement) return true
+    if (target instanceof HTMLInputElement) {
+        return !NON_KEYBOARD_INPUT_TYPES.has(target.type.toLowerCase())
+    }
+    return false
+}
+
+export function resolveVisualViewportHeight(args: {
+    windowHeight: number
+    viewportHeight: number
+    activeElement: EventTarget | null
+}): number | null {
+    if (!isVirtualKeyboardTarget(args.activeElement)) return null
+    return args.windowHeight - args.viewportHeight > 1
+        ? args.viewportHeight
+        : null
+}
+
 /**
  * Sets a CSS custom property `--app-viewport-height` on <html> that tracks the
  * visual viewport height. This is a fallback for browsers that do not support
@@ -38,12 +73,17 @@ export function useViewportHeight(): void {
 
         function update() {
             if (!viewport) return
-            // Only apply when the visual viewport is meaningfully smaller than
-            // the window (keyboard is open). A small threshold (1px) avoids
-            // false positives from sub-pixel rounding.
-            const diff = window.innerHeight - viewport.height
-            if (diff > 1) {
-                root.style.setProperty('--app-viewport-height', `${viewport.height}px`)
+            // Only constrain the app while a real text editor owns focus. iOS
+            // PWA can leave visualViewport.height at its keyboard-open value
+            // after the keyboard/editor is dismissed. Treating that stale
+            // metric as authoritative leaves the whole app permanently short.
+            const viewportHeight = resolveVisualViewportHeight({
+                windowHeight: window.innerHeight,
+                viewportHeight: viewport.height,
+                activeElement: document.activeElement,
+            })
+            if (viewportHeight !== null) {
+                root.style.setProperty('--app-viewport-height', `${viewportHeight}px`)
                 // On iOS PWA (black-translucent status bar + viewport-fit=cover),
                 // the browser scrolls the page upward when the keyboard opens to
                 // keep the focused input visible. This pushes the header behind
@@ -70,9 +110,27 @@ export function useViewportHeight(): void {
         }
 
         function scheduleFocusUpdates() {
+            for (const timer of focusTimers.splice(0)) {
+                window.clearTimeout(timer)
+            }
             scheduleUpdate()
             focusTimers.push(window.setTimeout(scheduleUpdate, 50))
             focusTimers.push(window.setTimeout(scheduleUpdate, 250))
+            focusTimers.push(window.setTimeout(scheduleUpdate, 500))
+            focusTimers.push(window.setTimeout(scheduleUpdate, 1000))
+        }
+
+        function handleFocusOut(event: FocusEvent) {
+            // Mobile WebKit often reports no final visualViewport resize when
+            // leaving a PWA text field. Release the keyboard-sized override at
+            // the focus boundary instead of waiting for a metric that may never
+            // arrive. A following focusin restores it when focus moved between
+            // two editors.
+            if (!isVirtualKeyboardTarget(event.relatedTarget)) {
+                root.style.removeProperty('--app-viewport-height')
+                resetWindowScroll()
+            }
+            scheduleFocusUpdates()
         }
 
         update()
@@ -81,7 +139,7 @@ export function useViewportHeight(): void {
         window.addEventListener('resize', scheduleUpdate)
         window.addEventListener('orientationchange', scheduleFocusUpdates)
         document.addEventListener('focusin', scheduleFocusUpdates)
-        document.addEventListener('focusout', scheduleFocusUpdates)
+        document.addEventListener('focusout', handleFocusOut)
 
         return () => {
             viewport.removeEventListener('resize', scheduleUpdate)
@@ -89,7 +147,7 @@ export function useViewportHeight(): void {
             window.removeEventListener('resize', scheduleUpdate)
             window.removeEventListener('orientationchange', scheduleFocusUpdates)
             document.removeEventListener('focusin', scheduleFocusUpdates)
-            document.removeEventListener('focusout', scheduleFocusUpdates)
+            document.removeEventListener('focusout', handleFocusOut)
             if (rafId !== null) {
                 window.cancelAnimationFrame(rafId)
             }
