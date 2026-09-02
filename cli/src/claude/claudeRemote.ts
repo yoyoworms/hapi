@@ -103,6 +103,7 @@ export async function claudeRemote(opts: {
     let isCompactCommand = false;
     let compactFailure: string | null = null;
     let awaitingForkInit = forkSession;
+    let forkInitialTurnPromise: Promise<{ message: string; mode: EnhancedMode } | null> | null = null;
 
     const messages = new PushableAsyncIterable<SDKUserMessage>();
 
@@ -155,8 +156,9 @@ export async function claudeRemote(opts: {
         return next;
     };
 
-    // Prepare SDK options. For --fork-session, start query() before waiting for the
-    // first child prompt so the native fork materializes at the clicked source state.
+    // Prepare SDK options. Forked Claude processes need their first prompt before
+    // they emit the native init event in stream-json mode, so the prompt is fed
+    // concurrently with query startup rather than waiting for init first.
     const hapiSystemPrompt = getSystemPrompt();
     const sdkOptions: Options = {
         additionalArgs: filterCatalogAffectingClaudeArgs(opts.claudeArgs),
@@ -219,6 +221,21 @@ export async function claudeRemote(opts: {
         }
     };
 
+    if (forkSession) {
+        // Start waiting for the first child message before reading Claude's
+        // output. Claude Code materializes --fork-session when that message is
+        // received; waiting for system/init first deadlocks an idle fork.
+        forkInitialTurnPromise = applyInitialTurn();
+        void forkInitialTurnPromise.then((first) => {
+            if (first) {
+                initial = first;
+                updateThinking(true);
+            }
+        }).catch((error) => {
+            messages.setError(error instanceof Error ? error : new Error(String(error)));
+        });
+    }
+
     // Start the loop
     const response = query({
         prompt: messages,
@@ -277,7 +294,9 @@ export async function claudeRemote(opts: {
         })();
     };
 
-    updateThinking(true);
+    // A fork with no first prompt is idle, not actively generating. Once the
+    // prompt arrives, forkInitialTurnPromise above marks it as thinking.
+    updateThinking(!forkSession);
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
@@ -315,7 +334,9 @@ export async function claudeRemote(opts: {
                 // Fork: only accept the first child prompt after the native branch exists.
                 if (awaitingForkInit) {
                     awaitingForkInit = false;
-                    const first = await applyInitialTurn();
+                    const first = forkInitialTurnPromise
+                        ? await forkInitialTurnPromise
+                        : await applyInitialTurn();
                     if (!first) {
                         return;
                     }

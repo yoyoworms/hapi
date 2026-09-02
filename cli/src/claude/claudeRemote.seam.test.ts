@@ -52,6 +52,72 @@ afterEach(() => {
 })
 
 describe('claudeRemote/query real seam', () => {
+    it('feeds the first fork prompt before waiting for the native init event', async () => {
+        const child = createFakeChild()
+        spawnMock.mockReturnValueOnce(child)
+        process.env.HAPI_CLAUDE_PATH = 'claude'
+
+        let resolveFirstMessage!: (value: { message: string; mode: { permissionMode: 'default' } }) => void
+        const firstMessage = new Promise<{ message: string; mode: { permissionMode: 'default' } }>((resolve) => {
+            resolveFirstMessage = resolve
+        })
+        let nextMessageCalls = 0
+        const stdinChunks: string[] = []
+        child.stdin.on('data', (chunk) => stdinChunks.push(chunk.toString()))
+        const found: string[] = []
+        const thinking: boolean[] = []
+
+        const { claudeRemote } = await import('./claudeRemote')
+        const runPromise = claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            mcpServers: {},
+            claudeEnvVars: {},
+            claudeArgs: ['--resume', 'source-session', '--fork-session'],
+            allowedTools: [],
+            hookSettingsPath: '/tmp/hook.json',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            nextMessage: async () => {
+                nextMessageCalls += 1
+                return nextMessageCalls === 1 ? firstMessage : null
+            },
+            onReady: () => {},
+            isAborted: () => false,
+            onSessionFound: (sessionId) => found.push(sessionId),
+            onThinkingChange: (value) => thinking.push(value),
+            onMessage: () => {},
+            onCompletionEvent: () => {},
+            onSessionReset: () => {}
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(nextMessageCalls).toBe(1)
+        expect(stdinChunks).toEqual([])
+        expect(thinking).not.toContain(true)
+
+        resolveFirstMessage({ message: 'first fork prompt', mode: { permissionMode: 'default' } })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(stdinChunks.join('')).toContain('first fork prompt')
+        expect(thinking).toContain(true)
+
+        child.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'forked-session' }) + '\n')
+        child.stdout.write(JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            num_turns: 1,
+            total_cost_usd: 0,
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            session_id: 'forked-session'
+        }) + '\n')
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        child.emit('close', 0)
+
+        await expect(runPromise).resolves.toBeUndefined()
+        expect(found).toEqual(['forked-session'])
+    }, 15_000)
+
     it('propagates scheduled nextMessage failures through real query prompt plumbing', async () => {
         const child = createFakeChild()
         spawnMock.mockReturnValueOnce(child)
