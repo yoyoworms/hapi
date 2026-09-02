@@ -61,7 +61,7 @@ describe('CodexAppServerClient process cwd', () => {
         const [command, args, options] = spawnMock.mock.calls[0] ?? [];
         expect(command).toBe('codex');
         expect(args?.at(-1)).toBe('app-server');
-        expect(args).toContain('model_context_window=372000');
+        expect(args).not.toContain('model_context_window=372000');
         expect(options).toEqual(expect.objectContaining({ cwd: '/neutral-home' }));
         await client.disconnect();
     });

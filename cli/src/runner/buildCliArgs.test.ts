@@ -3,7 +3,40 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildCliArgs, classifyRecoveredProcessGeneration, createSpawnDeduplicator, releaseRecoveredSpawnDedupe } from './run'
+import {
+    buildCliArgs,
+    classifyRecoveredProcessGeneration,
+    createSpawnDeduplicator,
+    releaseRecoveredSpawnDedupe,
+    resolveCodexAccountModelOverride
+} from './run'
+
+describe('resolveCodexAccountModelOverride', () => {
+    it('uses the API account model only as the Default/Auto fallback', () => {
+        expect(resolveCodexAccountModelOverride({
+            accountDefaultModel: 'gpt-5.6-sol'
+        })).toBe('gpt-5.6-sol')
+        expect(resolveCodexAccountModelOverride({
+            requestedModel: 'auto',
+            accountDefaultModel: 'gpt-5.6-sol'
+        })).toBe('gpt-5.6-sol')
+    })
+
+    it('keeps an explicit upstream-picker model on the same account', () => {
+        expect(resolveCodexAccountModelOverride({
+            requestedModel: 'gpt-5.6-terra',
+            accountDefaultModel: 'gpt-5.6-sol'
+        })).toBeUndefined()
+    })
+
+    it('resets to the target account default during an account switch', () => {
+        expect(resolveCodexAccountModelOverride({
+            requestedModel: 'gpt-5.6-terra',
+            accountDefaultModel: 'gpt-5.6-sol',
+            switchingAccount: true
+        })).toBe('gpt-5.6-sol')
+    })
+})
 
 describe('buildCliArgs', () => {
     it('passes continue-latest only to agents that support the generic flag', () => {

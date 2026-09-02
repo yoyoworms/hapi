@@ -12,6 +12,11 @@ import { HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID } from '../hapiContextPolicy';
 
 describe('appServerConfig', () => {
     const mcpServers = { hapi: { command: 'node', args: ['mcp'] } };
+    const defaultContextConfig = {
+        model_context_window: 372_000,
+        model_auto_compact_token_limit: 330_000,
+        model_auto_compact_token_limit_scope: 'total'
+    };
     const withCollaborationInstructions = (developerInstructions: string): string => {
         return `${developerInstructions}\n\n${codexCollaborationSpawnAgentInstructions}`;
     };
@@ -53,6 +58,7 @@ describe('appServerConfig', () => {
         expect(params.baseInstructions).toBeUndefined();
         expect(params.developerInstructions).toBe(codexSystemPrompt);
         expect(params.config).toEqual({
+            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -90,6 +96,7 @@ describe('appServerConfig', () => {
         });
 
         expect(params.config).toEqual({
+            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp'],
@@ -164,6 +171,7 @@ describe('appServerConfig', () => {
         expect(params.baseInstructions).toBeUndefined();
         expect(params.developerInstructions).toBe(`${codexSystemPrompt}\n\nOnly respond in Chinese.`);
         expect(params.config).toEqual({
+            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -180,6 +188,7 @@ describe('appServerConfig', () => {
         });
 
         expect(params.config).toEqual({
+            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -221,6 +230,22 @@ describe('appServerConfig', () => {
         // thread lifecycle APIs. turn/start silently ignores unknown config,
         // so a context-tier change must resume the thread on a fresh server.
         expect(turn).not.toHaveProperty('config');
+    });
+
+    it('does not apply Sol context settings to another upstream model', () => {
+        const thread = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: 'gpt-5.3-codex-spark',
+                collaborationMode: 'default'
+            },
+            mcpServers
+        });
+
+        expect(thread.model).toBe('gpt-5.3-codex-spark');
+        expect(thread.config).not.toHaveProperty('model_context_window');
+        expect(thread.config).not.toHaveProperty('model_auto_compact_token_limit');
     });
 
     it('translates Fast to the advertised app-server tier (priority) in thread params', () => {

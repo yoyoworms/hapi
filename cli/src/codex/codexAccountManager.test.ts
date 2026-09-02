@@ -162,8 +162,17 @@ describe('CodexAccountManager', () => {
         });
         expect(resolved.homeDir.startsWith(join(rootDir, 'codex-accounts'))).toBe(true);
         const managedConfig = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
-        expect(managedConfig).toContain('model_context_window = 372000');
-        expect(managedConfig).toContain('model_auto_compact_token_limit = 330000');
+        expect(managedConfig).toContain('model = "gpt-5.6-sol"');
+        expect(managedConfig).not.toContain('model_context_window');
+        expect(managedConfig).not.toContain('model_auto_compact_token_limit');
+        await writeFile(
+            join(resolved.homeDir, 'config.toml'),
+            `${managedConfig}model_context_window = 372000\nmodel_auto_compact_token_limit = 330000\n`
+        );
+        await manager.resolveAccount(login.accountId);
+        const normalizedManagedConfig = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
+        expect(normalizedManagedConfig).not.toContain('model_context_window');
+        expect(normalizedManagedConfig).not.toContain('model_auto_compact_token_limit');
 
         const afterDefault = await manager.setDefaultAccount(login.accountId!);
         expect(afterDefault.defaultAccountId).toBe(login.accountId);
@@ -262,9 +271,18 @@ describe('CodexAccountManager', () => {
         expect(config).toContain('model_provider = "hapi_endpoint"');
         expect(config).toContain('wire_api = "responses"');
         expect(config).toContain('requires_openai_auth = true');
-        expect(config).toContain('model_context_window = 372000');
-        expect(config).toContain('model_auto_compact_token_limit = 330000');
+        expect(config).not.toContain('model_context_window');
+        expect(config).not.toContain('model_auto_compact_token_limit');
         expect(config).not.toContain('secret-key');
+        await writeFile(
+            join(resolved.homeDir, 'config.toml'),
+            `${config}model_context_window = 372000\nmodel_auto_compact_token_limit = 330000\n`
+        );
+        await manager.resolveAccount(endpoint!.id);
+        const normalizedApiConfig = await readFile(join(resolved.homeDir, 'config.toml'), 'utf8');
+        expect(normalizedApiConfig).not.toContain('model_context_window');
+        expect(normalizedApiConfig).not.toContain('model_auto_compact_token_limit');
+        expect(normalizedApiConfig).toContain('requires_openai_auth = true');
         expect(await readFile(join(resolved.homeDir, 'api-key'), 'utf8')).toBe('secret-key');
         expect((await stat(join(resolved.homeDir, 'api-key'))).mode & 0o777).toBe(0o600);
     });

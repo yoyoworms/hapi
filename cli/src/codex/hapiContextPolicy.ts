@@ -29,10 +29,6 @@ export const HAPI_CODEX_SOL_ONE_MILLION_CONTEXT = {
     autoCompactTokenLimitScope: 'total'
 } as const;
 
-const HAPI_CODEX_CONTEXT_CATALOG_MODELS = new Set([
-    HAPI_CODEX_SOL_MODEL_ID
-]);
-
 type CodexModelCatalog = {
     models: Array<Record<string, unknown>>;
     [key: string]: unknown;
@@ -68,6 +64,24 @@ export type HapiCodexModelSpec = {
     autoCompactTokenLimitScope?: 'total';
 };
 
+function resolveHapiCodexContextProfile(model: string | null | undefined): {
+    contextWindow: number;
+    autoCompactTokenLimit: number;
+    autoCompactTokenLimitScope: 'total';
+} | null {
+    const normalized = model?.trim();
+    if (normalized === HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID) {
+        return HAPI_CODEX_SOL_ONE_MILLION_CONTEXT;
+    }
+    // HAPI's Default selection resolves to the configured default Sol model.
+    // Keep its historical 372K profile, but let every other upstream model use
+    // the context settings advertised by Codex's own catalog.
+    if (!normalized || normalized === 'auto' || normalized === HAPI_CODEX_SOL_MODEL_ID) {
+        return HAPI_CODEX_CONTEXT_DEFAULTS;
+    }
+    return null;
+}
+
 /**
  * Resolve HAPI-only model variants to the upstream Codex model id and the
  * per-thread context settings that should accompany the request.
@@ -85,11 +99,16 @@ export function resolveHapiCodexModel(model: string | null | undefined): HapiCod
             autoCompactTokenLimitScope: HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.autoCompactTokenLimitScope
         };
     }
+    const contextProfile = resolveHapiCodexContextProfile(normalized);
     return {
         model: normalized,
-        contextWindow: HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow,
-        autoCompactTokenLimit: HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit,
-        autoCompactTokenLimitScope: HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope
+        ...(contextProfile
+            ? {
+                contextWindow: contextProfile.contextWindow,
+                autoCompactTokenLimit: contextProfile.autoCompactTokenLimit,
+                autoCompactTokenLimitScope: contextProfile.autoCompactTokenLimitScope
+            }
+            : {})
     };
 }
 
@@ -116,14 +135,14 @@ export function addHapiCodexModelVariants(models: readonly CodexModelSummary[]):
 }
 
 export function buildHapiCodexModelContextConfig(model: string | null | undefined): Record<string, unknown> {
-    const spec = resolveHapiCodexModel(model);
-    if (!spec?.contextWindow) {
+    const profile = resolveHapiCodexContextProfile(model);
+    if (!profile) {
         return {};
     }
     return {
-        model_context_window: spec.contextWindow,
-        model_auto_compact_token_limit: spec.autoCompactTokenLimit,
-        model_auto_compact_token_limit_scope: spec.autoCompactTokenLimitScope
+        model_context_window: profile.contextWindow,
+        model_auto_compact_token_limit: profile.autoCompactTokenLimit,
+        model_auto_compact_token_limit_scope: profile.autoCompactTokenLimitScope
     };
 }
 
@@ -236,13 +255,10 @@ export type HapiCodexCatalogPolicyOptions = {
 
 /**
  * Codex clamps `model_context_window` to the selected model catalog entry's
- * `max_context_window`. Keep the regular catalog rows at HAPI's historical
- * 372K default, while giving Sol enough max-capacity for the explicit 1M
- * picker variant. The `context_window` field remains the default for the base
- * model; the variant supplies its 1M override in thread/turn config.
- *
- * Keep the complete account catalog. Larger user-provided values are preserved,
- * while smaller rows are raised to HAPI's historical default floor.
+ * `max_context_window`. Only Sol is extended: its base selection keeps HAPI's
+ * historical 372K profile and its max capacity is raised for the explicit 1M
+ * picker variant. Every other row keeps Codex's context fields unchanged so
+ * upstream model selection cannot accidentally inherit Sol's budget.
  */
 export function applyHapiCodexContextCatalogPolicy(
     value: unknown,
@@ -255,6 +271,7 @@ export function applyHapiCodexContextCatalogPolicy(
     return {
         ...catalog,
         models: catalog.models.map((model) => {
+            const isSol = model.slug === HAPI_CODEX_SOL_MODEL_ID;
             return {
                 ...model,
                 ...(options.inlineTools
@@ -263,16 +280,18 @@ export function applyHapiCodexContextCatalogPolicy(
                         tool_mode: model.tool_mode === 'code_mode_only' ? null : model.tool_mode
                     }
                     : {}),
-                context_window: atLeast(
-                    model.context_window,
-                    HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
-                ),
-                max_context_window: atLeast(
-                    model.max_context_window,
-                    HAPI_CODEX_CONTEXT_CATALOG_MODELS.has(model.slug as string)
-                        ? HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.contextWindow
-                        : HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
-                )
+                ...(isSol
+                    ? {
+                        context_window: atLeast(
+                            model.context_window,
+                            HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
+                        ),
+                        max_context_window: atLeast(
+                            model.max_context_window,
+                            HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.contextWindow
+                        )
+                    }
+                    : {})
             };
         })
     };
@@ -342,20 +361,12 @@ function prepareHapiCodexModelCatalog(
 }
 
 function buildHapiCodexContextArgs(modelCatalogPath?: string | null): string[] {
-    return [
-        ...(modelCatalogPath
-            ? [
-                '-c',
-                `model_catalog_json=${JSON.stringify(modelCatalogPath)}`
-            ]
-            : []),
-        '-c',
-        `model_context_window=${HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow}`,
-        '-c',
-        `model_auto_compact_token_limit=${HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit}`,
-        '-c',
-        `model_auto_compact_token_limit_scope=${JSON.stringify(HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope)}`
-    ];
+    return modelCatalogPath
+        ? [
+            '-c',
+            `model_catalog_json=${JSON.stringify(modelCatalogPath)}`
+        ]
+        : [];
 }
 
 export function prepareHapiCodexContextArgs(

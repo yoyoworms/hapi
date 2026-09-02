@@ -15,7 +15,7 @@ import {
 } from './hapiContextPolicy';
 
 describe('buildCodexAppServerArgs', () => {
-    it('applies the shared HAPI context policy before starting app-server', () => {
+    it('loads the HAPI catalog without globally overriding every model context', () => {
         expect(HAPI_CODEX_CONTEXT_DEFAULTS).toEqual({
             contextWindow: 372_000,
             autoCompactTokenLimit: 330_000,
@@ -24,12 +24,6 @@ describe('buildCodexAppServerArgs', () => {
         expect(buildCodexAppServerArgs('/tmp/hapi model catalog.json')).toEqual([
             '-c',
             'model_catalog_json="/tmp/hapi model catalog.json"',
-            '-c',
-            'model_context_window=372000',
-            '-c',
-            'model_auto_compact_token_limit=330000',
-            '-c',
-            'model_auto_compact_token_limit_scope="total"',
             'app-server'
         ]);
     });
@@ -40,7 +34,7 @@ describe('buildCodexAppServerArgs', () => {
 });
 
 describe('applyHapiCodexContextCatalogPolicy', () => {
-    it('keeps the historical 372K default while raising Sol max capacity for the 1M variant', () => {
+    it('extends only Sol while preserving other upstream model contexts', () => {
         const result = applyHapiCodexContextCatalogPolicy({
             fetched_at: 'preserved',
             models: [{
@@ -64,8 +58,8 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
                 effective_context_window_percent: 95
             }, {
                 slug: 'gpt-5.6-terra',
-                context_window: 372_000,
-                max_context_window: 372_000
+                context_window: 272_000,
+                max_context_window: 272_000
             }]
         });
     });
@@ -128,6 +122,15 @@ describe('HAPI Sol model variant', () => {
             model_auto_compact_token_limit: 330_000,
             model_auto_compact_token_limit_scope: 'total'
         });
+        expect(buildHapiCodexModelContextConfig(null)).toEqual({
+            model_context_window: 372_000,
+            model_auto_compact_token_limit: 330_000,
+            model_auto_compact_token_limit_scope: 'total'
+        });
+        expect(resolveHapiCodexModel('gpt-5.6-terra')).toEqual({
+            model: 'gpt-5.6-terra'
+        });
+        expect(buildHapiCodexModelContextConfig('gpt-5.6-terra')).toEqual({});
     });
 });
 
@@ -201,8 +204,8 @@ describe('inline tool fallback for third-party Codex endpoints', () => {
             tool_mode: null
         }, {
             slug: 'gpt-5.5',
-            context_window: 372_000,
-            max_context_window: 372_000,
+            context_window: 272_000,
+            max_context_window: 272_000,
             use_responses_lite: false,
             tool_mode: null
         }]);

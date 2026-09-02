@@ -1724,13 +1724,10 @@ describe('codexRemoteLauncher', () => {
         });
         expect(harness.resumeThreadParams[1]).toMatchObject({
             threadId: 'thread-1',
-            model: 'gpt-5.4',
-            config: {
-                model_context_window: 372_000,
-                model_auto_compact_token_limit: 330_000,
-                model_auto_compact_token_limit_scope: 'total'
-            }
+            model: 'gpt-5.4'
         });
+        expect(harness.resumeThreadParams[1]?.config).not.toHaveProperty('model_context_window');
+        expect(harness.resumeThreadParams[1]?.config).not.toHaveProperty('model_auto_compact_token_limit');
         expect(harness.startThreadIds).toEqual(['thread-1']);
         expect(harness.startTurnParams[1]).not.toHaveProperty('config');
         expect(harness.startTurnParams[2]).not.toHaveProperty('config');

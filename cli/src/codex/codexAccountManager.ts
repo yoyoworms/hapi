@@ -15,7 +15,7 @@ import type {
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { CodexAppServerClient } from './codexAppServerClient';
-import { HAPI_CODEX_CONTEXT_DEFAULTS } from './hapiContextPolicy';
+import { HAPI_CODEX_SOL_MODEL_ID } from './hapiContextPolicy';
 import { sanitizeCodexSessionEnvironment } from './codexProcessEnvironment';
 import type { GetAccountRateLimitsResponse, GetAccountResponse } from './appServerTypes';
 
@@ -189,10 +189,39 @@ function escapeTomlString(value: string): string {
     return JSON.stringify(value);
 }
 
-const MANAGED_CODEX_CONTEXT_CONFIG_LINES = [
-    `model_context_window = ${HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow}`,
-    `model_auto_compact_token_limit = ${HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit}`
-] as const;
+const LEGACY_MANAGED_CONTEXT_KEYS = new Set([
+    'model_context_window',
+    'model_auto_compact_token_limit',
+    'model_auto_compact_token_limit_scope'
+]);
+
+async function normalizeManagedAccountConfig(
+    homeDir: string,
+    kind: 'managed' | 'api'
+): Promise<void> {
+    const path = join(homeDir, 'config.toml');
+    let contents: string;
+    try {
+        contents = await readFile(path, 'utf8');
+    } catch {
+        return;
+    }
+
+    const hadTrailingNewline = contents.endsWith('\n');
+    const lines = contents.split(/\r?\n/).filter((line) => {
+        const key = line.split('=', 1)[0]?.trim();
+        return !key || !LEGACY_MANAGED_CONTEXT_KEYS.has(key);
+    });
+    if (hadTrailingNewline && lines.at(-1) === '') lines.pop();
+    if (kind === 'managed' && !lines.some((line) => /^\s*model\s*=/.test(line))) {
+        const insertAt = lines[0]?.trimStart().startsWith('#') ? 1 : 0;
+        lines.splice(insertAt, 0, `model = ${escapeTomlString(HAPI_CODEX_SOL_MODEL_ID)}`);
+    }
+    const normalized = `${lines.join('\n')}${hadTrailingNewline ? '\n' : ''}`;
+    if (normalized === contents) return;
+    await writeFile(path, normalized, { encoding: 'utf8', mode: 0o600 });
+    await chmod(path, 0o600).catch(() => {});
+}
 
 async function findTranscriptPath(root: string, sessionId: string): Promise<string | null> {
     const candidates: Array<{ path: string; mtimeMs: number }> = [];
@@ -272,8 +301,8 @@ export class CodexAccountManager {
             join(homeDir, 'config.toml'),
             [
                 '# Managed by HAPI. This account is isolated from the system Codex login.',
+                `model = ${escapeTomlString(HAPI_CODEX_SOL_MODEL_ID)}`,
                 'cli_auth_credentials_store = "file"',
-                ...MANAGED_CODEX_CONTEXT_CONFIG_LINES,
                 ''
             ].join('\n'),
             { encoding: 'utf8', mode: 0o600 }
@@ -387,7 +416,6 @@ export class CodexAccountManager {
                     '# Managed by HAPI. The API key is stored only on this runner.',
                     `model = ${escapeTomlString(input.model.trim())}`,
                     'model_provider = "hapi_endpoint"',
-                    ...MANAGED_CODEX_CONTEXT_CONFIG_LINES,
                     '',
                     '[model_providers.hapi_endpoint]',
                     `name = ${escapeTomlString(input.label.trim())}`,
@@ -473,6 +501,7 @@ export class CodexAccountManager {
         if (!account) throw new Error('Selected Codex account is not available on this runner');
         const homeDir = this.getManagedHome(account.id);
         const kind = account.kind === 'api' ? 'api' : 'managed';
+        await normalizeManagedAccountConfig(homeDir, kind);
         const credentialFile = kind === 'api' ? API_KEY_FILE : 'auth.json';
         if (!existsSync(join(homeDir, credentialFile))) {
             throw new Error('Selected Codex account is not authenticated');
@@ -666,6 +695,9 @@ export class CodexAccountManager {
         homeDir: string,
         defaultAccountId: string
     ): Promise<CodexAccountSummary> {
+        if (kind !== 'system') {
+            await normalizeManagedAccountConfig(homeDir, kind);
+        }
         if (kind === 'api') {
             return {
                 id: account.id,

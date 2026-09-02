@@ -32,7 +32,7 @@ import {
 } from '@/modules/common/remote/RemoteLauncherBase';
 import { CodexConversationHistory } from './conversationHistory';
 import {
-    HAPI_CODEX_CONTEXT_DEFAULTS,
+    buildHapiCodexModelContextConfig,
     resolveHapiCodexModel
 } from './hapiContextPolicy';
 
@@ -4354,13 +4354,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         let appliedContextProfile: string | null = null;
 
         const contextProfileForModel = (model: string | null | undefined): string => {
-            const spec = resolveHapiCodexModel(model);
-            return JSON.stringify({
-                contextWindow: spec?.contextWindow ?? HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow,
-                autoCompactTokenLimit: spec?.autoCompactTokenLimit ?? HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimit,
-                autoCompactTokenLimitScope: spec?.autoCompactTokenLimitScope
-                    ?? HAPI_CODEX_CONTEXT_DEFAULTS.autoCompactTokenLimitScope
-            });
+            return JSON.stringify(buildHapiCodexModelContextConfig(model));
         };
 
         const markAppliedContextProfile = (mode: EnhancedMode) => {

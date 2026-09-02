@@ -47,6 +47,22 @@ export type SpawnDeduplicator = ((options: SpawnSessionOptions) => Promise<Spawn
   onChildExited: (existingSessionId: string) => void
 }
 
+export function resolveCodexAccountModelOverride(args: {
+  requestedModel?: string | null
+  accountDefaultModel?: string | null
+  switchingAccount?: boolean
+}): string | undefined {
+  const accountDefaultModel = args.accountDefaultModel?.trim()
+  if (!accountDefaultModel) return undefined
+  const requestedModel = args.requestedModel?.trim()
+  if (requestedModel && requestedModel !== 'auto' && args.switchingAccount !== true) {
+    // Upstream HAPI's model picker is authoritative. The model stored on a
+    // custom API account is only its Default/Auto fallback, not a hard lock.
+    return undefined
+  }
+  return accountDefaultModel
+}
+
 export function createSpawnDeduplicator(
   spawnOnce: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>,
   isRecoveredChildGenerationCurrent?: (existingSessionId: string) => boolean
@@ -720,8 +736,13 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
               codexAccountModelOverride = null;
             }
           }
-          if (account.model) {
-            codexAccountModelOverride = account.model;
+          const accountModelOverride = resolveCodexAccountModelOverride({
+            requestedModel: options.model,
+            accountDefaultModel: account.model,
+            switchingAccount: options.codexSourceAccountId !== undefined
+          });
+          if (accountModelOverride) {
+            codexAccountModelOverride = accountModelOverride;
           }
           // Docker does not mount managed host credential homes. Preserve the
           // system-account sandbox behavior, but isolate every normal child.
