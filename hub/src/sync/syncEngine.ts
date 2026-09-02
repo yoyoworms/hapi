@@ -1407,36 +1407,6 @@ export class SyncEngine {
     }
 
     /**
-     * Claude `--fork-session` materializes only after the child process starts.
-     * Poll until the child metadata has a native id distinct from the source.
-     */
-    private async waitForClaudeForkBound(
-        childId: string,
-        sourceNativeSessionId: string,
-        timeoutMs: number = 60_000
-    ): Promise<boolean> {
-        const startedAt = Date.now()
-        while (Date.now() - startedAt < timeoutMs) {
-            this.sessionCache.refreshSession(childId)
-            const child = this.sessionCache.getSession(childId)
-            const boundId = child?.metadata?.claudeSessionId
-            if (
-                typeof boundId === 'string'
-                && boundId.length > 0
-                && boundId !== sourceNativeSessionId
-            ) {
-                return true
-            }
-            // Give the runner a few seconds to come up before treating inactivity as failure.
-            if (child && !child.active && Date.now() - startedAt > 5_000) {
-                return false
-            }
-            await new Promise((resolve) => setTimeout(resolve, 250))
-        }
-        return false
-    }
-
-    /**
      * A native fork may be created before its runner child has loaded it. Wait
      * for the exact persisted native id; Pi additionally requires its
      * validated `session-ready` event before the fork is visible to callers.
@@ -1761,16 +1731,10 @@ export class SyncEngine {
                 throw new Error(spawn.message)
             }
 
-            // Claude fork is spawn+flag, not an RPC-time snapshot. Keep the
-            // source history lock (caller holds historyActionsInFlight) until
-            // the child binds a distinct native id — otherwise the source can
-            // advance before --fork-session materializes.
-            if (flavor === 'claude' && rpcResult.forkSession === true) {
-                const bound = await this.waitForClaudeForkBound(childId, rpcResult.nativeSessionId)
-                if (!bound) {
-                    throw new Error('Claude fork did not materialize before timeout')
-                }
-            }
+            // Claude Code materializes --fork-session when the child receives
+            // its first prompt in stream-json mode. The runner child is already
+            // tracked and will bind claudeSessionId asynchronously on that
+            // prompt, so do not block the fork RPC waiting for system/init.
 
             // Grok forks at RPC time, but spawn may still fall back to a blank
             // session if load fails. Do not report success until the child is

@@ -1144,7 +1144,23 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
                 }).unref();
                 logger.debug(`[RUNNER RUN] Requested Docker sandbox stop for ${containerName}`);
               }
-              const treeStopped = await killProcessByChildProcess(session.childProcess);
+              const pid = session.childProcess.pid;
+              await killProcessByChildProcess(session.childProcess, false);
+              let treeStopped = true;
+              const gracefulDeadline = Date.now() + 1_000;
+              while (pid && isProcessAlive(pid) && Date.now() < gracefulDeadline) {
+                await new Promise(resolve => setTimeout(resolve, 50));
+              }
+              if (pid && isProcessAlive(pid)) {
+                // Detached Claude children can ignore the graceful Windows
+                // taskkill request. Escalate once before reporting still_alive.
+                await killProcessByChildProcess(session.childProcess, true);
+                const forceDeadline = Date.now() + 5_000;
+                while (pid && isProcessAlive(pid) && Date.now() < forceDeadline) {
+                  await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                treeStopped = !isProcessAlive(pid);
+              }
               if (!treeStopped) {
                 logger.debug(`[RUNNER RUN] Process tree for session ${sessionId} is still alive after stop request`);
                 return 'still_alive';
