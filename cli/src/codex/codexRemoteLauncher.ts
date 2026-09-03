@@ -1,7 +1,11 @@
 import React from 'react';
 import { randomUUID } from 'node:crypto';
 
-import { CodexAppServerClient, isIndeterminateError } from './codexAppServerClient';
+import {
+    CodexAppServerClient,
+    isCodexArchivedThreadError,
+    isIndeterminateError
+} from './codexAppServerClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
@@ -4278,6 +4282,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             });
         };
 
+        const resumeAppServerThread = async (
+            params: Parameters<CodexAppServerClient['resumeThread']>[0],
+            options?: Parameters<CodexAppServerClient['resumeThread']>[1]
+        ) => {
+            try {
+                return await appServerClient.resumeThread(params, options);
+            } catch (error) {
+                if (!isCodexArchivedThreadError(error)) throw error;
+                logger.debug(`[Codex] Unarchiving fork handoff thread ${params.threadId}`);
+                await appServerClient.unarchiveThread({ threadId: params.threadId });
+                return await appServerClient.resumeThread(params, options);
+            }
+        };
+
         await initializeAppServer();
 
         const publishConversationHistoryCapabilities = async () => {
@@ -4396,7 +4414,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             );
             await appServerClient.disconnect();
             await initializeAppServer();
-            const resumeResponse = await appServerClient.resumeThread({
+            const resumeResponse = await resumeAppServerThread({
                 threadId,
                 ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
                     ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
@@ -4582,7 +4600,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             });
 
             try {
-                const resumeResponse = await appServerClient.resumeThread({
+                const resumeResponse = await resumeAppServerThread({
                     threadId: resumeCandidate,
                     ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
                         ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
@@ -4650,7 +4668,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     cliOverrides: session.codexCliOverrides
                 });
                 try {
-                    const resumeResponse = await appServerClient.resumeThread({
+                    const resumeResponse = await resumeAppServerThread({
                         threadId: resumeCandidate,
                         ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
                             ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
@@ -4976,7 +4994,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                                 }, {
                                     signal: this.abortController.signal
                                 })
-                                : await appServerClient.resumeThread({
+                                : await resumeAppServerThread({
                                     threadId: resumeCandidate,
                                     ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
                                         ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }

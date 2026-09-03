@@ -28,7 +28,21 @@ vi.mock('@/ui/logger', () => ({
     logger: { debug: vi.fn() }
 }));
 
-import { CodexAppServerClient, isIndeterminateError } from './codexAppServerClient';
+import {
+    CodexAppServerClient,
+    isCodexArchivedThreadError,
+    isIndeterminateError
+} from './codexAppServerClient';
+
+describe('isCodexArchivedThreadError', () => {
+    it('matches the app-server handoff error without swallowing unrelated resume failures', () => {
+        expect(isCodexArchivedThreadError(new Error(
+            'session thread-1 is archived. Run `codex unarchive thread-1` to unarchive it first.'
+        ))).toBe(true);
+        expect(isCodexArchivedThreadError(new Error('thread already has an active writer'))).toBe(false);
+        expect(isCodexArchivedThreadError(new Error('resume failed'))).toBe(false);
+    });
+});
 
 function fakeStream(): EventEmitter & { setEncoding: ReturnType<typeof vi.fn> } {
     return Object.assign(new EventEmitter(), { setEncoding: vi.fn() });

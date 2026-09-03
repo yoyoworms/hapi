@@ -3,12 +3,14 @@ import { CodexConversationHistory } from './conversationHistory'
 
 function createClient(overrides?: {
     fork?: (params: Record<string, unknown>) => Promise<{ thread: { id: string } }>
+    archive?: (params: { threadId: string }) => Promise<void>
     rollback?: (params: { threadId: string; numTurns: number }) => Promise<unknown>
     read?: () => Promise<{ thread: { id: string; turns: Array<Record<string, unknown>> } }>
 }) {
     return {
         supportsMethod: async () => true,
         forkThread: overrides?.fork ?? (async () => ({ thread: { id: 'forked-1' } })),
+        archiveThread: overrides?.archive ?? (async () => {}),
         rollbackThread: overrides?.rollback ?? (async () => ({ thread: { id: 'thread-1' } })),
         readThread: overrides?.read ?? (async () => ({
             thread: {
@@ -39,15 +41,28 @@ describe('CodexConversationHistory', () => {
     })
 
     it('forks current without a turn boundary', async () => {
+        const archive = vi.fn(async () => {})
         const fork = vi.fn(async (params: Record<string, unknown>) => {
             expect(params.beforeTurnId).toBeUndefined()
             return { thread: { id: 'forked-current' } }
         })
-        const history = new CodexConversationHistory(() => createClient({ fork }) as never)
+        const history = new CodexConversationHistory(() => createClient({ fork, archive }) as never)
         history.setThreadId('thread-1')
         const result = await history.fork()
         expect(result).toEqual({ nativeSessionId: 'forked-current' })
         expect(fork).toHaveBeenCalledTimes(1)
+        expect(archive).toHaveBeenCalledWith({ threadId: 'forked-current' })
+    })
+
+    it('does not hand off a fork while the source app-server still owns its writer', async () => {
+        const history = new CodexConversationHistory(() => createClient({
+            archive: async () => {
+                throw new Error('archive failed')
+            }
+        }) as never)
+        history.setThreadId('thread-1')
+
+        await expect(history.fork()).rejects.toThrow('archive failed')
     })
 
     it('historical fork passes lastTurnId of the previous turn', async () => {

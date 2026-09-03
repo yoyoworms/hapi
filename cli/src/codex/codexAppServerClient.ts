@@ -18,6 +18,9 @@ import type {
     ThreadResumeResponse,
     ThreadForkParams,
     ThreadForkResponse,
+    ThreadArchiveParams,
+    ThreadUnarchiveParams,
+    ThreadUnarchiveResponse,
     ThreadReadParams,
     ThreadReadResponse,
     TurnStartParams,
@@ -43,6 +46,11 @@ import type {
     LoginAccountParams,
     LoginAccountResponse
 } from './appServerTypes';
+
+export function isCodexArchivedThreadError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /\bis archived\b.*\bunarchive\b/i.test(message);
+}
 
 type JsonRpcLiteRequest = {
     id: number;
@@ -381,6 +389,19 @@ export class CodexAppServerClient extends JsonLineParser {
             timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
         });
         return response as ThreadForkResponse;
+    }
+
+    async archiveThread(params: ThreadArchiveParams): Promise<void> {
+        await this.sendRequest('thread/archive', params, {
+            timeoutMs: 30_000
+        });
+    }
+
+    async unarchiveThread(params: ThreadUnarchiveParams): Promise<ThreadUnarchiveResponse> {
+        const response = await this.sendRequest('thread/unarchive', params, {
+            timeoutMs: 30_000
+        });
+        return response as ThreadUnarchiveResponse;
     }
 
     async supportsMethod(method: 'thread/fork' | 'thread/rollback'): Promise<boolean> {

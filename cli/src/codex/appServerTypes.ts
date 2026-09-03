@@ -248,6 +248,22 @@ export interface ThreadForkResponse {
     [key: string]: unknown;
 }
 
+export interface ThreadArchiveParams {
+    threadId: string;
+}
+
+export interface ThreadUnarchiveParams {
+    threadId: string;
+}
+
+export interface ThreadUnarchiveResponse {
+    thread: {
+        id: string;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
 export type UserInput =
     | {
         type: 'text';

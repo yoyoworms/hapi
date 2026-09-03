@@ -33,6 +33,8 @@ const harness = vi.hoisted(() => ({
     startThreadParams: [] as Array<Record<string, unknown>>,
     resumeThreadIds: [] as string[],
     resumeThreadParams: [] as Array<Record<string, unknown>>,
+    archivedResumeThreadIds: new Set<string>(),
+    unarchiveThreadIds: [] as string[],
     deferResumeThread: false,
     readThreadCalls: [] as Array<{ threadId: string; includeTurns?: boolean }>,
     threadStatusById: new Map<string, 'notLoaded' | 'idle' | 'systemError' | 'active'>(),
@@ -257,10 +259,18 @@ vi.mock('./codexAppServerClient', () => {
             if (harness.failResumeThreadIds.includes(id)) {
                 throw new Error('resume failed');
             }
+            if (harness.archivedResumeThreadIds.has(id) && !harness.unarchiveThreadIds.includes(id)) {
+                throw new Error(`session ${id} is archived. Run \`codex unarchive ${id}\` to unarchive it first.`);
+            }
             return {
                 thread: { id },
                 model: typeof params?.model === 'string' ? params.model : 'gpt-5.4'
             };
+        }
+
+        async unarchiveThread(params: { threadId: string }): Promise<{ thread: { id: string } }> {
+            harness.unarchiveThreadIds.push(params.threadId);
+            return { thread: { id: params.threadId } };
         }
 
         async readThread(params: { threadId: string; includeTurns?: boolean }): Promise<unknown> {
@@ -1230,6 +1240,9 @@ vi.mock('./codexAppServerClient', () => {
         INDETERMINATE_SYMBOL,
         isIndeterminateError: (error: unknown) => Boolean(
             error && (error as Record<symbol, unknown>)[INDETERMINATE_SYMBOL] === true
+        ),
+        isCodexArchivedThreadError: (error: unknown) => /\bis archived\b.*\bunarchive\b/i.test(
+            error instanceof Error ? error.message : String(error)
         )
     };
 });
@@ -1572,6 +1585,8 @@ describe('codexRemoteLauncher', () => {
         harness.startThreadParams = [];
         harness.resumeThreadIds = [];
         harness.resumeThreadParams = [];
+        harness.archivedResumeThreadIds = new Set();
+        harness.unarchiveThreadIds = [];
         harness.deferResumeThread = false;
         harness.readThreadCalls = [];
         harness.threadStatusById = new Map();
@@ -2917,6 +2932,21 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('unarchives a transferred native fork before resuming it', async () => {
+        harness.archivedResumeThreadIds.add('thread-forked');
+        const { session } = createSessionStub(['continue the fork']);
+        session.sessionId = 'thread-forked';
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.resumeThreadIds).toEqual(['thread-forked', 'thread-forked']);
+        expect(harness.unarchiveThreadIds).toEqual(['thread-forked']);
+        expect(harness.startThreadIds).toEqual([]);
+        expect(harness.startTurnThreadIds).toEqual(['thread-forked']);
+        expect(session.sessionId).toBe('thread-forked');
+    });
+
     it('resumes a migrated conversation by its explicit rollout path', async () => {
         process.env.HAPI_CODEX_RESUME_PATH = '/tmp/migrated-thread.jsonl';
         const { session } = createSessionStub(['continue']);
@@ -4075,7 +4105,9 @@ describe('codexRemoteLauncher', () => {
         });
         await new Promise((resolve) => setTimeout(resolve, 350));
 
-        expect(harness.readThreadCalls.at(-1)).toEqual({
+        // Capability/history probes can complete after the status probe; only
+        // assert that the authoritative no-turns status read occurred.
+        expect(harness.readThreadCalls).toContainEqual({
             threadId: 'thread-1',
             includeTurns: false
         });

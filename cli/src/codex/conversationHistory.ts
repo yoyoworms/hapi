@@ -137,6 +137,11 @@ export class CodexConversationHistory {
                 })
                 const nativeSessionId = asString(asRecord(response.thread)?.id)
                 if (!nativeSessionId) throw new Error('thread/fork did not return thread.id')
+                // thread/fork loads the new rollout into this app-server and
+                // keeps its writer lock. HAPI hands the fork to a separate
+                // runner process, so archive it here to close that writer; the
+                // child unarchives it immediately before resume.
+                await client.archiveThread({ threadId: nativeSessionId })
                 this.states = markSupported(this.states, 'forkAtMessage')
                 this.states = markSupported(this.states, 'forkCurrent')
                 await this.publishCapabilities?.()
@@ -157,6 +162,7 @@ export class CodexConversationHistory {
             const response = await client.forkThread({ threadId })
             const nativeSessionId = asString(asRecord(response.thread)?.id)
             if (!nativeSessionId) throw new Error('thread/fork did not return thread.id')
+            await client.archiveThread({ threadId: nativeSessionId })
             this.states = markSupported(this.states, 'forkCurrent')
             await this.publishCapabilities?.()
             return { nativeSessionId }
