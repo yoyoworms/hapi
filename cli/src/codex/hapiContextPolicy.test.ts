@@ -9,6 +9,8 @@ import {
     buildHapiCodexModelContextArgs,
     buildHapiCodexModelContextConfig,
     buildCodexAppServerArgs,
+    HAPI_CODEX_ASTRA_CONTEXT,
+    HAPI_CODEX_ASTRA_MODEL_ID,
     HAPI_CODEX_CONTEXT_DEFAULTS,
     HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
     resolveHapiCodexModel
@@ -34,7 +36,7 @@ describe('buildCodexAppServerArgs', () => {
 });
 
 describe('applyHapiCodexContextCatalogPolicy', () => {
-    it('extends only Sol while preserving other upstream model contexts', () => {
+    it('adds Astra, extends Sol, and preserves other upstream model contexts', () => {
         const result = applyHapiCodexContextCatalogPolicy({
             fetched_at: 'preserved',
             models: [{
@@ -49,18 +51,27 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
             }]
         });
 
-        expect(result).toEqual({
-            fetched_at: 'preserved',
-            models: [{
-                slug: 'gpt-5.6-sol',
-                context_window: 372_000,
-                max_context_window: 1_000_000,
-                effective_context_window_percent: 95
-            }, {
-                slug: 'gpt-5.6-terra',
-                context_window: 272_000,
-                max_context_window: 272_000
-            }]
+        expect(result?.fetched_at).toBe('preserved');
+        expect(result?.models.map((model) => model.slug)).toEqual([
+            HAPI_CODEX_ASTRA_MODEL_ID,
+            'gpt-5.6-sol',
+            'gpt-5.6-terra'
+        ]);
+        expect(result?.models.find((model) => model.slug === HAPI_CODEX_ASTRA_MODEL_ID)).toMatchObject({
+            display_name: 'GPT-6-Astra',
+            context_window: 1_050_000,
+            max_context_window: 1_050_000,
+            effective_context_window_percent: 95
+        });
+        expect(result?.models.find((model) => model.slug === 'gpt-5.6-sol')).toMatchObject({
+            context_window: 372_000,
+            max_context_window: 1_000_000,
+            effective_context_window_percent: 95
+        });
+        expect(result?.models.find((model) => model.slug === 'gpt-5.6-terra')).toEqual({
+            slug: 'gpt-5.6-terra',
+            context_window: 272_000,
+            max_context_window: 272_000
         });
     });
 
@@ -71,17 +82,36 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
                 context_window: 1_000_000,
                 max_context_window: 1_000_000
             }]
-        })?.models[0]).toMatchObject({
+        })?.models.find((model) => model.slug === 'gpt-5.6-sol')).toMatchObject({
             context_window: 1_000_000,
             max_context_window: 1_000_000
         });
         expect(applyHapiCodexContextCatalogPolicy({ models: [null] })).toBeNull();
         expect(applyHapiCodexContextCatalogPolicy({})).toBeNull();
     });
+
+    it('raises a catalog-provided Astra row to the official 1.05M raw window', () => {
+        const result = applyHapiCodexContextCatalogPolicy({
+            models: [{
+                slug: HAPI_CODEX_ASTRA_MODEL_ID,
+                display_name: 'GPT-6-Astra',
+                context_window: 272_000,
+                max_context_window: 872_000,
+                effective_context_window_percent: 95
+            }]
+        });
+
+        expect(result?.models).toEqual([expect.objectContaining({
+            slug: HAPI_CODEX_ASTRA_MODEL_ID,
+            context_window: 1_050_000,
+            max_context_window: 1_050_000,
+            effective_context_window_percent: 95
+        })]);
+    });
 });
 
-describe('HAPI Sol model variant', () => {
-    it('adds a selectable 1M row while preserving the base model as default', () => {
+describe('HAPI Codex model variants', () => {
+    it('adds Astra and a selectable Sol 1M row while preserving Sol as default', () => {
         const models = addHapiCodexModelVariants([{
             id: 'gpt-5.6-sol',
             displayName: 'GPT-5.6-Sol',
@@ -90,6 +120,13 @@ describe('HAPI Sol model variant', () => {
         }]);
 
         expect(models).toEqual([
+            expect.objectContaining({
+                id: HAPI_CODEX_ASTRA_MODEL_ID,
+                displayName: 'GPT-6 Astra (1M)',
+                isDefault: false,
+                defaultReasoningEffort: 'medium',
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max']
+            }),
             expect.objectContaining({ id: 'gpt-5.6-sol', isDefault: true }),
             expect.objectContaining({
                 id: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
@@ -98,6 +135,33 @@ describe('HAPI Sol model variant', () => {
                 supportedReasoningEfforts: ['low']
             })
         ]);
+    });
+
+    it('keeps a catalog-provided Astra row while labeling it', () => {
+        const models = addHapiCodexModelVariants([{
+            id: HAPI_CODEX_ASTRA_MODEL_ID,
+            displayName: 'GPT-6-Astra',
+            isDefault: true,
+            supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+        }]);
+
+        expect(models).toEqual([expect.objectContaining({
+            id: HAPI_CODEX_ASTRA_MODEL_ID,
+            displayName: 'GPT-6 Astra (1M)',
+            isDefault: false,
+            supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+        })]);
+        expect(resolveHapiCodexModel(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({
+            model: HAPI_CODEX_ASTRA_MODEL_ID,
+            contextWindow: HAPI_CODEX_ASTRA_CONTEXT.contextWindow,
+            autoCompactTokenLimit: HAPI_CODEX_ASTRA_CONTEXT.autoCompactTokenLimit,
+            autoCompactTokenLimitScope: 'total'
+        });
+        expect(buildHapiCodexModelContextConfig(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({
+            model_context_window: 1_050_000,
+            model_auto_compact_token_limit: 950_000,
+            model_auto_compact_token_limit_scope: 'total'
+        });
     });
 
     it('maps the virtual row to upstream Sol and per-thread context settings', () => {
@@ -196,19 +260,26 @@ describe('inline tool fallback for third-party Codex endpoints', () => {
             }]
         }, { inlineTools: true });
 
-        expect(result?.models).toEqual([{
+        expect(result?.models.find((model) => model.slug === HAPI_CODEX_ASTRA_MODEL_ID)).toMatchObject({
+            context_window: 1_050_000,
+            max_context_window: 1_050_000,
+            use_responses_lite: false,
+            tool_mode: null
+        });
+        expect(result?.models.find((model) => model.slug === 'gpt-5.6-sol')).toEqual({
             slug: 'gpt-5.6-sol',
             context_window: 372_000,
             max_context_window: 1_000_000,
             use_responses_lite: false,
             tool_mode: null
-        }, {
+        });
+        expect(result?.models.find((model) => model.slug === 'gpt-5.5')).toEqual({
             slug: 'gpt-5.5',
             context_window: 272_000,
             max_context_window: 272_000,
             use_responses_lite: false,
             tool_mode: null
-        }]);
+        });
     });
 
     it('leaves the catalog request shape untouched by default', () => {

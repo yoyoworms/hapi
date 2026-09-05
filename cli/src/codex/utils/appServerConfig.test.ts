@@ -8,7 +8,10 @@ import {
     supportsReasoningSummary
 } from './appServerConfig';
 import { codexSystemPrompt } from './systemPrompt';
-import { HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID } from '../hapiContextPolicy';
+import {
+    HAPI_CODEX_ASTRA_MODEL_ID,
+    HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID
+} from '../hapiContextPolicy';
 
 describe('appServerConfig', () => {
     const mcpServers = { hapi: { command: 'node', args: ['mcp'] } };
@@ -230,6 +233,25 @@ describe('appServerConfig', () => {
         // thread lifecycle APIs. turn/start silently ignores unknown config,
         // so a context-tier change must resume the thread on a fresh server.
         expect(turn).not.toHaveProperty('config');
+    });
+
+    it('applies Astra official 1.05M raw context at thread start', () => {
+        const thread = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: HAPI_CODEX_ASTRA_MODEL_ID,
+                collaborationMode: 'default'
+            },
+            mcpServers
+        });
+
+        expect(thread.model).toBe(HAPI_CODEX_ASTRA_MODEL_ID);
+        expect(thread.config).toMatchObject({
+            model_context_window: 1_050_000,
+            model_auto_compact_token_limit: 950_000,
+            model_auto_compact_token_limit_scope: 'total'
+        });
     });
 
     it('does not apply Sol context settings to another upstream model', () => {
