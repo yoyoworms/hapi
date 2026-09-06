@@ -21,6 +21,49 @@ test.describe('composer IME focus lifecycle', () => {
         await expect(page.getByTestId('rich-composer-input')).toHaveCount(0)
     })
 
+    test('does not repaint provisional native voice input during unrelated renders', async ({ page }) => {
+        const editor = await openComposer(page, 'native')
+        await editor.click()
+
+        // iOS/third-party dictation mutates a provisional range before it has
+        // committed the replacement to application state. Repainting a
+        // controlled value here destroys that range and duplicates the prefix
+        // when the recognizer refines it.
+        await page.evaluate(() => {
+            const input = document.querySelector<HTMLTextAreaElement>('textarea[name="input"]')!
+            input.value = '在'
+            input.setSelectionRange(1, 1)
+            window.__composerImeE2E?.rerender()
+        })
+
+        await expect(editor).toHaveValue('在')
+        await expect(editor).toBeFocused()
+    })
+
+    test('accepts successive native voice replacement values without duplicating the prefix', async ({ page }) => {
+        const editor = await openComposer(page, 'native')
+        await editor.click()
+
+        await page.evaluate(() => {
+            const input = document.querySelector<HTMLTextAreaElement>('textarea[name="input"]')!
+            const replace = (value: string, inputType: string) => {
+                input.value = value
+                input.setSelectionRange(value.length, value.length)
+                input.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType,
+                    data: value,
+                }))
+                window.__composerImeE2E?.rerender()
+            }
+            replace('在', 'insertText')
+            replace('在输入', 'insertReplacementText')
+            replace('在输入框里', 'insertReplacementText')
+        })
+
+        await expect(editor).toHaveValue('在输入框里')
+    })
+
     for (const mode of ['native', 'rich'] as const) {
         test(`keeps the ${mode} input focused across a pending send and resumes editing`, async ({ page }) => {
             const editor = await openComposer(page, mode)
@@ -54,7 +97,7 @@ test.describe('composer IME focus lifecycle', () => {
             await editor.click()
             await editor.fill('send this')
 
-            await page.getByRole('button', { name: 'Send' }).click()
+            await page.getByRole('button', { name: 'Send', exact: true }).click()
 
             await expect(editor).toBeFocused()
             await expect(editor).toBeEditable()

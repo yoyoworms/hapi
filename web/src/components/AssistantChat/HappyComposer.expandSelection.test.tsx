@@ -108,7 +108,10 @@ describe('HappyComposer plain-text expansion', () => {
         await waitFor(() => {
             expect(screen.getByRole('button', { name: 'Collapse message editor' })).toBeInTheDocument()
             const expandedInput = screen.getByRole('textbox') as HTMLTextAreaElement
-            expect(expandedInput).not.toBe(collapsedInput)
+            // The DOM-owned textarea stays mounted so an active IME/dictation
+            // replacement range survives the layout change.
+            expect(expandedInput).toBe(collapsedInput)
+            expect(expandedInput.style.height).toBe('')
             expect(expandedInput.value).toBe(draft)
             expect(expandedInput.selectionStart).toBe(12)
             expect(expandedInput.selectionEnd).toBe(36)
@@ -123,7 +126,7 @@ describe('HappyComposer plain-text expansion', () => {
         await waitFor(() => {
             expect(screen.getByRole('button', { name: 'Expand message editor' })).toBeInTheDocument()
             const nextCollapsedInput = screen.getByRole('textbox') as HTMLTextAreaElement
-            expect(nextCollapsedInput).not.toBe(expandedInput)
+            expect(nextCollapsedInput).toBe(expandedInput)
             expect(nextCollapsedInput.value).toBe(draft)
             expect(nextCollapsedInput.selectionStart).toBe(42)
             expect(nextCollapsedInput.selectionEnd).toBe(67)

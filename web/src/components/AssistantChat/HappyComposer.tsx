@@ -15,6 +15,7 @@ import {
     type SyntheticEvent as ReactSyntheticEvent,
     useCallback,
     useEffect,
+    useLayoutEffect,
     useMemo,
     useRef,
     useState
@@ -1513,6 +1514,47 @@ export function HappyComposer(props: {
         handleUserEdit()
     }, [editorReadOnly, handleUserEdit])
 
+    // Keep the native textarea DOM-owned while the user is editing. iOS and
+    // third-party voice keyboards keep an internal provisional replacement
+    // range while refining the first words of a dictation. A React-controlled
+    // `value` write on every interim input destroys that range, so the next
+    // refinement is inserted beside the old prefix instead of replacing it
+    // (for example `在` -> `在在输入` -> `在在在输入框`).
+    //
+    // ComposerPrimitive.Input still owns the input/change handlers and writes
+    // every accepted DOM value into assistant-ui synchronously. We only push a
+    // value back into the DOM when composer state was changed externally
+    // (draft restore, history, suggestion, send clear, dictation button, etc.).
+    useLayoutEffect(() => {
+        if (richMentionsEnabled) return
+        const input = textareaRef.current
+        if (!input) return
+
+        if (input.value !== composerText) {
+            const hadFocus = document.activeElement === input
+            input.value = composerText
+            if (hadFocus) {
+                const position = composerText.length
+                input.setSelectionRange(position, position)
+            }
+        }
+        if (isExpanded) {
+            // The same DOM node survives compact/expanded transitions; remove
+            // the compact editor's measured inline height so `h-full` wins.
+            input.style.height = ''
+        } else {
+            input.style.height = 'auto'
+            input.style.height = `${input.scrollHeight}px`
+        }
+    }, [composerText, isExpanded, richMentionsEnabled])
+
+    const handleNativeInput = useCallback((e: ReactFormEvent<HTMLTextAreaElement>) => {
+        if (isExpanded) return
+        const input = e.currentTarget
+        input.style.height = 'auto'
+        input.style.height = `${input.scrollHeight}px`
+    }, [isExpanded])
+
     const handleSelect = useCallback((e: ReactSyntheticEvent<HTMLTextAreaElement>) => {
         const target = e.target as HTMLTextAreaElement
         setInputState(prev => ({
@@ -2428,34 +2470,46 @@ export function HappyComposer(props: {
                                     onPaste={handlePaste}
                                 >
                                     <textarea
+                                        // Radix Slot lets the child override the primitive's
+                                        // controlled value. See the layout effect above.
+                                        value={undefined}
+                                        defaultValue={composerText}
                                         placeholder={t(resolveComposerPlaceholderKey({
                                             richMentionsEnabled: false,
                                             showContinueHint,
                                         }))}
                                         disabled={editorDisabled}
                                         readOnly={editorReadOnly}
+                                        onInput={handleNativeInput}
                                         className="h-full min-h-0 flex-1 resize-none overflow-y-auto bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                                     />
                                 </ComposerPrimitive.Input>
                             ) : (
                                 <ComposerPrimitive.Input
+                                    asChild
                                     ref={textareaRef}
                                     autoFocus={!editorDisabled && !isTouch}
-                                    placeholder={t(resolveComposerPlaceholderKey({
-                                        richMentionsEnabled: false,
-                                        showContinueHint,
-                                    }))}
-                                    disabled={editorDisabled}
-                                    readOnly={editorReadOnly}
-                                    maxRows={5}
                                     submitOnEnter={false}
                                     cancelOnEscape={false}
                                     onChange={handleChange}
                                     onSelect={handleSelect}
                                     onKeyDown={handleKeyDown}
                                     onPaste={handlePaste}
-                                    className="flex-1 resize-none bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                                />
+                                >
+                                    <textarea
+                                        value={undefined}
+                                        defaultValue={composerText}
+                                        rows={1}
+                                        placeholder={t(resolveComposerPlaceholderKey({
+                                            richMentionsEnabled: false,
+                                            showContinueHint,
+                                        }))}
+                                        disabled={editorDisabled}
+                                        readOnly={editorReadOnly}
+                                        onInput={handleNativeInput}
+                                        className="max-h-[6.875rem] flex-1 resize-none overflow-y-auto bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                                    />
+                                </ComposerPrimitive.Input>
                             )}
                         </div>
                         {richMentionsEnabled && richComposerFueStatus === 'engaging' ? (
