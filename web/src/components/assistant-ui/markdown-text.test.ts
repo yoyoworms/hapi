@@ -12,6 +12,7 @@ import {
     MARKDOWN_PLUGINS_STANDALONE_WITH_BREAKS,
     MARKDOWN_PLUGINS_WITH_BREAKS,
     MARKDOWN_REHYPE_PLUGINS,
+    preprocessMarkdownText,
 } from '@/components/assistant-ui/markdown-text'
 import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
@@ -30,6 +31,17 @@ describe('MARKDOWN_PLUGINS integration', () => {
     it('keeps hard-break parsing scoped to opt-in user prompt rendering', () => {
         expect(MARKDOWN_PLUGINS).not.toContain(remarkBreaks)
         expect(MARKDOWN_PLUGINS_WITH_BREAKS).toContain(remarkBreaks)
+    })
+})
+
+describe('preprocessMarkdownText', () => {
+    it('removes unsupported Codex internal citation sentinels', () => {
+        expect(preprocessMarkdownText(
+            '首页卡片已经使用 lazy loading。citeturn0search4'
+        )).toBe('首页卡片已经使用 lazy loading。')
+        expect(preprocessMarkdownText(
+            '参考citeturn0search4turn0search7后续'
+        )).toBe('参考后续')
     })
 })
 

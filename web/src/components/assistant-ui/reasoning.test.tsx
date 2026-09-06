@@ -34,6 +34,7 @@ vi.mock('@/components/assistant-ui/markdown-text', () => ({
     MARKDOWN_REHYPE_PLUGINS: [],
     defaultComponents: {},
     denyOnlyTransform: vi.fn(),
+    preprocessMarkdownText: (text: string) => text,
     UriConfirmProvider: ({ children }: React.PropsWithChildren) => <>{children}</>
 }))
 

@@ -44,6 +44,16 @@ import { useToast } from '@/lib/toast-context'
 
 import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 
+// Codex web-search answers can contain private-use citation sentinels such as
+// `citeturn0search4`. Official clients resolve those against structured
+// source metadata. HAPI does not receive that metadata in its text message
+// parts, so rendering the sentinel verbatim only exposes protocol noise.
+const INTERNAL_CITATION_SENTINEL = /cite[^]*/g
+
+export function preprocessMarkdownText(text: string): string {
+    return normalizeLatexDelimiters(text.replace(INTERNAL_CITATION_SENTINEL, ''))
+}
+
 // ── Plugin array ────────────────────────────────────────────────────────────
 // Order: remarkGfm → remarkRepairTables → remarkNonHttpsAutolink → remarkStripCjkAutolink → remarkMath → remarkDisableIndentedCode → remarkSessionPathLinks → remarkFilePathLinks
 // remarkRepairTables must run immediately after remarkGfm — it reads file.value
@@ -977,7 +987,7 @@ export function MarkdownText({ smooth }: { smooth?: boolean } = {}) {
     return (
         <UriConfirmProvider>
             <MarkdownTextPrimitive
-                preprocess={normalizeLatexDelimiters}
+                preprocess={preprocessMarkdownText}
                 smooth={smooth}
                 remarkPlugins={MARKDOWN_PLUGINS}
                 rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
