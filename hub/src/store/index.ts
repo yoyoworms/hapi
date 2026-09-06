@@ -46,7 +46,7 @@ export {
 
 // v24 is the convergence point between upstream's v23 usage/work-graph/pin
 // ladder and the local content-UUID/session-share schema.
-const SCHEMA_VERSION: number = 25
+const SCHEMA_VERSION: number = 26
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -400,6 +400,7 @@ export class Store {
             22: () => this.migrateFromV22ToV23(),
             23: () => this.migrateFromV23ToV24(),
             24: () => this.migrateFromV24ToV25(),
+            25: () => this.migrateFromV25ToV26(),
         })
 
         if (currentVersion === 0) {
@@ -513,6 +514,12 @@ export class Store {
             CREATE INDEX IF NOT EXISTS idx_messages_scheduled_pending
                 ON messages(scheduled_at)
                 WHERE scheduled_at IS NOT NULL AND invoked_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_messages_immediate_queued
+                ON messages(session_id, seq)
+                WHERE invoked_at IS NULL
+                  AND local_id IS NOT NULL
+                  AND scheduled_at IS NULL
+                  AND delivery_state = 'queued';
 
             CREATE TABLE IF NOT EXISTS message_epochs (
                 session_id TEXT PRIMARY KEY,
@@ -659,6 +666,18 @@ export class Store {
                 ON event_links(namespace, from_event_id);
             CREATE INDEX IF NOT EXISTS idx_event_links_namespace_to
                 ON event_links(namespace, to_event_id);
+        `)
+    }
+
+    /** v25→v26: make empty immediate-queue heartbeat replay an indexed lookup. */
+    private migrateFromV25ToV26(): void {
+        this.db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_messages_immediate_queued
+                ON messages(session_id, seq)
+                WHERE invoked_at IS NULL
+                  AND local_id IS NOT NULL
+                  AND scheduled_at IS NULL
+                  AND delivery_state = 'queued';
         `)
     }
 
