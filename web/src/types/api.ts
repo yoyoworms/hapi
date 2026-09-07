@@ -293,6 +293,7 @@ export type CodexDesktopSyncRequest = {
     sessionIds: string[]
     cwd?: string | null
     machineId?: string | null
+    codexAccountId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null

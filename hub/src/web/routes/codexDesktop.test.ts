@@ -438,6 +438,31 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
+    it('imports Codex transcripts into the requesting namespace without leaking into default', async () => {
+        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-namespace-test-'))
+        const store = new Store(':memory:')
+        const codexSessionId = '11111111-1111-4111-8111-111111111112'
+        process.env.CODEX_HOME = codexHome
+
+        try {
+            createTranscript(codexHome, codexSessionId)
+
+            const result = await importSelectedCodexSessions({
+                codexSessionIds: [codexSessionId],
+                store,
+                namespace: 'team-a',
+                getSyncEngine: () => null
+            })
+
+            expect(result.success).toBe(true)
+            expect(store.sessions.getSessionsByNamespace('team-a')).toHaveLength(1)
+            expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(0)
+        } finally {
+            store.close()
+            rmSync(codexHome, { recursive: true, force: true })
+        }
+    })
+
     it('updates an existing forked import when syncing the original Codex session id', async () => {
         const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-source-test-'))
         const store = new Store(':memory:')
@@ -1085,14 +1110,15 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
-    it('rejects Codex transcript endpoints outside the default namespace', async () => {
+    it('keeps Codex transcript endpoints namespace-scoped without requiring default namespace', async () => {
         const app = createRoutesApp('team-a')
         const response = await app.request('/api/codex/sessions')
 
-        expect(response.status).toBe(403)
+        expect(response.status).toBe(503)
         expect(await response.json()).toEqual({
             success: false,
-            error: 'Codex transcript import is not available outside the default namespace'
+            error: 'No online machine available for Codex history import',
+            sessions: []
         })
     })
 

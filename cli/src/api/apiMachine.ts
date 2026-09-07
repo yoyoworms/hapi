@@ -47,6 +47,7 @@ import {
 import type { SpawnSessionOptions, SpawnSessionResult } from '../modules/common/rpcTypes'
 import { applyVersionedAck } from './versionedUpdate'
 import { archiveLocalCodexSession, listLocalCodexSessionSummaries, listLocalCodexSessionsWithMessagesByIds } from '../modules/common/codexSessions'
+import { codexAccountManager } from '@/codex/codexAccountManager'
 import { listLocalPiSessionSummaries, listLocalPiSessionsWithMessagesByIds } from '../modules/common/piSessions'
 import { buildSocketIoExtraHeaderOptions } from './hubExtraHeaders'
 import { collectMachineHealth } from '@/utils/machineHealth'
@@ -304,9 +305,20 @@ export class ApiMachineClient {
                 const requestedIds = parsed.data.sessionIds
                     ? new Set(parsed.data.sessionIds)
                     : null
+                let codexHome: string | undefined
+                if (parsed.data.codexAccountId) {
+                    try {
+                        codexHome = (await codexAccountManager.resolveAccount(parsed.data.codexAccountId)).homeDir
+                    } catch (error) {
+                        return {
+                            success: false,
+                            error: error instanceof Error ? error.message : 'Codex account is unavailable'
+                        }
+                    }
+                }
                 const allSessions = requestedIds
-                    ? listLocalCodexSessionsWithMessagesByIds(requestedIds)
-                    : listLocalCodexSessionSummaries()
+                    ? listLocalCodexSessionsWithMessagesByIds(requestedIds, codexHome)
+                    : listLocalCodexSessionSummaries(undefined, codexHome)
                 const sessions = []
                 for (const session of allSessions) {
                     if (await this.isLocalSessionWithinWorkspaceRoots(session)) {

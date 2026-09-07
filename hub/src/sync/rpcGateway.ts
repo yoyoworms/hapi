@@ -524,8 +524,8 @@ export class RpcGateway {
         ) as RpcListCodexModelsResponse
     }
 
-    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListCodexSessionsResponse> {
-        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexSessions, { cwd: cwd ?? null, sessionIds }, MODEL_LIST_RPC_TIMEOUT_MS)
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[], codexAccountId?: string | null): Promise<RpcListCodexSessionsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexSessions, { cwd: cwd ?? null, sessionIds, codexAccountId: codexAccountId ?? null }, MODEL_LIST_RPC_TIMEOUT_MS)
         return ListCodexSessionsRpcResponseSchema.parse(result)
     }
 

@@ -132,6 +132,7 @@ type SyncSessionRequestParseResult = {
     sessionIds: string[]
     cwd?: string | null
     machineId?: string | null
+    codexAccountId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null
@@ -172,7 +173,6 @@ type DuplicateSessionGroupCandidate = {
 const CODEX_DESKTOP_NOT_FOUND_ERROR = '尝试重启codex客户端失败，未安装/找不到codex客户端'
 const SCRIPT_TIMEOUT_ERROR = '执行超时'
 const NO_SYNC_SESSION_SELECTED_ERROR = '未选择需要导入的 Codex 会话'
-const CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR = 'Codex transcript import is not available outside the default namespace'
 const DEFAULT_SCRIPT_TIMEOUT_MS = 60_000
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 500
 const DARWIN_CODEX_APP_NAME = 'Codex'
@@ -983,12 +983,13 @@ async function listCodexSessionsViaMachine(options: {
     cwd?: string | null
     machineId?: string | null
     sessionIds?: string[]
+    codexAccountId?: string | null
 }): Promise<{ sessions: RemoteCodexSession[]; machineId?: string; error?: string }> {
     const machineId = resolveCodexImportMachineId(options.cwd, options.namespace, options.engine, options.machineId)
     if (!machineId || !options.engine) {
         return { sessions: [], error: 'No online machine available for Codex history import' }
     }
-    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds)
+    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds, options.codexAccountId)
     if (!result || typeof result !== 'object') {
         return { sessions: [], machineId, error: 'Unexpected Codex sessions RPC response' }
     }
@@ -1911,7 +1912,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         return { sessionIds: [] }
     }
 
-    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
+    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; codexAccountId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
     const rawSessionIds = bodyRecord.sessionIds
     if (!Array.isArray(rawSessionIds)) {
         return { sessionIds: [], error: 'Invalid sessionIds' }
@@ -1944,6 +1945,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         sessionIds: Array.from(new Set(sessionIds)),
         cwd: typeof bodyRecord.cwd === 'string' && bodyRecord.cwd.trim() ? bodyRecord.cwd.trim() : null,
         machineId: typeof bodyRecord.machineId === 'string' && bodyRecord.machineId.trim() ? bodyRecord.machineId.trim() : null,
+        codexAccountId: typeof bodyRecord.codexAccountId === 'string' && bodyRecord.codexAccountId.trim() ? bodyRecord.codexAccountId.trim() : null,
         model: hasModel ? (typeof bodyRecord.model === 'string' && bodyRecord.model.trim() ? bodyRecord.model.trim() : null) : undefined,
         modelReasoningEffort: hasModelReasoningEffort ? (typeof bodyRecord.modelReasoningEffort === 'string' && bodyRecord.modelReasoningEffort.trim() ? bodyRecord.modelReasoningEffort.trim() : null) : undefined,
         serviceTier: hasServiceTier ? bodyRecord.serviceTier as 'fast' | 'standard' | null : undefined,
@@ -2234,15 +2236,11 @@ export function createCodexDesktopRoutes(options: {
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
-    app.use('/codex/*', async (c, next) => {
-        if (c.get('namespace') !== 'default') {
-            return c.json({
-                success: false,
-                error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR
-            }, 403)
-        }
-        return next()
-    })
+    // Transcript import is namespace-scoped end to end: the selected Runner
+    // is resolved within the caller's namespace, and imported HAPI rows are
+    // persisted with that same namespace. Do not restrict this to `default` —
+    // managed HAPI accounts must be able to recover their own local Codex
+    // history as well.
 
     app.get('/codex/status', (c) => {
         const codexStatus = getCodexDesktopStatus()
@@ -2256,11 +2254,13 @@ export function createCodexDesktopRoutes(options: {
     app.get('/codex/sessions', async (c) => {
         const cwd = c.req.query('cwd')?.trim() || null
         const machineId = c.req.query('machineId')?.trim() || null
+        const codexAccountId = c.req.query('codexAccountId')?.trim() || null
         const remote = await listCodexSessionsViaMachine({
             engine: options.getSyncEngine(),
             namespace: c.get('namespace'),
             cwd,
-            machineId
+            machineId,
+            codexAccountId
         })
         if (remote.error) {
             return c.json({
@@ -2328,7 +2328,8 @@ export function createCodexDesktopRoutes(options: {
             namespace: c.get('namespace'),
             cwd: parsed.cwd,
             machineId: parsed.machineId,
-            sessionIds: parsed.sessionIds
+            sessionIds: parsed.sessionIds,
+            codexAccountId: parsed.codexAccountId
         })
         if (remote.error) {
             const { workspace } = getDirectImportRouteContext()

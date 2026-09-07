@@ -936,7 +936,7 @@ export function NewSession(props: {
         setIsLoadingCodexImportSessions(true)
         setCodexImportError(null)
         try {
-            const result = await props.api.getCodexSessions(trimmedDirectory || null, machineId)
+            const result = await props.api.getCodexSessions(trimmedDirectory || null, machineId, codexAccountId)
             setCodexImportSessions(result.sessions)
             setCodexImportMachineId(result.machineId ?? machineId)
             setSelectedCodexImportSessionId((current) => current && result.sessions.some((session) => session.id === current) ? current : null)
@@ -948,7 +948,7 @@ export function NewSession(props: {
         } finally {
             setIsLoadingCodexImportSessions(false)
         }
-    }, [agent, machineId, props.api, trimmedDirectory, t])
+    }, [agent, codexAccountId, machineId, props.api, trimmedDirectory, t])
 
     useEffect(() => {
         piLoadGenerationRef.current += 1
@@ -1058,7 +1058,8 @@ export function NewSession(props: {
             const result = await props.api.syncCodexSession({
                 sessionIds,
                 cwd: trimmedDirectory || null,
-                machineId: codexImportMachineId ?? machineId
+                machineId: codexImportMachineId ?? machineId,
+                codexAccountId
             })
             if (!result.success) {
                 throw new Error(normalizeCodexScriptError(result.error, t('codexSync.failed.body')))
@@ -1498,6 +1499,7 @@ export function NewSession(props: {
                     sessionIds: [selectedCodexImportSession.id],
                     cwd: selectedCodexImportSession.cwd ?? trimmedDirectory,
                     machineId: codexImportMachineId ?? machineId,
+                    codexAccountId,
                     model: resolvedModel ?? null,
                     modelReasoningEffort: resolvedModelReasoningEffort ?? null,
                     serviceTier: resolvedServiceTier,

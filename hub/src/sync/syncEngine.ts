@@ -4464,8 +4464,8 @@ export class SyncEngine {
         return await this.rpcGateway.listCodexModelsForSession(sessionId)
     }
 
-    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]) {
-        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds)
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[], codexAccountId?: string | null) {
+        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds, codexAccountId)
     }
 
     async listPiSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListPiSessionsResponse> {

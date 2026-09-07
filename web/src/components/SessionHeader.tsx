@@ -311,7 +311,8 @@ export function SessionHeader(props: {
             const result = await api.syncCodexSession({
                 sessionIds: [codexSessionId],
                 cwd: typeof session.metadata?.path === 'string' ? session.metadata.path : undefined,
-                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined
+                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined,
+                codexAccountId: typeof session.metadata?.codexAccountId === 'string' ? session.metadata.codexAccountId : undefined
             })
             if (!result.success) {
                 throw new Error(result.error || t('codexSync.failed.body'))

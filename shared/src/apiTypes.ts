@@ -212,7 +212,8 @@ export const CodexLocalSessionWithMessagesSchema = CodexLocalSessionSummarySchem
 
 export const ListCodexSessionsRpcRequestSchema = z.object({
     cwd: z.string().nullable().optional(),
-    sessionIds: z.array(z.string().min(1)).optional()
+    sessionIds: z.array(z.string().min(1)).optional(),
+    codexAccountId: z.string().nullable().optional()
 })
 
 export const ListCodexSessionsRpcResponseSchema = z.union([
