@@ -21,15 +21,19 @@ describe('getContextBudgetTokens', () => {
     })
 
     it('uses Codex app-server context window with headroom', () => {
-        expect(getContextBudgetTokens('gpt-5.4', 'codex')).toBe(343_400)
+        expect(getContextBudgetTokens('gpt-5.4', 'codex')).toBe(248_400)
     })
 
     it('uses the large Codex budget for the selectable Sol 1M variant', () => {
         expect(getContextBudgetTokens('gpt-5.6-sol[1m]', 'codex')).toBe(990_000)
     })
 
-    it('uses Astra effective 1M context before live usage arrives', () => {
-        expect(getContextBudgetTokens('gpt-6-astra', 'codex')).toBe(987_500)
+    it('uses Astra effective 1M context for the explicit large variant', () => {
+        expect(getContextBudgetTokens('gpt-6-astra[1m]', 'codex')).toBe(987_500)
+    })
+
+    it('uses the normal Codex budget for Astra', () => {
+        expect(getContextBudgetTokens('gpt-6-astra', 'codex')).toBe(248_400)
     })
 
     it('parses context budget from Cursor wire ids', () => {

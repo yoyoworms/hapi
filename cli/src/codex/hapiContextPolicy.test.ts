@@ -10,19 +10,14 @@ import {
     buildHapiCodexModelContextConfig,
     buildCodexAppServerArgs,
     HAPI_CODEX_ASTRA_CONTEXT,
+    HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
     HAPI_CODEX_ASTRA_MODEL_ID,
-    HAPI_CODEX_CONTEXT_DEFAULTS,
     HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
     resolveHapiCodexModel
 } from './hapiContextPolicy';
 
 describe('buildCodexAppServerArgs', () => {
-    it('loads the HAPI catalog without globally overriding every model context', () => {
-        expect(HAPI_CODEX_CONTEXT_DEFAULTS).toEqual({
-            contextWindow: 372_000,
-            autoCompactTokenLimit: 330_000,
-            autoCompactTokenLimitScope: 'total'
-        });
+    it('loads the HAPI catalog without globally overriding Codex defaults', () => {
         expect(buildCodexAppServerArgs('/tmp/hapi model catalog.json')).toEqual([
             '-c',
             'model_catalog_json="/tmp/hapi model catalog.json"',
@@ -59,12 +54,12 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
         ]);
         expect(result?.models.find((model) => model.slug === HAPI_CODEX_ASTRA_MODEL_ID)).toMatchObject({
             display_name: 'GPT-6-Astra',
-            context_window: 1_050_000,
+            context_window: 272_000,
             max_context_window: 1_050_000,
             effective_context_window_percent: 95
         });
         expect(result?.models.find((model) => model.slug === 'gpt-5.6-sol')).toMatchObject({
-            context_window: 372_000,
+            context_window: 272_000,
             max_context_window: 1_000_000,
             effective_context_window_percent: 95
         });
@@ -90,7 +85,7 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
         expect(applyHapiCodexContextCatalogPolicy({})).toBeNull();
     });
 
-    it('raises a catalog-provided Astra row to the official 1.05M raw window', () => {
+    it('raises a catalog-provided Astra max cap while preserving its normal window', () => {
         const result = applyHapiCodexContextCatalogPolicy({
             models: [{
                 slug: HAPI_CODEX_ASTRA_MODEL_ID,
@@ -103,7 +98,7 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
 
         expect(result?.models).toEqual([expect.objectContaining({
             slug: HAPI_CODEX_ASTRA_MODEL_ID,
-            context_window: 1_050_000,
+            context_window: 272_000,
             max_context_window: 1_050_000,
             effective_context_window_percent: 95
         })]);
@@ -111,7 +106,7 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
 });
 
 describe('HAPI Codex model variants', () => {
-    it('adds Astra and a selectable Sol 1M row while preserving Sol as default', () => {
+    it('adds normal and 1M Astra options plus a selectable Sol 1M row while preserving Sol as default', () => {
         const models = addHapiCodexModelVariants([{
             id: 'gpt-5.6-sol',
             displayName: 'GPT-5.6-Sol',
@@ -122,6 +117,13 @@ describe('HAPI Codex model variants', () => {
         expect(models).toEqual([
             expect.objectContaining({
                 id: HAPI_CODEX_ASTRA_MODEL_ID,
+                displayName: 'GPT-6 Astra',
+                isDefault: false,
+                defaultReasoningEffort: 'medium',
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max']
+            }),
+            expect.objectContaining({
+                id: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
                 displayName: 'GPT-6 Astra (1M)',
                 isDefault: false,
                 defaultReasoningEffort: 'medium',
@@ -145,26 +147,39 @@ describe('HAPI Codex model variants', () => {
             supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
         }]);
 
-        expect(models).toEqual([expect.objectContaining({
+        expect(models).toEqual([
+            expect.objectContaining({
+                id: HAPI_CODEX_ASTRA_MODEL_ID,
+                displayName: 'GPT-6 Astra',
+                isDefault: false,
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+            }),
+            expect.objectContaining({
+                id: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
+                displayName: 'GPT-6 Astra (1M)',
+                isDefault: false,
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+            })
+        ]);
+        expect(models).toContainEqual(expect.objectContaining({
             id: HAPI_CODEX_ASTRA_MODEL_ID,
-            displayName: 'GPT-6 Astra (1M)',
-            isDefault: false,
-            supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
-        })]);
-        expect(resolveHapiCodexModel(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({
+            displayName: 'GPT-6 Astra',
+            isDefault: false
+        }));
+        expect(resolveHapiCodexModel(HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID)).toEqual({
             model: HAPI_CODEX_ASTRA_MODEL_ID,
             contextWindow: HAPI_CODEX_ASTRA_CONTEXT.contextWindow,
             autoCompactTokenLimit: HAPI_CODEX_ASTRA_CONTEXT.autoCompactTokenLimit,
             autoCompactTokenLimitScope: 'total'
         });
-        expect(buildHapiCodexModelContextConfig(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({
+        expect(buildHapiCodexModelContextConfig(HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID)).toEqual({
             model_context_window: 1_050_000,
             model_auto_compact_token_limit: 950_000,
             model_auto_compact_token_limit_scope: 'total'
         });
     });
 
-    it('maps the virtual row to upstream Sol and per-thread context settings', () => {
+    it('maps the virtual row to upstream Sol and keeps normal models on Codex defaults', () => {
         expect(resolveHapiCodexModel(HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID)).toEqual({
             model: 'gpt-5.6-sol',
             contextWindow: 1_000_000,
@@ -181,20 +196,19 @@ describe('HAPI Codex model variants', () => {
             '-c', 'model_auto_compact_token_limit=900000',
             '-c', 'model_auto_compact_token_limit_scope="total"'
         ]);
-        expect(buildHapiCodexModelContextConfig('gpt-5.6-sol')).toEqual({
-            model_context_window: 372_000,
-            model_auto_compact_token_limit: 330_000,
-            model_auto_compact_token_limit_scope: 'total'
-        });
-        expect(buildHapiCodexModelContextConfig(null)).toEqual({
-            model_context_window: 372_000,
-            model_auto_compact_token_limit: 330_000,
-            model_auto_compact_token_limit_scope: 'total'
-        });
+        expect(buildHapiCodexModelContextConfig('gpt-5.6-sol')).toEqual({});
+        expect(buildHapiCodexModelContextConfig(null)).toEqual({});
         expect(resolveHapiCodexModel('gpt-5.6-terra')).toEqual({
             model: 'gpt-5.6-terra'
         });
         expect(buildHapiCodexModelContextConfig('gpt-5.6-terra')).toEqual({});
+    });
+
+    it('keeps the normal Astra row on Codex defaults', () => {
+        expect(resolveHapiCodexModel(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({
+            model: HAPI_CODEX_ASTRA_MODEL_ID
+        });
+        expect(buildHapiCodexModelContextConfig(HAPI_CODEX_ASTRA_MODEL_ID)).toEqual({});
     });
 });
 
@@ -261,14 +275,14 @@ describe('inline tool fallback for third-party Codex endpoints', () => {
         }, { inlineTools: true });
 
         expect(result?.models.find((model) => model.slug === HAPI_CODEX_ASTRA_MODEL_ID)).toMatchObject({
-            context_window: 1_050_000,
+            context_window: 272_000,
             max_context_window: 1_050_000,
             use_responses_lite: false,
             tool_mode: null
         });
         expect(result?.models.find((model) => model.slug === 'gpt-5.6-sol')).toEqual({
             slug: 'gpt-5.6-sol',
-            context_window: 372_000,
+            context_window: 272_000,
             max_context_window: 1_000_000,
             use_responses_lite: false,
             tool_mode: null

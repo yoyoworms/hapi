@@ -13,13 +13,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     return value as Record<string, unknown>;
 }
 
-export const HAPI_CODEX_CONTEXT_DEFAULTS = {
-    // Keep the existing HAPI default. The 1M Sol variant is an explicit
-    // picker option and is applied per thread/turn rather than globally.
-    contextWindow: 372_000,
-    autoCompactTokenLimit: 330_000,
-    autoCompactTokenLimitScope: 'total'
-} as const;
+const HAPI_CODEX_CATALOG_POLICY_VERSION = 'upstream-default-v1';
 
 export const HAPI_CODEX_SOL_MODEL_ID = 'gpt-5.6-sol';
 export const HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID = 'gpt-5.6-sol[1m]';
@@ -29,6 +23,7 @@ export const HAPI_CODEX_SOL_ONE_MILLION_CONTEXT = {
     autoCompactTokenLimitScope: 'total'
 } as const;
 export const HAPI_CODEX_ASTRA_MODEL_ID = 'gpt-6-astra';
+export const HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID = 'gpt-6-astra[1m]';
 export const HAPI_CODEX_ASTRA_CONTEXT = {
     // OpenAI advertises a 1,050,000-token raw window. Codex exposes 95% of
     // that value (997,500) as the effective model context window.
@@ -94,17 +89,11 @@ function resolveHapiCodexContextProfile(model: string | null | undefined): {
     autoCompactTokenLimitScope: 'total';
 } | null {
     const normalized = model?.trim();
-    if (normalized === HAPI_CODEX_ASTRA_MODEL_ID) {
+    if (normalized === HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID) {
         return HAPI_CODEX_ASTRA_CONTEXT;
     }
     if (normalized === HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID) {
         return HAPI_CODEX_SOL_ONE_MILLION_CONTEXT;
-    }
-    // HAPI's Default selection resolves to the configured default Sol model.
-    // Keep its historical 372K profile, but let every other upstream model use
-    // the context settings advertised by Codex's own catalog.
-    if (!normalized || normalized === 'auto' || normalized === HAPI_CODEX_SOL_MODEL_ID) {
-        return HAPI_CODEX_CONTEXT_DEFAULTS;
     }
     return null;
 }
@@ -126,6 +115,14 @@ export function resolveHapiCodexModel(model: string | null | undefined): HapiCod
             autoCompactTokenLimitScope: HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.autoCompactTokenLimitScope
         };
     }
+    if (normalized === HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID) {
+        return {
+            model: HAPI_CODEX_ASTRA_MODEL_ID,
+            contextWindow: HAPI_CODEX_ASTRA_CONTEXT.contextWindow,
+            autoCompactTokenLimit: HAPI_CODEX_ASTRA_CONTEXT.autoCompactTokenLimit,
+            autoCompactTokenLimitScope: HAPI_CODEX_ASTRA_CONTEXT.autoCompactTokenLimitScope
+        };
+    }
     const contextProfile = resolveHapiCodexContextProfile(normalized);
     return {
         model: normalized,
@@ -142,12 +139,12 @@ export function resolveHapiCodexModel(model: string | null | undefined): HapiCod
 /** Add HAPI context variants and phased-rollout models to Codex's picker. */
 export function addHapiCodexModelVariants(models: readonly CodexModelSummary[]): CodexModelSummary[] {
     let next = [...models];
-    const astraIndex = next.findIndex((model) => model.id === HAPI_CODEX_ASTRA_MODEL_ID);
+    let astraIndex = next.findIndex((model) => model.id === HAPI_CODEX_ASTRA_MODEL_ID);
     if (astraIndex >= 0) {
         const astra = next[astraIndex]!;
         next[astraIndex] = {
             ...astra,
-            displayName: 'GPT-6 Astra (1M)',
+            displayName: 'GPT-6 Astra',
             // The user's HAPI default remains Sol; Astra is explicit opt-in.
             isDefault: false
         };
@@ -156,13 +153,35 @@ export function addHapiCodexModelVariants(models: readonly CodexModelSummary[]):
         if (solIndex >= 0) {
             const astra: CodexModelSummary = {
                 id: HAPI_CODEX_ASTRA_MODEL_ID,
-                displayName: 'GPT-6 Astra (1M)',
+                displayName: 'GPT-6 Astra',
                 isDefault: false,
                 defaultReasoningEffort: 'medium',
                 supportedReasoningEfforts: [...HAPI_CODEX_ASTRA_REASONING_EFFORTS],
                 serviceTiers: ['priority', 'fast']
             };
             next = [...next.slice(0, solIndex), astra, ...next.slice(solIndex)];
+            astraIndex = solIndex;
+        }
+    }
+
+    if (astraIndex >= 0) {
+        const oneMillionIndex = next.findIndex(
+            (model) => model.id === HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID
+        );
+        if (oneMillionIndex >= 0) {
+            next[oneMillionIndex] = {
+                ...next[oneMillionIndex]!,
+                displayName: 'GPT-6 Astra (1M)',
+                isDefault: false
+            };
+        } else {
+            const astra = next[astraIndex]!;
+            next.splice(astraIndex + 1, 0, {
+                ...astra,
+                id: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
+                displayName: 'GPT-6 Astra (1M)',
+                isDefault: false
+            });
         }
     }
 
@@ -305,9 +324,9 @@ export type HapiCodexCatalogPolicyOptions = {
 
 /**
  * Codex clamps `model_context_window` to the selected model catalog entry's
- * `max_context_window`. Sol keeps HAPI's historical 372K base plus its explicit
- * 1M variant; Astra receives its official 1.05M raw window. Every other row
- * keeps Codex's context fields unchanged.
+ * `max_context_window`. Normal sessions keep the context fields advertised by
+ * Codex; Sol and Astra only receive a larger max cap so their explicit 1M
+ * picker variants can opt in per thread.
  */
 export function applyHapiCodexContextCatalogPolicy(
     value: unknown,
@@ -330,10 +349,6 @@ export function applyHapiCodexContextCatalogPolicy(
                 : {}),
             ...(isAstra
                 ? {
-                    context_window: atLeast(
-                        model.context_window,
-                        HAPI_CODEX_ASTRA_CONTEXT.contextWindow
-                    ),
                     max_context_window: atLeast(
                         model.max_context_window,
                         HAPI_CODEX_ASTRA_CONTEXT.contextWindow
@@ -341,10 +356,6 @@ export function applyHapiCodexContextCatalogPolicy(
                 }
                 : isSol
                     ? {
-                        context_window: atLeast(
-                            model.context_window,
-                            HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow
-                        ),
                         max_context_window: atLeast(
                             model.max_context_window,
                             HAPI_CODEX_SOL_ONE_MILLION_CONTEXT.contextWindow
@@ -372,8 +383,10 @@ export function applyHapiCodexContextCatalogPolicy(
                 // Keep configured Sol as HAPI's default while surfacing Astra
                 // immediately after it in Codex's priority ordering.
                 priority: 2,
-                context_window: HAPI_CODEX_ASTRA_CONTEXT.contextWindow,
-                max_context_window: HAPI_CODEX_ASTRA_CONTEXT.contextWindow,
+                max_context_window: atLeast(
+                    models[solIndex]!.max_context_window,
+                    HAPI_CODEX_ASTRA_CONTEXT.contextWindow
+                ),
                 effective_context_window_percent: 95,
                 additional_speed_tiers: ['fast'],
                 service_tiers: [{
@@ -438,7 +451,7 @@ function prepareHapiCodexModelCatalog(
     const digest = createHash('sha256').update(contents).digest('hex').slice(0, 16);
     const directory = join(codexHome, '.hapi', 'model-catalogs');
     const prefix = inlineTools ? 'inline-context' : 'context';
-    const path = join(directory, `${prefix}-${HAPI_CODEX_CONTEXT_DEFAULTS.contextWindow}-${digest}.json`);
+    const path = join(directory, `${prefix}-${HAPI_CODEX_CATALOG_POLICY_VERSION}-${digest}.json`);
     try {
         mkdirSync(directory, { recursive: true });
         if (!existsSync(path)) {

@@ -10,16 +10,13 @@ import {
 import { codexSystemPrompt } from './systemPrompt';
 import {
     HAPI_CODEX_ASTRA_MODEL_ID,
+    HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
     HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID
 } from '../hapiContextPolicy';
 
 describe('appServerConfig', () => {
     const mcpServers = { hapi: { command: 'node', args: ['mcp'] } };
-    const defaultContextConfig = {
-        model_context_window: 372_000,
-        model_auto_compact_token_limit: 330_000,
-        model_auto_compact_token_limit_scope: 'total'
-    };
+    const defaultContextConfig = {};
     const withCollaborationInstructions = (developerInstructions: string): string => {
         return `${developerInstructions}\n\n${codexCollaborationSpawnAgentInstructions}`;
     };
@@ -240,7 +237,7 @@ describe('appServerConfig', () => {
             cwd: '/workspace/project',
             mode: {
                 permissionMode: 'default',
-                model: HAPI_CODEX_ASTRA_MODEL_ID,
+                model: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
                 collaborationMode: 'default'
             },
             mcpServers
@@ -252,6 +249,21 @@ describe('appServerConfig', () => {
             model_auto_compact_token_limit: 950_000,
             model_auto_compact_token_limit_scope: 'total'
         });
+    });
+
+    it('keeps normal Astra on Codex defaults', () => {
+        const thread = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: {
+                permissionMode: 'default',
+                model: HAPI_CODEX_ASTRA_MODEL_ID,
+                collaborationMode: 'default'
+            },
+            mcpServers
+        });
+
+        expect(thread.model).toBe(HAPI_CODEX_ASTRA_MODEL_ID);
+        expect(thread.config).toMatchObject(defaultContextConfig);
     });
 
     it('does not apply Sol context settings to another upstream model', () => {

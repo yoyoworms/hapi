@@ -91,6 +91,10 @@ describe('listCodexModels cwd', () => {
 
         expect(first).toEqual([expect.objectContaining({
             id: 'gpt-6-astra',
+            displayName: 'GPT-6 Astra',
+            isDefault: false
+        }), expect.objectContaining({
+            id: 'gpt-6-astra[1m]',
             displayName: 'GPT-6 Astra (1M)',
             isDefault: false
         }), expect.objectContaining({
@@ -136,7 +140,7 @@ describe('listCodexModels cwd', () => {
         expect(constructorOptions).toHaveLength(1);
         expect(listModelsMock).toHaveBeenCalledTimes(1);
         expect(first).toEqual(second);
-        expect(first).toHaveLength(3);
+        expect(first).toHaveLength(4);
     });
 
     it('expires the cache after the TTL so a later call respawns the app-server', async () => {
