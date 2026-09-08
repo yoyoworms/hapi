@@ -49,7 +49,11 @@ import type {
 
 export function isCodexArchivedThreadError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
-    return /\bis archived\b.*\bunarchive\b/i.test(message);
+    // Codex 0.153 reports a thread moved to archived_sessions with
+    // "no rollout found", while older builds explicitly said "is archived".
+    // Both responses require the same handoff: unarchive, then retry resume.
+    return /\bis archived\b.*\bunarchive\b/i.test(message)
+        || /no rollout found for thread id\b/i.test(message);
 }
 
 type JsonRpcLiteRequest = {

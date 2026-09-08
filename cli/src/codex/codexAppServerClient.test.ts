@@ -39,6 +39,9 @@ describe('isCodexArchivedThreadError', () => {
         expect(isCodexArchivedThreadError(new Error(
             'session thread-1 is archived. Run `codex unarchive thread-1` to unarchive it first.'
         ))).toBe(true);
+        expect(isCodexArchivedThreadError(new Error(
+            'no rollout found for thread id thread-1'
+        ))).toBe(true);
         expect(isCodexArchivedThreadError(new Error('thread already has an active writer'))).toBe(false);
         expect(isCodexArchivedThreadError(new Error('resume failed'))).toBe(false);
     });
