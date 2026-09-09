@@ -236,6 +236,69 @@ describe('CodexAccountManager', () => {
         }
     });
 
+    it('migrates old HAPI context settings from the system account without touching user settings', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const systemHomeDir = join(rootDir, 'system-codex-home');
+        await mkdir(systemHomeDir);
+        const configPath = join(systemHomeDir, 'config.toml');
+        await writeFile(configPath, [
+            'model = "gpt-5.6-sol"',
+            'model_context_window = 372000',
+            'model_auto_compact_token_limit = 330000',
+            'model_auto_compact_token_limit_scope = "total"',
+            `model_catalog_json = ${JSON.stringify(join(systemHomeDir, 'model-catalogs', 'code-cli-372k.json'))}`,
+            `custom_catalog = ${JSON.stringify(join(systemHomeDir, 'model-catalogs', 'my-models.json'))}`,
+            '',
+            '[profiles.default]',
+            'model_context_window = 123000'
+        ].join('\n'));
+
+        const manager = new CodexAccountManager({
+            rootDir,
+            systemHomeDir,
+            clientFactory: (homeDir) => new FakeAuthClient(homeDir, systemHomeDir)
+        });
+
+        await manager.resolveAccount(SYSTEM_CODEX_ACCOUNT_ID);
+        const normalized = await readFile(configPath, 'utf8');
+        expect(normalized).not.toContain('model_context_window = 372000');
+        expect(normalized).not.toContain('model_auto_compact_token_limit = 330000');
+        expect(normalized).not.toContain('model_auto_compact_token_limit_scope');
+        expect(normalized).not.toContain('code-cli-372k.json');
+        expect(normalized).toContain('custom_catalog');
+        expect(normalized).toContain('my-models.json');
+        expect(normalized).toContain('[profiles.default]');
+        expect(normalized).toContain('model_context_window = 123000');
+    });
+
+    it('keeps a user model catalog and non-HAPI context profile in the system account', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const systemHomeDir = join(rootDir, 'system-codex-home');
+        await mkdir(systemHomeDir);
+        const configPath = join(systemHomeDir, 'config.toml');
+        await writeFile(configPath, [
+            'model_context_window = 400000',
+            'model_auto_compact_token_limit = 360000',
+            `model_catalog_json = ${JSON.stringify(join(systemHomeDir, 'model-catalogs', 'user.json'))}`,
+            ''
+        ].join('\n'));
+
+        const manager = new CodexAccountManager({
+            rootDir,
+            systemHomeDir,
+            clientFactory: (homeDir) => new FakeAuthClient(homeDir, systemHomeDir)
+        });
+
+        await manager.resolveAccount(SYSTEM_CODEX_ACCOUNT_ID);
+        const normalized = await readFile(configPath, 'utf8');
+        expect(normalized).toContain('model_context_window = 400000');
+        expect(normalized).toContain('model_auto_compact_token_limit = 360000');
+        expect(normalized).toContain('model_catalog_json');
+        expect(normalized).toContain('user.json');
+    });
+
     it('stores custom API credentials only in the isolated runner home', async () => {
         const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
         cleanupPaths.push(rootDir);

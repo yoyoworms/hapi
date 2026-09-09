@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod, copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 
 import type {
     AddCodexApiEndpointRequest,
@@ -189,15 +189,80 @@ function escapeTomlString(value: string): string {
     return JSON.stringify(value);
 }
 
-const LEGACY_MANAGED_CONTEXT_KEYS = new Set([
+const LEGACY_HAPI_CONTEXT_KEYS = new Set([
     'model_context_window',
     'model_auto_compact_token_limit',
     'model_auto_compact_token_limit_scope'
 ]);
 
-async function normalizeManagedAccountConfig(
+/**
+ * HAPI used to persist a fixed context catalog in the Codex home.  Keep this
+ * migration deliberately narrow: remove only the catalog filenames that HAPI
+ * itself generated, and leave a user's arbitrary `model_catalog_json` alone.
+ */
+const LEGACY_HAPI_CATALOG_BASENAMES = new Set([
+    'code-cli-350k.json',
+    'code-cli-372k.json'
+]);
+
+const LEGACY_HAPI_SYSTEM_CONTEXT_PROFILES = [
+    {
+        model_context_window: '350000',
+        model_auto_compact_token_limit: '320000'
+    },
+    {
+        model_context_window: '372000',
+        model_auto_compact_token_limit: '330000'
+    }
+] as const;
+
+function stripTomlComment(value: string): string {
+    let quoted = false;
+    for (let index = 0; index < value.length; index += 1) {
+        const character = value[index];
+        if (character === '"') {
+            quoted = !quoted;
+        } else if (character === '#' && !quoted) {
+            return value.slice(0, index);
+        }
+    }
+    return value;
+}
+
+function normalizeTomlValue(value: string): string {
+    return stripTomlComment(value).trim().replaceAll('_', '');
+}
+
+function parseTomlString(value: string): string | null {
+    const trimmed = stripTomlComment(value).trim();
+    if (!trimmed.startsWith('"')) return null;
+    try {
+        const parsed = JSON.parse(trimmed);
+        return typeof parsed === 'string' ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function isLegacyHapiCatalogPath(homeDir: string, value: string): boolean {
+    const parsed = parseTomlString(value);
+    if (!parsed) return false;
+
+    const catalogPath = resolve(homeDir, parsed);
+    const relativePath = relative(homeDir, catalogPath);
+    if (
+        relativePath.startsWith('..')
+        || isAbsolute(relativePath)
+        || !relativePath.split(/[\\/]/u).includes('model-catalogs')
+    ) {
+        return false;
+    }
+    return LEGACY_HAPI_CATALOG_BASENAMES.has(basename(catalogPath));
+}
+
+async function normalizeCodexAccountConfig(
     homeDir: string,
-    kind: 'managed' | 'api'
+    kind: 'system' | 'managed' | 'api'
 ): Promise<void> {
     const path = join(homeDir, 'config.toml');
     let contents: string;
@@ -208,9 +273,60 @@ async function normalizeManagedAccountConfig(
     }
 
     const hadTrailingNewline = contents.endsWith('\n');
+    const rootValues = new Map<string, string>();
+    let inTable = false;
+    for (const line of contents.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('[')) {
+            inTable = true;
+            continue;
+        }
+        if (inTable) continue;
+        const equalsIndex = line.indexOf('=');
+        if (equalsIndex < 0) continue;
+        const key = line.slice(0, equalsIndex).trim();
+        if (key) rootValues.set(key, normalizeTomlValue(line.slice(equalsIndex + 1)));
+    }
+    const hasLegacySystemContextProfile = kind === 'system'
+        && LEGACY_HAPI_SYSTEM_CONTEXT_PROFILES.some((profile) => (
+            rootValues.get('model_context_window') === profile.model_context_window
+            && rootValues.get('model_auto_compact_token_limit')
+                === profile.model_auto_compact_token_limit
+        ));
+
+    inTable = false;
     const lines = contents.split(/\r?\n/).filter((line) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('[')) {
+            inTable = true;
+            return true;
+        }
         const key = line.split('=', 1)[0]?.trim();
-        return !key || !LEGACY_MANAGED_CONTEXT_KEYS.has(key);
+        if (
+            key
+            && LEGACY_HAPI_CONTEXT_KEYS.has(key)
+            && kind !== 'system'
+        ) {
+            return false;
+        }
+        // These are root-level settings from the old HAPI context policy. Do
+        // not touch similarly named keys inside a user-defined TOML table.
+        if (!inTable) {
+            if (
+                key
+                && LEGACY_HAPI_CONTEXT_KEYS.has(key)
+                && hasLegacySystemContextProfile
+            ) {
+                return false;
+            }
+            if (
+                key === 'model_catalog_json'
+                && isLegacyHapiCatalogPath(homeDir, line.slice(line.indexOf('=') + 1))
+            ) {
+                return false;
+            }
+        }
+        return true;
     });
     if (hadTrailingNewline && lines.at(-1) === '') lines.pop();
     if (kind === 'managed' && !lines.some((line) => /^\s*model\s*=/.test(line))) {
@@ -221,6 +337,13 @@ async function normalizeManagedAccountConfig(
     if (normalized === contents) return;
     await writeFile(path, normalized, { encoding: 'utf8', mode: 0o600 });
     await chmod(path, 0o600).catch(() => {});
+}
+
+async function normalizeManagedAccountConfig(
+    homeDir: string,
+    kind: 'managed' | 'api'
+): Promise<void> {
+    await normalizeCodexAccountConfig(homeDir, kind);
 }
 
 async function findTranscriptPath(root: string, sessionId: string): Promise<string | null> {
@@ -490,6 +613,10 @@ export class CodexAccountManager {
         const registry = await this.readRegistry();
         const selectedId = accountId?.trim() || registry.defaultAccountId;
         if (selectedId === SYSTEM_CODEX_ACCOUNT_ID) {
+            // Migrate old HAPI context overrides out of the user's system
+            // Codex config. Ordinary models must inherit Codex defaults; the
+            // current 1M picker variants apply their overrides per thread.
+            await normalizeCodexAccountConfig(this.systemHomeDir, 'system');
             return {
                 id: SYSTEM_CODEX_ACCOUNT_ID,
                 label: 'System default',
