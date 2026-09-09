@@ -56,7 +56,15 @@ describe('applyHapiCodexContextCatalogPolicy', () => {
             display_name: 'GPT-6-Astra',
             context_window: 272_000,
             max_context_window: 1_050_000,
-            effective_context_window_percent: 95
+            effective_context_window_percent: 95,
+            supported_reasoning_levels: [
+                expect.objectContaining({ effort: 'low' }),
+                expect.objectContaining({ effort: 'medium' }),
+                expect.objectContaining({ effort: 'high' }),
+                expect.objectContaining({ effort: 'xhigh' }),
+                expect.objectContaining({ effort: 'max' }),
+                expect.objectContaining({ effort: 'ultra' })
+            ]
         });
         expect(result?.models.find((model) => model.slug === 'gpt-5.6-sol')).toMatchObject({
             context_window: 272_000,
@@ -120,14 +128,14 @@ describe('HAPI Codex model variants', () => {
                 displayName: 'GPT-6 Astra',
                 isDefault: false,
                 defaultReasoningEffort: 'medium',
-                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max']
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
             }),
             expect.objectContaining({
                 id: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
                 displayName: 'GPT-6 Astra (1M)',
                 isDefault: false,
                 defaultReasoningEffort: 'medium',
-                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max']
+                supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
             }),
             expect.objectContaining({ id: 'gpt-5.6-sol', isDefault: true }),
             expect.objectContaining({

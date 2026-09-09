@@ -37,7 +37,8 @@ const HAPI_CODEX_ASTRA_REASONING_EFFORTS = [
     'medium',
     'high',
     'xhigh',
-    'max'
+    'max',
+    'ultra'
 ] as const;
 
 const HAPI_CODEX_ASTRA_REASONING_LEVELS = [
@@ -45,7 +46,8 @@ const HAPI_CODEX_ASTRA_REASONING_LEVELS = [
     { effort: 'medium', description: 'Balances speed and reasoning depth' },
     { effort: 'high', description: 'Greater reasoning depth for complex problems' },
     { effort: 'xhigh', description: 'Extra high reasoning depth for complex problems' },
-    { effort: 'max', description: 'Maximum reasoning depth for the hardest problems' }
+    { effort: 'max', description: 'Maximum reasoning depth for the hardest problems' },
+    { effort: 'ultra', description: 'Maximum reasoning with automatic task delegation' }
 ] as const;
 
 type CodexModelCatalog = {
