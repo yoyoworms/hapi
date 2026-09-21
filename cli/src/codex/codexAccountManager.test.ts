@@ -415,6 +415,32 @@ describe('CodexAccountManager', () => {
             .resolves.toBe(targetPath);
     });
 
+    it('falls back to the system account when the recorded account was removed', async () => {
+        const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
+        cleanupPaths.push(rootDir);
+        const systemHomeDir = join(rootDir, 'system-codex-home');
+        await mkdir(systemHomeDir);
+        const manager = new CodexAccountManager({
+            rootDir,
+            systemHomeDir,
+            clientFactory: (homeDir) => new FakeAuthClient(homeDir, systemHomeDir)
+        });
+        const result = await manager.addApiEndpoint({
+            label: 'Removed later',
+            baseUrl: 'https://api.example.com/v1',
+            apiKey: 'secret-key',
+            model: 'test-model'
+        });
+        const accountId = result.accounts.find((account) => account.label === 'Removed later')!.id;
+        await manager.removeAccount(accountId);
+
+        await expect(manager.resolveAccountForResume(accountId, 'missing-thread'))
+            .resolves.toMatchObject({
+                id: SYSTEM_CODEX_ACCOUNT_ID,
+                kind: 'system'
+            });
+    });
+
     it('does not guess when a resume rollout exists in multiple alternate accounts', async () => {
         const rootDir = await mkdtemp(join(tmpdir(), 'hapi-codex-accounts-'));
         cleanupPaths.push(rootDir);

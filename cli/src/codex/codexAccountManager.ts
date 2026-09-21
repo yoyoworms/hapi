@@ -665,7 +665,29 @@ export class CodexAccountManager {
         accountId: string | undefined,
         sessionId: string
     ): Promise<ResolvedCodexAccount> {
-        const requested = await this.resolveAccount(accountId);
+        let requested: ResolvedCodexAccount;
+        try {
+            requested = await this.resolveAccount(accountId);
+        } catch (error) {
+            // A session can outlive the managed account that originally
+            // launched it.  Account removal must not make the historical
+            // session permanently unreopenable; fall back to the system
+            // Codex home so the normal resume path can still inspect it.
+            if (
+                accountId
+                && accountId.trim() !== SYSTEM_CODEX_ACCOUNT_ID
+                && error instanceof Error
+                && /not available|not authenticated|not found/i.test(error.message)
+            ) {
+                logger.debug('[CodexAccountManager] Falling back to system account for removed resume account', {
+                    sessionId,
+                    removedAccountId: accountId
+                });
+                requested = await this.resolveAccount(SYSTEM_CODEX_ACCOUNT_ID);
+            } else {
+                throw error;
+            }
+        }
         const requestedPath = await findTranscriptPath(
             join(requested.homeDir, 'sessions'),
             sessionId
