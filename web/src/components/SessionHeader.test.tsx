@@ -84,6 +84,33 @@ describe('resolveSessionHeaderMachineLabel', () => {
 })
 
 describe('SessionHeader', () => {
+    it('shows the current Codex account in the title metadata', () => {
+        renderHeader(baseSession({
+            metadata: {
+                flavor: 'codex',
+                path: '/repo',
+                host: 'machine',
+                codexAccountId: 'account-1',
+                codexAccountLabel: 'Work account',
+            },
+        }))
+
+        expect(screen.getByTestId('session-header-codex-account')).toHaveTextContent('Account: Work account')
+    })
+
+    it('labels the system Codex account when no account label was persisted', () => {
+        renderHeader(baseSession({
+            metadata: {
+                flavor: 'codex',
+                path: '/repo',
+                host: 'machine',
+                codexAccountId: 'system',
+            },
+        }))
+
+        expect(screen.getByTestId('session-header-codex-account')).toHaveTextContent('Account: System default')
+    })
+
     it('does not query machines or expose owner actions in shared mode', async () => {
         const getMachines = vi.fn().mockResolvedValue({ machines: [] })
         const api = { getMachines } as unknown as ApiClient

@@ -188,6 +188,11 @@ export function SessionHeader(props: {
     const codexSessionId = session.metadata?.flavor === 'codex'
         ? session.metadata.codexSessionId?.trim() || null
         : null
+    const codexAccountLabel = session.metadata?.flavor === 'codex'
+        ? session.metadata.codexAccountLabel?.trim() || (
+            session.metadata.codexAccountId === 'system' ? 'System default' : null
+        )
+        : null
     const piSessionId = session.metadata?.flavor === 'pi'
         ? session.metadata.piSessionId?.trim() || null
         : null
@@ -217,7 +222,9 @@ export function SessionHeader(props: {
         worktree: headerMetadata.worktree && Boolean(worktreeBranch),
         fastMode: headerMetadata.fastMode && showFastBadge,
     })
-    const showMobileMetadata = (headerMetadata.agent && agentLabel !== null) || mobileSecondary !== null
+    const showMobileMetadata = (headerMetadata.agent && agentLabel !== null)
+        || mobileSecondary !== null
+        || codexAccountLabel !== null
 
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
@@ -449,6 +456,7 @@ export function SessionHeader(props: {
                                 {mobileSecondary === 'createdAt' && createdAtLabel ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
                                 {mobileSecondary === 'worktree' && worktreeBranch ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}{worktreeBranch}</span> : null}
                                 {mobileSecondary === 'fastMode' ? <span className="truncate text-[#34C759]">fast</span> : null}
+                                {codexAccountLabel ? <span className="truncate" data-testid="session-header-codex-account">{codexAccountLabel}</span> : null}
                             </div>
                         ) : null}
                         <div className="hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--app-hint)] sm:flex">
@@ -482,6 +490,11 @@ export function SessionHeader(props: {
                             {headerMetadata.fastMode && showFastBadge ? (
                                 <span data-testid="session-header-fast" className="text-[#34C759]">
                                     fast
+                                </span>
+                            ) : null}
+                            {codexAccountLabel ? (
+                                <span data-testid="session-header-codex-account" title={codexAccountLabel}>
+                                    {headerMetadata.showLabels ? `Account: ` : ''}{codexAccountLabel}
                                 </span>
                             ) : null}
                             {createdAtLabel ? <span>{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
