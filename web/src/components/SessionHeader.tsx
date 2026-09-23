@@ -456,7 +456,7 @@ export function SessionHeader(props: {
                                 {mobileSecondary === 'createdAt' && createdAtLabel ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
                                 {mobileSecondary === 'worktree' && worktreeBranch ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}{worktreeBranch}</span> : null}
                                 {mobileSecondary === 'fastMode' ? <span className="truncate text-[#34C759]">fast</span> : null}
-                                {codexAccountLabel ? <span className="truncate" data-testid="session-header-codex-account">{codexAccountLabel}</span> : null}
+                                {codexAccountLabel ? <span className="truncate">{codexAccountLabel}</span> : null}
                             </div>
                         ) : null}
                         <div className="hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--app-hint)] sm:flex">
