@@ -13,6 +13,7 @@ import { useOpencodeModelsForCwd } from '@/hooks/queries/useOpencodeModelsForCwd
 import { useGrokModelsForCwd } from '@/hooks/queries/useGrokModelsForCwd'
 import { useCopilotModelsForCwd } from '@/hooks/queries/useCopilotModelsForCwd'
 import { usePiModelsForMachine } from '@/hooks/queries/usePiModelsForMachine'
+import { useClaudeModelsForMachine } from '@/hooks/queries/useClaudeModelsForMachine'
 import { useAgentAvailability } from '@/hooks/queries/useAgentAvailability'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { useActiveSuggestions, type Suggestion } from '@/hooks/useActiveSuggestions'
@@ -619,6 +620,21 @@ export function NewSession(props: {
         machineId,
         enabled: agent === 'pi' && Boolean(machineId)
     })
+    const claudeModelsState = useClaudeModelsForMachine({
+        api: props.api,
+        machineId,
+        enabled: agent === 'claude' && Boolean(machineId)
+    })
+    const claudeModelOptions = useMemo(() => {
+        const options = [{ value: 'auto', label: 'Default' }]
+        for (const claudeModel of claudeModelsState.availableModels) {
+            options.push({ value: claudeModel.modelId, label: claudeModel.name ?? claudeModel.modelId })
+        }
+        if (model !== 'auto' && !options.some((option) => option.value === model)) {
+            options.splice(1, 0, { value: model, label: model })
+        }
+        return options
+    }, [claudeModelsState.availableModels, model])
     // Pi models are grouped by provider (optionSource: 'machine' in the agent
     // config descriptor). Option values are provider-qualified
     // (`provider/modelId`) so two providers sharing a modelId stay distinct;
@@ -1825,8 +1841,10 @@ export function NewSession(props: {
                         agent={agent}
                         model={model}
                         options={
-                            agent === 'codex'
-                                ? codexModelOptions
+                            agent === 'claude'
+                                ? claudeModelOptions
+                                : agent === 'codex'
+                                    ? codexModelOptions
                                 : agent === 'grok'
                                     ? grokModelOptions
                                     : agent === 'copilot'
@@ -1837,16 +1855,20 @@ export function NewSession(props: {
                         }
                         isDisabled={
                             isFormDisabled
+                            || (agent === 'claude' && Boolean(claudeModelsState.error))
                             || (agent === 'codex' && Boolean(codexModelsState.error))
                             || (agent === 'grok' && Boolean(grokModelsState.error))
                             || (agent === 'copilot' && Boolean(copilotModelsState.error))
                             || (agent === 'pi' && Boolean(piModelsState.error))
                         }
-                        isLoading={(agent === 'codex' && codexModelsState.isLoading)
+                        isLoading={(agent === 'claude' && claudeModelsState.isLoading)
+                            || (agent === 'codex' && codexModelsState.isLoading)
                             || (agent === 'grok' && grokModelsState.isLoading)
                             || (agent === 'copilot' && copilotModelsState.isLoading)
                             || (agent === 'pi' && piModelsState.isLoading)}
-                        error={agent === 'codex' && codexModelsState.error
+                        error={agent === 'claude' && claudeModelsState.error
+                            ? `${t('newSession.model.loadFailed')}: ${claudeModelsState.error}`
+                            : agent === 'codex' && codexModelsState.error
                             ? `${t('newSession.model.loadFailed')}: ${codexModelsState.error}`
                             : agent === 'grok' && grokModelsState.error
                                 ? `${t('newSession.model.loadFailed')}: ${grokModelsState.error}`

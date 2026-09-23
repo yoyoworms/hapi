@@ -113,6 +113,7 @@ import { useGrokModels } from '@/hooks/queries/useGrokModels'
 import { useCopilotModels } from '@/hooks/queries/useCopilotModels'
 import { useGrokReasoningEffortOptions } from '@/hooks/queries/useGrokReasoningEffortOptions'
 import { usePiModels } from '@/hooks/queries/usePiModels'
+import { useClaudeModelsForMachine } from '@/hooks/queries/useClaudeModelsForMachine'
 import { useOpencodeReasoningEffortOptions } from '@/hooks/queries/useOpencodeReasoningEffortOptions'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { AgentTerminalView } from '@/components/AgentTerminal/AgentTerminalView'
@@ -1051,6 +1052,15 @@ function SessionChatInner(props: SessionChatProps) {
         sessionId: props.session.id,
         enabled: !sharedMode && agentFlavor === 'pi' && props.session.active
     })
+    const claudeModelsState = useClaudeModelsForMachine({
+        api: ownerApi,
+        machineId: sessionMachineId,
+        enabled: !sharedMode && agentFlavor === 'claude' && Boolean(sessionMachineId)
+    })
+    const claudeModelOptions = useMemo(() => {
+        if (claudeModelsState.availableModels.length === 0) return undefined
+        return claudeModelsState.availableModels.map((entry) => ({ value: entry.modelId, label: entry.name ?? entry.modelId }))
+    }, [claudeModelsState.availableModels])
     // Fallback to cached models from metadata when session is inactive
     const piMetadata = props.session.metadata as Record<string, unknown> | null
     const piCachedModels = piMetadata?.piAvailableModels as PiModelSummary[] | undefined ?? []
@@ -2036,6 +2046,8 @@ function SessionChatInner(props: SessionChatProps) {
                                     )
                                     : agentFlavor === 'opencode'
                                         ? opencodeModelOptions
+                                        : agentFlavor === 'claude'
+                                            ? claudeModelOptions
                                         : agentFlavor === 'grok'
                                             ? grokModelOptions
                                         : agentFlavor === 'copilot'

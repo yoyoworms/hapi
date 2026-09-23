@@ -17,6 +17,7 @@ import { registerSkillsHandlers } from './handlers/skills'
 import { registerUploadHandlers } from './handlers/uploads'
 import { registerAgentSessionHandlers } from './handlers/agentSessions'
 import { registerCodexAccountHandlers } from './handlers/codexAccounts'
+import { registerClaudeModelHandlers } from './handlers/claudeModels'
 
 export interface RegisterCommonHandlerOptions {
     codexModelsMachineScoped?: boolean
@@ -29,6 +30,7 @@ export function registerCommonHandlers(
     options?: RegisterCommonHandlerOptions
 ): void {
     registerAgyModelHandlers(rpcHandlerManager)
+    registerClaudeModelHandlers(rpcHandlerManager)
     registerBashHandlers(rpcHandlerManager, workingDirectory)
     registerCodexModelHandlers(rpcHandlerManager, options?.codexModelsMachineScoped === true)
     registerCursorModelHandlers(rpcHandlerManager)

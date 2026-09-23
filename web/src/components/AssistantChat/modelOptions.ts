@@ -44,36 +44,7 @@ function withCurrentModelOption(options: ModelOption[], currentModel?: string | 
 }
 
 function getClaudeModelOptions(currentModel?: string | null, customOptions?: ModelOption[]): ModelOption[] {
-    if (!customOptions || customOptions.length === 0) {
-        return getClaudeComposerModelOptions(currentModel)
-    }
-
-    const options = getClaudeComposerModelOptions(currentModel)
-    const nextOptions = [...options]
-    let insertIndex = Math.max(1, nextOptions.findIndex((option) => option.value !== null))
-
-    for (const option of customOptions) {
-        const normalizedValue = normalizeCurrentModel(option.value)
-        if (!normalizedValue) {
-            continue
-        }
-
-        const existingIndex = nextOptions.findIndex((nextOption) => nextOption.value === normalizedValue)
-        if (existingIndex >= 0) {
-            if (nextOptions[existingIndex]?.label === normalizedValue) {
-                nextOptions[existingIndex] = option
-            }
-            continue
-        }
-
-        nextOptions.splice(insertIndex, 0, {
-            value: normalizedValue,
-            label: option.label
-        })
-        insertIndex += 1
-    }
-
-    return nextOptions
+    return getClaudeComposerModelOptions(currentModel, customOptions)
 }
 
 function getAgyModelOptions(currentModel?: string | null): ModelOption[] {
@@ -215,5 +186,5 @@ export function getNextModelForFlavor(
     if (flavor === 'pi') {
         return normalizeCurrentModel(currentModel)
     }
-    return getNextClaudeComposerModel(currentModel)
+    return getNextClaudeComposerModel(currentModel, customOptions)
 }

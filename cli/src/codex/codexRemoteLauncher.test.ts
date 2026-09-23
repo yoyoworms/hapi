@@ -65,6 +65,7 @@ const harness = vi.hoisted(() => ({
     emitModelSafetyNotices: false,
     startTurnMessages: [] as string[],
     failResumeThreadIds: [] as string[],
+    resumeErrorMessage: 'resume failed',
     nextThreadSystemErrorMessage: null as string | null,
     failNextCompact: false,
     deferCompactCompletion: false,
@@ -257,7 +258,7 @@ vi.mock('./codexAppServerClient', () => {
                 });
             }
             if (harness.failResumeThreadIds.includes(id)) {
-                throw new Error('resume failed');
+                throw new Error(harness.resumeErrorMessage);
             }
             if (harness.archivedResumeThreadIds.has(id) && !harness.unarchiveThreadIds.includes(id)) {
                 throw new Error(`session ${id} is archived. Run \`codex unarchive ${id}\` to unarchive it first.`);
@@ -2928,6 +2929,26 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents).toContainEqual({
             type: 'message',
             message: 'Task failed: Codex conversation thread-old could not be resumed; no new conversation was created. Reason: resume failed'
+        });
+        expect(session.thinking).toBe(false);
+    });
+
+    it('starts a fresh thread when the runtime cannot list turns for an old conversation', async () => {
+        harness.failResumeThreadIds = ['thread-old'];
+        harness.resumeErrorMessage = 'list_turns is not supported yet';
+        const { session, sessionEvents } = createSessionStub(['first message']);
+        session.sessionId = 'thread-old';
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.resumeThreadIds).toEqual(['thread-old']);
+        expect(harness.startThreadIds).toEqual(['thread-1']);
+        expect(harness.startTurnThreadIds).toEqual(['thread-1']);
+        expect(session.sessionId).toBe('thread-1');
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: '旧 Codex 会话 thread-old 不支持当前运行时的历史恢复，已自动创建新的 Codex 会话继续。'
         });
         expect(session.thinking).toBe(false);
     });

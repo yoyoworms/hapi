@@ -96,6 +96,10 @@ function formatCodexResumeError(error: unknown): string {
     return parts.length > 0 ? Array.from(new Set(parts)).join(': ') : 'unknown resume error';
 }
 
+function shouldStartFreshThreadAfterResumeFailure(error: unknown): boolean {
+    return /list_turns is not supported yet/i.test(formatCodexResumeError(error));
+}
+
 const SAME_THREAD_RETRYABLE_ERROR_PATTERNS = [
     'selected model is at capacity',
     'codex thread entered systemerror'
@@ -5015,12 +5019,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                                 throw error;
                             }
                             const resumeError = formatCodexResumeError(error);
-                            logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate}; preserving old conversation boundary: ${resumeError}`, error);
-                            const failureMessage = `Task failed: Codex conversation ${resumeCandidate} could not be resumed; no new conversation was created. Reason: ${resumeError}`;
-                            messageBuffer.addMessage(failureMessage, 'status');
-                            session.sendSessionEvent({ type: 'message', message: failureMessage });
-                            pending = null;
-                            continue;
+                            if (shouldStartFreshThreadAfterResumeFailure(error)) {
+                                logger.warn(`[Codex] Native thread ${resumeCandidate} cannot be resumed by this Codex runtime; starting a fresh thread in the same HAPI session`);
+                                const recoveryMessage = `旧 Codex 会话 ${resumeCandidate} 不支持当前运行时的历史恢复，已自动创建新的 Codex 会话继续。`;
+                                messageBuffer.addMessage(recoveryMessage, 'status');
+                                session.sendSessionEvent({ type: 'message', message: recoveryMessage });
+                                threadId = null;
+                            } else {
+                                logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate}; preserving old conversation boundary: ${resumeError}`, error);
+                                const failureMessage = `Task failed: Codex conversation ${resumeCandidate} could not be resumed; no new conversation was created. Reason: ${resumeError}`;
+                                messageBuffer.addMessage(failureMessage, 'status');
+                                session.sendSessionEvent({ type: 'message', message: failureMessage });
+                                pending = null;
+                                continue;
+                            }
                         }
                     }
 

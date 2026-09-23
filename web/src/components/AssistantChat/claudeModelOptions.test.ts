@@ -2,38 +2,31 @@ import { describe, expect, it } from 'vitest'
 import { getClaudeComposerModelOptions, getNextClaudeComposerModel } from './claudeModelOptions'
 
 describe('getClaudeComposerModelOptions', () => {
-    it('includes the active non-preset Claude model in the options list', () => {
-        expect(getClaudeComposerModelOptions('claude-opus-4-1-20250805')).toEqual([
+    it('renders the discovered catalog and keeps an active unknown model visible', () => {
+        const catalog = [
+            { value: 'sonnet', label: 'Sonnet 5.5' },
+            { value: 'opus[1m]', label: 'Opus 5.5 (1M)' },
+        ]
+        expect(getClaudeComposerModelOptions('claude-custom', catalog)).toEqual([
             { value: null, label: 'Default' },
-            { value: 'claude-opus-4-1-20250805', label: 'claude-opus-4-1-20250805' },
-            { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
-            { value: 'opus', label: 'Opus' },
-            { value: 'opus[1m]', label: 'Opus 1M' },
-            { value: 'fable', label: 'Fable' },
-            { value: 'fable[1m]', label: 'Fable 1M' },
-            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
+            { value: 'claude-custom', label: 'claude-custom' },
+            ...catalog,
         ])
     })
 
-    it('does not duplicate preset Claude models', () => {
-        expect(getClaudeComposerModelOptions('opus')).toEqual([
+    it('does not duplicate the active discovered model', () => {
+        expect(getClaudeComposerModelOptions('opus', [{ value: 'opus', label: 'Opus 5.5' }])).toEqual([
             { value: null, label: 'Default' },
-            { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
-            { value: 'opus', label: 'Opus' },
-            { value: 'opus[1m]', label: 'Opus 1M' },
-            { value: 'fable', label: 'Fable' },
-            { value: 'fable[1m]', label: 'Fable 1M' },
-            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' },
+            { value: 'opus', label: 'Opus 5.5' },
         ])
     })
 })
 
 describe('getNextClaudeComposerModel', () => {
-    it('cycles from a non-preset Claude model to the next selectable model instead of auto', () => {
-        expect(getNextClaudeComposerModel('claude-opus-4-1-20250805')).toBe('sonnet')
+    it('cycles through the discovered catalog', () => {
+        expect(getNextClaudeComposerModel('sonnet', [
+            { value: 'sonnet', label: 'Sonnet' },
+            { value: 'opus', label: 'Opus' },
+        ])).toBe('opus')
     })
 })

@@ -17,6 +17,8 @@ export type {
     AgyModelSummary,
     CodexModelsResponse,
     CodexModelSummary,
+    ClaudeModelsResponse,
+    ClaudeModelSummary,
     CommandResponse,
     CursorModelsResponse,
     CursorModelSummary,

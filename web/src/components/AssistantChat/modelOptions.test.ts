@@ -21,47 +21,19 @@ describe('getModelOptionsForFlavor', () => {
         expect(options.some((o) => o.value === 'gemini-2.5-flash')).toBe(true)
     })
 
-    it('returns Claude model options for claude flavor', () => {
-        const options = getModelOptionsForFlavor('claude')
-        expect(options[0]).toEqual({ value: null, label: 'Default' })
-        expect(options.some((o) => o.value === 'sonnet')).toBe(true)
-        expect(options.some((o) => o.value === 'opus')).toBe(true)
+    it('returns only Default until Claude Code discovery supplies models', () => {
+        expect(getModelOptionsForFlavor('claude')).toEqual([{ value: null, label: 'Default' }])
     })
 
-    it('keeps Claude presets when explicit options only include Sonnet models', () => {
+    it('uses the discovered Claude catalog without adding static presets', () => {
         const options = getModelOptionsForFlavor('claude', null, [
-            { value: null, label: 'Default' },
-            { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+            { value: 'sonnet', label: 'Sonnet 5.5' },
+            { value: 'opus[1m]', label: 'Opus 5.5 (1M)' }
         ])
         expect(options).toEqual([
             { value: null, label: 'Default' },
-            { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
-            { value: 'opus', label: 'Opus' },
-            { value: 'opus[1m]', label: 'Opus 1M' },
-            { value: 'fable', label: 'Fable' },
-            { value: 'fable[1m]', label: 'Fable 1M' },
-            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
-        ])
-    })
-
-    it('adds non-preset Claude options without hiding Opus presets', () => {
-        const options = getModelOptionsForFlavor('claude', null, [
-            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' }
-        ])
-        expect(options).toEqual([
-            { value: null, label: 'Default' },
-            { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' },
-            { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
-            { value: 'opus', label: 'Opus' },
-            { value: 'opus[1m]', label: 'Opus 1M' },
-            { value: 'fable', label: 'Fable' },
-            { value: 'fable[1m]', label: 'Fable 1M' },
-            { value: 'claude-opus-4-6[1m]', label: 'Opus 4.6 1M' },
-            { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 1M' }
+            { value: 'sonnet', label: 'Sonnet 5.5' },
+            { value: 'opus[1m]', label: 'Opus 5.5 (1M)' }
         ])
     })
 
@@ -209,15 +181,15 @@ describe('getNextModelForFlavor', () => {
         expect(next).not.toBeNull()
     })
 
-    it('cycles Claude models', () => {
-        const next = getNextModelForFlavor('claude', null)
-        expect(next).not.toBeNull()
+    it('does not invent Claude models before discovery', () => {
+        expect(getNextModelForFlavor('claude', null)).toBeNull()
     })
 
-    it('cycles through Claude presets when explicit options only include Sonnet models', () => {
+    it('cycles through discovered Claude models', () => {
         const next = getNextModelForFlavor('claude', 'sonnet[1m]', [
             { value: 'sonnet', label: 'Sonnet' },
-            { value: 'sonnet[1m]', label: 'Sonnet 1M' }
+            { value: 'sonnet[1m]', label: 'Sonnet 1M' },
+            { value: 'opus', label: 'Opus' }
         ])
         expect(next).toBe('opus')
     })

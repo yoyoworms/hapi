@@ -56,6 +56,10 @@ type ResolveSessionAccess = (sessionId: string) => AccessResult<StoredSession>
 
 type EmitAccessError = (scope: 'session' | 'machine', id: string, reason: AccessErrorReason) => void
 
+// Hub-lifetime dedupe for completion edges. Kept outside the socket handler so
+// Socket.IO reconnects cannot replay the same `ready` event as new activity.
+const readyActivityDeliveredBySession = new Set<string>()
+
 type UpdateMetadataHandler = ClientToServerEvents['update-metadata']
 type UpdateStateHandler = ClientToServerEvents['update-state']
 
@@ -309,7 +313,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
 
     // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
     const recentContentUuids = new Set<string>()
-
     socket.on('message', (data: unknown, ack?: () => void) => {
         const parsed = messageSchema.safeParse(data)
         if (!parsed.success) {
@@ -373,6 +376,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         // event is NOT persisted to the store (fork optimization).
         const agentEventType = getAgentEventType(_c)
         if (agentEventType === 'ready') {
+            if (readyActivityDeliveredBySession.has(sid)) {
+                // Duplicate ready from Socket.IO replay/reconnect: it is not new
+                // user-visible information and must not create another unread.
+                ack?.()
+                return
+            }
+            readyActivityDeliveredBySession.add(sid)
             const now = Date.now()
             onWebappEvent?.({
                 type: 'message-received',
@@ -736,6 +746,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number') {
             return
         }
+        if (data.thinking === true) {
+            readyActivityDeliveredBySession.delete(data.sid)
+        }
         const sessionAccess = resolveSessionAccess(data.sid)
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
@@ -879,6 +892,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number') {
             return
         }
+        readyActivityDeliveredBySession.delete(data.sid)
         const sessionAccess = resolveSessionAccess(data.sid)
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
