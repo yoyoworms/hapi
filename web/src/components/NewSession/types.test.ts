@@ -3,14 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { CLAUDE_EFFORT_OPTIONS, GROK_EFFORT_OPTIONS, MODEL_OPTIONS } from './types'
 
 describe('Claude model options', () => {
-    it('derives options from shared Claude model presets', () => {
-        expect(MODEL_OPTIONS.claude).toEqual([
-            { value: 'auto', label: 'Default' },
-            ...CLAUDE_MODEL_PRESETS.map((model) => ({
-                value: model,
-                label: getClaudeModelLabel(model) ?? model
-            }))
-        ])
+    it('starts with Default until Claude Code discovery completes', () => {
+        expect(MODEL_OPTIONS.claude).toEqual([{ value: 'auto', label: 'Default' }])
     })
 
     it('exposes friendly labels for Claude model presets', () => {
