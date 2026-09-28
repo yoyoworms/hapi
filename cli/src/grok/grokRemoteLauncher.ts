@@ -18,6 +18,7 @@ import {
     isGrokBuildAuxiliaryQuotaError
 } from './utils/grokBackend'
 import { GrokPermissionHandler } from './utils/permissionHandler'
+import { GrokExtensionAdapter } from './utils/grokExtensionAdapter'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import { getGrokTitleInstruction } from './utils/systemPrompt'
 import { GrokConversationHistory } from './conversationHistory'
@@ -38,6 +39,7 @@ type GrokRemoteLauncherOptions = {
 class GrokRemoteLauncher extends RemoteLauncherBase {
     private backend: ReturnType<typeof createGrokBackend> | null = null
     private permissionHandler: GrokPermissionHandler | null = null
+    private extensionAdapter: GrokExtensionAdapter | null = null
     private happyServer: { stop: () => void } | null = null
     private abortController = new AbortController()
     private displayPermissionMode: PermissionMode | null = null
@@ -103,6 +105,10 @@ class GrokRemoteLauncher extends RemoteLauncherBase {
         })
 
         await backend.initialize()
+        this.extensionAdapter = new GrokExtensionAdapter(session.client, backend, () => {
+            session.setPermissionMode('default')
+            this.applyDisplayMode('default')
+        })
 
         const acpMcpServers = toAcpMcpServers(mcpServers)
         // Fork children must load the exact native id hub forked. Falling back to
@@ -224,7 +230,8 @@ class GrokRemoteLauncher extends RemoteLauncherBase {
         this.permissionHandler = new GrokPermissionHandler(
             session.client,
             backend,
-            () => session.getPermissionMode() as PermissionMode | undefined
+            () => session.getPermissionMode() as PermissionMode | undefined,
+            (response) => this.extensionAdapter?.handlePermissionResponse(response) ?? Promise.resolve(false)
         )
         this.applyDisplayMode(session.getPermissionMode() as PermissionMode | undefined)
         this.messageBuffer.addMessage(`[MODEL:${this.currentBackendModel ?? 'default'}]`, 'system')
@@ -360,6 +367,7 @@ class GrokRemoteLauncher extends RemoteLauncherBase {
                 this.conversationHistory.setBusy(false)
                 session.onThinkingChange(false)
                 await this.permissionHandler?.cancelAll('Prompt finished')
+                await this.extensionAdapter?.cancelAll('Prompt finished')
                 if (session.queue.size() === 0 && !this.shouldExit) {
                     session.sendSessionEvent({ type: 'ready' })
                 }
@@ -372,6 +380,10 @@ class GrokRemoteLauncher extends RemoteLauncherBase {
         if (this.permissionHandler) {
             await this.permissionHandler.cancelAll('Session ended')
             this.permissionHandler = null
+        }
+        if (this.extensionAdapter) {
+            await this.extensionAdapter.cancelAll('Session ended')
+            this.extensionAdapter = null
         }
         if (this.backend) {
             await this.backend.disconnect()
@@ -498,6 +510,7 @@ class GrokRemoteLauncher extends RemoteLauncherBase {
             await this.backend.cancelPrompt(this.session.sessionId)
         }
         await this.permissionHandler?.cancelAll('User aborted')
+        await this.extensionAdapter?.cancelAll('User aborted')
         this.session.queue.reset()
         this.session.onThinkingChange(false)
         this.abortController.abort()

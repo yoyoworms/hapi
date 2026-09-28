@@ -9,11 +9,9 @@ import {
     type PendingPermissionRequest,
     type PermissionCompletion
 } from '@/modules/common/permission/BasePermissionHandler'
+import type { GrokPermissionResponse } from './grokExtensionAdapter'
 
-interface PermissionResponseMessage {
-    id: string
-    approved: boolean
-    decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort'
+interface PermissionResponseMessage extends GrokPermissionResponse {
     reason?: string
 }
 
@@ -62,7 +60,8 @@ export class GrokPermissionHandler extends BasePermissionHandler<PermissionRespo
     constructor(
         session: ApiSessionClient,
         private readonly backend: AgentBackend,
-        private readonly getPermissionMode: () => GrokPermissionMode | undefined
+        private readonly getPermissionMode: () => GrokPermissionMode | undefined,
+        private readonly interceptPermissionResponse?: (response: GrokPermissionResponse) => Promise<boolean>
     ) {
         super(session)
         this.backend.onPermissionRequest((request) => this.handlePermissionRequest(request))
@@ -170,6 +169,14 @@ export class GrokPermissionHandler extends BasePermissionHandler<PermissionRespo
     }
 
     protected handleMissingPendingResponse(response: PermissionResponseMessage): void {
+        if (this.interceptPermissionResponse) {
+            void this.interceptPermissionResponse(response).then((handled) => {
+                if (!handled) {
+                    logger.debug('[Grok] Permission response received for unknown request', response.id)
+                }
+            })
+            return
+        }
         logger.debug('[Grok] Permission response received for unknown request', response.id)
     }
 

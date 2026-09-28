@@ -14,11 +14,15 @@ const harness = vi.hoisted(() => ({
     loadSessionCalls: [] as string[],
     loadSessionError: null as Error | null,
     newSessionCalls: 0,
+    extensionHandlers: new Map<string, (params: unknown) => Promise<unknown>>(),
 }))
 
 vi.mock('./utils/grokBackend', () => ({
     createGrokBackend: vi.fn(() => ({
         initialize: vi.fn(async () => {}),
+        registerExtensionRequestHandler: vi.fn((method: string, handler: (params: unknown) => Promise<unknown>) => {
+            harness.extensionHandlers.set(method, handler)
+        }),
         newSession: vi.fn(async () => {
             harness.newSessionCalls += 1
             return 'grok-new-session'
@@ -151,6 +155,7 @@ describe('grokRemoteLauncher runtime config', () => {
         harness.loadSessionCalls = []
         harness.loadSessionError = null
         harness.newSessionCalls = 0
+        harness.extensionHandlers.clear()
     })
 
     it('switches model and effort between turns and exposes session catalogs', async () => {
