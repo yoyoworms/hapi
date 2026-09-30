@@ -1,7 +1,6 @@
 import type { AttachmentMetadata, MessageStatus } from '@/types/api'
 import type { ThreadGoal } from '@/types/api'
 import type { InlineMediaSource } from '@/chat/inlineMediaSource'
-import type { AgentMessagePhase } from '@hapi/protocol/messages'
 
 export type UsageData = {
     input_tokens: number
@@ -23,6 +22,7 @@ export type RoundModelUsage = {
 }
 
 export type RoundSummary = {
+    provider?: 'codex'
     usage?: UsageData
     modelUsage: Record<string, RoundModelUsage>
     totalCostUsd?: number
@@ -41,9 +41,9 @@ export type AgentEvent =
     | { type: 'api-error'; retryAttempt: number; maxRetries: number; error: unknown }
     | { type: 'turn-duration'; durationMs: number; targetMessageId?: string }
     | { type: 'turn-summary'; summary: RoundSummary }
+    | { type: 'token-count'; info: unknown; provider?: 'codex'; model?: string | null }
     | { type: 'microcompact'; trigger: string; preTokens: number; tokensSaved: number }
-    | { type: 'compact'; trigger: string; preTokens: number; postTokens?: number }
-    | { type: 'usage'; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }
+    | { type: 'compact'; trigger: string; preTokens: number }
     // Structured result of Pi's compact RPC; rendered as a dedicated chat block.
     | { type: 'compact-summary'; summary: string; tokensBefore?: number; estimatedTokensAfter?: number }
     // Claude Code's automatic away-summary recap (TUI window blur 5min+, then focus).
@@ -82,7 +82,6 @@ export type ToolResult = {
     uuid: string
     parentUUID: string | null
     permissions?: ToolResultPermission
-    cosFileUrl?: string
 }
 
 export type GeneratedImageContent = {
@@ -118,7 +117,6 @@ export type NormalizedAgentContent =
         text: string
         uuid: string
         streamId?: string
-        phase?: AgentMessagePhase
         parentUUID: string | null
     }
     | {
@@ -180,7 +178,7 @@ export type NormalizedMessage = ({
 
 export type ToolPermission = {
     id: string
-    status: 'pending' | 'approved' | 'denied' | 'canceled'
+    status: 'pending' | 'approved' | 'denied' | 'canceled' | 'resolved'
     reason?: string
     mode?: string
     allowedTools?: string[]
@@ -216,7 +214,6 @@ export type ChatToolCall = {
     nativeKind?: string | null
     result?: unknown
     permission?: ToolPermission
-    cosFileUrl?: string
 }
 
 export type UserTextBlock = {
@@ -245,7 +242,6 @@ export type AgentTextBlock = {
     model?: string | null
     roundSummary?: RoundSummary
     text: string
-    phase?: AgentMessagePhase
     meta?: unknown
 }
 

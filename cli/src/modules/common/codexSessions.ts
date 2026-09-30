@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
-import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import { isCodexSubagentSource } from '@/codex/utils/codexSessionMetadata'
 
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 200
@@ -58,14 +57,16 @@ function extractCodexText(value: unknown): string {
     if (Array.isArray(value)) {
         return value.map((item) => {
             const record = asRecord(item)
-            const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-            if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text
+            if (record?.type === 'text' && typeof record.text === 'string') return record.text
+            if (record?.type === 'input_text' && typeof record.text === 'string') return record.text
+            if (record?.type === 'output_text' && typeof record.text === 'string') return record.text
             return null
         }).filter((part): part is string => Boolean(part)).join(' ').trim()
     }
     const record = asRecord(value)
-    const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-    if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text.trim()
+    if (record?.type === 'text' && typeof record.text === 'string') return record.text.trim()
+    if (record?.type === 'input_text' && typeof record.text === 'string') return record.text.trim()
+    if (record?.type === 'output_text' && typeof record.text === 'string') return record.text.trim()
     return ''
 }
 
@@ -96,22 +97,23 @@ function collectJsonlFiles(root: string, files: string[]): void {
     }
 }
 
-function getCodexHome(codexHome?: string | null): string {
-    return codexHome?.trim() || process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+function getCodexHome(): string {
+    return process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
 }
 
-function getCodexSessionRoots(codexHome?: string | null): string[] {
-    return [join(getCodexHome(codexHome), 'sessions')]
+function getCodexSessionRoots(): string[] {
+    const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+    return [join(codexHome, 'sessions')]
 }
 
-function getCodexSessionIndexPath(codexHome?: string | null): string {
-    return join(getCodexHome(codexHome), 'session_index.jsonl')
+function getCodexSessionIndexPath(): string {
+    return join(getCodexHome(), 'session_index.jsonl')
 }
 
-function readCodexSessionIndexTitles(codexHome?: string | null): Map<string, CodexSessionIndexTitle> {
+function readCodexSessionIndexTitles(): Map<string, CodexSessionIndexTitle> {
     let content: string
     try {
-        content = readFileSync(getCodexSessionIndexPath(codexHome), 'utf-8')
+        content = readFileSync(getCodexSessionIndexPath(), 'utf-8')
     } catch {
         return new Map()
     }
@@ -229,24 +231,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
             return text && !shouldIgnoreSyntheticUserMessage(text) ? buildImportedUserMessage(text) : null
         }
         if (eventType === 'agent_message') {
-            const rawMessage = asString(payload.message)
-            const message = rawMessage ? (unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage) : null
-            const phase = normalizeAgentMessagePhase(payload.phase)
-            return message ? buildImportedAgentMessage({ type: 'message', message, ...(phase ? { phase } : {}), id: randomUUID() }) : null
-        }
-        if (eventType === 'item_completed') {
-            const item = asRecord(payload.item)
-            const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-            if (itemType !== 'agentmessage') return null
-            const rawMessage = extractCodexText(item?.content ?? item?.message ?? item?.text)
-            const message = unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage
-            const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
-            return message ? buildImportedAgentMessage({
-                type: 'message',
-                message,
-                ...(phase ? { phase } : {}),
-                id: asString(item?.id) ?? randomUUID()
-            }) : null
+            const message = asString(payload.message)
+            return message ? buildImportedAgentMessage({ type: 'message', message, id: randomUUID() }) : null
         }
         if (eventType === 'token_count') {
             const info = asRecord(payload.info)
@@ -258,16 +244,10 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
     const itemType = asString(payload.type)
     if (itemType === 'message') {
         const role = asString(payload.role)
-        const rawText = extractCodexText(payload.content)
-        const text = role === 'assistant'
-            ? (unwrapCodexResponseStepEnvelope(rawText) ?? rawText)
-            : rawText
+        const text = extractCodexText(payload.content)
         if (!text || shouldIgnoreSyntheticUserMessage(text)) return null
         if (role === 'user') return buildImportedUserMessage(text)
-        if (role === 'assistant') {
-            const phase = normalizeAgentMessagePhase(payload.phase)
-            return buildImportedAgentMessage({ type: 'message', message: text, ...(phase ? { phase } : {}), id: randomUUID() })
-        }
+        if (role === 'assistant') return buildImportedAgentMessage({ type: 'message', message: text, id: randomUUID() })
     }
     if (itemType === 'function_call') {
         const name = asString(payload.name)
@@ -300,13 +280,6 @@ function normalizeComparableContent(content: unknown): string | null {
     if (record.role === 'agent') {
         const body = asRecord(record.content)
         const data = asRecord(body?.data)
-        if (body?.type === AGENT_MESSAGE_PAYLOAD_TYPE && data?.type === 'message' && typeof data.message === 'string') {
-            return stableSerialize({
-                role: 'agent',
-                type: 'message',
-                message: unwrapCodexResponseStepEnvelope(data.message) ?? data.message
-            })
-        }
         const normalized = data ? { ...data } : body?.data
         if (data) delete (normalized as Record<string, unknown>).id
         return body?.type === AGENT_MESSAGE_PAYLOAD_TYPE ? stableSerialize({ role: 'agent', data: normalized }) : null
@@ -403,12 +376,12 @@ function parseCodexLocalSession(
     return includeMessages ? { ...summary, messages: deduplicateAdjacentImportedMessages(messages) } : summary
 }
 
-function listLocalCodexSessions(includeMessages: false, limit?: number, codexHome?: string | null): LocalCodexSessionSummary[]
-function listLocalCodexSessions(includeMessages: true, limit?: number, codexHome?: string | null): LocalCodexSessionWithMessages[]
-function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): Array<LocalCodexSessionSummary | LocalCodexSessionWithMessages> {
+function listLocalCodexSessions(includeMessages: false, limit?: number): LocalCodexSessionSummary[]
+function listLocalCodexSessions(includeMessages: true, limit?: number): LocalCodexSessionWithMessages[]
+function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): Array<LocalCodexSessionSummary | LocalCodexSessionWithMessages> {
     const files: string[] = []
-    for (const root of getCodexSessionRoots(codexHome)) collectJsonlFiles(root, files)
-    const sessionIndexTitles = readCodexSessionIndexTitles(codexHome)
+    for (const root of getCodexSessionRoots()) collectJsonlFiles(root, files)
+    const sessionIndexTitles = readCodexSessionIndexTitles()
     const deduped = new Map<string, LocalCodexSessionSummary | LocalCodexSessionWithMessages>()
     for (const file of files) {
         const session = parseCodexLocalSession(file, includeMessages, sessionIndexTitles)
@@ -419,18 +392,18 @@ function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_
     return Array.from(deduped.values()).sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, limit)
 }
 
-export function listLocalCodexSessionSummaries(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): LocalCodexSessionSummary[] {
-    return listLocalCodexSessions(false, limit, codexHome)
+export function listLocalCodexSessionSummaries(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): LocalCodexSessionSummary[] {
+    return listLocalCodexSessions(false, limit)
 }
 
-export function listLocalCodexSessionsWithMessages(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): LocalCodexSessionWithMessages[] {
-    return listLocalCodexSessions(true, limit, codexHome)
+export function listLocalCodexSessionsWithMessages(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): LocalCodexSessionWithMessages[] {
+    return listLocalCodexSessions(true, limit)
 }
 
-export function listLocalCodexSessionsWithMessagesByIds(ids: Set<string>, codexHome?: string | null): LocalCodexSessionWithMessages[] {
+export function listLocalCodexSessionsWithMessagesByIds(ids: Set<string>): LocalCodexSessionWithMessages[] {
     if (ids.size === 0) return []
-    const sessionIndexTitles = readCodexSessionIndexTitles(codexHome)
-    return listLocalCodexSessionSummaries(Number.MAX_SAFE_INTEGER, codexHome)
+    const sessionIndexTitles = readCodexSessionIndexTitles()
+    return listLocalCodexSessionSummaries(Number.MAX_SAFE_INTEGER)
         .filter((session) => ids.has(session.id))
         .map((session) => parseCodexLocalSession(session.file, true, sessionIndexTitles))
         .filter((session): session is LocalCodexSessionWithMessages => Boolean(session))

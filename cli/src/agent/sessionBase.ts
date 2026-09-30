@@ -10,8 +10,6 @@ import type {
 } from '@/api/types';
 import { logger } from '@/ui/logger';
 
-export type SessionFoundCallback = (sessionId: string, sessionFilePath?: string) => void;
-
 export type AgentSessionBaseOptions<Mode> = {
     api: ApiClient;
     client: ApiSessionClient;
@@ -45,7 +43,7 @@ export class AgentSessionBase<Mode> {
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
 
-    private sessionFoundCallbacks: SessionFoundCallback[] = [];
+    private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];
     private readonly applySessionIdToMetadata: (metadata: Metadata, sessionId: string, extras?: Partial<Metadata>) => Metadata;
     private readonly sessionLabel: string;
     private readonly sessionIdLabel: string;
@@ -111,21 +109,21 @@ export class AgentSessionBase<Mode> {
         this._onModeChange(mode);
     };
 
-    onSessionFound = (sessionId: string, extras?: Partial<Metadata>, sessionFilePath?: string) => {
+    onSessionFound = (sessionId: string, extras?: Partial<Metadata>) => {
         this.sessionId = sessionId;
         this.client.updateMetadata((metadata) => this.applySessionIdToMetadata(metadata, sessionId, extras));
         logger.debug(`[${this.sessionLabel}] ${this.sessionIdLabel} session ID ${sessionId} added to metadata`);
 
         for (const callback of this.sessionFoundCallbacks) {
-            callback(sessionId, sessionFilePath);
+            callback(sessionId);
         }
     };
 
-    addSessionFoundCallback = (callback: SessionFoundCallback): void => {
+    addSessionFoundCallback = (callback: (sessionId: string) => void): void => {
         this.sessionFoundCallbacks.push(callback);
     };
 
-    removeSessionFoundCallback = (callback: SessionFoundCallback): void => {
+    removeSessionFoundCallback = (callback: (sessionId: string) => void): void => {
         const index = this.sessionFoundCallbacks.indexOf(callback);
         if (index !== -1) {
             this.sessionFoundCallbacks.splice(index, 1);

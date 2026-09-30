@@ -29,8 +29,6 @@ function elapsedSince(startedAt: number | null, now: number): string | null {
 export function SessionStatusPanel({ data }: { data: SessionStatusData }) {
     const { t } = useTranslation()
     const completedTasks = data.tasks.filter((task) => task.status === 'completed').length
-    const currentTask = data.tasks.find((task) => task.status === 'in_progress')
-        ?? data.tasks.find((task) => task.status === 'pending')
     const hasLiveElapsed = data.terminals.length > 0
         || data.subagents.some((subagent) => subagent.endedAt === null && subagent.startedAt !== null)
     const [now, setNow] = useState(() => Date.now())
@@ -45,12 +43,7 @@ export function SessionStatusPanel({ data }: { data: SessionStatusData }) {
         <details className="group mx-3 mt-3 rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)]">
             <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-semibold text-[var(--app-fg)] [&::-webkit-details-marker]:hidden">
                 {t('session.status.title')}
-                {data.tasks.length > 0 ? (
-                    <span className="min-w-0 flex-1 truncate font-normal text-[var(--app-link)]" title={currentTask?.content}>
-                        {completedTasks}/{data.tasks.length}{currentTask ? ` · ${currentTask.content}` : ''}
-                    </span>
-                ) : <span className="flex-1" />}
-                <span className="shrink-0 text-[10px] text-[var(--app-hint)] transition-transform group-open:rotate-180" aria-hidden="true">▼</span>
+                <span className="ml-auto text-[10px] text-[var(--app-hint)] transition-transform group-open:rotate-180" aria-hidden="true">▼</span>
             </summary>
             <div className="grid max-h-[min(50dvh,24rem)] gap-3 overflow-y-auto border-t border-[var(--app-border)] px-3 py-2.5 sm:grid-cols-2">
                 {data.goal ? (

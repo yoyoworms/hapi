@@ -1,18 +1,14 @@
+import { SESSION_LIFECYCLE_IDLE, SESSION_LIFECYCLE_RUNNING } from '@hapi/protocol'
 import { AgentStateSchema, MetadataSchema, SessionPatchSchema, TeamStateSchema } from '@hapi/protocol/schemas'
-import type { AgentAccountStatus, CodexCollaborationMode, CopilotAgentMode, PermissionMode, Session, SessionPatch } from '@hapi/protocol/types'
+import type { CodexCollaborationMode, CopilotAgentMode, PermissionMode, Session, SessionPatch } from '@hapi/protocol/types'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
 import { EventPublisher } from './eventPublisher'
 import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
 import { extractBackgroundTaskDelta } from './backgroundTasks'
+import { resolveSessionIdleTimeoutMs, shouldClearKeepaliveIdle, shouldMarkKeepaliveIdle } from './sessionIdle'
 
 const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
-// Lifecycle timestamps are authored by the CLI's wall clock.  A socket
-// handshake supplies the Hub-minus-CLI offset so a small host skew does not
-// reject a legitimate replacement runtime.  Keep the correction deliberately
-// bounded: clientTime is untrusted input and must never become an arbitrary
-// takeover tolerance.
-const MAX_RUNTIME_CLOCK_OFFSET_MS = 10_000
 // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
 // restoreSessionArchiveMetadata) retry on version-mismatch with a fresh cache
 // snapshot. Cap retries so genuine concurrent contention still surfaces to the
@@ -28,14 +24,14 @@ export class SessionCache {
     private readonly deduplicatePending: Set<string> = new Set()
     private readonly pendingThinkingUntilBySessionId: Map<string, number> = new Map()
     private readonly runtimeConfigUpdatedAtBySessionId: Map<string, Partial<Record<RuntimeConfigKey, number>>> = new Map()
-    /** Last ordered liveness timestamp (Hub clock for identified runtimes). */
-    private readonly lastAlivePayloadTimeBySessionId: Map<string, number> = new Map()
-    /** Hub-local owner prevents an older CLI connection from ending a newer run. */
-    private readonly runtimeOwnerBySessionId: Map<string, {
-        runtimeId: string
-        runtimeGeneration: number
-        ended: boolean
-    }> = new Map()
+    /**
+     * Last time the hub saw real agent progress per session (tiann/hapi#1820).
+     * Deliberately NOT bumped by `session-alive`: keepalives are exactly the
+     * signal this clock has to be immune to. Seeded lazily from `updatedAt`,
+     * so a hub restart re-derives it from the last human turn on disk.
+     */
+    private readonly agentProgressAtBySessionId: Map<string, number> = new Map()
+    private readonly sessionIdleTimeoutMs: number = resolveSessionIdleTimeoutMs()
 
     constructor(
         private readonly store: Store,
@@ -105,6 +101,29 @@ export class SessionCache {
         return this.refreshSession(stored.id) ?? (() => { throw new Error('Failed to load session') })()
     }
 
+    adoptPreallocatedSession(
+        id: string,
+        tag: string,
+        metadata: unknown,
+        agentState: unknown,
+        namespace: string,
+        model?: string,
+        effort?: string,
+        modelReasoningEffort?: string
+    ): Session {
+        const stored = this.store.sessions.adoptPreallocatedSession(
+            id,
+            tag,
+            metadata,
+            agentState,
+            namespace,
+            model,
+            effort,
+            modelReasoningEffort
+        )
+        return this.refreshSession(stored.id) ?? (() => { throw new Error('Failed to load adopted session') })()
+    }
+
     /**
      * After fork hydrate / rewind truncate, re-scan the transcript for the
      * latest TodoWrite (or clear todos). Bypasses the one-shot backfill flag
@@ -143,8 +162,7 @@ export class SessionCache {
             const existed = this.sessions.delete(sessionId)
             this.pendingThinkingUntilBySessionId.delete(sessionId)
             this.runtimeConfigUpdatedAtBySessionId.delete(sessionId)
-            this.lastAlivePayloadTimeBySessionId.delete(sessionId)
-            this.runtimeOwnerBySessionId.delete(sessionId)
+            this.agentProgressAtBySessionId.delete(sessionId)
             if (existed) {
                 this.publisher.emit({ type: 'session-removed', sessionId })
             }
@@ -192,6 +210,7 @@ export class SessionCache {
         })()
 
         const session: Session = {
+            hasConversationContent: this.store.messages.hasConversationContent(sessionId),
             id: stored.id,
             namespace: stored.namespace,
             seq: stored.seq,
@@ -225,14 +244,21 @@ export class SessionCache {
             serviceTier: stored.serviceTier,
             permissionMode: existing?.permissionMode ?? metadata?.preferredPermissionMode,
             collaborationMode: existing?.collaborationMode,
-            usage: existing?.usage ?? null,
-            accountStatus: existing?.accountStatus ?? null,
             copilotAgentMode: existing?.copilotAgentMode ?? metadata?.preferredCopilotAgentMode
         }
 
         this.sessions.set(sessionId, session)
         this.publisher.emit({ type: existing ? 'session-updated' : 'session-added', sessionId, data: session })
         return session
+    }
+
+    refreshConversationContent(sessionId: string): void {
+        const session = this.sessions.get(sessionId)
+        const hasContent = this.store.messages.hasConversationContent(sessionId)
+        if (session && session.hasConversationContent !== hasContent) {
+            session.hasConversationContent = hasContent
+            this.publisher.emit({ type: 'session-updated', sessionId, data: { ...session } })
+        }
     }
 
     reloadAll(): void {
@@ -277,40 +303,6 @@ export class SessionCache {
         if (!wasActive) {
             this.refreshSession(sessionId)
         }
-    }
-
-    /**
-     * Persist the authoritative CLI process id without touching the session's
-     * user-visible activity timestamp. This is intentionally version-retried:
-     * metadata writes (title/model/native thread id) can race the first alive
-     * packet, but a claim is not safe across Hub restart until it is durable.
-     */
-    private persistRuntimeOwnerId(sessionId: string, runtimeId: string): Session | null {
-        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
-            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
-            if (!session?.metadata) {
-                return null
-            }
-            if (session.metadata.runtimeId === runtimeId) {
-                return session
-            }
-
-            const result = this.store.sessions.updateSessionMetadata(
-                sessionId,
-                { ...session.metadata, runtimeId },
-                session.metadataVersion,
-                session.namespace,
-                { touchUpdatedAt: false }
-            )
-            if (result.result === 'error') {
-                return null
-            }
-            if (result.result === 'success') {
-                return this.refreshSession(sessionId)
-            }
-            this.refreshSession(sessionId)
-        }
-        return null
     }
 
     /**
@@ -361,7 +353,6 @@ export class SessionCache {
 
         if (patch.active !== undefined) session.active = patch.active
         if (patch.thinking !== undefined) session.thinking = patch.thinking
-        if (patch.activeTurnStartedAt !== undefined) session.activeTurnStartedAt = patch.activeTurnStartedAt
         if (patch.activeAt !== undefined) session.activeAt = patch.activeAt
         if (patch.updatedAt !== undefined) session.updatedAt = Math.max(session.updatedAt, patch.updatedAt)
         if (patch.model !== undefined) session.model = patch.model
@@ -372,7 +363,6 @@ export class SessionCache {
         }
         if (patch.permissionMode !== undefined) session.permissionMode = patch.permissionMode
         if (patch.collaborationMode !== undefined) session.collaborationMode = patch.collaborationMode
-        if (patch.copilotAgentMode !== undefined) session.copilotAgentMode = patch.copilotAgentMode
         if (patch.backgroundTaskCount !== undefined) session.backgroundTaskCount = patch.backgroundTaskCount
         if (patch.todos !== undefined) {
             session.todos = patch.todos.value
@@ -407,88 +397,12 @@ export class SessionCache {
         serviceTier?: string | null
         collaborationMode?: CodexCollaborationMode
         copilotAgentMode?: CopilotAgentMode
-        runtimeId?: string
-        runtimeGeneration?: number
-    }): boolean {
-        const hasRuntimeSource = typeof payload.runtimeId === 'string'
-            && Number.isSafeInteger(payload.runtimeGeneration)
-        // Runtime identity establishes ordering across runners; use Hub receive
-        // time for liveness/config comparisons so host clock skew cannot make a
-        // valid owner look ten minutes stale.
-        const t = hasRuntimeSource ? Date.now() : clampAliveTime(payload.time)
-        if (!t) return false
+    }): void {
+        const t = clampAliveTime(payload.time)
+        if (!t) return
 
-        let session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-        if (!session) return false
-
-        // An explicit end persists lifecycleState=archived before (new CLIs) or
-        // during (Hub fallback) teardown. A delayed heartbeat must never turn
-        // that durable terminal state back into active=true. A genuinely new
-        // runtime first writes lifecycleState=running through the ownership-
-        // gated metadata path, then its alive event can activate the row.
-        if (session.metadata?.lifecycleState === 'archived') {
-            return false
-        }
-
-        // Once a modern runtime has durably claimed the row, legacy packets
-        // without a complete runtime identity are no longer authoritative.
-        // Otherwise an orphaned older CLI can keep overwriting the current
-        // owner's active/thinking state indefinitely.
-        if (!hasRuntimeSource && session.metadata?.runtimeId) {
-            return false
-        }
-
-        if (hasRuntimeSource) {
-            const runtimeGeneration = payload.runtimeGeneration as number
-            const owner = this.runtimeOwnerBySessionId.get(session.id)
-            const durableRuntimeId = session.metadata?.runtimeId
-            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
-                // A different process must first persist a newer `running`
-                // transition through the metadata ownership gate. Requiring
-                // that transition closes both cold-start ambiguity and the
-                // warm-cache case where a stale, later-first-seen runtime sends
-                // alive after the current owner's heartbeat expires.
-                return false
-            }
-            if (owner) {
-                const sameRuntime = payload.runtimeId === owner.runtimeId
-                if (sameRuntime) {
-                    if (owner.ended || runtimeGeneration !== owner.runtimeGeneration) {
-                        return false
-                    }
-                } else {
-                    // Within one Hub lifetime, generation is the first-seen
-                    // ordering authority. Once a newer runtime has owned this
-                    // session, an older runtime must not reclaim it merely
-                    // because the newer owner ended or its heartbeat expired.
-                    if (runtimeGeneration <= owner.runtimeGeneration) {
-                        return false
-                    }
-                    if (session.active && !owner.ended) {
-                        // A later first-seen runtime still cannot steal a live
-                        // owner: an older runner may have been offline when the
-                        // current runner connected, then reconnect with a higher
-                        // Hub-local generation.
-                        return false
-                    }
-                }
-            }
-            if (!owner || payload.runtimeId !== owner.runtimeId) {
-                this.lastAlivePayloadTimeBySessionId.delete(session.id)
-            }
-            this.runtimeOwnerBySessionId.set(session.id, {
-                runtimeId: payload.runtimeId as string,
-                runtimeGeneration,
-                ended: false
-            })
-            const persistedSession = this.persistRuntimeOwnerId(session.id, payload.runtimeId as string)
-            if (!persistedSession) {
-                // Keep the in-memory owner as a retry watermark, but do not
-                // advertise the row active until the claim is durable.
-                return false
-            }
-            session = persistedSession
-        }
+        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+        if (!session) return
 
         const wasActive = session.active
         const wasThinking = session.thinking
@@ -506,25 +420,9 @@ export class SessionCache {
         const preserveQueuedThinking = !requestedThinking && pendingThinkingUntil > hubNow
         const hasUnconsumedPrompt = preserveQueuedThinking
             && this.store.messages.getImmediateQueuedLocalMessages(session.id).length > 0
-        // Codex update_plan is scoped to one turn and is not guaranteed to
-        // receive a final all-completed update. A quiet heartbeat is the safe
-        // lifecycle boundary: unlike the volatile false -> true heartbeat it
-        // cannot race a reliable update_plan from the newly-started turn.
-        const hasPendingRequest = Object.keys(session.agentState?.requests ?? {}).length > 0
-        const hasBackgroundWork = (session.backgroundTaskCount ?? 0) > 0
-        const clearedTodos = !requestedThinking
-            && !preserveQueuedThinking
-            && !hasPendingRequest
-            && !hasBackgroundWork
-            ? this.clearCodexTurnTodos(session)
-            : null
 
         session.active = true
         session.activeAt = Math.max(session.activeAt, t)
-        this.lastAlivePayloadTimeBySessionId.set(
-            session.id,
-            Math.max(this.lastAlivePayloadTimeBySessionId.get(session.id) ?? Number.NEGATIVE_INFINITY, t)
-        )
         session.thinking = requestedThinking || preserveQueuedThinking
         session.thinkingAt = t
         if (!requestedThinking && preserveQueuedThinking && hasUnconsumedPrompt) {
@@ -593,7 +491,6 @@ export class SessionCache {
             || (wasThinking !== session.thinking)
             || turnBoundaryChanged
             || modeChanged
-            || clearedTodos !== null
             || (now - lastBroadcastAt > 10_000)
 
         if (shouldBroadcast) {
@@ -612,15 +509,10 @@ export class SessionCache {
                     effort: session.effort,
                     serviceTier: session.serviceTier,
                     collaborationMode: session.collaborationMode,
-                    copilotAgentMode: session.copilotAgentMode,
-                    ...(clearedTodos ? {
-                        todos: clearedTodos,
-                        updatedAt: session.updatedAt
-                    } : {})
+                    copilotAgentMode: session.copilotAgentMode
                 } satisfies SessionPatch
             })
         }
-        return true
     }
 
     /**
@@ -639,31 +531,6 @@ export class SessionCache {
         this.pendingThinkingUntilBySessionId.delete(sessionId)
     }
 
-    /** Clear a completed/idle Codex turn's plan without outranking future
-     * client timestamps. The one-step ratchet preserves stale-write rejection
-     * while avoiding a Hub Date.now watermark from a different clock. */
-    private clearCodexTurnTodos(session: Session): { version: number; value: [] } | null {
-        if (session.metadata?.flavor !== 'codex' || !session.todos?.length) {
-            return null
-        }
-
-        const version = (session.todosUpdatedAt ?? 0) + 1
-        const updated = this.store.sessions.setSessionTodos(
-            session.id,
-            [],
-            version,
-            session.namespace
-        )
-        if (!updated) {
-            return null
-        }
-
-        session.todos = []
-        session.todosUpdatedAt = version
-        session.updatedAt = Math.max(session.updatedAt, version)
-        return { version, value: [] }
-    }
-
     markMessageQueued(
         sessionId: string,
         time: number = Date.now(),
@@ -676,15 +543,13 @@ export class SessionCache {
         const nextTime = clampAliveTime(time) ?? Date.now()
         const wasThinking = session.thinking
         const previousUpdatedAt = session.updatedAt
-        const clearedTodos = !wasThinking
-            ? this.clearCodexTurnTodos(session)
-            : null
 
         session.thinking = true
         session.thinkingAt = nextTime
         if (!wasThinking) session.activeTurnStartedAt = activeTurnStartedAt
         session.updatedAt = Math.max(session.updatedAt, nextTime)
         this.pendingThinkingUntilBySessionId.set(session.id, nextTime + QUEUED_MESSAGE_THINKING_GRACE_MS)
+        this.recordAgentProgress(session.id, nextTime)
 
         if (!wasThinking || session.updatedAt !== previousUpdatedAt) {
             this.lastBroadcastAtBySessionId.set(session.id, Date.now())
@@ -694,8 +559,7 @@ export class SessionCache {
                 data: {
                     thinking: true,
                     activeTurnStartedAt: session.activeTurnStartedAt,
-                    updatedAt: session.updatedAt,
-                    ...(clearedTodos ? { todos: clearedTodos } : {})
+                    updatedAt: session.updatedAt
                 } satisfies SessionPatch
             })
         }
@@ -710,6 +574,7 @@ export class SessionCache {
         if (next === prev) return
 
         session.backgroundTaskCount = next
+        this.recordAgentProgress(sessionId)
         this.publisher.emit({
             type: 'session-updated',
             sessionId,
@@ -728,6 +593,7 @@ export class SessionCache {
         }
 
         const nextUpdatedAt = Math.max(stored.updatedAt, updatedAt)
+        this.recordAgentProgress(sessionId, nextUpdatedAt)
         const touched = this.store.sessions.touchSessionUpdatedAt(sessionId, nextUpdatedAt, stored.namespace)
         const session = this.sessions.get(sessionId)
 
@@ -749,6 +615,112 @@ export class SessionCache {
             namespace: session.namespace,
             data: { updatedAt: session.updatedAt } satisfies SessionPatch
         })
+    }
+
+    /**
+     * tiann/hapi#1820: record real agent progress (a message in either
+     * direction, a queued prompt, a background task starting). This is the
+     * clock `reconcileKeepaliveIdle` reads — `session-alive` must never reach
+     * it, otherwise a heartbeating-but-dead session looks healthy forever.
+     *
+     * Pure bookkeeping on purpose: the lifecycle write is left to the tick so
+     * this is safe to call from anywhere holding a cached Session reference
+     * (`refreshSession` replaces the cached object).
+     */
+    recordAgentProgress(sessionId: string, at: number = Date.now()): void {
+        if (!Number.isFinite(at)) return
+        const previous = this.agentProgressAtBySessionId.get(sessionId) ?? 0
+        if (at > previous) {
+            this.agentProgressAtBySessionId.set(sessionId, at)
+        }
+    }
+
+    /**
+     * A cold cache (hub restart) has observed no progress of its own, so seed
+     * it once from disk.
+     *
+     * `updatedAt` alone is not enough: assistant messages deliberately do not
+     * move it, so a session that was streaming output a minute before the
+     * restart would read as hours idle and get marked on the very next tick.
+     * The newest stored message is the durable record of that output.
+     *
+     * `updatedAt` stays a floor on top of the seed, because todos / teamState
+     * / agentState writes bump it without routing through
+     * `recordAgentProgress`.
+     */
+    private getAgentProgressAt(session: Session): number {
+        let observed = this.agentProgressAtBySessionId.get(session.id)
+        if (observed === undefined) {
+            observed = this.store.messages.getNewestMessagePosition(session.id)?.at ?? 0
+            this.agentProgressAtBySessionId.set(session.id, observed)
+        }
+        return Math.max(observed, session.updatedAt)
+    }
+
+    /**
+     * tiann/hapi#1820: reconcile `lifecycleState` for sessions that only the
+     * keepalive is keeping alive. Runs on the existing inactivity tick.
+     *
+     * `active` is deliberately left alone: the CLI socket really is up, and
+     * flipping `active` would make `resumeSession` spawn a second agent
+     * against a live process (and would unlock dedup-merge / delete on it).
+     * What changes is the honest agent-health signal, which operators, the
+     * session list and downstream tooling can act on.
+     *
+     * Returns the session ids newly marked `idle`.
+     */
+    reconcileKeepaliveIdle(now: number = Date.now(), timeoutMs: number = this.sessionIdleTimeoutMs): string[] {
+        if (timeoutMs <= 0) return []
+
+        const marked: string[] = []
+        // Snapshot: a lifecycle write refreshes the cached Session in place.
+        for (const session of Array.from(this.sessions.values())) {
+            const progressAt = this.getAgentProgressAt(session)
+            if (shouldClearKeepaliveIdle(session, progressAt, now, timeoutMs)) {
+                this.writeLifecycleState(session.id, SESSION_LIFECYCLE_RUNNING)
+                continue
+            }
+            if (!shouldMarkKeepaliveIdle(session, progressAt, now, timeoutMs)) {
+                continue
+            }
+            if (this.writeLifecycleState(session.id, SESSION_LIFECYCLE_IDLE)) {
+                marked.push(session.id)
+            }
+        }
+        return marked
+    }
+
+    /**
+     * Swap `metadata.lifecycleState` between `running` and `idle`, retrying on
+     * version-mismatch like the other hub-side metadata writers. Best effort:
+     * a session whose CLI is concurrently rewriting metadata just gets
+     * reconciled on a later tick.
+     */
+    private writeLifecycleState(sessionId: string, next: typeof SESSION_LIFECYCLE_RUNNING | typeof SESSION_LIFECYCLE_IDLE): boolean {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId)
+            const current = session?.metadata
+            if (!session || !current) return false
+            if (current.lifecycleState === next) return false
+            // Only the running <-> idle pair is ours; never step on `archived`
+            // or any CLI-authored state.
+            const expected = next === SESSION_LIFECYCLE_IDLE ? SESSION_LIFECYCLE_RUNNING : SESSION_LIFECYCLE_IDLE
+            if (current.lifecycleState !== expected) return false
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...current, lifecycleState: next, lifecycleStateSince: Date.now() },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') return false
+            // refreshSession re-reads the row and broadcasts the full session,
+            // so clients pick up the new lifecycleState without a second emit.
+            this.refreshSession(sessionId)
+            if (result.result === 'success') return true
+        }
+        return false
     }
 
     /**
@@ -780,127 +752,14 @@ export class SessionCache {
         })
     }
 
-    handleSessionEnd(payload: {
-        sid: string
-        time: number
-        runtimeId?: string
-        runtimeGeneration?: number
-    }): number | null {
-        return this.handleSessionEndInternal(payload, false)
-    }
+    handleSessionEnd(payload: { sid: string; time: number }): void {
+        const t = clampAliveTime(payload.time) ?? Date.now()
 
-    /** Explicit Hub archive/kill is an authority boundary of its own. */
-    handleHubSessionEnd(payload: { sid: string; time: number }): number | null {
-        return this.handleSessionEndInternal(payload, true)
-    }
+        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
+        if (!session) return
 
-    private handleSessionEndInternal(payload: {
-        sid: string
-        time: number
-        runtimeId?: string
-        runtimeGeneration?: number
-    }, hubAuthoritative: boolean): number | null {
-        if (!Number.isFinite(payload.time)) {
-            return null
-        }
-        // Preserve old timestamps for generation ordering. clampAliveTime()
-        // returns null for values older than ten minutes, and substituting now
-        // here would let a replayed old session-end kill a newly reopened run.
-        const legacyEventTime = Math.min(payload.time, Date.now())
-
-        let session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-        if (!session) return null
-
-        if (
-            session.metadata?.lifecycleState === 'archived'
-            && !session.active
-            && !session.thinking
-            && (session.backgroundTaskCount ?? 0) === 0
-            && session.metadata.piResumeAttempt === undefined
-            && session.metadata.ptyResumeAttempt === undefined
-        ) {
-            // Durable terminal state already reconciled. Treat a cold/replayed
-            // duplicate as rejected so handlers do not emit another ended
-            // event or sweep immediate messages queued after the original end.
-            return null
-        }
-
-        const hasRuntimeSource = typeof payload.runtimeId === 'string'
-            && Number.isSafeInteger(payload.runtimeGeneration)
-        // Mirror the alive fence: an unsourced legacy end must not stop (and
-        // subsequently archive) a session already owned by a modern runtime.
-        if (!hubAuthoritative && !hasRuntimeSource && session.metadata?.runtimeId) {
-            return null
-        }
-        if (hasRuntimeSource) {
-            const owner = this.runtimeOwnerBySessionId.get(session.id)
-            const durableRuntimeId = session.metadata?.runtimeId
-            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
-                return null
-            }
-            if (owner) {
-                if (
-                    owner.ended
-                    || payload.runtimeGeneration !== owner.runtimeGeneration
-                    || payload.runtimeId !== owner.runtimeId
-                ) {
-                    return null
-                }
-            } else {
-                // A reconnect can flush buffered events before the client's
-                // connect handler sends its first keepalive. Claim the cold
-                // cache now so the following same-runtime alive cannot revive
-                // a runner that already ended.
-                this.runtimeOwnerBySessionId.set(session.id, {
-                    runtimeId: payload.runtimeId as string,
-                    runtimeGeneration: payload.runtimeGeneration as number,
-                    ended: false
-                })
-            }
-            const persistedSession = this.persistRuntimeOwnerId(session.id, payload.runtimeId as string)
-            if (!persistedSession) {
-                return null
-            }
-            session = persistedSession
-        }
-        const t = (hasRuntimeSource || hubAuthoritative) ? Date.now() : legacyEventTime
-
-        // Timestamp ordering is only meaningful inside one runtime. New clients
-        // additionally carry a Hub-owned runtime generation, which is the
-        // cross-run authority and is checked above.
-        const lastAlivePayloadTime = this.lastAlivePayloadTimeBySessionId.get(session.id)
-        if (!hubAuthoritative && !hasRuntimeSource && lastAlivePayloadTime !== undefined && t < lastAlivePayloadTime) {
-            return null
-        }
-        const lifecycleStateSince = typeof session.metadata?.lifecycleStateSince === 'number'
-            ? session.metadata.lifecycleStateSince
-            : 0
-        if (
-            !hubAuthoritative
-            && !hasRuntimeSource
-            &&
-            session.metadata?.lifecycleState === 'running'
-            && lifecycleStateSince > t
-        ) {
-            return null
-        }
-
-        if (hasRuntimeSource || hubAuthoritative) {
-            const owner = this.runtimeOwnerBySessionId.get(session.id)
-            if (owner) {
-                owner.ended = true
-            }
-        }
-
-        if (
-            !session.active
-            && !session.thinking
-            && (session.backgroundTaskCount ?? 0) === 0
-        ) {
-            // A valid explicit end can arrive after the 30s liveness expiry.
-            // Report it as accepted so SyncEngine can still reconcile stale
-            // lifecycleState=running metadata without changing live state.
-            return t
+        if (!session.active && !session.thinking) {
+            return
         }
 
         session.active = false
@@ -909,193 +768,12 @@ export class SessionCache {
         session.thinkingAt = t
         session.activeTurnStartedAt = null
         session.backgroundTaskCount = 0
-        const clearedTodos = this.clearCodexTurnTodos(session)
         this.pendingThinkingUntilBySessionId.delete(session.id)
-        this.lastAlivePayloadTimeBySessionId.delete(session.id)
 
         this.publisher.emit({
             type: 'session-updated',
             sessionId: session.id,
-            data: {
-                active: false,
-                thinking: false,
-                activeTurnStartedAt: null,
-                backgroundTaskCount: 0,
-                ...(clearedTodos ? { todos: clearedTodos, updatedAt: session.updatedAt } : {})
-            } satisfies SessionPatch
-        })
-        return t
-    }
-
-    isRuntimeMetadataUpdateAllowed(payload: {
-        sid: string
-        metadata: unknown
-        runtimeId: string
-        runtimeGeneration: number
-        clockOffset?: number
-    }): boolean {
-        const owner = this.runtimeOwnerBySessionId.get(payload.sid)
-        if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
-            return false
-        }
-        const lifecycleState = (payload.metadata as Record<string, unknown>).lifecycleState
-        if (!owner) {
-            const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-            const durableRuntimeId = session?.metadata?.runtimeId
-            if (
-                durableRuntimeId === payload.runtimeId
-                && session?.metadata?.lifecycleState === 'archived'
-                && lifecycleState === 'running'
-            ) {
-                // runtimeId survives transport reconnects, not process restarts.
-                // Once that runtime archived, it cannot reopen itself after a
-                // Hub restart; a legitimate new run has a new runtimeId.
-                return false
-            }
-            if (durableRuntimeId && durableRuntimeId !== payload.runtimeId) {
-                if (lifecycleState !== 'running') {
-                    return false
-                }
-                // Cold Hub cache cannot order random runtime ids. Accept a
-                // replacement only when its process-start lifecycle timestamp
-                // is strictly newer than the durable owner's last running OR
-                // archived transition. This also prevents an old buffered
-                // `running` write from reviving an explicitly archived row.
-                // Both values are authored by CLI lifecycle code; comparison
-                // is limited to different-runtime takeover. Same-runtime
-                // liveness/config ordering remains entirely in Hub time.
-                if (!session || !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata, payload.clockOffset)) {
-                    return false
-                }
-            }
-            return true
-        }
-
-        const sameRuntime = payload.runtimeId === owner.runtimeId
-            && payload.runtimeGeneration === owner.runtimeGeneration
-        if (sameRuntime) {
-            return owner.ended ? lifecycleState === 'archived' : true
-        }
-
-        // An ended or expired newer owner remains the ordering watermark for
-        // this Hub lifetime. Without this check, a delayed `running` write from
-        // an older runtime can reclaim the session after B(gen=2) ended merely
-        // because the row is now inactive.
-        if (payload.runtimeGeneration <= owner.runtimeGeneration) {
-            return false
-        }
-
-        const session = this.sessions.get(payload.sid) ?? this.refreshSession(payload.sid)
-        if (lifecycleState === 'running' && (!session?.active || owner.ended)) {
-            const durableRuntimeId = session?.metadata?.runtimeId
-            if (
-                durableRuntimeId
-                && durableRuntimeId !== payload.runtimeId
-                && !this.isStrictlyNewerRuntimeLifecycle(session, payload.metadata, payload.clockOffset)
-            ) {
-                return false
-            }
-            // bootstrapExistingSession queues running metadata before Socket.IO
-            // invokes the client's connect handler/keepalive. The successful
-            // write callback (recordRuntimeMetadataUpdate) establishes owner;
-            // a version-mismatch must not let a stale writer steal it.
-            return true
-        }
-        return false
-    }
-
-    private isStrictlyNewerRuntimeLifecycle(
-        session: Session,
-        metadata: unknown,
-        clockOffset?: number
-    ): boolean {
-        if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-            return false
-        }
-        const incomingSince = (metadata as Record<string, unknown>).lifecycleStateSince
-        const durableSince = session.metadata?.lifecycleStateSince
-        const boundedClockOffset = typeof clockOffset === 'number'
-            && Number.isFinite(clockOffset)
-            && Math.abs(clockOffset) <= MAX_RUNTIME_CLOCK_OFFSET_MS
-            ? clockOffset
-            : 0
-        return typeof incomingSince === 'number'
-            && Number.isFinite(incomingSince)
-            && typeof durableSince === 'number'
-            && Number.isFinite(durableSince)
-            && incomingSince + boundedClockOffset > durableSince
-    }
-
-    /** Commit ownership only after update-metadata actually persisted. */
-    recordRuntimeMetadataUpdate(payload: {
-        sid: string
-        metadata: unknown
-        runtimeId: string
-        runtimeGeneration: number
-    }): void {
-        if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {
-            return
-        }
-        const metadataRecord = payload.metadata as Record<string, unknown>
-        const lifecycleState = metadataRecord.lifecycleState
-        if (lifecycleState !== 'running' || metadataRecord.runtimeId !== payload.runtimeId) {
-            return
-        }
-
-        const owner = this.runtimeOwnerBySessionId.get(payload.sid)
-        const sameRuntime = owner
-            && owner.runtimeId === payload.runtimeId
-            && owner.runtimeGeneration === payload.runtimeGeneration
-        if (sameRuntime && !owner.ended) {
-            return
-        }
-        if (owner && payload.runtimeGeneration <= owner.runtimeGeneration) {
-            return
-        }
-
-        this.lastAlivePayloadTimeBySessionId.delete(payload.sid)
-        this.runtimeOwnerBySessionId.set(payload.sid, {
-            runtimeId: payload.runtimeId,
-            runtimeGeneration: payload.runtimeGeneration,
-            ended: false
-        })
-    }
-
-    handleSessionUsage(payload: {
-        sid: string
-        totalCostUsd: number
-        totalInputTokens: number
-        totalOutputTokens: number
-    }): void {
-        const session = this.sessions.get(payload.sid)
-        if (!session) return
-
-        session.usage = {
-            totalCostUsd: payload.totalCostUsd,
-            totalInputTokens: payload.totalInputTokens,
-            totalOutputTokens: payload.totalOutputTokens
-        }
-
-        // Upstream's SessionPatchSchema is strict and excludes usage/accountStatus,
-        // so emit the full Session (also a valid SessionUpdatedData variant).
-        this.publisher.emit({
-            type: 'session-updated',
-            sessionId: session.id,
-            data: session
-        })
-    }
-
-    handleSessionAccountStatus(payload: { sid: string; accountStatus: AgentAccountStatus }): void {
-        const session = this.sessions.get(payload.sid)
-        if (!session) return
-
-        session.accountStatus = payload.accountStatus
-
-        // See handleSessionUsage — emit full Session rather than a strict SessionPatch.
-        this.publisher.emit({
-            type: 'session-updated',
-            sessionId: session.id,
-            data: session
+            data: { active: false, thinking: false, activeTurnStartedAt: null, backgroundTaskCount: 0 } satisfies SessionPatch
         })
     }
 
@@ -1109,23 +787,12 @@ export class SessionCache {
             session.active = false
             this.store.sessions.setSessionActive(session.id, false, now, session.namespace)
             session.thinking = false
-            session.thinkingAt = now
-            session.activeTurnStartedAt = null
-            session.backgroundTaskCount = 0
-            const clearedTodos = this.clearCodexTurnTodos(session)
             this.pendingThinkingUntilBySessionId.delete(session.id)
-            this.lastAlivePayloadTimeBySessionId.delete(session.id)
             expired.push(session.id)
             this.publisher.emit({
                 type: 'session-updated',
                 sessionId: session.id,
-                data: {
-                    active: false,
-                    thinking: false,
-                    activeTurnStartedAt: null,
-                    backgroundTaskCount: 0,
-                    ...(clearedTodos ? { todos: clearedTodos, updatedAt: session.updatedAt } : {})
-                } satisfies SessionPatch
+                data: { active: false } satisfies SessionPatch
             })
         }
 
@@ -1261,11 +928,7 @@ export class SessionCache {
      * `archiveSession` flow still marks the session inactive in cache via
      * `handleSessionEnd`, just without flipping the persisted lifecycle.
      */
-    markSessionArchivedFromHub(
-        sessionId: string,
-        reason: string,
-        options?: { onlyRunningSinceAtOrBefore?: number }
-    ): void {
+    markSessionArchivedFromHub(sessionId: string, reason: string): void {
         for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
             const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
             if (!session) return
@@ -1273,17 +936,6 @@ export class SessionCache {
             if (!current) return
             if (current.lifecycleState === 'archived') {
                 return
-            }
-            if (options?.onlyRunningSinceAtOrBefore !== undefined) {
-                if (current.lifecycleState !== 'running') {
-                    return
-                }
-                const lifecycleStateSince = typeof current.lifecycleStateSince === 'number'
-                    ? current.lifecycleStateSince
-                    : 0
-                if (lifecycleStateSince > options.onlyRunningSinceAtOrBefore) {
-                    return
-                }
             }
 
             const next: Record<string, unknown> = {
@@ -1455,7 +1107,8 @@ export class SessionCache {
                 next,
                 session.metadataVersion,
                 session.namespace,
-                { touchUpdatedAt: false }
+                // #1911 M1: store rejects un-archive unless hub reopen opts in.
+                { touchUpdatedAt: false, allowUnarchive: true }
             )
 
             if (result.result === 'error') {
@@ -1572,6 +1225,7 @@ export class SessionCache {
         this.lastBroadcastAtBySessionId.delete(sessionId)
         this.todoBackfillAttemptedSessionIds.delete(sessionId)
         this.pendingThinkingUntilBySessionId.delete(sessionId)
+        this.agentProgressAtBySessionId.delete(sessionId)
 
         void import('../scratchlistAttachments/storage').then(async ({
             deleteScratchlistAttachmentFiles,
@@ -1630,13 +1284,6 @@ export class SessionCache {
                 this.publisher.emit({ type: 'messages-invalidated', sessionId: oldSessionId, namespace })
             }
             this.publisher.emit({ type: 'messages-invalidated', sessionId: newSessionId, namespace })
-        }
-
-        // Keep any share link alive across the id change (resume spawns a new
-        // session id and merges the old one in). Without this the shared link
-        // would 404 the moment the owner resumes the shared session.
-        if (options.deleteOldSession) {
-            this.store.shares.migrateShares(oldSessionId, newSessionId, namespace)
         }
 
         // tiann/hapi#920: transfer scratchlist rows BEFORE the
@@ -1828,6 +1475,13 @@ export class SessionCache {
             }
             this.lastBroadcastAtBySessionId.delete(oldSessionId)
             this.todoBackfillAttemptedSessionIds.delete(oldSessionId)
+            // The merged history is the new row's progress too — carry the
+            // clock over so a resume-rotated id does not start out stale.
+            const oldProgressAt = this.agentProgressAtBySessionId.get(oldSessionId)
+            if (oldProgressAt !== undefined) {
+                this.recordAgentProgress(newSessionId, oldProgressAt)
+            }
+            this.agentProgressAtBySessionId.delete(oldSessionId)
         } else {
             this.refreshSession(oldSessionId)
         }

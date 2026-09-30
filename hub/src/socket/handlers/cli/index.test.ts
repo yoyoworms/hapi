@@ -1,575 +1,345 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, mock } from 'bun:test'
 import { Store } from '../../../store'
-import { RpcRegistry } from '../../rpcRegistry'
-import { TerminalRegistry } from '../../terminalRegistry'
-import type { CliSocketWithData, SocketServer } from '../../socketTypes'
+import type { CliSocketWithData } from '../../socketTypes'
 import { registerCliHandlers } from './index'
 
-type Handler = (...args: unknown[]) => void
+class FakeCliSocket {
+    readonly handlers = new Map<string, (data: unknown, ack?: (response: unknown) => void) => void>()
+    readonly emitted: Array<{ event: string; data: unknown }> = []
+    readonly rooms: string[] = []
+    data: { namespace?: string } = {}
+    handshake = { auth: {} as Record<string, unknown> }
 
-class FakeNamespace {
-    readonly sockets = new Map<string, FakeSocket>()
-    readonly adapter = { rooms: new Map<string, Set<string>>() }
-}
-
-class FakeSocket {
-    readonly data: Record<string, unknown>
-    readonly handshake: { auth: Record<string, unknown> }
-    readonly joinedRooms = new Set<string>()
-    disconnected = false
-    private readonly handlers = new Map<string, Handler>()
-
-    constructor(
-        readonly id: string,
-        private readonly namespace: FakeNamespace,
-        options: {
-            sessionId: string
-            runtimeId?: string
-            runtimeGeneration?: number
-            clockOffset?: number
-        }
-    ) {
-        this.data = {
-            namespace: 'default',
-            ...(options.runtimeId ? { runtimeId: options.runtimeId } : {}),
-            ...(options.runtimeGeneration !== undefined
-                ? { runtimeGeneration: options.runtimeGeneration }
-                : {}),
-            ...(options.clockOffset !== undefined
-                ? { clockOffset: options.clockOffset }
-                : {})
-        }
-        this.handshake = { auth: { sessionId: options.sessionId } }
-        namespace.sockets.set(id, this)
-    }
-
-    on(event: string, handler: Handler): this {
+    on(event: string, handler: (data: unknown, ack?: (response: unknown) => void) => void): this {
         this.handlers.set(event, handler)
         return this
     }
 
-    emit(): boolean {
-        return true
-    }
-
-    to(): { emit: () => void } {
-        return { emit: () => {} }
-    }
-
-    join(room: string): void {
-        this.joinedRooms.add(room)
-        const ids = this.namespace.adapter.rooms.get(room) ?? new Set<string>()
-        ids.add(this.id)
-        this.namespace.adapter.rooms.set(room, ids)
-    }
-
-    leave(room: string): void {
-        this.joinedRooms.delete(room)
-        const ids = this.namespace.adapter.rooms.get(room)
-        ids?.delete(this.id)
-        if (ids?.size === 0) {
-            this.namespace.adapter.rooms.delete(room)
-        }
-    }
-
-    disconnect(): this {
-        if (this.disconnected) {
-            return this
-        }
-        this.disconnected = true
-        for (const room of [...this.joinedRooms]) {
-            this.leave(room)
-        }
-        this.namespace.sockets.delete(this.id)
-        this.handlers.get('disconnect')?.('server namespace disconnect')
+    join(room: string): this {
+        this.rooms.push(room)
         return this
     }
 
-    trigger(event: string, ...args: unknown[]): void {
-        this.handlers.get(event)?.(...args)
+    emit(event: string, data: unknown): this {
+        this.emitted.push({ event, data })
+        return this
+    }
+
+    to(): { emit: (event: string, data: unknown) => void } {
+        return { emit: () => {} }
+    }
+
+    trigger(event: string, data: unknown, ack?: (response: unknown) => void): void {
+        this.handlers.get(event)?.(data, ack)
     }
 }
 
-class FakeIo {
-    readonly cli = new FakeNamespace()
-    readonly terminal = new FakeNamespace()
+const anyRegistry = new Proxy({}, { get: () => () => {} }) as never
+const fakeIo = { of: () => ({ to: () => ({ emit: () => {} }) }) } as never
 
-    of(name: string): FakeNamespace {
-        return name === '/cli' ? this.cli : this.terminal
-    }
-}
-
-function register(
-    socket: FakeSocket,
-    io: FakeIo,
-    store: Store,
-    rpcRegistry: RpcRegistry,
-    onSessionAlive?: (payload: {
-        sid: string
-        time: number
-        thinking?: boolean
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }) => boolean,
-    onSessionEnd?: (payload: {
-        sid: string
-        time: number
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }) => boolean,
-    onSessionMetadataUpdateAllowed?: (payload: {
-        sid: string
-        metadata: unknown
-        runtimeId: string
-        runtimeGeneration: number
-        clockOffset?: number
-    }) => boolean
-): void {
-    registerCliHandlers(socket as unknown as CliSocketWithData, {
-        io: io as unknown as SocketServer,
-        store,
-        rpcRegistry,
-        terminalRegistry: new TerminalRegistry({ idleTimeoutMs: 0 }),
-        onSessionAlive,
-        onSessionEnd,
-        onSessionMetadataUpdateAllowed
-    })
-}
-
-describe('cli session runtime rooms', () => {
-    it('keeps a legacy socket out of the room and RPC registry for a running modern owner', () => {
+describe('cli handler session-access memo', () => {
+    it('serves repeated events for one session from the per-socket cache', () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-existing-owner',
-            {
-                lifecycleState: 'running',
-                lifecycleStateSince: Date.now(),
-                runtimeId: 'runtime-current'
-            },
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const rpcRegistry = new RpcRegistry()
-        expect(store.sessions.setSessionActive(session.id, true, Date.now(), session.namespace)).toBe(true)
-        const legacy = new FakeSocket('legacy', io.cli, { sessionId: session.id })
+        const session = store.sessions.getOrCreateSession('memo-burst', null, null, 'default')
 
-        register(legacy, io, store, rpcRegistry)
-        legacy.trigger('rpc-register', { method: `${session.id}:sendMessage` })
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
 
-        expect(legacy.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBeNull()
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        const alive = mock()
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry,
+            onSessionAlive: alive
+        })
+
+        // Burst of events against the same session: one store read, many events.
+        for (let i = 0; i < 5; i += 1) {
+            socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        }
+        expect(alive).toHaveBeenCalledTimes(5)
+        expect(byNamespaceCalls).toBe(1)
+
+        // A different session id misses the cache.
+        socket.trigger('session-alive', { sid: 'other-session', time: Date.now() })
+        expect(byNamespaceCalls).toBe(2)
+        store.close()
     })
 
-    it('replaces an overlapping socket from the same durable runtime immediately', () => {
+    it('does not cache denials — every denied event re-resolves', () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-reconnect-overlap',
-            { runtimeId: 'runtime-owner', lifecycleState: 'running' },
-            null,
-            'default'
-        )
-        expect(store.sessions.setSessionActive(session.id, true, Date.now(), session.namespace)).toBe(true)
-        const io = new FakeIo()
-        const room = `session:${session.id}`
-        const previous = new FakeSocket('previous', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-owner',
-            runtimeGeneration: 1
-        })
-        const rpcRegistry = new RpcRegistry()
-        register(previous, io, store, rpcRegistry)
-        const reconnect = new FakeSocket('reconnect', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-owner',
-            runtimeGeneration: 1
+        let plainCalls = 0
+        const original = store.sessions.getSession.bind(store.sessions)
+        store.sessions.getSession = ((sessionId: string) => {
+            plainCalls += 1
+            return original(sessionId)
+        }) as typeof store.sessions.getSession
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry
         })
 
-        register(reconnect, io, store, rpcRegistry)
-
-        expect(previous.disconnected).toBe(true)
-        expect(reconnect.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(room)).toEqual(new Set(['reconnect']))
-
-        let lateMessageAcked = false
-        previous.trigger('message', {
-            sid: session.id,
-            message: {
-                role: 'agent',
-                content: { type: 'text', data: 'late duplicate' }
-            }
-        }, () => {
-            lateMessageAcked = true
-        })
-        previous.trigger('session-alive', {
-            sid: session.id,
-            time: Date.now(),
-            thinking: true
-        })
-
-        expect(lateMessageAcked).toBe(true)
-        expect(store.messages.getMessages(session.id)).toEqual([])
-        expect(previous.disconnected).toBe(true)
-        expect(io.cli.adapter.rooms.get(room)).toEqual(new Set(['reconnect']))
+        socket.trigger('session-alive', { sid: 'missing', time: Date.now() })
+        socket.trigger('session-alive', { sid: 'missing', time: Date.now() })
+        expect(plainCalls).toBe(2)
+        expect(socket.emitted.filter(({ event }) => event === 'error')).toHaveLength(2)
+        store.close()
     })
 
-    it('accepts buffered output from the exact running owner before reconnect alive', () => {
+    it('expires the memo after the TTL window', async () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-inactive-reconnect-buffer',
-            { runtimeId: 'runtime-owner', lifecycleState: 'running' },
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const owner = new FakeSocket('owner', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-owner',
-            runtimeGeneration: 1
+        const session = store.sessions.getOrCreateSession('memo-ttl', null, null, 'default')
+
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry
         })
 
-        // Simulates liveness expiry while the CLI transport was offline. On
-        // reconnect, Socket.IO flushes buffered messages before `connect` emits
-        // the next session-alive packet.
-        expect(store.sessions.getSession(session.id)?.active).toBe(false)
-        register(owner, io, store, new RpcRegistry(), () => true)
-        owner.trigger('message', {
-            sid: session.id,
-            message: {
-                role: 'agent',
-                content: { type: 'text', data: 'buffered completion' }
-            }
-        }, () => {})
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(1)
 
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['owner']))
-        expect(store.messages.getMessages(session.id)).toHaveLength(1)
+        await new Promise((resolve) => setTimeout(resolve, 1100))
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(2)
+        store.close()
     })
 
-    it('activates only the modern socket after its runtime claim is accepted', () => {
+    it('keeps per-session entries under interleaved multi-session traffic (A-B-A)', () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-claim',
-            { lifecycleState: 'running', lifecycleStateSince: Date.now() },
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const rpcRegistry = new RpcRegistry()
-        const room = `session:${session.id}`
-        const legacy = new FakeSocket('legacy', io.cli, { sessionId: session.id })
-        const owner = new FakeSocket('owner', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-owner',
-            runtimeGeneration: 2
+        const a = store.sessions.getOrCreateSession('memo-inter-a', null, null, 'default')
+        const b = store.sessions.getOrCreateSession('memo-inter-b', null, null, 'default')
+
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        const alive = mock()
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry,
+            onSessionAlive: alive
         })
 
-        register(legacy, io, store, rpcRegistry)
-        legacy.trigger('rpc-register', { method: `${session.id}:sendMessage` })
-        register(owner, io, store, rpcRegistry, () => true)
-        owner.trigger('rpc-register', { method: `${session.id}:sendMessage` })
-
-        expect(io.cli.adapter.rooms.get(room)).toBeUndefined()
-        legacy.trigger('session-alive', {
-            sid: session.id,
-            time: Date.now() - 1,
-            thinking: false
-        })
-        expect(io.cli.adapter.rooms.get(room)).toEqual(new Set(['legacy']))
-        owner.trigger('session-alive', {
-            sid: session.id,
-            time: Date.now(),
-            thinking: true
-        })
-
-        expect(legacy.disconnected).toBe(true)
-        expect(owner.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(room)).toEqual(new Set(['owner']))
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBe('owner')
+        // A-B-A interleave within the TTL: a single-slot memo thrashes to a
+        // miss on every event here (one runner socket multiplexes concurrent
+        // sessions); the per-session map must resolve each session once.
+        socket.trigger('session-alive', { sid: a.id, time: Date.now() })
+        socket.trigger('session-alive', { sid: b.id, time: Date.now() })
+        socket.trigger('session-alive', { sid: a.id, time: Date.now() })
+        socket.trigger('session-alive', { sid: b.id, time: Date.now() })
+        socket.trigger('session-alive', { sid: a.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(2)
+        expect(alive).toHaveBeenCalledTimes(5)
+        store.close()
     })
 
-    it('keeps exactly one pure-legacy socket active after alive claims', () => {
+    it('bounds the cache across many sessions (oldest evicted first)', () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-pure-legacy',
-            {},
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const rpcRegistry = new RpcRegistry()
-        const method = `${session.id}:sendMessage`
-        const first = new FakeSocket('legacy-first', io.cli, { sessionId: session.id })
-        const second = new FakeSocket('legacy-second', io.cli, { sessionId: session.id })
-
-        register(first, io, store, rpcRegistry, () => true)
-        register(second, io, store, rpcRegistry, () => true)
-        first.trigger('rpc-register', { method })
-        second.trigger('rpc-register', { method })
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(method)).toBeNull()
-
-        first.trigger('session-alive', { sid: session.id, time: Date.now() })
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['legacy-first']))
-        expect(rpcRegistry.getSocketIdForMethod(method)).toBe('legacy-first')
-
-        second.trigger('session-alive', { sid: session.id, time: Date.now() + 1 })
-        expect(first.disconnected).toBe(true)
-        expect(second.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['legacy-second']))
-        expect(rpcRegistry.getSocketIdForMethod(method)).toBe('legacy-second')
-    })
-
-    it('lets a new runtime claim an inactive row instead of fencing legitimate resume', () => {
-        const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-inactive-resume',
-            {
-                lifecycleState: 'running',
-                lifecycleStateSince: 100,
-                runtimeId: 'runtime-ended'
-            },
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const next = new FakeSocket('next', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-next',
-            runtimeGeneration: 2
-        })
-
-        register(next, io, store, new RpcRegistry())
-        expect(next.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-
-        let ack: unknown = null
-        next.trigger('update-metadata', {
-            sid: session.id,
-            expectedVersion: session.metadataVersion,
-            metadata: {
-                lifecycleState: 'running',
-                lifecycleStateSince: 200
-            }
-        }, (response: unknown) => {
-            ack = response
-        })
-
-        expect(ack).toEqual(expect.objectContaining({ result: 'success' }))
-        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
-            runtimeId: 'runtime-next',
-            lifecycleStateSince: 200
-        }))
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['next']))
-    })
-
-    it('forwards the bounded clock offset with a replacement metadata claim', () => {
-        const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-clock-offset',
-            {
-                lifecycleState: 'archived',
-                lifecycleStateSince: 10_000,
-                runtimeId: 'runtime-ended'
-            },
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const next = new FakeSocket('next-clock-offset', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-next',
-            runtimeGeneration: 2,
-            // The CLI's local lifecycle timestamp is 2.6s behind Hub time.
-            clockOffset: 2_600
-        })
-        let receivedOffset: number | undefined
-
-        register(next, io, store, new RpcRegistry(), undefined, undefined, (payload) => {
-            receivedOffset = payload.clockOffset
-            return payload.clockOffset === 2_600
-        })
-
-        let ack: unknown = null
-        next.trigger('update-metadata', {
-            sid: session.id,
-            expectedVersion: session.metadataVersion,
-            metadata: {
-                lifecycleState: 'running',
-                // 7.5s + 2.6s = 10.1s, strictly newer than the durable 10s.
-                lifecycleStateSince: 7_500
-            }
-        }, (response: unknown) => {
-            ack = response
-        })
-
-        expect(receivedOffset).toBe(2_600)
-        expect(ack).toEqual(expect.objectContaining({ result: 'success' }))
-        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
-            runtimeId: 'runtime-next',
-            lifecycleState: 'running',
-            lifecycleStateSince: 7_500
-        }))
-    })
-
-    it('removes a socket from the prompt room when its alive claim is rejected', () => {
-        const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-rejected',
-            {},
-            null,
-            'default'
-        )
-        const io = new FakeIo()
-        const socket = new FakeSocket('rejected', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-rejected',
-            runtimeGeneration: 1
-        })
-        const rpcRegistry = new RpcRegistry()
-
-        register(socket, io, store, rpcRegistry, () => false)
-        socket.trigger('rpc-register', { method: `${session.id}:sendMessage` })
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBeNull()
-
-        socket.trigger('session-alive', {
-            sid: session.id,
-            time: Date.now(),
-            thinking: false
-        })
-
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBeNull()
-    })
-
-    it('rejects session-end from a pending socket that never owned the session', () => {
-        const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-pending-end',
-            { lifecycleState: 'running' },
-            null,
-            'default'
-        )
-        expect(store.sessions.setSessionActive(session.id, true, Date.now(), session.namespace)).toBe(true)
-        const io = new FakeIo()
-        const owner = new FakeSocket('legacy-owner', io.cli, { sessionId: session.id })
-        const pending = new FakeSocket('pending', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-pending',
-            runtimeGeneration: 1
-        })
-        let pendingEndCalls = 0
-
-        register(owner, io, store, new RpcRegistry(), () => true)
-        owner.trigger('session-alive', { sid: session.id, time: Date.now() })
-        register(pending, io, store, new RpcRegistry(), () => false, () => {
-            pendingEndCalls += 1
-            return true
-        })
-
-        pending.trigger('session-end', { sid: session.id, time: Date.now() + 1 })
-
-        expect(pendingEndCalls).toBe(0)
-        expect(owner.disconnected).toBe(false)
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['legacy-owner']))
-    })
-
-    it('rejects terminal metadata writes from pending sockets while another legacy owner is active', () => {
-        const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-pending-legacy-metadata',
-            { lifecycleState: 'running', lifecycleStateSince: 100 },
-            null,
-            'default'
-        )
-        expect(store.sessions.setSessionActive(session.id, true, Date.now(), session.namespace)).toBe(true)
-        const io = new FakeIo()
-        const owner = new FakeSocket('legacy-owner', io.cli, { sessionId: session.id })
-        const pendingLegacy = new FakeSocket('legacy-pending', io.cli, { sessionId: session.id })
-        const pendingModern = new FakeSocket('modern-pending', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-pending',
-            runtimeGeneration: 1
-        })
-
-        register(owner, io, store, new RpcRegistry(), () => true)
-        owner.trigger('session-alive', { sid: session.id, time: Date.now() })
-        register(pendingLegacy, io, store, new RpcRegistry(), () => false)
-        register(pendingModern, io, store, new RpcRegistry(), () => false)
-
-        const acks: unknown[] = []
-        for (const pending of [pendingLegacy, pendingModern]) {
-            pending.trigger('update-metadata', {
-                sid: session.id,
-                expectedVersion: session.metadataVersion,
-                metadata: {
-                    lifecycleState: 'archived',
-                    lifecycleStateSince: 200
-                }
-            }, (response: unknown) => {
-                acks.push(response)
-            })
+        const ids: string[] = []
+        for (let i = 0; i < 70; i += 1) {
+            ids.push(store.sessions.getOrCreateSession(`memo-many-${i}`, null, null, 'default').id)
         }
 
-        expect(acks).toHaveLength(2)
-        for (const ack of acks) {
-            expect(ack).toEqual(expect.objectContaining({
-                result: 'success',
-                metadata: expect.objectContaining({ lifecycleState: 'running' })
-            }))
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry
+        })
+
+        for (const id of ids) {
+            socket.trigger('session-alive', { sid: id, time: Date.now() })
         }
-        expect(store.sessions.getSession(session.id)?.metadata).toEqual(expect.objectContaining({
-            lifecycleState: 'running',
-            lifecycleStateSince: 100
-        }))
-        expect(owner.disconnected).toBe(false)
+        const afterFirstPass = byNamespaceCalls
+
+        // The newest entry is still cached.
+        socket.trigger('session-alive', { sid: ids[69], time: Date.now() })
+        expect(byNamespaceCalls).toBe(afterFirstPass)
+
+        // The oldest entries were evicted once the cache exceeded its cap.
+        socket.trigger('session-alive', { sid: ids[0], time: Date.now() })
+        expect(byNamespaceCalls).toBe(afterFirstPass + 1)
+        store.close()
     })
 
-    it('deactivates room and RPC ownership after an accepted session end', () => {
+    it('update-metadata resolves the session fresh so hub-owned fields survive a warm memo', () => {
         const store = new Store(':memory:')
-        const session = store.sessions.getOrCreateSession(
-            'runtime-room-ended',
-            { runtimeId: 'runtime-owner', lifecycleState: 'running' },
-            null,
+        const session = store.sessions.getOrCreateSession('memo-meta', null, null, 'default')
+
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry
+        })
+
+        // Warm the memo with a metadata-less snapshot of the session.
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(1)
+
+        // A hub-side write lands the hub-owned key AFTER the memo was warmed.
+        const hubWrite = store.sessions.updateSessionMetadata(
+            session.id,
+            { supersededBySessionId: 'successor' },
+            session.metadataVersion,
             'default'
         )
-        expect(store.sessions.setSessionActive(session.id, true, Date.now(), session.namespace)).toBe(true)
-        const io = new FakeIo()
-        const rpcRegistry = new RpcRegistry()
-        const owner = new FakeSocket('owner', io.cli, {
-            sessionId: session.id,
-            runtimeId: 'runtime-owner',
-            runtimeGeneration: 1
-        })
+        expect(hubWrite.result).toBe('success')
+        const live = store.sessions.getSession(session.id)
+        expect(live).not.toBeNull()
 
-        let endCalls = 0
-        register(owner, io, store, rpcRegistry, undefined, () => {
-            endCalls += 1
-            return true
-        })
-        owner.trigger('rpc-register', { method: `${session.id}:sendMessage` })
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toEqual(new Set(['owner']))
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBe('owner')
-
-        owner.trigger('update-metadata', {
+        // The client's metadata write omits the hub-owned key. A stale memo
+        // base (metadata: null) would strip it from the merged row; a fresh
+        // resolve preserves it from the live row.
+        let ack: unknown
+        socket.trigger('update-metadata', {
             sid: session.id,
-            expectedVersion: session.metadataVersion,
-            metadata: {
-                lifecycleState: 'archived',
-                lifecycleStateSince: Date.now()
-            }
-        }, () => {})
+            metadata: { title: 'renamed' },
+            expectedVersion: live!.metadataVersion
+        }, (response: unknown) => { ack = response })
 
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBeNull()
+        // The write path bypassed the memo (fresh resolve).
+        expect(byNamespaceCalls).toBe(2)
+        expect((ack as { result: string }).result).toBe('success')
 
-        owner.trigger('session-end', { sid: session.id, time: Date.now() })
+        const stored = store.sessions.getSession(session.id)
+        const metadata = stored!.metadata as Record<string, unknown>
+        expect(metadata.title).toBe('renamed')
+        expect(metadata.supersededBySessionId).toBe('successor')
+        store.close()
+    })
 
-        expect(endCalls).toBe(1)
-        expect(io.cli.adapter.rooms.get(`session:${session.id}`)).toBeUndefined()
-        expect(rpcRegistry.getSocketIdForMethod(`${session.id}:sendMessage`)).toBeNull()
+    it('drops the memo as soon as the session is deleted (deletion epoch)', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('memo-del', null, null, 'default')
+
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry
+        })
+
+        // Warm the memo.
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(1)
+
+        // Hub-side delete (webapp API, session merge — every path funnels
+        // through the store's deleteSession).
+        expect(store.sessions.deleteSession(session.id, 'default')).toBe(true)
+
+        // Well inside the TTL, the next event must not be served from the
+        // memo: the deletion bumped the epoch, forcing a fresh resolve that
+        // denies instead of authorizing events against the deleted row.
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(2)
+        expect(socket.emitted.filter(({ event }) => event === 'error')).toHaveLength(1)
+        store.close()
+    })
+
+    it('native-queue-message reads live capabilities, not a memo snapshot', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('memo-queue', null, null, 'default')
+
+        let byNamespaceCalls = 0
+        const original = store.sessions.getSessionByNamespace.bind(store.sessions)
+        store.sessions.getSessionByNamespace = ((sessionId: string, namespace: string) => {
+            byNamespaceCalls += 1
+            return original(sessionId, namespace)
+        }) as typeof store.sessions.getSessionByNamespace
+
+        const socket = new FakeCliSocket()
+        socket.data = { namespace: 'default' }
+        const onWebappEvent = mock()
+        registerCliHandlers(socket as unknown as CliSocketWithData, {
+            io: fakeIo,
+            store,
+            rpcRegistry: anyRegistry,
+            terminalRegistry: anyRegistry,
+            onWebappEvent
+        })
+
+        // Warm the memo while the session has no capabilities.
+        socket.trigger('session-alive', { sid: session.id, time: Date.now() })
+        expect(byNamespaceCalls).toBe(1)
+
+        // Capabilities land via a metadata write (hub side, e.g. a merge
+        // copying capabilities onto the session).
+        const write = store.sessions.updateSessionMetadata(
+            session.id,
+            { capabilities: { concurrentClients: true } },
+            session.metadataVersion,
+            'default'
+        )
+        expect(write.result).toBe('success')
+
+        // Within the TTL a memo snapshot would still see capabilities as
+        // absent and silently drop the queued entry; the fresh read
+        // processes it.
+        socket.trigger('native-queue-message', { sid: session.id, localId: 'q1', text: 'queued hello' })
+        expect(byNamespaceCalls).toBe(2)
+
+        const received = onWebappEvent.mock.calls
+            .map(([event]) => event as { type: string })
+            .find((event) => event.type === 'message-received')
+        expect(received).toBeDefined()
+        store.close()
     })
 })

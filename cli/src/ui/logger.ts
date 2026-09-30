@@ -12,38 +12,6 @@ import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { readRunnerState } from '@/persistence'
 
-function serializeLogArgument(value: unknown): string {
-  if (typeof value === 'string') return value
-
-  const seen = new WeakSet<object>()
-  try {
-    const serialized = JSON.stringify(value, (_key, current) => {
-      if (typeof current === 'bigint') return current.toString()
-      if (!current || typeof current !== 'object') return current
-      if (seen.has(current)) return '[Circular]'
-      seen.add(current)
-
-      if (current instanceof Error) {
-        return {
-          name: current.name,
-          message: current.message,
-          stack: current.stack,
-          cause: current.cause
-        }
-      }
-
-      return current
-    })
-    return serialized ?? String(value)
-  } catch {
-    try {
-      return String(value)
-    } catch {
-      return '[Unserializable]'
-    }
-  }
-}
-
 /**
  * Consistent date/time formatting functions
  */
@@ -76,7 +44,7 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-export class Logger {
+class Logger {
   private dangerouslyUnencryptedServerLoggingUrl: string | undefined
 
   constructor(
@@ -117,15 +85,9 @@ export class Logger {
   ): void {
     if (!process.env.DEBUG) {
       this.debug(`In production, skipping message inspection`)
-      return
     }
 
-    // Some of our messages are huge, but we still want to show them in the logs.
-    // Redact by key before truncating: truncation still leaks useful prefixes of
-    // bearer tokens, API keys, and passwords.
-    const isSensitiveKey = (key: string): boolean => (
-      /authorization|cookie|credential|password|secret|token|api[_-]?key/i.test(key)
-    )
+    // Some of our messages are huge, but we still want to show them in the logs
     const truncateStrings = (obj: unknown): unknown => {
       if (typeof obj === 'string') {
         return obj.length > maxStringLength 
@@ -148,7 +110,7 @@ export class Logger {
             // Drop usage, not generally useful for debugging
             continue
           }
-          result[key] = isSensitiveKey(key) ? '[REDACTED]' : truncateStrings(value)
+          result[key] = truncateStrings(value)
         }
         return result
       }
@@ -225,7 +187,9 @@ export class Logger {
         body: JSON.stringify({
           timestamp: new Date().toISOString(),
           level,
-          message: `${message} ${args.map(serializeLogArgument).join(' ')}`,
+          message: `${message} ${args.map(a => 
+            typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)
+          ).join(' ')}`,
           source: 'cli',
           platform: process.platform
         })
@@ -236,7 +200,9 @@ export class Logger {
   }
 
   private logToFile(prefix: string, message: string, ...args: unknown[]): void {
-    const logLine = `${prefix} ${message} ${args.map(serializeLogArgument).join(' ')}\n`
+    const logLine = `${prefix} ${message} ${args.map(arg => 
+      typeof arg === 'string' ? arg : JSON.stringify(arg)
+    ).join(' ')}\n`
     
     // Send to remote server if configured
     if (this.dangerouslyUnencryptedServerLoggingUrl) {

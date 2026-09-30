@@ -31,13 +31,11 @@ describe('getOrCreateCliApiToken', () => {
         await expect(getOrCreateCliApiToken(dir)).rejects.toThrow('namespace suffixes are not accepted')
     })
 
-    it('strips namespace suffix from legacy file tokens with a warning', async () => {
+    it('rejects namespace-suffixed file tokens', async () => {
         dir = makeTempDir()
         delete process.env.CLI_API_TOKEN
         writeFileSync(join(dir, 'settings.json'), JSON.stringify({ cliApiToken: 'base-token:default' }))
 
-        const result = await getOrCreateCliApiToken(dir)
-        expect(result.token).toBe('base-token')
-        expect(result.source).toBe('file')
+        await expect(getOrCreateCliApiToken(dir)).rejects.toThrow('namespace suffixes are not accepted')
     })
 })

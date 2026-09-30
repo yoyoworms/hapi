@@ -54,7 +54,7 @@ export async function loop(opts: LoopOptions): Promise<void> {
         cursorWorktree: opts.cursorWorktree,
         cursorAddDirs: opts.cursorAddDirs,
         model: opts.model,
-        permissionMode: opts.permissionMode ?? 'yolo',
+        permissionMode: opts.permissionMode ?? 'default',
         onPermissionModeChanged: opts.onPermissionModeChanged
     });
 

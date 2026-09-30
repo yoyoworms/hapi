@@ -1,9 +1,11 @@
-import { unwrapCodexResponseStepEnvelope, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
 import { isObject } from '@hapi/protocol'
 import type { DecryptedMessage, Session } from '@/types/api'
+import { getSessionTitle, hasSessionTitleSignal } from '@/lib/sessionTitle'
 import { VOICE_CONFIG } from '../voiceConfig'
 
 interface SessionMetadata {
+    name?: string
     summary?: { text?: string }
     path?: string
     machineId?: string
@@ -159,7 +161,7 @@ function extractSpeakableFromContent(content: unknown): string | null {
     if (isObject(content) && content.type === 'codex' && isObject(content.data)) {
         const data = content.data
         if (data.type === 'message' && typeof data.message === 'string' && data.message.trim()) {
-            return (unwrapCodexResponseStepEnvelope(data.message) ?? data.message).trim()
+            return data.message.trim()
         }
     }
 
@@ -253,17 +255,16 @@ export function formatSessionFull(session: Session | null, messages: DecryptedMe
         return 'Session not available'
     }
 
-    const sessionName = session.metadata?.summary?.text
+    const sessionTitle = hasSessionTitleSignal(session) ? getSessionTitle(session) : undefined
     const sessionPath = session.metadata?.path
     const lines: string[] = []
 
     lines.push(`# Session ID: ${session.id}`)
     lines.push(`# Project path: ${sessionPath}`)
-    lines.push(`# Session summary:\n${sessionName}`)
-
-    if (session.metadata?.summary?.text) {
+    if (sessionTitle) {
+        lines.push(`# Session summary:\n${sessionTitle}`)
         lines.push('## Session Summary')
-        lines.push(session.metadata.summary.text)
+        lines.push(sessionTitle)
         lines.push('')
     }
 

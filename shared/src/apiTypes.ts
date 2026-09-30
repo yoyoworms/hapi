@@ -26,6 +26,11 @@ export type CreateOrLoadMachineRequest = z.infer<typeof CreateOrLoadMachineReque
 
 export const CreateOrLoadSessionRequestSchema = z.object({
     id: z.string().uuid().optional(),
+    /**
+     * When true with `id`, bind a hub-preallocated stub (overwrite tag/metadata)
+     * instead of create/getOrCreate. Rejects non-stub rows (#1911 adopt).
+     */
+    adopt: z.boolean().optional(),
     tag: z.string().min(1),
     metadata: z.unknown(),
     agentState: z.unknown().nullable().optional(),
@@ -33,6 +38,14 @@ export const CreateOrLoadSessionRequestSchema = z.object({
     modelReasoningEffort: z.string().optional(),
     effort: z.string().optional(),
     machine: CreateOrLoadMachineRequestSchema.optional()
+}).superRefine((value, ctx) => {
+    if (value.adopt === true && !value.id) {
+        ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'adopt requires id',
+            path: ['id'],
+        })
+    }
 })
 
 export type CreateOrLoadSessionRequest = z.infer<typeof CreateOrLoadSessionRequestSchema>
@@ -144,9 +157,7 @@ export const SessionPermissionModeRequestSchema = z.object({
 export type SessionPermissionModeRequest = z.infer<typeof SessionPermissionModeRequestSchema>
 
 export const ResumeSessionRequestSchema = z.object({
-    permissionMode: PermissionModeSchema.optional(),
-    resumeWithSessionId: z.string().min(1).optional(),
-    codexAccountId: z.string().min(1).optional()
+    permissionMode: PermissionModeSchema.optional()
 })
 
 export type ResumeSessionRequest = z.infer<typeof ResumeSessionRequestSchema>
@@ -212,8 +223,7 @@ export const CodexLocalSessionWithMessagesSchema = CodexLocalSessionSummarySchem
 
 export const ListCodexSessionsRpcRequestSchema = z.object({
     cwd: z.string().nullable().optional(),
-    sessionIds: z.array(z.string().min(1)).optional(),
-    codexAccountId: z.string().nullable().optional()
+    sessionIds: z.array(z.string().min(1)).optional()
 })
 
 export const ListCodexSessionsRpcResponseSchema = z.union([
@@ -561,6 +571,18 @@ export type ForkConversationResponse = {
     sessionId: string
 }
 
+export const ImplementCodexPlanRequestSchema = z.object({
+    planId: z.string().min(1)
+})
+
+export type ImplementCodexPlanRequest = z.infer<typeof ImplementCodexPlanRequestSchema>
+
+export type ImplementCodexPlanResult = { ok: true } | {
+    ok: false
+    code: 'stale_plan' | 'unavailable' | 'indeterminate' | 'failed'
+    error: string
+}
+
 export const RewindConversationRequestSchema = z.object({
     messageLocalId: z.string().min(1)
 })
@@ -574,9 +596,15 @@ export type RewindConversationResponse = {
 /** CLI → hub RPC result for native fork (before HAPI child binding). */
 export type ForkConversationRpcResult = {
     nativeSessionId: string
+    /** Shared runtimes bind the child themselves; hub must not spawn another engine. */
+    sessionId?: string
     /** When true, hub must spawn with --fork-session (Claude). */
     forkSession?: boolean
 }
+
+export type RewindConversationErrorCode =
+    | 'ambiguous_native_boundary'
+    | 'ambiguous_native_boundary_fork_safe'
 
 export type RewindConversationRpcResult = {
     success: true
@@ -591,6 +619,7 @@ export type RewindConversationRpcResult = {
 } | {
     success: false
     error: string
+    code?: RewindConversationErrorCode
     /** Native state is unchanged, cancelled, or was restored exactly. */
     outcome: 'rejected' | 'cancelled' | 'source_restored'
 }
@@ -610,79 +639,6 @@ export type QueuedStateResponse = {
     }>
 }
 
-export const CodexAccountLimitSchema = z.object({
-    usedPercent: z.number().min(0).max(100).nullable().optional(),
-    resetsAt: z.number().nullable().optional()
-})
-
-export const CodexAccountSummarySchema = z.object({
-    id: z.string().min(1),
-    label: z.string().min(1),
-    kind: z.enum(['system', 'managed', 'api']),
-    isDefault: z.boolean(),
-    authenticated: z.boolean(),
-    planType: z.string().nullable().optional(),
-    baseUrl: z.string().url().optional(),
-    model: z.string().min(1).optional(),
-    primaryLimit: CodexAccountLimitSchema.nullable().optional(),
-    secondaryLimit: CodexAccountLimitSchema.nullable().optional(),
-    error: z.string().nullable().optional()
-})
-
-export type CodexAccountSummary = z.infer<typeof CodexAccountSummarySchema>
-
-export const CodexAccountsResponseSchema = z.object({
-    success: z.boolean(),
-    accounts: z.array(CodexAccountSummarySchema),
-    defaultAccountId: z.string(),
-    error: z.string().optional()
-})
-
-export type CodexAccountsResponse = z.infer<typeof CodexAccountsResponseSchema>
-
-export const CodexAccountLoginStartResponseSchema = z.object({
-    success: z.boolean(),
-    attemptId: z.string().optional(),
-    accountId: z.string().optional(),
-    verificationUrl: z.string().optional(),
-    userCode: z.string().optional(),
-    error: z.string().optional()
-})
-
-export type CodexAccountLoginStartResponse = z.infer<typeof CodexAccountLoginStartResponseSchema>
-
-export const CodexAccountLoginStatusResponseSchema = z.object({
-    success: z.boolean(),
-    status: z.enum(['pending', 'completed', 'error', 'not_found']),
-    account: CodexAccountSummarySchema.optional(),
-    error: z.string().optional()
-})
-
-export type CodexAccountLoginStatusResponse = z.infer<typeof CodexAccountLoginStatusResponseSchema>
-
-export const AddCodexApiEndpointRequestSchema = z.object({
-    label: z.string().trim().min(1).max(80),
-    baseUrl: z.string().trim().url(),
-    apiKey: z.string().trim().min(1).max(8192),
-    model: z.string().trim().min(1).max(200)
-}).superRefine((value, context) => {
-    let url: URL
-    try {
-        url = new URL(value.baseUrl)
-    } catch {
-        return
-    }
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-        context.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['baseUrl'],
-            message: 'Base URL must use http or https'
-        })
-    }
-})
-
-export type AddCodexApiEndpointRequest = z.infer<typeof AddCodexApiEndpointRequestSchema>
-
 export const SpawnSessionRequestSchema = z.object({
     directory: z.string().min(1),
     agent: AgentFlavorSchema.optional(),
@@ -691,10 +647,6 @@ export const SpawnSessionRequestSchema = z.object({
     modelReasoningEffort: z.string().optional(),
     yolo: z.boolean().optional(),
     permissionMode: PermissionModeSchema.optional(),
-    continueLatest: z.boolean().optional(),
-    codexAccountId: z.string().min(1).optional(),
-    codexSourceAccountId: z.string().min(1).optional(),
-    sandbox: z.boolean().optional(),
     sessionType: z.enum(['simple', 'worktree']).optional(),
     worktreeName: z.string().optional(),
     serviceTier: z.enum(['fast', 'standard']).optional(),
@@ -841,20 +793,6 @@ export type CodexModelsResponse = {
 
 export type ListCodexModelsResponse = CodexModelsResponse
 
-export type ClaudeModelSummary = {
-    modelId: string
-    name?: string
-}
-
-export type ClaudeModelsResponse = {
-    success: boolean
-    availableModels?: ClaudeModelSummary[]
-    currentModelId?: string | null
-    error?: string
-}
-
-export type ListClaudeModelsResponse = ClaudeModelsResponse
-
 export type OpencodeModelSummary = {
     modelId: string
     name?: string
@@ -870,6 +808,13 @@ export type OpencodeModelsResponse = {
 }
 
 export type ListOpencodeModelsResponse = OpencodeModelsResponse
+
+/** Variant values keyed by `providerId/modelId` from the OpenCode server catalog. */
+export type OpencodeModelVariantsResponse = {
+    success: boolean
+    variants?: Record<string, string[]>
+    error?: string
+}
 
 export type GrokModelSummary = {
     modelId: string
@@ -906,6 +851,22 @@ export type CopilotModelsResponse = {
 
 export type ListCopilotModelsResponse = CopilotModelsResponse
 
+export type KimiModelSummary = {
+    /** Kimi model alias as used by `--model` / `session/set_model`. */
+    modelId: string
+    name?: string
+    provider?: string
+}
+
+export type KimiModelsResponse = {
+    success: boolean
+    availableModels?: KimiModelSummary[]
+    currentModelId?: string | null
+    error?: string
+}
+
+export type ListKimiModelsResponse = KimiModelsResponse
+
 export type GrokReasoningEffortResponse = {
     success: boolean
     options?: GrokReasoningEffortOption[]
@@ -922,6 +883,10 @@ export type OpencodeReasoningEffortResponse = {
     success: boolean
     options?: OpencodeReasoningEffortOption[]
     currentValue?: string | null
+    /** Backend-side model the options belong to — lets clients detect a pending model switch. */
+    currentModelId?: string | null
+    /** Concrete backend model requested by the session, including a resolved Default selection. */
+    targetModelId?: string | null
     error?: string
 }
 
@@ -941,7 +906,15 @@ export type ListAgyModelsResponse = AgyModelsResponse
 
 export type CursorModelSummary = OpencodeModelSummary
 
-export type CursorModelsResponse = OpencodeModelsResponse
+export type CursorModelsResponse = OpencodeModelsResponse & {
+    /**
+     * True when ACP advertised Cursor's parameterized model picker: bare model bases
+     * plus separate `fast` / `thought_level` config options. The ACP apply path
+     * expresses variant CLI skus through those options, so variant rows stay valid
+     * even when the catalog itself carries no bracket wire ids.
+     */
+    parameterized?: boolean
+}
 
 export type ListCursorModelsResponse = CursorModelsResponse
 

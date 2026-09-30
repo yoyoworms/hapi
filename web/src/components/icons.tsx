@@ -61,6 +61,21 @@ export function CheckIcon(props: IconProps) {
     )
 }
 
+export function MarkAllReadIcon(props: IconProps) {
+    return createIcon(
+        <>
+            <path d="m3 5 2 2 4-4" />
+            <path d="M13 5h8" />
+            <path d="m3 12 2 2 4-4" />
+            <path d="M13 12h8" />
+            <path d="m3 19 2 2 4-4" />
+            <path d="M13 19h8" />
+        </>,
+        props,
+        2
+    )
+}
+
 export function InfoIcon(props: IconProps) {
     return createIcon(
         <>
@@ -107,25 +122,6 @@ export function ScheduleIcon(props: IconProps) {
         </>,
         props,
         2
-    )
-}
-
-export function PinIcon(props: IconProps & { filled?: boolean }) {
-    return (
-        <svg
-            className={props.className ?? 'h-4 w-4'}
-            viewBox="0 0 24 24"
-            fill={props.filled ? 'currentColor' : 'none'}
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-        >
-            <path d="M12 17v5" />
-            <path d="M5 17h14" />
-            <path d="M7 4V2h10v2l-2 5v4l2 2H7l2-2V9Z" />
-        </svg>
     )
 }
 

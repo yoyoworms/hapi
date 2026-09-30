@@ -3,12 +3,15 @@ import type { NotificationChannel, TaskNotification } from '../notifications/not
 import type { NotificationSendContext } from '../notifications/notificationSendContext'
 import { getAgentName, getSessionName } from '../notifications/sessionInfo'
 import type { SSEManager } from '../sse/sseManager'
+import type { VisibilityTracker } from '../visibility/visibilityTracker'
 import type { PushPayload, PushService } from './pushService'
+import { composeInputRequestNotification, getFirstPendingRequest } from '../notifications/inputRequest'
 
 export class PushNotificationChannel implements NotificationChannel {
     constructor(
         private readonly pushService: PushService,
         private readonly sseManager: SSEManager,
+        private readonly visibilityTracker: VisibilityTracker,
         _appUrl: string
     ) {}
 
@@ -30,24 +33,24 @@ export class PushNotificationChannel implements NotificationChannel {
         }
 
         const name = getSessionName(session)
-        const requests = session.agentState?.requests ?? null
-        const requestEntries = requests ? Object.entries(requests) : []
-        const [requestId, request] = requestEntries[0] ?? [undefined, null]
+        const pending = getFirstPendingRequest(session)
+        const { requestId, request } = pending ?? {}
+        const inputNotification = composeInputRequestNotification(session, pending)
         const toolName = request?.tool ? ` (${request.tool})` : ''
 
         const payload: PushPayload = {
-            title: 'Permission Request',
-            body: `${name}${toolName}`,
-            tag: `permission-${session.id}`,
+            title: inputNotification?.title ?? 'Permission Request',
+            body: inputNotification?.body ?? `${name}${toolName}`,
+            tag: inputNotification?.tag ?? `permission-${session.id}`,
             data: {
-                type: 'permission-request',
+                type: inputNotification?.type ?? 'permission-request',
                 sessionId: session.id,
                 url: this.buildSessionPath(session.id),
                 requestId
             }
         }
 
-        await this.deliverWebAndToast(session, payload, ctx, 'permission')
+        await this.deliverWebOrToast(session, payload, ctx, 'permission')
     }
 
     async sendReady(session: Session, ctx?: NotificationSendContext): Promise<void> {
@@ -69,7 +72,7 @@ export class PushNotificationChannel implements NotificationChannel {
             }
         }
 
-        await this.deliverWebAndToast(session, payload, ctx, 'ready')
+        await this.deliverWebOrToast(session, payload, ctx, 'ready')
     }
 
     async sendTaskNotification(session: Session, notification: TaskNotification, ctx?: NotificationSendContext): Promise<void> {
@@ -95,10 +98,10 @@ export class PushNotificationChannel implements NotificationChannel {
             }
         }
 
-        await this.deliverWebAndToast(session, payload, ctx, 'task')
+        await this.deliverWebOrToast(session, payload, ctx, 'task')
     }
 
-    private async deliverWebAndToast(
+    private async deliverWebOrToast(
         session: Session,
         payload: PushPayload,
         ctx: NotificationSendContext | undefined,
@@ -110,26 +113,25 @@ export class PushNotificationChannel implements NotificationChannel {
         }
 
         const url = payload.data?.url ?? this.buildSessionPath(session.id)
-        const delivered = await this.sseManager.sendToast(session.namespace, {
-            type: 'toast',
-            data: {
-                title: payload.title,
-                body: payload.body,
-                sessionId: session.id,
-                url
+        if (this.visibilityTracker.hasVisibleConnection(session.namespace)) {
+            const delivered = await this.sseManager.sendToast(session.namespace, {
+                type: 'toast',
+                data: {
+                    title: payload.title,
+                    body: payload.body,
+                    sessionId: session.id,
+                    url
+                }
+            })
+            if (delivered > 0) {
+                this.logBranch(method, session.namespace, 'sse-toast-delivered', `count=${delivered}`)
+                return
             }
-        })
-        this.logBranch(
-            method,
-            session.namespace,
-            delivered > 0 ? 'sse-toast-delivered' : 'sse-toast-zero',
-            `count=${delivered}`
-        )
+            this.logBranch(method, session.namespace, 'sse-toast-zero', 'visible but delivered=0')
+        } else {
+            this.logBranch(method, session.namespace, 'not-visible')
+        }
 
-        // Hub visibility is namespace-wide, so a visible desktop tab cannot
-        // tell us whether a different device's PWA is hidden. Always dispatch
-        // Web Push; the service worker performs the correct per-device check
-        // and suppresses its OS notification only when that device is visible.
         this.logBranch(method, session.namespace, 'web-push-fired')
         await this.pushService.sendToNamespace(session.namespace, payload)
     }

@@ -32,27 +32,6 @@ describe('convertCodexEvent', () => {
         });
     });
 
-    it('unwraps response-step envelopes from agent_message events', () => {
-        const raw = JSON.stringify({
-            steps: [
-                { kind: 'output', value: 'Intro' },
-                { kind: 'tool_calls', value: [] },
-                { kind: 'output', value: '**Result**' },
-                { kind: 'execute_report', value: 'internal' }
-            ]
-        });
-        const result = convertCodexEvent({
-            type: 'event_msg',
-            payload: { type: 'agent_message', message: raw, phase: 'final_answer' }
-        });
-
-        expect(result?.messages?.[0]).toMatchObject({
-            type: 'message',
-            message: 'Intro\n\n**Result**',
-            phase: 'final_answer'
-        });
-    });
-
     it('converts user_message events', () => {
         const result = convertCodexEvent({
             type: 'event_msg',
@@ -123,8 +102,7 @@ describe('convertCodexEvent', () => {
             messages: [{
                 type: 'message',
                 message: 'visible commentary',
-                id: 'agent-147',
-                phase: 'commentary'
+                id: 'agent-147'
             }]
         });
     });
@@ -202,48 +180,6 @@ describe('convertCodexEvent', () => {
         expect(result).toEqual({ finishedTurnId: 'turn-1' });
     });
 
-    it('preserves both the turn boundary and visible error for task_failed', () => {
-        const result = convertCodexEvent({
-            type: 'event_msg',
-            payload: {
-                type: 'task_failed',
-                turn_id: 'turn-1',
-                error: 'Selected model is at capacity.'
-            }
-        });
-
-        expect(result).toEqual({
-            finishedTurnId: 'turn-1',
-            sessionEvent: {
-                type: 'message',
-                message: '⚠ Selected model is at capacity.'
-            }
-        });
-    });
-
-    it('converts an unretryable Codex error into a visible session event', () => {
-        const result = convertCodexEvent({
-            type: 'event_msg',
-            payload: {
-                type: 'error',
-                message: 'Selected model is at capacity.',
-                will_retry: false
-            }
-        });
-
-        expect(result?.sessionEvent).toEqual({
-            type: 'message',
-            message: '⚠ Selected model is at capacity.'
-        });
-    });
-
-    it('suppresses retryable Codex error notices', () => {
-        expect(convertCodexEvent({
-            type: 'event_msg',
-            payload: { type: 'stream_error', message: 'temporary', willRetry: true }
-        })).toBeNull();
-    });
-
     it.each([
         ['user text', {
             type: 'response_item',
@@ -291,8 +227,7 @@ describe('convertCodexEvent', () => {
             messages: [{
                 type: 'message',
                 message: 'complete final answer',
-                id: 'final-1',
-                phase: 'final_answer'
+                id: 'final-1'
             }]
         });
     });
@@ -328,14 +263,14 @@ describe('convertCodexEvent', () => {
         expect(getAgentMessages(convert({
             type: 'event_msg',
             payload: { type: 'agent_message', phase: 'commentary', message: 'legacy commentary' }
-        }))[0]).toMatchObject({ message: 'legacy commentary', phase: 'commentary' });
+        }))[0]).toMatchObject({ message: 'legacy commentary' });
         expect(convert({
             type: 'response_item',
             payload: {
                 type: 'message',
                 id: 'legacy-commentary',
                 role: 'assistant',
-                phase: 'final_answer',
+                phase: 'commentary',
                 content: [{ type: 'output_text', text: 'legacy commentary' }],
                 internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' }
             }
@@ -353,7 +288,7 @@ describe('convertCodexEvent', () => {
                     content: [{ type: 'Text', text: 'new commentary' }]
                 }
             }
-        }))[0]).toMatchObject({ message: 'new commentary', phase: 'commentary' });
+        }))[0]).toMatchObject({ message: 'new commentary' });
         expect(convert({
             type: 'response_item',
             payload: {
@@ -433,13 +368,11 @@ describe('convertCodexEvent', () => {
         expect(getAgentMessages(mirrored)).toEqual([{
             type: 'message',
             message: 'visible final A',
-            id: 'final-a',
-            phase: 'final_answer'
+            id: 'final-a'
         }, {
             type: 'message',
             message: 'visible final B',
-            id: 'final-b',
-            phase: 'final_answer'
+            id: 'final-b'
         }]);
         expect(convert({
             type: 'event_msg',
@@ -477,8 +410,7 @@ describe('convertCodexEvent', () => {
         }))).toEqual([{
             type: 'message',
             message: 'same visible text',
-            id: 'paired-final',
-            phase: 'final_answer'
+            id: 'paired-final'
         }]);
 
         expect(convert({
@@ -498,8 +430,7 @@ describe('convertCodexEvent', () => {
         }))).toEqual([{
             type: 'message',
             message: 'same visible text',
-            id: 'response-only-final',
-            phase: 'final_answer'
+            id: 'response-only-final'
         }]);
     });
 
@@ -522,8 +453,7 @@ describe('convertCodexEvent', () => {
         expect(getAgentMessages(convert.finalize())).toEqual([{
             type: 'message',
             message: 'visible answer at EOF',
-            id: 'final-at-eof',
-            phase: 'final_answer'
+            id: 'final-at-eof'
         }]);
         expect(convert.finalize()).toEqual([]);
     });
@@ -553,8 +483,7 @@ describe('convertCodexEvent', () => {
             message: {
                 type: 'message',
                 message: 'visible final answer',
-                id: 'visible-final',
-                phase: 'final_answer'
+                id: 'visible-final'
             }
         }, {
             type: 'user-message',
@@ -589,8 +518,7 @@ describe('convertCodexEvent', () => {
         }))).toEqual([{
             type: 'message',
             message: 'visible final answer',
-            id: 'visible-final',
-            phase: 'final_answer'
+            id: 'visible-final'
         }, expect.objectContaining({
             type: 'tool-call',
             name: 'ReadFile',
@@ -633,8 +561,7 @@ describe('convertCodexEvent', () => {
         }))).toEqual([{
             type: 'message',
             message: 'earlier visible final answer',
-            id: 'earlier-visible-final',
-            phase: 'final_answer'
+            id: 'earlier-visible-final'
         }]);
         expect(convert({
             type: 'event_msg',
@@ -699,8 +626,7 @@ describe('convertCodexEvent', () => {
         expect(getAgentMessages(completed)).toEqual([{
             type: 'message',
             message: 'visible final answer',
-            id: 'visible-final',
-            phase: 'final_answer'
+            id: 'visible-final'
         }]);
     });
 
@@ -740,8 +666,7 @@ describe('convertCodexEvent', () => {
         expect(getAgentMessages(completed)).toEqual([{
             type: 'message',
             message: 'visible before remote compaction',
-            id: 'visible-before-remote-compaction',
-            phase: 'final_answer'
+            id: 'visible-before-remote-compaction'
         }]);
         expect(completed.at(-1)).toEqual({ type: 'turn-finished', turnId: 'turn-1' });
     });

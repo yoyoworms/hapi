@@ -28,15 +28,10 @@ import type {
     HubHealthResponse,
     SessionResponse,
     SessionTitleSuggestionResponse,
-    SessionsResponse,
-    UsageResponse
+    SessionsResponse
 } from '@/types/api'
 import type {
-    AddCodexApiEndpointRequest,
     AgyModelsResponse,
-    CodexAccountLoginStartResponse,
-    CodexAccountLoginStatusResponse,
-    CodexAccountsResponse,
     AgentAvailabilityResponse,
     CodexModelsResponse,
     CursorMigrateOutcome,
@@ -47,15 +42,16 @@ import type {
     FileReadResponse,
     GitCommandResponse,
     GrokModelsResponse,
+    KimiModelsResponse,
     CopilotModelsResponse,
     GrokReasoningEffortResponse,
     ListDirectoryResponse,
     MachineListDirectoryResponse,
     MachinePathsExistsResponse,
     OpencodeModelsResponse,
+    OpencodeModelVariantsResponse,
     OpencodeReasoningEffortResponse,
     PiModelsResponse,
-    ClaudeModelsResponse,
     QueuedStateResponse,
     ReopenSessionResponse,
     SqliteStorageUsageResponse,
@@ -242,31 +238,6 @@ export class ApiClient {
         return await res.json() as AuthResponse
     }
 
-    /** Redeem a share link without an owner authentication header. */
-    async redeemShare(shareToken: string): Promise<{ token: string; sessionId: string }> {
-        const res = await fetch(this.buildUrl(`/api/share/${encodeURIComponent(shareToken)}/auth`), {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' }
-        })
-        if (!res.ok) {
-            const body = await res.text().catch(() => '')
-            throw new ApiError(`Share redeem failed: HTTP ${res.status}`, res.status, undefined, body || undefined)
-        }
-        return await res.json() as { token: string; sessionId: string }
-    }
-
-    async getSessionShare(sessionId: string): Promise<{ shared: boolean; token: string | null }> {
-        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`)
-    }
-
-    async createSessionShare(sessionId: string): Promise<{ shared: boolean; token: string }> {
-        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'POST' })
-    }
-
-    async revokeSessionShare(sessionId: string): Promise<void> {
-        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'DELETE' })
-    }
-
     async bind(auth: { initData: string; accessToken: string }): Promise<AuthResponse> {
         const res = await fetch(this.buildUrl('/api/bind'), {
             method: 'POST',
@@ -311,11 +282,10 @@ export class ApiClient {
         })
     }
 
-    async getCodexSessions(cwd?: string | null, machineId?: string | null, codexAccountId?: string | null): Promise<CodexLocalSessionsResponse> {
+    async getCodexSessions(cwd?: string | null, machineId?: string | null): Promise<CodexLocalSessionsResponse> {
         const params = new URLSearchParams()
         if (cwd?.trim()) params.set('cwd', cwd.trim())
         if (machineId?.trim()) params.set('machineId', machineId.trim())
-        if (codexAccountId?.trim()) params.set('codexAccountId', codexAccountId.trim())
         const query = params.size ? `?${params.toString()}` : ''
         return await this.request<CodexLocalSessionsResponse>(`/api/codex/sessions${query}`)
     }
@@ -507,43 +477,6 @@ export class ApiClient {
         return await this.request<FileReadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/file?${params.toString()}`)
     }
 
-    /** Download through the authenticated Hub route; never expose a CLI-local URL. */
-    async getSessionFileBlob(
-        sessionId: string,
-        path: string,
-        attempt: number = 0,
-        overrideToken?: string | null
-    ): Promise<Blob> {
-        const params = new URLSearchParams({ path, download: 'true' })
-        const headers = new Headers()
-        const liveToken = this.getToken ? this.getToken() : null
-        const authToken = overrideToken !== undefined
-            ? (overrideToken ?? (liveToken ?? this.token))
-            : (liveToken ?? this.token)
-        if (authToken) headers.set('authorization', `Bearer ${authToken}`)
-
-        const res = await fetch(this.buildUrl(
-            `/api/sessions/${encodeURIComponent(sessionId)}/file/raw?${params.toString()}`
-        ), { headers })
-        if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
-            const refreshed = await this.onUnauthorized()
-            if (refreshed) {
-                this.token = refreshed
-                return await this.getSessionFileBlob(sessionId, path, attempt + 1, refreshed)
-            }
-        }
-        if (!res.ok) {
-            const body = await res.text().catch(() => '')
-            throw new ApiError(
-                `HTTP ${res.status} ${res.statusText}: ${body}`,
-                res.status,
-                parseErrorCode(body),
-                body || undefined
-            )
-        }
-        return await res.blob()
-    }
-
     async listSessionDirectory(sessionId: string, path?: string): Promise<ListDirectoryResponse> {
         const params = new URLSearchParams()
         if (path) {
@@ -570,29 +503,17 @@ export class ApiClient {
         })
     }
 
-    async resumeSession(
-        sessionId: string,
-        opts?: { permissionMode?: string; resumeWithSessionId?: string; codexAccountId?: string }
-    ): Promise<string> {
-        const body: Record<string, unknown> = {}
-        if (opts?.permissionMode !== undefined) body.permissionMode = opts.permissionMode
-        if (opts?.resumeWithSessionId !== undefined) body.resumeWithSessionId = opts.resumeWithSessionId
-        if (opts?.codexAccountId !== undefined) body.codexAccountId = opts.codexAccountId
+    async resumeSession(sessionId: string, opts?: { permissionMode?: string }): Promise<string> {
         const response = await this.request<{ sessionId: string }>(
             `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
             {
                 method: 'POST',
-                ...(Object.keys(body).length > 0 ? { body: JSON.stringify(body) } : {})
+                ...(opts?.permissionMode !== undefined && {
+                    body: JSON.stringify({ permissionMode: opts.permissionMode })
+                })
             }
         )
         return response.sessionId
-    }
-
-    async getResumeOptions(sessionId: string): Promise<{
-        sessions: Array<{ sessionId: string; modifiedAt: number; sizeBytes: number; valid: boolean }>
-        currentSessionId: string | null
-    }> {
-        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/resume-options`)
     }
 
     async getCursorChatStoreStatus(sessionId: string): Promise<CursorChatStoreStatus> {
@@ -658,6 +579,16 @@ export class ApiClient {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/abort`, {
             method: 'POST',
             body: JSON.stringify({})
+        })
+    }
+
+    async clearConversation(sessionId: string): Promise<{ sessionId: string }> {
+        return await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/clear`, { method: 'POST' })
+    }
+
+    async implementCodexPlan(sessionId: string, planId: string): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/codex/plan/implement`, {
+            method: 'POST', body: JSON.stringify({ planId })
         })
     }
 
@@ -828,10 +759,6 @@ export class ApiClient {
         return await this.request<MachinesResponse>('/api/machines')
     }
 
-    async getUsage(): Promise<UsageResponse> {
-        return await this.request<UsageResponse>('/api/usage')
-    }
-
     /** Pass an empty string to clear the custom name and fall back to the hostname. */
     async renameMachine(machineId: string, displayName: string): Promise<void> {
         await this.request(`/api/machines/${encodeURIComponent(machineId)}`, {
@@ -916,9 +843,7 @@ export class ApiClient {
         sessionType?: 'simple' | 'worktree',
         worktreeName?: string,
         effort?: string,
-        sandbox?: boolean,
         permissionMode?: PermissionMode,
-        codexAccountId?: string,
         serviceTier?: 'fast' | 'standard',
         collaborationMode?: CodexCollaborationMode,
         copilotAgentMode?: CopilotAgentMode,
@@ -935,9 +860,7 @@ export class ApiClient {
                 sessionType,
                 worktreeName,
                 effort,
-                sandbox,
                 permissionMode,
-                codexAccountId,
                 serviceTier,
                 collaborationMode,
                 copilotAgentMode,
@@ -946,53 +869,14 @@ export class ApiClient {
         })
     }
 
-    async getMachineCodexAccounts(machineId: string): Promise<CodexAccountsResponse> {
-        return await this.request(`/api/machines/${encodeURIComponent(machineId)}/codex-accounts`)
-    }
-
-    async startMachineCodexAccountLogin(machineId: string): Promise<CodexAccountLoginStartResponse> {
-        return await this.request(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login`,
-            { method: 'POST' }
-        )
-    }
-
-    async addMachineCodexApiEndpoint(
+    async getMachineAgyModels(
         machineId: string,
-        input: AddCodexApiEndpointRequest
-    ): Promise<CodexAccountsResponse> {
-        return await this.request(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/api-endpoints`,
-            { method: 'POST', body: JSON.stringify(input) }
-        )
-    }
-
-    async getMachineCodexAccountLoginStatus(
-        machineId: string,
-        attemptId: string
-    ): Promise<CodexAccountLoginStatusResponse> {
-        return await this.request(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/login/${encodeURIComponent(attemptId)}`
-        )
-    }
-
-    async setMachineDefaultCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
-        return await this.request(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/default`,
-            { method: 'POST', body: JSON.stringify({ accountId }) }
-        )
-    }
-
-    async removeMachineCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
-        return await this.request(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-accounts/${encodeURIComponent(accountId)}`,
-            { method: 'DELETE' }
-        )
-    }
-
-    async getMachineAgyModels(machineId: string): Promise<AgyModelsResponse> {
+        options?: { refresh?: boolean }
+    ): Promise<AgyModelsResponse> {
+        // Without `refresh` the machine may answer from its cached catalog.
+        const query = options?.refresh ? '?refresh=true' : ''
         return await this.request<AgyModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/agy-models`
+            `/api/machines/${encodeURIComponent(machineId)}/agy-models${query}`
         )
     }
 
@@ -1002,18 +886,9 @@ export class ApiClient {
         )
     }
 
-    async getMachineClaudeModels(machineId: string): Promise<ClaudeModelsResponse> {
-        return await this.request<ClaudeModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/claude-models`
-        )
-    }
-
-    async getMachineCodexModels(machineId: string, accountId?: string | null): Promise<CodexModelsResponse> {
-        const query = accountId?.trim()
-            ? `?accountId=${encodeURIComponent(accountId.trim())}`
-            : ''
+    async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
         return await this.request<CodexModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-models${query}`
+            `/api/machines/${encodeURIComponent(machineId)}/codex-models`
         )
     }
 
@@ -1061,6 +936,12 @@ export class ApiClient {
         )
     }
 
+    async getMachineOpencodeModelVariants(machineId: string, cwd?: string | null): Promise<OpencodeModelVariantsResponse> {
+        return await this.request<OpencodeModelVariantsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/opencode-model-variants${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ''}`
+        )
+    }
+
     async getMachineGrokModelsForCwd(machineId: string, cwd: string): Promise<GrokModelsResponse> {
         return await this.request<GrokModelsResponse>(
             `/api/machines/${encodeURIComponent(machineId)}/grok-models?cwd=${encodeURIComponent(cwd)}`
@@ -1070,6 +951,18 @@ export class ApiClient {
     async getMachineCopilotModelsForCwd(machineId: string, cwd: string): Promise<CopilotModelsResponse> {
         return await this.request<CopilotModelsResponse>(
             `/api/machines/${encodeURIComponent(machineId)}/copilot-models?cwd=${encodeURIComponent(cwd)}`
+        )
+    }
+
+    async getMachineKimiModelsForCwd(machineId: string, cwd: string): Promise<KimiModelsResponse> {
+        return await this.request<KimiModelsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/kimi-models?cwd=${encodeURIComponent(cwd)}`
+        )
+    }
+
+    async getSessionKimiModels(sessionId: string): Promise<KimiModelsResponse> {
+        return await this.request<KimiModelsResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/kimi-models`
         )
     }
 

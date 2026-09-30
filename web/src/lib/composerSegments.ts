@@ -2,8 +2,6 @@ import { buildSessionReferencePath, parseSessionPathHref } from '@/lib/sessionRe
 import { truncateGraphemes } from '@/lib/graphemes'
 import { findActiveWord } from '@/utils/findActiveWord'
 
-export { isRichComposerMentionsEnabled } from '@/lib/composerInputMode'
-
 /** Object Replacement Character — one mirror slot per session atom. */
 export const COMPOSER_MENTION_MIRROR_CHAR = '\uFFFC'
 
@@ -286,6 +284,24 @@ export function insertSegmentsInComposerSegments(
         segments: next,
         selection: { start: caret, end: caret },
     }
+}
+
+/**
+ * Rich segmented composer is the product default (same as v1 @ autocomplete:
+ * no user opt-in). Emergency kill-switch only:
+ *   localStorage `hapi.composer.richMentions=0` or `?richMentions=0`
+ *   or build `VITE_RICH_COMPOSER_MENTIONS=false`
+ */
+export function isRichComposerMentionsEnabled(): boolean {
+    if (typeof window === 'undefined') return true
+    try {
+        if (window.localStorage.getItem('hapi.composer.richMentions') === '0') return false
+        if (new URLSearchParams(window.location.search).get('richMentions') === '0') return false
+    } catch {
+        // ignore storage / URL access failures
+    }
+    if (import.meta.env.VITE_RICH_COMPOSER_MENTIONS === 'false') return false
+    return true
 }
 
 /**

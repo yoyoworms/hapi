@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-    decodeFileDownloadHref,
-    decodeFilePathHref,
-    remarkFilePathLinks,
-} from '@/lib/remark-file-path-links'
+import { decodeFilePathHref, remarkFilePathLinks } from '@/lib/remark-file-path-links'
 
 type TestNode = {
     type: string
@@ -181,16 +177,6 @@ describe('remarkFilePathLinks — explicit markdown links', () => {
     it('rewrites ./ prefixed relative file links', () => {
         const nodes = transformNodes([linkNode('./diagram.mmd')])
         expect(linkedPath(nodes.find((n) => n.type === 'link')!)).toBe('./diagram.mmd')
-    })
-
-    it('keeps authenticated downloads for explicit local binary artifacts', () => {
-        const transformArtifactLink = (url: string) => transformNodes([linkNode(url)])[0]!
-        expect(decodeFileDownloadHref(transformArtifactLink('/Users/dev/project/outputs/report.xlsx').url!))
-            .toBe('/Users/dev/project/outputs/report.xlsx')
-        expect(decodeFileDownloadHref(transformArtifactLink('file:///Users/dev/project/report.pdf').url!))
-            .toBe('/Users/dev/project/report.pdf')
-        expect(decodeFileDownloadHref(transformArtifactLink('sandbox:/Users/dev/project/report.docx').url!))
-            .toBe('/Users/dev/project/report.docx')
     })
 
     it('rewrites a relative link with a #fragment, stripping it from the target', () => {

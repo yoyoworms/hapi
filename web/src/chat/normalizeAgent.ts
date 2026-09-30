@@ -1,7 +1,7 @@
 import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, RoundModelUsage, RoundSummary, ToolResultPermission, UsageData } from '@/chat/types'
 import { inlineMediaSourceFromWire } from '@/chat/inlineMediaSource'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
-import { isClaudeChatVisibleMessage, normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
+import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
 import { parseAgentTimestampMs } from '@/chat/agentTimestamp'
 
 function normalizeToolResultPermissions(value: unknown): ToolResultPermission | undefined {
@@ -28,8 +28,6 @@ function normalizeToolResultPermissions(value: unknown): ToolResultPermission | 
         decision: normalizedDecision
     }
 }
-
-const AGY_OUTPUT_TYPES = new Set(['agy_message', 'agy_tool_action'])
 
 function normalizeAgentEvent(value: unknown): AgentEvent | null {
     if (!isObject(value) || typeof value.type !== 'string') return null
@@ -466,7 +464,6 @@ function normalizeUserOutput(
                 const embeddedToolUseResult = 'toolUseResult' in data ? (data as Record<string, unknown>).toolUseResult : null
 
                 const permissions = normalizeToolResultPermissions(block.permissions)
-                const cosFileUrl = typeof block.cosFileUrl === 'string' ? block.cosFileUrl : undefined
 
                 blocks.push({
                     type: 'tool-result',
@@ -475,8 +472,7 @@ function normalizeUserOutput(
                     is_error: isError,
                     uuid,
                     parentUUID,
-                    permissions,
-                    cosFileUrl,
+                    permissions
                 })
             }
         }
@@ -701,18 +697,7 @@ function mapAgyToolCall(
 }
 
 export function isSkippableAgentContent(content: unknown): boolean {
-    if (!isObject(content) || typeof content.type !== 'string') return false
-
-    // Skip internal event types that should never be displayed
-    const internalTypes = new Set(['usage', 'ready', 'rate_limit_event', 'rate_limit_info'])
-    if (internalTypes.has(content.type)) return true
-
-    if (content.type === 'event') {
-        const data = isObject(content.data) ? content.data : null
-        return !data || typeof data.type !== 'string'
-    }
-
-    if (content.type !== 'output') return false
+    if (!isObject(content) || content.type !== 'output') return false
     const data = isObject(content.data) ? content.data : null
     if (!data) return false
     if (Boolean(data.isMeta) || Boolean(data.isCompactSummary)) return true
@@ -723,10 +708,7 @@ export function isSkippableAgentContent(content: unknown): boolean {
     // Empty agy planner steps (no text, no tool calls) carry nothing to render —
     // skip cleanly so they don't fall through to the raw-JSON stringify fallback.
     if (data.type === 'agy_message' && !(asString(data.content) ?? '').trim()) return true
-    const outputType = asString(data.type)
-    return !outputType || (!AGY_OUTPUT_TYPES.has(outputType)
-        && !isClaudeChatVisibleMessage({ type: data.type, subtype: data.subtype })
-    )
+    return !isClaudeChatVisibleMessage({ type: data.type, subtype: data.subtype })
 }
 
 export function isCodexContent(content: unknown): boolean {
@@ -749,8 +731,7 @@ export function normalizeAgentRecord(
         // Skip meta/compact-summary messages (parity with hapi-app)
         if (data.isMeta) return null
         if (data.isCompactSummary) return null
-        if (!AGY_OUTPUT_TYPES.has(data.type)
-            && !isClaudeChatVisibleMessage({ type: data.type, subtype: data.subtype })) return null
+        if (!isClaudeChatVisibleMessage({ type: data.type, subtype: data.subtype })) return null
 
         if (data.type === 'assistant') {
             return normalizeAssistantOutput(messageId, localId, createdAt, data, meta)
@@ -851,7 +832,6 @@ export function normalizeAgentRecord(
         }
         if (data.type === 'system' && data.subtype === 'compact_boundary') {
             const metadata = isObject(data.compactMetadata) ? data.compactMetadata : null
-            const postTokens = asNumber(metadata?.postTokens)
             return {
                 id: messageId,
                 localId,
@@ -860,8 +840,7 @@ export function normalizeAgentRecord(
                 content: {
                     type: 'compact',
                     trigger: asString(metadata?.trigger) ?? 'auto',
-                    preTokens: asNumber(metadata?.preTokens) ?? 0,
-                    ...(typeof postTokens === 'number' ? { postTokens } : {})
+                    preTokens: asNumber(metadata?.preTokens) ?? 0
                 },
                 isSidechain: false,
                 meta
@@ -1078,11 +1057,9 @@ export function normalizeAgentRecord(
 
         if (data.type === 'message' && typeof data.message === 'string') {
             const streamId = asString(data.id)
-            const phase = normalizeAgentMessagePhase(data.phase)
             const isPiStreamSnapshot = data.streamSnapshot === true
                 || (streamId !== null && /^pi-.+-turn-\d+-message-\d+-text-\d+$/.test(streamId))
-            const text = unwrapCodexResponseStepEnvelope(data.message) ?? data.message
-            const review = isPiStreamSnapshot ? null : parseCodexReviewMessage(text)
+            const review = isPiStreamSnapshot ? null : parseCodexReviewMessage(data.message)
             if (review) {
                 return {
                     id: messageId,
@@ -1102,10 +1079,9 @@ export function normalizeAgentRecord(
                 isSidechain: false,
                 content: [{
                     type: 'text',
-                    text,
+                    text: data.message,
                     uuid: messageId,
                     ...(streamId !== null ? { streamId } : {}),
-                    ...(phase ? { phase } : {}),
                     parentUUID: null
                 }],
                 meta
@@ -1172,7 +1148,13 @@ export function normalizeAgentRecord(
                 role: 'event',
                 content: {
                     type: 'token-count',
-                    info: data.info
+                    info: data.info,
+                    ...(data.flavor === 'codex'
+                        ? {
+                            provider: 'codex' as const,
+                            model: asString(data.model) ?? undefined
+                        }
+                        : {})
                 },
                 isSidechain: false,
                 meta,
@@ -1301,8 +1283,6 @@ export function normalizeAgentRecord(
             const plan = normalizePlanEntries(data.plan ?? data.update ?? data.items ?? data.steps ?? data)
             if (plan.length === 0) return null
             const uuid = asString(data.id) ?? messageId
-            const update = isObject(data.update) ? data.update : null
-            const explanation = asString(data.explanation ?? update?.explanation)
             return {
                 id: messageId,
                 localId,
@@ -1316,7 +1296,6 @@ export function normalizeAgentRecord(
                         name: 'update_plan',
                         input: {
                             plan,
-                            ...(explanation ? { explanation } : {}),
                             source: 'codex'
                         },
                         description: null,
@@ -1328,7 +1307,6 @@ export function normalizeAgentRecord(
                         tool_use_id: 'codex-plan-state',
                         content: {
                             plan,
-                            ...(explanation ? { explanation } : {}),
                             source: 'codex',
                             status: 'updated'
                         },

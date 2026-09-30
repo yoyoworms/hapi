@@ -12,9 +12,8 @@ import {
     MARKDOWN_PLUGINS_STANDALONE_WITH_BREAKS,
     MARKDOWN_PLUGINS_WITH_BREAKS,
     MARKDOWN_REHYPE_PLUGINS,
-    preprocessMarkdownText,
+    isExternalHttpHref,
 } from '@/components/assistant-ui/markdown-text'
-import { normalizeLatexDelimiters } from '@/lib/normalize-latex-delimiters'
 
 describe('MARKDOWN_PLUGINS integration', () => {
     it('includes remarkNonHttpsAutolink', () => {
@@ -34,24 +33,13 @@ describe('MARKDOWN_PLUGINS integration', () => {
     })
 })
 
-describe('preprocessMarkdownText', () => {
-    it('removes unsupported Codex internal citation sentinels', () => {
-        expect(preprocessMarkdownText(
-            '首页卡片已经使用 lazy loading。citeturn0search4'
-        )).toBe('首页卡片已经使用 lazy loading。')
-        expect(preprocessMarkdownText(
-            '参考citeturn0search4turn0search7后续'
-        )).toBe('参考后续')
-    })
-})
-
 function render(markdown: string, plugins: PluggableList = MARKDOWN_PLUGINS): string {
     const processor = unified()
         .use(remarkParse)
         .use(plugins)
         .use(remarkRehype)
         .use(MARKDOWN_REHYPE_PLUGINS)
-    const tree = processor.runSync(processor.parse(normalizeLatexDelimiters(markdown)))
+    const tree = processor.runSync(processor.parse(markdown))
     return toHtml(tree as never)
 }
 
@@ -109,28 +97,36 @@ describe('MARKDOWN_PLUGINS — currency prose vs KaTeX', () => {
         const html = render(md)
         expect(html).toContain('class="katex"')
     })
+})
 
-    it('renders Codex LaTeX delimiters as KaTeX without losing symbols', () => {
-        const md = [
-            '\\[',
-            '企业价值=\\sum_{t=1}^{n} \\frac{FCF_t}{(1+r)^t}',
-            '\\]',
-            '',
-            '- \\(FCF_t\\)：未来第t年的自由现金流',
-            '- \\(r\\)：折现率',
-            '',
-            '\\[ SPCX：-5\\%\\sim-12\\% \\]'
-        ].join('\n')
-        const html = render(md)
+describe('isExternalHttpHref', () => {
+    it('is true for http/https links', () => {
+        expect(isExternalHttpHref('https://example.com')).toBe(true)
+        expect(isExternalHttpHref('http://example.com/path?q=1#frag')).toBe(true)
+        expect(isExternalHttpHref('HTTPS://Example.com')).toBe(true)
+    })
 
-        expect(html.match(/class="katex"/g)).toHaveLength(4)
-        expect(html).toContain('∑')
-        expect(html).toContain('FCF')
-        expect(html).toContain('SPCX')
-        expect(html).toContain('∼')
-        expect(html).not.toContain('\\[')
-        expect(html).not.toContain('\\]')
-        expect(html).not.toContain('\\(')
-        expect(html).not.toContain('\\)')
+    it('is false for relative/SPA hrefs', () => {
+        expect(isExternalHttpHref('/settings')).toBe(false)
+        expect(isExternalHttpHref('./foo')).toBe(false)
+        expect(isExternalHttpHref('#section')).toBe(false)
+        expect(isExternalHttpHref('?q=1')).toBe(false)
+        expect(isExternalHttpHref('/path:colon')).toBe(false)
+    })
+
+    it('is false for non-http(s) schemes', () => {
+        expect(isExternalHttpHref('mailto:a@b.com')).toBe(false)
+        expect(isExternalHttpHref('vscode://file/foo')).toBe(false)
+        expect(isExternalHttpHref('javascript:alert(1)')).toBe(false)
+    })
+
+    it('is false for Windows drive paths (single-letter scheme, not http/https)', () => {
+        expect(isExternalHttpHref('C:\\Users\\ian\\file.txt')).toBe(false)
+    })
+
+    it('is false for empty/nullish input', () => {
+        expect(isExternalHttpHref('')).toBe(false)
+        expect(isExternalHttpHref(null)).toBe(false)
+        expect(isExternalHttpHref(undefined)).toBe(false)
     })
 })

@@ -31,7 +31,6 @@ import { fileURLToPath } from 'node:url';
 import { isBunCompiled, projectPath } from '@/projectPath';
 import { logger } from '@/ui/logger';
 import { existsSync } from 'node:fs';
-import { sanitizeCodexSessionEnvironment } from '@/codex/codexProcessEnvironment';
 
 const HAPI_CLI_EXECUTABLE_ENV = 'HAPI_CLI_EXECUTABLE';
 
@@ -134,21 +133,7 @@ export function getHappyCliCommand(args: string[]): HappyCliCommand {
   };
 }
 
-/**
- * Get the real working directory for spawned CLI processes.
- * In dev mode, spawnHappyCLI overrides cwd to cli/ for tsconfig resolution
- * and passes the real project directory via HAPI_SPAWN_CWD.
- */
-export function getSpawnedWorkingDirectory(): string {
-  return process.env.HAPI_SPAWN_CWD || process.cwd();
-}
-
-export type SpawnHappyCliOptions = SpawnOptions & {
-  /** Use options.env as the complete child environment instead of overlaying process.env. */
-  replaceEnv?: boolean;
-};
-
-export function spawnHappyCLI(args: string[], options: SpawnHappyCliOptions = {}): ChildProcess {
+export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): ChildProcess {
 
   let directory: string | URL | undefined;
   if ('cwd' in options) {
@@ -179,14 +164,8 @@ export function spawnHappyCLI(args: string[], options: SpawnHappyCliOptions = {}
   
   // On Windows, detached processes allocate a new console window by default.
   // windowsHide: true suppresses this to prevent cmd windows from accumulating.
-  const { replaceEnv = false, ...spawnOptions } = options;
-  const finalOptions: SpawnOptions = { ...spawnOptions };
-  let finalEnv = replaceEnv
-    ? { ...options.env }
-    : { ...process.env, ...options.env };
-  if (args[0] === 'runner') {
-    finalEnv = sanitizeCodexSessionEnvironment(finalEnv);
-  }
+  const finalOptions: SpawnOptions = { ...options };
+  const finalEnv = { ...process.env, ...options.env };
   let shouldSetEnv = false;
   if (compiledMode) {
     finalEnv[HAPI_CLI_EXECUTABLE_ENV] = spawnCommand;

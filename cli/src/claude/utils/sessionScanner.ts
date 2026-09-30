@@ -16,17 +16,13 @@ const INTERNAL_CLAUDE_EVENT_TYPES = new Set([
     'queue-operation',
 ]);
 
-const HISTORY_IMPORT_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 export async function createSessionScanner(opts: {
     sessionId: string | null;
-    sessionFilePath?: string;
     workingDirectory: string;
     onMessage: (message: RawJSONLines) => void;
 }) {
     const scanner = new ClaudeSessionScanner({
         sessionId: opts.sessionId,
-        sessionFilePath: opts.sessionFilePath,
         workingDirectory: opts.workingDirectory,
         onMessage: opts.onMessage
     });
@@ -37,8 +33,8 @@ export async function createSessionScanner(opts: {
         cleanup: async () => {
             await scanner.cleanup();
         },
-        onNewSession: (sessionId: string, sessionFilePath?: string) => {
-            scanner.onNewSession(sessionId, sessionFilePath);
+        onNewSession: (sessionId: string) => {
+            scanner.onNewSession(sessionId);
         }
     };
 }
@@ -53,26 +49,15 @@ class ClaudeSessionScanner extends BaseSessionScanner<RawJSONLines> {
     private readonly pendingSessions = new Set<string>();
     private currentSessionId: string | null;
     private readonly scannedSessions = new Set<string>();
-    private readonly importInitialSessionHistory: boolean;
-    private readonly sessionFileOverrides = new Map<string, string>();
-    private readonly historyCutoffMs: number | null;
 
-    constructor(opts: { sessionId: string | null; sessionFilePath?: string; workingDirectory: string; onMessage: (message: RawJSONLines) => void }) {
+    constructor(opts: { sessionId: string | null; workingDirectory: string; onMessage: (message: RawJSONLines) => void }) {
         super({ intervalMs: 3000 });
         this.projectDir = getProjectPath(opts.workingDirectory);
         this.onMessage = opts.onMessage;
         this.currentSessionId = opts.sessionId;
-        if (opts.sessionId && opts.sessionFilePath) {
-            this.sessionFileOverrides.set(opts.sessionId, opts.sessionFilePath);
-        }
-        this.importInitialSessionHistory = Boolean(opts.sessionId);
-        this.historyCutoffMs = this.importInitialSessionHistory ? Date.now() - HISTORY_IMPORT_WINDOW_MS : null;
     }
 
-    public onNewSession(sessionId: string, sessionFilePath?: string): void {
-        if (sessionFilePath) {
-            this.sessionFileOverrides.set(sessionId, sessionFilePath);
-        }
+    public onNewSession(sessionId: string): void {
         if (this.currentSessionId === sessionId) {
             logger.debug(`[SESSION_SCANNER] New session: ${sessionId} is the same as the current session, skipping`);
             return;
@@ -95,10 +80,6 @@ class ClaudeSessionScanner extends BaseSessionScanner<RawJSONLines> {
 
     protected async initialize(): Promise<void> {
         if (!this.currentSessionId) {
-            return;
-        }
-        if (this.importInitialSessionHistory) {
-            logger.debug(`[SESSION_SCANNER] Importing existing messages from initial resumed session ${this.currentSessionId}`);
             return;
         }
         const sessionFile = this.sessionFilePath(this.currentSessionId);
@@ -132,7 +113,7 @@ class ClaudeSessionScanner extends BaseSessionScanner<RawJSONLines> {
         if (sessionId) {
             this.scannedSessions.add(sessionId);
         }
-        const { events, nextCursor } = await readSessionLog(filePath, cursor, this.historyCutoffMs);
+        const { events, nextCursor } = await readSessionLog(filePath, cursor);
         return {
             events,
             nextCursor
@@ -165,10 +146,6 @@ class ClaudeSessionScanner extends BaseSessionScanner<RawJSONLines> {
     }
 
     private sessionFilePath(sessionId: string): string {
-        const override = this.sessionFileOverrides.get(sessionId);
-        if (override) {
-            return override;
-        }
         return join(this.projectDir, `${sessionId}.jsonl`);
     }
 }
@@ -221,11 +198,7 @@ function isCompleteJsonLine(segment: Buffer): boolean {
  * and the whole file is re-read (dedup by uuid in the base scanner absorbs any
  * re-sent events).
  */
-export async function readSessionLog(
-    filePath: string,
-    startByte: number,
-    minTimestampMs: number | null = null
-): Promise<{ events: SessionFileScanEntry<RawJSONLines>[]; nextCursor: number }> {
+export async function readSessionLog(filePath: string, startByte: number): Promise<{ events: SessionFileScanEntry<RawJSONLines>[]; nextCursor: number }> {
     let size: number;
     try {
         size = (await stat(filePath)).size;
@@ -299,13 +272,6 @@ export async function readSessionLog(
             if (message.type && INTERNAL_CLAUDE_EVENT_TYPES.has(message.type)) {
                 continue;
             }
-            if (minTimestampMs !== null && message.timestamp) {
-                const timestampMs = Date.parse(message.timestamp);
-                if (Number.isFinite(timestampMs) && timestampMs < minTimestampMs) {
-                    continue;
-                }
-            }
-
             const parsed = RawJSONLinesSchema.safeParse(message);
             if (!parsed.success) {
                 // Unknown message types are silently skipped.

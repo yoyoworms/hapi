@@ -227,6 +227,10 @@ export function isEligibleForToolGrouping(block: ToolCallBlock): boolean {
     if (PLAN_TOOL_NAMES.has(block.tool.name)) return false
     if (MILESTONE_TOOL_NAMES.has(block.tool.name)) return false
     if (isInteractiveToolBlock(block)) return false
+    // Command classification selects the group family, not eligibility.
+    // Shared Codex reports ordinary agent commands as `unknown` actions.
+    if (block.tool.name === 'CodexBash'
+        && getInputStringAny(block.tool.input, ['command_source', 'commandSource'])?.toLowerCase() === 'usershell') return false
     return true
 }
 
@@ -238,18 +242,13 @@ function getGroupingFamily(block: ToolCallBlock): 'default' | 'codex-exploration
 function createToolGroupId(
     tools: ToolCallBlock[],
     needsOlderHistory: boolean,
-    previousGroups: ToolGroupBlock[],
-    claimedPreviousGroupIds: Set<string>
+    previousGroups: ToolGroupBlock[]
 ): string {
     const firstToolId = tools[0]?.id ?? 'unknown'
     const lastToolId = tools[tools.length - 1]?.id ?? firstToolId
 
-    const previous = previousGroups.find((group) => (
-        !claimedPreviousGroupIds.has(group.id)
-        && (group.firstToolId === firstToolId || group.lastToolId === lastToolId)
-    ))
+    const previous = previousGroups.find((group) => group.firstToolId === firstToolId || group.lastToolId === lastToolId)
     if (previous) {
-        claimedPreviousGroupIds.add(previous.id)
         return previous.id
     }
 
@@ -268,7 +267,6 @@ export function buildVisibleChatBlocks(
 ): VisibleChatBlock[] {
     const visibleBlocks: VisibleChatBlock[] = []
     const previousGroups = options.previousGroups ?? []
-    const claimedPreviousGroupIds = new Set<string>()
 
     for (let index = 0; index < blocks.length; index += 1) {
         const block = blocks[index]
@@ -293,12 +291,7 @@ export function buildVisibleChatBlocks(
             cursor += 1
         }
 
-        // Codex emits ordinary verification/build commands as individual
-        // commandExecution items. Keep even a singleton behind the same
-        // semantic, collapsed activity surface as exploration; otherwise each
-        // test/git/build step becomes a noisy raw Terminal card.
-        const isSingletonCodexCommand = tools.length === 1 && block.tool.name === 'CodexBash'
-        if (tools.length < 2 && groupingFamily !== 'codex-exploration' && !isSingletonCodexCommand) {
+        if (tools.length < 2 && groupingFamily !== 'codex-exploration') {
             visibleBlocks.push(block)
             continue
         }
@@ -312,7 +305,7 @@ export function buildVisibleChatBlocks(
             : null
         visibleBlocks.push({
             kind: 'tool-group',
-            id: createToolGroupId(tools, needsOlderHistory, previousGroups, claimedPreviousGroupIds),
+            id: createToolGroupId(tools, needsOlderHistory, previousGroups),
             createdAt: tools[0].createdAt,
             invokedAt: tools[0].invokedAt,
             firstToolId: tools[0].id,

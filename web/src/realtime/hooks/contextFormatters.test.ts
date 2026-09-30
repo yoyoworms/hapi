@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import type { DecryptedMessage } from '@/types/api'
-import { extractLastAssistantSpeakable, formatMessage, formatNewMessages, formatReadyEvent } from './contextFormatters'
+import type { DecryptedMessage, Session } from '@/types/api'
+import {
+    extractLastAssistantSpeakable,
+    formatMessage,
+    formatNewMessages,
+    formatReadyEvent,
+    formatSessionFull
+} from './contextFormatters'
 
 function msg(partial: Pick<DecryptedMessage, 'id' | 'seq' | 'content'>): DecryptedMessage {
     return {
@@ -81,27 +87,6 @@ describe('extractLastAssistantSpeakable', () => {
             })
         ]
         expect(extractLastAssistantSpeakable(messages)).toBe('Indexed 5,018 items in the search database.')
-    })
-
-    it('speaks visible output instead of a Codex response-step envelope', () => {
-        const raw = JSON.stringify({
-            steps: [
-                { kind: 'output', value: '查询完成。' },
-                { kind: 'tool_calls', value: [] },
-                { kind: 'output', value: '累计ROI为72.59%。' },
-                { kind: 'execute_report', value: 'internal' }
-            ]
-        })
-        const messages = [msg({
-            id: '1',
-            seq: 1,
-            content: {
-                role: 'agent',
-                content: { type: 'codex', data: { type: 'message', message: raw } }
-            }
-        })]
-
-        expect(extractLastAssistantSpeakable(messages)).toBe('查询完成。\n\n累计ROI为72.59%。')
     })
 
     it('unwraps codex-style output envelopes', () => {
@@ -258,5 +243,35 @@ describe('formatNewMessages', () => {
         expect(update).toContain('Local database file size is 2.43 GiB.')
         expect(update).toContain('Codex:')
         expect(update).not.toContain('Claude Code')
+    })
+})
+
+describe('formatSessionFull title precedence', () => {
+    it('prefers metadata.name over a stale summary', () => {
+        const session = {
+            id: 'sess-1',
+            metadata: {
+                path: '/proj',
+                name: 'Renamed triage peer',
+                summary: { text: 'issue-triage-#54' }
+            }
+        } as Session
+
+        const text = formatSessionFull(session, [], 'Codex')
+
+        expect(text).toContain('Renamed triage peer')
+        expect(text).not.toContain('issue-triage-#54')
+    })
+
+    it('uses metadata.name when summary is absent', () => {
+        const session = {
+            id: 'sess-2',
+            metadata: {
+                path: '/proj',
+                name: 'spawned-peer'
+            }
+        } as Session
+
+        expect(formatSessionFull(session, [], 'Codex')).toContain('spawned-peer')
     })
 })

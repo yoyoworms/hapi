@@ -260,8 +260,21 @@ export function aggregateResponseGroups(
     let groupUsage: UsageData | undefined
     let groupTurnCount = 0
     let groupRoundSummary: RoundSummary | undefined
+    let groupStartedAt: number | null = null
+    let groupCompletedAt: number | null = null
+    let latestUserInvokedAt: number | null = null
 
     const flush = () => {
+        const roundSummary = groupRoundSummary
+            && groupRoundSummary.provider === 'codex'
+            && groupRoundSummary.durationMs === undefined
+            && groupStartedAt !== null
+            && groupCompletedAt !== null
+            ? {
+                ...groupRoundSummary,
+                durationMs: Math.max(0, groupCompletedAt - groupStartedAt)
+            }
+            : groupRoundSummary
         if (groupFirstBlockId !== null && (groupTurnCount >= 2 || groupRoundSummary)) {
             const joinedModel = seenModels.length > 0 ? seenModels.join(', ') : null
             aggregates.set(groupFirstBlockId, {
@@ -270,7 +283,7 @@ export function aggregateResponseGroups(
                 invokedAt: groupInvokedAt,
                 durationMs: undefined,
                 turnCount: groupTurnCount,
-                roundSummary: groupRoundSummary
+                roundSummary
             })
         }
         groupFirstBlockId = null
@@ -280,6 +293,8 @@ export function aggregateResponseGroups(
         groupUsage = undefined
         groupTurnCount = 0
         groupRoundSummary = undefined
+        groupStartedAt = null
+        groupCompletedAt = null
     }
 
     for (const block of blocks) {
@@ -287,12 +302,17 @@ export function aggregateResponseGroups(
         if (role !== 'assistant') {
             // Boundary: close the open group, if any.
             flush()
+            if (block.kind === 'user-text') {
+                latestUserInvokedAt = block.invokedAt ?? null
+            }
             continue
         }
 
         if (groupFirstBlockId === null) {
             groupFirstBlockId = block.id
+            groupStartedAt = latestUserInvokedAt
         }
+        groupCompletedAt = Math.max(groupCompletedAt ?? 0, getBlockPresentationTimestamp(block))
 
         const roundSummary = block.kind === 'tool-group'
             ? block.roundSummary
@@ -742,6 +762,7 @@ export function useHappyRuntime(props: {
     viewMode?: 'tail' | 'history'
     isSyncingTail?: boolean
     isLoadingMore?: boolean
+    isSending: boolean
     isRunning?: boolean
     onSendMessage: (
         text: string,
@@ -956,11 +977,7 @@ export function useHappyRuntime(props: {
     // Memoize the adapter to avoid recreating on every render
     // useExternalStoreRuntime may use adapter identity for subscriptions
     const adapter = useMemo(() => ({
-        // A short-lived send request must not disable the composer input. Doing
-        // so blurs native inputs/contenteditables and unregisters third-party
-        // IME text clients. useSendMessage already rejects concurrent sends;
-        // the composer UI separately disables send actions while pending.
-        isDisabled: !props.session.active && !props.allowSendWhenInactive,
+        isDisabled: props.isSending || (!props.session.active && !props.allowSendWhenInactive),
         isRunning,
         messages: convertedMessages,
         extras,
@@ -970,6 +987,7 @@ export function useHappyRuntime(props: {
         unstable_capabilities: { copy: true }
     }), [
         props.session.active,
+        props.isSending,
         props.allowSendWhenInactive,
         isRunning,
         convertedMessages,

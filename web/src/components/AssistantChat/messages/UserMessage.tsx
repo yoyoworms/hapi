@@ -82,7 +82,7 @@ export function HappyUserMessage() {
             <MessagePrimitive.Root
                 id={elementId}
                 data-hapi-message-role="user"
-                className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full overflow-x-clip"
+                className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full overflow-x-hidden"
             >
                 <div className="ml-auto w-full max-w-[92%]">
                     <CliOutputBlock text={cliText} />

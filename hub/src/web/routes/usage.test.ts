@@ -3,15 +3,14 @@ import { Hono } from 'hono'
 import { Store } from '../../store'
 import type { WebAppEnv } from '../middleware/auth'
 import { createUsageRoutes } from './usage'
-import type { SyncEngine } from '../../sync/syncEngine'
 
-function createApp(store: Store, namespace: string, engine?: SyncEngine): Hono<WebAppEnv> {
+function createApp(store: Store, namespace: string): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
     app.use('*', async (c, next) => {
         c.set('namespace', namespace)
         await next()
     })
-    app.route('/api', createUsageRoutes(store, engine ? () => engine : undefined))
+    app.route('/api', createUsageRoutes(store))
     return app
 }
 
@@ -55,35 +54,6 @@ describe('GET /api/usage/summary', () => {
                 const response = await createApp(store, 'default').request(`/api/usage/summary?timeZone=${encodeURIComponent(timeZone)}`)
                 expect(response.status).toBe(400)
             }
-        } finally {
-            store.close()
-        }
-    })
-})
-
-describe('GET /api/usage', () => {
-    it('keeps live account quota caches isolated by namespace', async () => {
-        const store = new Store(':memory:')
-        const namespaces: string[] = []
-        const engine = {
-            getUsage: async (namespace: string) => {
-                namespaces.push(namespace)
-                return {
-                    five_hour: null,
-                    seven_day: null,
-                    seven_day_opus: null,
-                    seven_day_sonnet: null,
-                    extra_usage: null,
-                    subscriptionType: namespace
-                }
-            }
-        } as Partial<SyncEngine> as SyncEngine
-        try {
-            const teamA = await createApp(store, 'usage-team-a', engine).request('/api/usage')
-            const teamB = await createApp(store, 'usage-team-b', engine).request('/api/usage')
-            expect(await teamA.json()).toMatchObject({ subscriptionType: 'usage-team-a' })
-            expect(await teamB.json()).toMatchObject({ subscriptionType: 'usage-team-b' })
-            expect(namespaces).toEqual(['usage-team-a', 'usage-team-b'])
         } finally {
             store.close()
         }

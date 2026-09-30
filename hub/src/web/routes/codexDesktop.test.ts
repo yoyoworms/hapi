@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
 import { Store } from '../../store'
-import type { Machine, SyncEngine } from '../../sync/syncEngine'
+import { SyncEngine, type Machine } from '../../sync/syncEngine'
+import { RpcRegistry } from '../../socket/rpcRegistry'
 import type { WebAppEnv } from '../middleware/auth'
 import { createCodexDesktopRoutes, getDarwinCodexOpenArgs, importSelectedCodexSessions } from './codexDesktop'
 
@@ -92,14 +93,13 @@ function createMirroredAgentMessageTranscript(codexHome: string, sessionId: stri
         },
         {
             type: 'event_msg',
-            payload: { type: 'agent_message', phase: 'commentary', message: 'duplicated assistant message' }
+            payload: { type: 'agent_message', message: 'duplicated assistant message' }
         },
         {
             type: 'response_item',
             payload: {
                 type: 'message',
                 role: 'assistant',
-                phase: 'final_answer',
                 content: [{ type: 'output_text', text: 'duplicated assistant message' }]
             }
         }
@@ -386,6 +386,7 @@ describe('Codex Desktop import routes', () => {
     it('imports normal response_item chat messages', async () => {
         const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-test-'))
         const store = new Store(':memory:')
+        const engine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
         const codexSessionId = '11111111-1111-4111-8111-111111111111'
         process.env.CODEX_HOME = codexHome
 
@@ -396,16 +397,13 @@ describe('Codex Desktop import routes', () => {
                 codexSessionIds: [codexSessionId],
                 store,
                 namespace: 'default',
-                getSyncEngine: () => null
+                getSyncEngine: () => engine
             })
 
             expect(result.success).toBe(true)
             const session = store.sessions.getSessionsByNamespace('default')[0]
             expect(session).toBeDefined()
-            expect(session.metadata).toMatchObject({
-                codexAccountId: 'system',
-                codexAccountLabel: 'System default'
-            })
+            expect(engine.getSession(session.id)?.hasConversationContent).toBe(true)
             const messages = store.messages.getAllMessages(session.id)
             expect(messages).toHaveLength(2)
             expect(messages[0].content).toEqual({
@@ -433,30 +431,45 @@ describe('Codex Desktop import routes', () => {
                 }
             })
         } finally {
+            engine.stop()
             store.close()
             rmSync(codexHome, { recursive: true, force: true })
         }
     })
 
-    it('imports Codex transcripts into the requesting namespace without leaking into default', async () => {
-        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-namespace-test-'))
+    it('refuses a transcript import for an active Codex thread when stored messages do not match its prefix', async () => {
+        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-active-sync-test-'))
         const store = new Store(':memory:')
-        const codexSessionId = '11111111-1111-4111-8111-111111111112'
+        const codexSessionId = '10101010-1010-4010-8010-101010101010'
         process.env.CODEX_HOME = codexHome
 
         try {
             createTranscript(codexHome, codexSessionId)
+            const liveSession = store.sessions.getOrCreateSession('live-session', {
+                path: 'C:\\work\\project',
+                flavor: 'codex',
+                codexSessionId
+            }, {}, 'default')
+            store.messages.addMessage(liveSession.id, {
+                role: 'user',
+                content: { type: 'text', text: 'different from the transcript' }
+            }, 'live-1')
+            const engine = {
+                getSessionsByNamespace: () => [{ ...liveSession, active: true }]
+            } as unknown as SyncEngine
 
             const result = await importSelectedCodexSessions({
                 codexSessionIds: [codexSessionId],
                 store,
-                namespace: 'team-a',
-                getSyncEngine: () => null
+                namespace: 'default',
+                getSyncEngine: () => engine
             })
 
-            expect(result.success).toBe(true)
-            expect(store.sessions.getSessionsByNamespace('team-a')).toHaveLength(1)
-            expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(0)
+            expect(result.success).toBe(false)
+            if (result.success) throw new Error('Expected active-session transcript import to fail')
+            expect(result.error).toContain('matching HAPI session is active')
+            expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(1)
+            expect(store.messages.getAllMessages(liveSession.id)).toHaveLength(1)
         } finally {
             store.close()
             rmSync(codexHome, { recursive: true, force: true })
@@ -502,49 +515,6 @@ describe('Codex Desktop import routes', () => {
                 codexSessionId: 'fork-session-id',
                 codexSourceSessionId: codexSessionId
             })
-        } finally {
-            store.close()
-            rmSync(codexHome, { recursive: true, force: true })
-        }
-    })
-
-    it('reuses a phase-less legacy import when the transcript now includes message phases', async () => {
-        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-home-phase-prefix-test-'))
-        const store = new Store(':memory:')
-        const codexSessionId = '13131313-1313-4131-8131-131313131313'
-        process.env.CODEX_HOME = codexHome
-
-        try {
-            createMirroredAgentMessageTranscript(codexHome, codexSessionId)
-            const legacy = store.sessions.getOrCreateSession(
-                'legacy-import-session',
-                { codexSessionId, lifecycleState: 'imported' },
-                {},
-                'default'
-            )
-            store.messages.addMessage(legacy.id, {
-                role: 'agent',
-                content: {
-                    type: AGENT_MESSAGE_PAYLOAD_TYPE,
-                    data: {
-                        type: 'message',
-                        message: 'duplicated assistant message',
-                        id: 'legacy-message-id'
-                    }
-                },
-                meta: { sentFrom: 'cli' }
-            })
-
-            const result = await importSelectedCodexSessions({
-                codexSessionIds: [codexSessionId],
-                store,
-                namespace: 'default',
-                getSyncEngine: () => null
-            })
-
-            expect(result.success).toBe(true)
-            expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(1)
-            expect(store.messages.getAllMessages(legacy.id)).toHaveLength(1)
         } finally {
             store.close()
             rmSync(codexHome, { recursive: true, force: true })
@@ -616,7 +586,6 @@ describe('Codex Desktop import routes', () => {
                     data: {
                         type: 'message',
                         message: 'duplicated assistant message',
-                        phase: 'commentary',
                         id: expect.any(String)
                     }
                 },
@@ -1110,15 +1079,14 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
-    it('keeps Codex transcript endpoints namespace-scoped without requiring default namespace', async () => {
+    it('rejects Codex transcript endpoints outside the default namespace', async () => {
         const app = createRoutesApp('team-a')
         const response = await app.request('/api/codex/sessions')
 
-        expect(response.status).toBe(503)
+        expect(response.status).toBe(403)
         expect(await response.json()).toEqual({
             success: false,
-            error: 'No online machine available for Codex history import',
-            sessions: []
+            error: 'Codex transcript import is not available outside the default namespace'
         })
     })
 

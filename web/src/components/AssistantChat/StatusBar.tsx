@@ -1,5 +1,4 @@
 import {
-    getClaudeModelLabel,
     getCodexCollaborationModeLabel,
     getCopilotAgentModeLabel,
     getPermissionModeLabel,
@@ -8,8 +7,8 @@ import {
 } from '@hapi/protocol'
 import type { PermissionModeTone } from '@hapi/protocol'
 import * as Popover from '@radix-ui/react-popover'
-import { useEffect, useMemo, useState } from 'react'
-import type { AgentAccountStatus, AgentState, CodexCollaborationMode, PermissionMode, ThreadGoal } from '@/types/api'
+import { useMemo } from 'react'
+import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import {
@@ -21,8 +20,6 @@ import {
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
-import type { LatestUsage } from '@/chat/reducer'
-import type { PlanProgress } from '@/chat/planProgress'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -59,7 +56,6 @@ function getConnectionStatus(
     agentState: AgentState | null | undefined,
     voiceStatus: ConversationStatus | undefined,
     backgroundTaskCount: number,
-    activityText: string | null | undefined,
     t: (key: string) => string
 ): { text: string; color: string; dotColor: string; isPulsing: boolean } {
     const hasPermissions = agentState?.requests && Object.keys(agentState.requests).length > 0
@@ -93,8 +89,7 @@ function getConnectionStatus(
     }
 
     if (thinking) {
-        const vibingMessage = activityText
-            ?? VIBING_MESSAGES[Math.floor(Math.random() * VIBING_MESSAGES.length)].toLowerCase() + '…'
+        const vibingMessage = VIBING_MESSAGES[Math.floor(Math.random() * VIBING_MESSAGES.length)].toLowerCase() + '…'
         return {
             text: vibingMessage,
             color: 'text-[#007AFF]',
@@ -136,92 +131,6 @@ function formatTokenCount(value: number): string {
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
     if (value >= 1_000) return `${Math.round(value / 1_000)}k`
     return String(value)
-}
-
-function formatCost(cost: number): string {
-    if (cost > 0 && cost < 0.01) return `$${cost.toFixed(3)}`
-    return `$${cost.toFixed(2)}`
-}
-
-function formatDuration(ms: number | null | undefined): string | null {
-    if (ms === null || ms === undefined || !Number.isFinite(ms)) return null
-    const hours = Math.max(0, Math.floor(ms / 3_600_000))
-    if (hours >= 24) {
-        const days = Math.floor(hours / 24)
-        const remainingHours = hours % 24
-        return remainingHours > 0 ? `${days}d${remainingHours}h` : `${days}d`
-    }
-    if (hours > 0) return `${hours}h`
-    const minutes = Math.max(0, Math.floor(ms / 60_000))
-    return `${minutes}m`
-}
-
-function formatReset(resetAt: number | null | undefined): string | null {
-    if (!resetAt) return null
-    return new Date(resetAt).toLocaleString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-    })
-}
-
-function useMinuteClock(enabled: boolean, version: number | undefined): number {
-    const [now, setNow] = useState(() => Date.now())
-
-    useEffect(() => {
-        if (!enabled) return
-        setNow(Date.now())
-        const timer = window.setInterval(() => setNow(Date.now()), 60_000)
-        return () => window.clearInterval(timer)
-    }, [enabled, version])
-
-    return now
-}
-
-export function formatAccountLimit(limit: AgentAccountStatus['window'], now = Date.now()): string | null {
-    if (!limit) return null
-    const duration = formatDuration(limit.resetAt ? limit.resetAt - now : limit.remainingMs)
-    const percentage = typeof limit.remainingPercent === 'number' && Number.isFinite(limit.remainingPercent)
-        ? `${Math.round(Math.max(0, Math.min(100, limit.remainingPercent)))}%`
-        : null
-    return duration && percentage ? `${percentage} (${duration})` : percentage ?? duration
-}
-
-export function formatUsageText(
-    usage: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null | undefined,
-    latestUsage: LatestUsage | null | undefined
-): { text: string; title: string } | null {
-    if (usage) {
-        const totalTokens = usage.totalInputTokens + usage.totalOutputTokens
-        return {
-            text: `${formatCost(usage.totalCostUsd)} · ${formatTokenCount(totalTokens)} tok`,
-            title: [
-                `Cost: ${formatCost(usage.totalCostUsd)}`,
-                `Input tokens: ${usage.totalInputTokens.toLocaleString()}`,
-                `Output tokens: ${usage.totalOutputTokens.toLocaleString()}`,
-                `Total tokens: ${totalTokens.toLocaleString()}`
-            ].join('\n')
-        }
-    }
-
-    if (!latestUsage) return null
-    const inputTokens = latestUsage.inputTokens + latestUsage.cacheCreation + latestUsage.cacheRead
-    const outputTokens = latestUsage.outputTokens
-    const totalTokens = inputTokens + outputTokens
-    if (totalTokens <= 0 && latestUsage.contextSize <= 0) return null
-
-    return {
-        text: `ctx ${formatTokenCount(latestUsage.contextSize)} · ${formatTokenCount(totalTokens)} tok`,
-        title: [
-            'Latest agent usage from transcript',
-            `Context tokens: ${latestUsage.contextSize.toLocaleString()}`,
-            `Input tokens: ${latestUsage.inputTokens.toLocaleString()}`,
-            `Cache creation: ${latestUsage.cacheCreation.toLocaleString()}`,
-            `Cache read: ${latestUsage.cacheRead.toLocaleString()}`,
-            `Output tokens: ${latestUsage.outputTokens.toLocaleString()}`
-        ].join('\n')
-    }
 }
 
 function getContextPercentages(contextSize: number, maxContextSize: number): {
@@ -282,24 +191,12 @@ export function shouldShowCodexFastBadge(
     return agentFlavor === 'codex' && isFastServiceTier(serviceTier)
 }
 
-export function getVisibleCodexPlanProgress(
-    agentFlavor: string | null | undefined,
-    progress: PlanProgress | null | undefined,
-    thinking: boolean
-): PlanProgress | null {
-    if (agentFlavor !== 'codex' || !progress || !thinking) return null
-    return progress
-}
-
 export function StatusBar(props: {
     active: boolean
     thinking: boolean
     agentState: AgentState | null | undefined
     backgroundTaskCount?: number
     contextSize?: number
-    latestUsage?: LatestUsage | null
-    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
-    accountStatus?: AgentAccountStatus | null
     contextCacheRead?: number
     contextWindow?: number | null
     /**
@@ -315,26 +212,15 @@ export function StatusBar(props: {
     serviceTier?: string | null
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
-    threadGoal?: ThreadGoal | null
-    planProgress?: PlanProgress | null
     copilotAgentMode?: import('@hapi/protocol').CopilotAgentMode
     agentFlavor?: string | null
-    activityText?: string | null
     voiceStatus?: ConversationStatus
 }) {
     const { t } = useTranslation()
     const { preferences: headerMetadata } = useSessionHeaderMetadata()
     const connectionStatus = useMemo(
-        () => getConnectionStatus(
-            props.active,
-            props.thinking,
-            props.agentState,
-            props.voiceStatus,
-            props.backgroundTaskCount ?? 0,
-            props.activityText,
-            t
-        ),
-        [props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount, props.activityText, t]
+        () => getConnectionStatus(props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount ?? 0, t),
+        [props.active, props.thinking, props.agentState, props.voiceStatus, props.backgroundTaskCount, t]
     )
 
     const contextHeuristicModel = props.contextModel ?? props.model
@@ -404,62 +290,25 @@ export function StatusBar(props: {
         ? formatCompactReasoningLabel(reasoningEffort)
         : null
     const codexFastMode = shouldShowCodexFastBadge(props.agentFlavor, props.serviceTier)
-    const accountStatus = props.accountStatus ?? null
-    const accountClock = useMinuteClock(Boolean(accountStatus), accountStatus?.updatedAt)
-    const accountWindowText = accountStatus ? formatAccountLimit(accountStatus.window, accountClock) : null
-    const accountWeeklyText = accountStatus ? formatAccountLimit(accountStatus.weekly, accountClock) : null
-    const accountWindowLabel = accountWindowText ? t('status.accountWindow', { value: accountWindowText }) : null
-    const accountWeeklyLabel = accountWeeklyText ? t('status.accountWeekly', { value: accountWeeklyText }) : null
-    const accountLimitText = [accountWindowLabel, accountWeeklyLabel].filter(Boolean).join(' · ')
-    const accountTitle = accountStatus
-        ? [
-            accountStatus.accountLabel ? `Account: ${accountStatus.accountLabel}` : null,
-            accountStatus.window?.resetAt ? `Window reset: ${formatReset(accountStatus.window.resetAt)}` : null,
-            accountStatus.weekly?.resetAt ? `Weekly reset: ${formatReset(accountStatus.weekly.resetAt)}` : null
-        ].filter(Boolean).join('\n')
-        : undefined
-    const usageText = formatUsageText(props.usage, props.latestUsage)
-    const goalLabel = props.agentFlavor === 'codex' && props.threadGoal
-        ? props.threadGoal.status === 'active'
-            ? 'goal'
-            : `goal ${props.threadGoal.status === 'budgetLimited' ? 'limited' : props.threadGoal.status}`
-        : null
-    const planProgress = getVisibleCodexPlanProgress(props.agentFlavor, props.planProgress, props.thinking)
 
     return (
         <div className="flex min-w-0 items-baseline justify-between gap-2 px-2 pb-1">
-            <div className="flex min-w-0 flex-1 items-baseline gap-2">
-                <div className="relative top-px sm:top-0.5 flex min-w-0 items-center gap-1.5">
+            <div className="flex min-w-0 items-baseline gap-2">
+                <div className="relative top-px sm:top-0.5 flex shrink-0 items-center gap-1.5">
                     <span
-                        className={`h-2 w-2 shrink-0 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
+                        className={`h-2 w-2 rounded-full ${connectionStatus.dotColor} ${connectionStatus.isPulsing ? 'animate-pulse' : ''}`}
                     />
-                    <span
-                        className={`max-w-[48vw] truncate whitespace-nowrap text-xs sm:max-w-96 ${connectionStatus.color}`}
-                        title={props.activityText ?? undefined}
-                    >
+                    <span className={`whitespace-nowrap text-xs ${connectionStatus.color}`}>
                         {connectionStatus.text}
                     </span>
                 </div>
-                {planProgress ? (
-                    <span
-                        data-testid="codex-plan-progress"
-                        className="min-w-0 flex-1 truncate text-[10px] text-[var(--app-link)] sm:max-w-[48vw] sm:flex-none"
-                        title={planProgress.explanation ?? planProgress.currentStep ?? undefined}
-                    >
-                        {t('status.planProgress', {
-                            completed: planProgress.completed,
-                            total: planProgress.total
-                        })}
-                        {planProgress.currentStep ? ` · ${planProgress.currentStep}` : null}
-                    </span>
-                ) : null}
                 {contextUsageLabel ? (
                     <Popover.Root>
                         <Popover.Trigger asChild>
                             <button
                                 type="button"
                                 aria-label={t('misc.contextDetails')}
-                                className={`${planProgress ? 'hidden sm:inline-flex' : ''} min-w-0 cursor-pointer whitespace-nowrap rounded-sm bg-transparent p-0 text-[10px] leading-4 outline-none focus-visible:ring-1 focus-visible:ring-[var(--app-link)] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}
+                                className={`min-w-0 cursor-pointer whitespace-nowrap rounded-sm bg-transparent p-0 text-[10px] leading-4 outline-none focus-visible:ring-1 focus-visible:ring-[var(--app-link)] ${contextWarning?.color ?? 'text-[var(--app-hint)]'}`}
                             >
                                 <span className="sm:hidden">{compactContextUsageLabel}</span>
                                 <span className="hidden items-center gap-2 sm:inline-flex">
@@ -516,54 +365,15 @@ export function StatusBar(props: {
             </div>
 
             <div className="flex min-w-0 shrink-0 items-baseline gap-2">
-                {accountStatus && (accountStatus.accountLabel || accountLimitText) ? (
-                    <span
-                        data-testid="account-usage-status"
-                        className={`${planProgress ? 'hidden sm:inline-flex' : 'inline-flex'} min-w-0 items-baseline text-[10px] font-medium text-[var(--app-fg)]`}
-                        title={accountTitle}
-                    >
-                        {accountStatus.accountLabel ? (
-                            <span className={`${accountLimitText ? 'hidden sm:inline' : 'inline'} max-w-[24vw] truncate`}>
-                                {accountStatus.accountLabel}{accountLimitText ? '\u00a0' : ''}
-                            </span>
-                        ) : null}
-                        {accountLimitText ? (
-                            <>
-                                <span data-testid="account-usage-mobile" className="flex shrink-0 flex-col items-end leading-[11px] sm:hidden">
-                                    {accountWindowLabel ? <span className="whitespace-nowrap">{accountWindowLabel}</span> : null}
-                                    {accountWeeklyLabel ? <span className="whitespace-nowrap">{accountWeeklyLabel}</span> : null}
-                                </span>
-                                <span data-testid="account-usage-desktop" className="hidden shrink-0 whitespace-nowrap sm:inline">
-                                    {accountLimitText}
-                                </span>
-                            </>
-                        ) : null}
-                    </span>
-                ) : null}
-                {usageText ? (
-                    <span data-testid="session-usage-status" className="hidden shrink-0 text-[10px] text-[var(--app-hint)] sm:inline" title={usageText.title}>
-                        {usageText.text}
-                    </span>
-                ) : null}
                 {reasoningLabel ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-hint)]`}>
+                    <span className="whitespace-nowrap text-xs text-[var(--app-hint)]">
                         <span className="sm:hidden">{compactReasoningLabel}</span>
                         <span className="hidden sm:inline">{reasoningLabel}</span>
                     </span>
                 ) : null}
                 {codexFastMode ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[#34C759]`}>
+                    <span className="whitespace-nowrap text-xs text-[#34C759]">
                         fast
-                    </span>
-                ) : null}
-                {goalLabel ? (
-                    <span className={`${planProgress ? 'hidden sm:inline' : ''} whitespace-nowrap text-xs text-[var(--app-link)]`}>
-                        {goalLabel}
-                    </span>
-                ) : null}
-                {props.model ? (
-                    <span className="hidden text-[10px] text-[var(--app-hint)] md:inline">
-                        {getClaudeModelLabel(props.model) ?? props.model}
                     </span>
                 ) : null}
                 {collaborationModeLabel ? (

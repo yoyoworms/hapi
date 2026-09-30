@@ -16,7 +16,7 @@ function ImageAttachment(props: { attachment: AttachmentMetadata }) {
             src={attachment.previewUrl ?? ''}
             fileName={attachment.filename}
             label={attachment.filename}
-            buttonClassName="relative overflow-clip rounded-lg text-left cursor-zoom-in"
+            buttonClassName="relative overflow-hidden rounded-lg text-left cursor-zoom-in"
             imageClassName="max-h-48 max-w-full object-contain"
             caption={(
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2 py-1.5">

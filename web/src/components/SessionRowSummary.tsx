@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import type { SessionSummary } from '@/types/api'
 import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
-import { PinIcon, ScheduleIcon } from '@/components/icons'
+import { ScheduleIcon } from '@/components/icons'
 import { HoverTooltip, SESSION_ROW_TOOLTIP_FOCUS_CLASS, useSessionRowTooltipIds } from '@/components/HoverTooltip'
 import { getAttentionLabel, SessionAttentionIndicator } from '@/components/SessionAttentionIndicator'
 import { classifySessionAttention } from '@/lib/sessionAttention'
@@ -12,7 +12,6 @@ import { getCodexImportedAt } from '@/lib/codexImportedSessions'
 import { getSessionTitle } from '@/lib/sessionTitle'
 import { useTranslation } from '@/lib/use-translation'
 import { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
-import { shouldShowSessionTasks } from '@/lib/sessionWorkState'
 
 function LoaderIcon(props: { className?: string }) {
     return (
@@ -60,7 +59,6 @@ const ATTENTION_DOT_CLASS = {
 function getTodoProgress(session: SessionSummary): { completed: number; total: number } | null {
     if (!session.todoProgress) return null
     if (session.todoProgress.completed === session.todoProgress.total) return null
-    if (!shouldShowSessionTasks(session.metadata?.flavor, session)) return null
     return session.todoProgress
 }
 
@@ -164,11 +162,6 @@ export function SessionRowSummary(props: {
     const attentionId = attentionTooltipIdProp ?? ownedIds.attentionId
     const scheduleId = scheduleTooltipIdProp ?? ownedIds.scheduleId
     const timeLabel = getSessionTimeLabel(s, t)
-    const pinLabel = s.globalPinned
-        ? t('session.item.pinnedGlobal')
-        : s.pinned
-            ? t('session.item.pinnedProject')
-            : null
 
     return (
         <div className={`flex w-full min-w-0 flex-col gap-1 ${className ?? ''}`}>
@@ -181,15 +174,6 @@ export function SessionRowSummary(props: {
                     >
                         {sessionName}
                     </div>
-                    {pinLabel ? (
-                        <span
-                            className="inline-flex shrink-0 text-[var(--app-link)]"
-                            title={pinLabel}
-                            aria-label={pinLabel}
-                        >
-                            <PinIcon filled className="h-3.5 w-3.5" />
-                        </span>
-                    ) : null}
                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (
                         <SessionAttentionIndicator
                             attention={attention}

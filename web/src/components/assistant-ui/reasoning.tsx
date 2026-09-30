@@ -15,7 +15,6 @@ import {
     MARKDOWN_REHYPE_PLUGINS,
     defaultComponents,
     denyOnlyTransform,
-    preprocessMarkdownText,
     UriConfirmProvider,
 } from '@/components/assistant-ui/markdown-text'
 
@@ -73,7 +72,6 @@ export const Reasoning: ReasoningMessagePartComponent = ({ text, status }) => {
     return (
         <UriConfirmProvider>
             <MarkdownTextPrimitive
-                preprocess={preprocessMarkdownText}
                 smooth={smooth}
                 remarkPlugins={MARKDOWN_PLUGINS}
                 rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
@@ -205,7 +203,7 @@ export const ReasoningGroup: FC<HappyReasoningGroupProps> = ({
     }, [])
 
     return (
-        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-3 overflow-clip rounded-2xl bg-[var(--app-reasoning-bg)]">
+        <div data-hapi-share-exclude="true" className="aui-reasoning-group my-3 overflow-hidden rounded-2xl bg-[var(--app-reasoning-bg)]">
             <button
                 type="button"
                 onClick={handleToggle}
@@ -226,7 +224,7 @@ export const ReasoningGroup: FC<HappyReasoningGroupProps> = ({
 
             <div
                 className={cn(
-                    'overflow-clip transition-all duration-200 ease-in-out',
+                    'overflow-hidden transition-all duration-200 ease-in-out',
                     isOpen ? 'max-h-[5000px] opacity-100' : 'max-h-0 opacity-0'
                 )}
             >

@@ -1,17 +1,14 @@
 import React from 'react';
 import { randomUUID } from 'node:crypto';
 
-import {
-    CodexAppServerClient,
-    isCodexArchivedThreadError,
-    isIndeterminateError
-} from './codexAppServerClient';
+import { CodexAppServerClient, isIndeterminateError } from './codexAppServerClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
 import { logger } from '@/ui/logger';
 import { CodexDisplay } from '@/ui/ink/CodexDisplay';
 import { buildHapiMcpBridge } from './utils/buildHapiMcpBridge';
+import { applySessionDisplayRename } from '@/agent/sessionDisplayRename';
 import { emitReadyIfIdle } from './utils/emitReadyIfIdle';
 import type { CodexSession } from './session';
 import type { EnhancedMode } from './loop';
@@ -20,13 +17,20 @@ import { hasCodexCliOverrides } from './utils/codexCliOverrides';
 import { AppServerEventConverter } from './utils/appServerEventConverter';
 import { registerGeneratedImageFromPath } from '@/modules/common/generatedImages';
 import { registerAppServerPermissionHandlers } from './utils/appServerPermissionAdapter';
-import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
+import {
+    buildThreadStartParams,
+    buildTurnStartParams,
+    type CodexContextManagementConfig
+} from './utils/appServerConfig';
+import {
+    extractCodexMcpServers,
+    mergeCodexMcpServers,
+    type CodexMcpServersConfig
+} from './utils/codexMcpServers';
+import { prepareCodexMcpServers } from './utils/codexMcpProxy';
 import type { SkillMetadata, ThreadGoal, ThreadGoalStatus } from './appServerTypes';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
-import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
-import type { AgentAccountStatus } from '@hapi/protocol/types';
-import { normalizeAgentMessagePhase } from '@hapi/protocol/messages';
 import { extractErrorInfo } from '@/utils/errorUtils';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import {
@@ -35,10 +39,7 @@ import {
     type RemoteLauncherExitReason
 } from '@/modules/common/remote/RemoteLauncherBase';
 import { CodexConversationHistory } from './conversationHistory';
-import {
-    buildHapiCodexModelContextConfig,
-    resolveHapiCodexModel
-} from './hapiContextPolicy';
+
 
 
 async function registerGeneratedImageFromPathWrapper(args: { id: string; path: string; fileName?: string | null }): Promise<Awaited<ReturnType<typeof registerGeneratedImageFromPath>> | null> {
@@ -55,12 +56,12 @@ async function registerGeneratedImageFromPathWrapper(args: { id: string; path: s
 
 type HappyServer = Awaited<ReturnType<typeof buildHapiMcpBridge>>['server'];
 type QueuedMessage = {
-    message: string;
-    mode: EnhancedMode;
-    isolate: boolean;
-    hash: string;
-    items?: Array<{ message: string; localId?: string }>;
-};
+    message: string
+    mode: EnhancedMode
+    isolate: boolean
+    hash: string
+    items?: Array<{ message: string; localId?: string }>
+}
 type ChildAgentRuntime = {
     reasoningProcessor: ReasoningProcessor;
     diffProcessor: DiffProcessor;
@@ -96,10 +97,6 @@ function formatCodexResumeError(error: unknown): string {
     return parts.length > 0 ? Array.from(new Set(parts)).join(': ') : 'unknown resume error';
 }
 
-function shouldStartFreshThreadAfterResumeFailure(error: unknown): boolean {
-    return /list_turns is not supported yet/i.test(formatCodexResumeError(error));
-}
-
 const SAME_THREAD_RETRYABLE_ERROR_PATTERNS = [
     'selected model is at capacity',
     'codex thread entered systemerror'
@@ -113,9 +110,6 @@ const SAME_THREAD_MAX_RETRIES = 3;
 const SAME_THREAD_MAX_COMPACT_RETRIES = 1;
 const SAME_THREAD_COMPACT_TIMEOUT_MS = 10 * 60 * 1000;
 const THREAD_STATUS_FAILURE_GRACE_MS = 250;
-const THREAD_IDLE_TERMINAL_GRACE_MS = 250;
-const ABORT_CONFIRMATION_TIMEOUT_MS = 8_000;
-const INTERRUPT_CHILD_DISCOVERY_POLL_MS = 50;
 const SAFETY_BUFFERING_LEARN_MORE_URL = 'https://help.openai.com/en/articles/20001326';
 const TRUSTED_ACCESS_FOR_CYBER_URL = 'https://chatgpt.com/cyber';
 const CYBER_POLICY_TRUSTED_ACCESS_URL = 'https://openai.com/form/enterprise-trusted-access-for-cyber/';
@@ -245,6 +239,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
     private reasoningProcessor: ReasoningProcessor | null = null;
     private diffProcessor: DiffProcessor | null = null;
     private happyServer: HappyServer | null = null;
+    private mcpProxyCleanup: (() => Promise<void>) | null = null;
     private abortController: AbortController = new AbortController();
     /** Invalidates queued-message steer handlers after abort or cleanup. */
     private steerEpoch = 0;
@@ -253,27 +248,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
     private currentTurnId: string | null = null;
     private readonly activeChildTurns = new Map<string, string>();
     readonly conversationHistory = new CodexConversationHistory(() => this.appServerClient);
-    private resetActiveTurnState: (() => void) | null = null;
-    private hasActiveTurnState: (() => boolean) | null = null;
-    private hasInFlightParentTurn: (() => boolean) | null = null;
-    private cancelActiveRecovery: (() => boolean) | null = null;
-    private cancelTurnPreparation: (() => boolean) | null = null;
-    private drainCodexEvents: (() => Promise<void>) | null = null;
-    private hasUndiscoveredChildWork: (() => boolean) | null = null;
-    private onUserAbortConfirmed: (() => void) | null = null;
-    private abortConfirmation: {
-        kind: 'user-abort' | 'admin' | 'safety-retry';
-        threadId: string | null;
-        turnId: string | null;
-        childTurns: Map<string, string>;
-        parentConfirmed: boolean;
-        initialInterruptDispatchSettled: boolean;
-        result: boolean | null;
-        promise: Promise<boolean>;
-        resolve: (confirmed: boolean) => void;
-        timer: ReturnType<typeof setTimeout>;
-        settleTimer: ReturnType<typeof setTimeout> | null;
-    } | null = null;
 
     constructor(session: CodexSession) {
         super(process.env.DEBUG ? session.logPath : undefined);
@@ -285,13 +259,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         return React.createElement(CodexDisplay, context);
     }
 
-    private async interruptActiveTurns(reason: string): Promise<{
-        attempted: number;
-        failed: number;
-        parentFailed: number;
-        childFailed: number;
-        failedChildTurns: Array<{ threadId: string; turnId: string }>;
-    }> {
+    private async interruptActiveTurns(reason: string): Promise<void> {
         const turnsToInterrupt = [
             ...(this.currentThreadId && this.currentTurnId
                 ? [{ threadId: this.currentThreadId, turnId: this.currentTurnId, role: 'parent' as const }]
@@ -304,13 +272,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         ];
 
         if (turnsToInterrupt.length === 0) {
-            return {
-                attempted: 0,
-                failed: 0,
-                parentFailed: 0,
-                childFailed: 0,
-                failedChildTurns: []
-            };
+            return;
         }
 
         const results = await Promise.allSettled(
@@ -320,352 +282,43 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }))
         );
 
-        let failed = 0;
-        let parentFailed = 0;
-        let childFailed = 0;
-        const failedChildTurns: Array<{ threadId: string; turnId: string }> = [];
         results.forEach((result, index) => {
             const target = turnsToInterrupt[index];
             if (result.status === 'fulfilled') {
+                if (target.role === 'child') {
+                    this.activeChildTurns.delete(target.threadId);
+                }
                 return;
             }
 
-            failed += 1;
-            if (target.role === 'parent') {
-                parentFailed += 1;
-            } else {
-                childFailed += 1;
-                failedChildTurns.push({ threadId: target.threadId, turnId: target.turnId });
-            }
             logger.debug(
                 `[Codex] Error interrupting ${target.role} app-server turn ` +
                 `for ${reason}; threadId=${target.threadId} turnId=${target.turnId}:`,
                 result.reason
             );
         });
-        return {
-            attempted: turnsToInterrupt.length,
-            failed,
-            parentFailed,
-            childFailed,
-            failedChildTurns
-        };
-    }
-
-    private beginAbortConfirmation(
-        threadId: string | null,
-        turnId: string | null,
-        kind: NonNullable<CodexRemoteLauncher['abortConfirmation']>['kind'],
-        options?: { awaitingParentTurn?: boolean }
-    ): NonNullable<CodexRemoteLauncher['abortConfirmation']> {
-        this.finishAbortConfirmation(false);
-
-        let resolveConfirmation!: (confirmed: boolean) => void;
-        const promise = new Promise<boolean>((resolve) => {
-            resolveConfirmation = resolve;
-        });
-        const confirmation: NonNullable<CodexRemoteLauncher['abortConfirmation']> = {
-            kind,
-            threadId,
-            turnId,
-            childTurns: new Map(this.activeChildTurns),
-            parentConfirmed: options?.awaitingParentTurn ? false : !threadId || !turnId,
-            initialInterruptDispatchSettled: false,
-            result: null,
-            promise,
-            resolve: resolveConfirmation,
-            settleTimer: null,
-            timer: setTimeout(() => {
-                this.resolveAbortConfirmation(confirmation, false);
-            }, ABORT_CONFIRMATION_TIMEOUT_MS)
-        };
-        confirmation.timer.unref?.();
-        this.abortConfirmation = confirmation;
-        return confirmation;
-    }
-
-    private resolveAbortConfirmation(
-        confirmation: NonNullable<CodexRemoteLauncher['abortConfirmation']>,
-        confirmed: boolean
-    ): void {
-        if (confirmation.result !== null) {
-            return;
-        }
-        if (this.abortConfirmation === confirmation) {
-            this.abortConfirmation = null;
-        }
-        clearTimeout(confirmation.timer);
-        if (confirmation.settleTimer) {
-            clearTimeout(confirmation.settleTimer);
-            confirmation.settleTimer = null;
-        }
-        confirmation.result = confirmed;
-        confirmation.resolve(confirmed);
-        if (confirmed && confirmation.kind === 'user-abort') {
-            this.onUserAbortConfirmed?.();
-        }
-    }
-
-    private scheduleAbortConfirmationSuccess(
-        confirmation: NonNullable<CodexRemoteLauncher['abortConfirmation']>
-    ): void {
-        if (
-            this.abortConfirmation !== confirmation
-            || confirmation.result !== null
-            || !confirmation.parentConfirmed
-            || !confirmation.initialInterruptDispatchSettled
-            || confirmation.childTurns.size > 0
-            || confirmation.settleTimer
-        ) {
-            return;
-        }
-        confirmation.settleTimer = setTimeout(() => {
-            confirmation.settleTimer = null;
-            if (
-                this.abortConfirmation === confirmation
-                && confirmation.parentConfirmed
-                && confirmation.childTurns.size === 0
-                && confirmation.initialInterruptDispatchSettled
-            ) {
-                if (this.hasUndiscoveredChildWork?.()) {
-                    this.scheduleAbortConfirmationSuccess(confirmation);
-                    return;
-                }
-                this.resolveAbortConfirmation(confirmation, true);
-            }
-        }, INTERRUPT_CHILD_DISCOVERY_POLL_MS);
-        confirmation.settleTimer.unref?.();
-    }
-
-    private markInitialInterruptDispatchSettled(
-        confirmation: NonNullable<CodexRemoteLauncher['abortConfirmation']>
-    ): void {
-        if (confirmation.result !== null) {
-            return;
-        }
-        confirmation.initialInterruptDispatchSettled = true;
-        this.scheduleAbortConfirmationSuccess(confirmation);
-    }
-
-    private finishAbortConfirmation(
-        confirmed: boolean,
-        scope?: { threadId?: string | null; turnId?: string | null }
-    ): boolean {
-        const confirmation = this.abortConfirmation;
-        if (!confirmation) {
-            return false;
-        }
-        if (confirmed) {
-            if (!confirmation.threadId || !confirmation.turnId) {
-                return false;
-            }
-            if (scope?.threadId && scope.threadId !== confirmation.threadId) {
-                return false;
-            }
-            if (scope?.turnId && scope.turnId !== confirmation.turnId) {
-                return false;
-            }
-            confirmation.parentConfirmed = true;
-            if (confirmation.childTurns.size > 0) {
-                return true;
-            }
-            this.scheduleAbortConfirmationSuccess(confirmation);
-            return true;
-        }
-
-        this.resolveAbortConfirmation(confirmation, false);
-        return true;
-    }
-
-    private finishChildAbortConfirmation(threadId: string, turnId: string): boolean {
-        const confirmation = this.abortConfirmation;
-        if (!confirmation) {
-            return false;
-        }
-        const expectedTurnId = confirmation.childTurns.get(threadId);
-        if (!expectedTurnId || turnId !== expectedTurnId) {
-            return false;
-        }
-
-        confirmation.childTurns.delete(threadId);
-        if (!confirmation.parentConfirmed || confirmation.childTurns.size > 0) {
-            return true;
-        }
-
-        this.scheduleAbortConfirmationSuccess(confirmation);
-        return true;
-    }
-
-    private trackLateChildTurnForAbort(threadId: string, turnId: string): boolean {
-        const confirmation = this.abortConfirmation;
-        if (!confirmation || confirmation.result !== null) {
-            return false;
-        }
-        if (confirmation.childTurns.get(threadId) === turnId) {
-            return false;
-        }
-        if (confirmation.settleTimer) {
-            clearTimeout(confirmation.settleTimer);
-            confirmation.settleTimer = null;
-        }
-        confirmation.childTurns.set(threadId, turnId);
-        void this.appServerClient.interruptTurn({ threadId, turnId }).catch(() => {
-            if (
-                this.abortConfirmation === confirmation
-                && confirmation.childTurns.get(threadId) === turnId
-            ) {
-                this.resolveAbortConfirmation(confirmation, false);
-            }
-        });
-        return true;
-    }
-
-    private trackLateParentTurnForAbort(threadId: string, turnId: string): boolean {
-        const confirmation = this.abortConfirmation;
-        if (
-            !confirmation
-            || confirmation.result !== null
-            || confirmation.threadId !== threadId
-        ) {
-            return false;
-        }
-        if (confirmation.turnId === turnId) {
-            return true;
-        }
-        if (confirmation.turnId !== null) {
-            return false;
-        }
-        if (confirmation.settleTimer) {
-            clearTimeout(confirmation.settleTimer);
-            confirmation.settleTimer = null;
-        }
-        confirmation.turnId = turnId;
-        confirmation.parentConfirmed = false;
-        void this.appServerClient.interruptTurn({ threadId, turnId }).catch(() => {
-            if (
-                this.abortConfirmation === confirmation
-                && confirmation.turnId === turnId
-            ) {
-                this.resolveAbortConfirmation(confirmation, false);
-            }
-        });
-        return true;
-    }
-
-    private isAbortConfirmationPending(
-        threadId: string | null,
-        turnId: string | null,
-        kind?: NonNullable<CodexRemoteLauncher['abortConfirmation']>['kind']
-    ): boolean {
-        const confirmation = this.abortConfirmation;
-        return Boolean(
-            confirmation
-            && confirmation.result === null
-            && threadId === confirmation.threadId
-            && turnId === confirmation.turnId
-            && (!kind || confirmation.kind === kind)
-        );
     }
 
     private async handleAbort(): Promise<void> {
         this.abortInProgress = true;
         this.steerEpoch++;
+        logger.debug('[Codex] Abort requested - stopping current task');
         try {
-            logger.debug('[Codex] Abort requested - stopping current task');
-            await this.drainCodexEvents?.();
-            const hasActiveTurn = this.hasActiveTurnState?.() ?? this.session.thinking;
+            await this.interruptActiveTurns('abort');
+            this.currentTurnId = null;
 
-            // Exit/switch tears down the whole launcher and app-server connection.
-            // It does not need to pretend that a turn/interrupt acknowledgement is
-            // a completed cancellation: best-effort interrupt, then force the local
-            // loop out so cleanup can close the process authoritatively.
-            if (this.shouldExit) {
-                await this.interruptActiveTurns('launcher exit');
-                this.finishAbortConfirmation(false);
-                this.resetActiveTurnState?.();
-                this.abortController.abort();
-                this.session.queue.reset();
-                this.permissionHandler?.reset();
-                this.reasoningProcessor?.abort();
-                this.diffProcessor?.reset();
-                return;
-            }
-
-            if (!hasActiveTurn) {
-                this.session.queue.clearPending();
-                return;
-            }
-
-            let threadId: string | null = this.currentThreadId;
-            let turnId: string | null = this.currentTurnId;
-            if (!threadId || !turnId) {
-                const cancelledPreparation = this.cancelTurnPreparation?.() ?? false;
-                const cancelledRecovery = this.cancelActiveRecovery?.() ?? false;
-                if ((cancelledPreparation || cancelledRecovery) && this.activeChildTurns.size === 0) {
-                    this.session.queue.clearPending();
-                    logger.debug('[Codex] Abort completed before an active turn was dispatched');
-                    return;
-                }
-                if (!cancelledPreparation && !cancelledRecovery && threadId && this.hasInFlightParentTurn?.()) {
-                    // turn/start can be accepted by app-server before its response
-                    // (or turn/started notification) reaches HAPI. Arm cancellation
-                    // now; the first authoritative turn id will be interrupted by
-                    // trackLateParentTurnForAbort().
-                    const confirmation = this.beginAbortConfirmation(threadId, null, 'user-abort', {
-                        awaitingParentTurn: true
-                    });
-                    this.session.queue.clearPending();
-                    const childInterruptResult = await this.interruptActiveTurns('abort while turn/start is pending');
-                    this.markInitialInterruptDispatchSettled(confirmation);
-                    if (childInterruptResult.failed > 0) {
-                        this.finishAbortConfirmation(false);
-                        throw new Error(
-                            `Codex rejected ${childInterruptResult.failed} turn interrupt request(s); task is still running`
-                        );
-                    }
-                    const confirmed = confirmation.result ?? await confirmation.promise;
-                    if (!confirmed) {
-                        throw new Error('Could not confirm that Codex stopped the task; task is still running');
-                    }
-                    logger.debug('[Codex] Abort completed after the pending turn/start reported its turn id');
-                    return;
-                }
-                if (this.activeChildTurns.size === 0) {
-                    throw new Error('Codex has not reported an active turn id yet; stop was not applied');
-                }
-                threadId = null;
-                turnId = null;
-            }
-
-            // Arm before sending turn/interrupt: app-server is allowed to emit the
-            // terminal notification synchronously with the RPC response.
-            const confirmation = this.beginAbortConfirmation(threadId, turnId, 'user-abort');
-            this.session.queue.clearPending();
-            const interruptResult = await this.interruptActiveTurns('abort');
-            this.markInitialInterruptDispatchSettled(confirmation);
-            const unresolvedFailedChild = interruptResult.failedChildTurns.some(({ threadId, turnId }) => (
-                confirmation.childTurns.get(threadId) === turnId
-            ));
-            if (unresolvedFailedChild || (interruptResult.parentFailed > 0 && !confirmation.parentConfirmed)) {
-                // A terminal notification can win the race with a rejected request
-                // (the turn completed naturally). Only that authoritative event may
-                // turn the rejection into success.
-                this.finishAbortConfirmation(false);
-                throw new Error(
-                    `Codex rejected ${interruptResult.failed} turn interrupt request(s); task is still running`
-                );
-            }
-
-            const confirmed = confirmation.result ?? await confirmation.promise;
-            if (!confirmed) {
-                throw new Error('Could not confirm that Codex stopped the task; task is still running');
-            }
-
-            logger.debug('[Codex] Abort completed after authoritative turn termination');
+            this.abortController.abort();
+            // A dispatched steer may still reconcile after Abort; preserve its
+            // reservation so a positive thread/read result can acknowledge it.
+            this.session.queue.reset({ preserveDispatchingReservations: true });
+            this.permissionHandler?.reset();
+            this.reasoningProcessor?.abort();
+            this.diffProcessor?.reset();
+            logger.debug('[Codex] Abort completed - session remains active');
+        } catch (error) {
+            logger.debug('[Codex] Error during abort:', error);
         } finally {
-            if (this.abortController.signal.aborted && !this.shouldExit) {
-                this.abortController = new AbortController();
-            }
+            this.abortController = new AbortController();
             this.abortInProgress = false;
         }
     }
@@ -797,19 +450,14 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             return false;
         };
 
-        const applyResolvedModel = (value: unknown, requestedModel?: string | null): string | undefined => {
+        const applyResolvedModel = (value: unknown): string | undefined => {
             const resolvedModel = asString(value) ?? undefined;
             if (!resolvedModel) {
                 return undefined;
             }
-            const requested = requestedModel?.trim();
-            const requestedSpec = resolveHapiCodexModel(requested);
-            const selectedModel = requested && requestedSpec?.model === resolvedModel
-                ? requested
-                : resolvedModel;
-            session.setModel(selectedModel);
-            logger.debug(`[Codex] Resolved app-server model: ${resolvedModel} (selected=${selectedModel})`);
-            return selectedModel;
+            session.setModel(resolvedModel);
+            logger.debug(`[Codex] Resolved app-server model: ${resolvedModel}`);
+            return resolvedModel;
         };
 
         const buildMcpToolName = (server: unknown, tool: unknown): string | null => {
@@ -826,11 +474,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         const sendTitleSummary = (title: string): void => {
-            session.client.sendClaudeSessionMessage({
-                type: 'summary',
-                summary: title,
-                leafUuid: randomUUID()
-            });
+            // Matches MCP change_title / web rename: set metadata.name so a
+            // prior spawn --name does not hide the agent rename.
+            applySessionDisplayRename(session.client, title);
         };
 
         const formatOutputPreview = (value: unknown): string => {
@@ -963,6 +609,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         const permissionHandler = new CodexPermissionHandler(session.client, getCurrentCodexPermissionMode, {
+            getCollaborationMode: () => session.getCollaborationMode(),
             onRequest: ({ id, toolName, input }) => {
                 if (toolName === 'request_user_input') {
                     session.sendAgentMessage({
@@ -1024,7 +671,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const diffProcessor = new DiffProcessor((message) => {
             session.sendAgentMessage(message);
         });
-        const emptyCompletionNoticeTracker = new EmptyCompletionNoticeTracker();
         const mcpTitleByCallId = new Map<string, string>();
         const agentCardByAgentId = new Map<string, string>();
         const agentSummaryByCardId = new Map<string, string>();
@@ -1058,7 +704,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
         setTurnInFlight(false);
         let usageModel: string | null = null;
-        let turnPreparationInFlight = false;
         let allowAnonymousTerminalEvent = false;
         let invalidThreadId: string | null = null;
         let childAgentActivityInCurrentTurn = false;
@@ -1110,6 +755,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         const hasKnownChildAgents = (): boolean => {
+            if (childAgentActivityInCurrentTurn) return true;
             if (pendingAgentStartCardIds.size > 0) return true;
             for (const agentId of new Set([...agentCardByAgentId.keys(), ...childAgentRuntimeById.keys()])) {
                 const status = agentStatusByAgentId.get(agentId);
@@ -1119,7 +765,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             return false;
         };
-        this.hasUndiscoveredChildWork = hasKnownChildAgents;
 
         const buildCodexEventScope = (
             threadId: string | null,
@@ -1908,20 +1553,16 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             if (msgType === 'agent_message') {
                 const message = asString(msg.message);
-                const phase = normalizeAgentMessagePhase(msg.phase);
                 if (message) {
-                    if (phase !== 'commentary') {
-                        runtime.finalMessage = message;
-                    }
+                    runtime.finalMessage = message;
                     emitAgentRunTraceMessage(agentId, {
                         type: 'message',
                         message,
-                        ...(phase ? { phase } : {}),
                         id: randomUUID()
                     });
                 }
                 if (runtime.terminal) {
-                    if (message && phase !== 'commentary') {
+                    if (message) {
                         emitAgentRunUpdate(agentId, {
                             status: 'completed',
                             statusText: 'Completed',
@@ -1949,17 +1590,18 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         input: inputs,
                         id: randomUUID()
                     });
+                    const command = normalizeCommand(inputs.command) ?? 'command';
                     if (!runtime.terminal) {
                         runtime.activeToolsByCallId.set(callId, {
                             name: 'CodexBash',
-                            label: 'command',
-                            activity: 'Running command',
+                            label: command,
+                            activity: formatActivity('Running command', command),
                             activityKind: 'running-command'
                         });
                         emitAgentRunUpdate(agentId, {
                             status: 'running',
-                            statusText: 'Running command',
-                            activity: 'Running command',
+                            statusText: formatActivity('Running command', command),
+                            activity: formatActivity('Running command', command),
                             activityKind: 'running-command'
                         });
                     }
@@ -1969,6 +1611,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'exec_command_end') {
                 const callId = asString(msg.call_id ?? msg.callId);
                 if (callId) {
+                    const activeTool = runtime.activeToolsByCallId.get(callId);
                     runtime.activeToolsByCallId.delete(callId);
                     const output: Record<string, unknown> = { ...msg };
                     delete output.type;
@@ -1983,9 +1626,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         is_error: Boolean(output.error),
                         id: randomUUID()
                     });
+                    const label = activeTool?.label ?? normalizeCommand(output.command) ?? 'command';
                     const isError = Boolean(output.error);
                     updateActivity(
-                        isError ? 'Command failed' : 'Command finished',
+                        formatActivity(isError ? 'Command failed' : 'Command finished', label),
                         isError ? 'command-failed' : 'command-completed'
                     );
                 }
@@ -2228,15 +1872,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             turnId: string;
             timer: ReturnType<typeof setTimeout>;
         } | null = null;
-        let pendingThreadIdleFallback: {
-            threadId: string;
-            turnId: string | null;
-            timer: ReturnType<typeof setTimeout>;
-        } | null = null;
-        const pendingChildThreadIdleFallbacks = new Map<string, {
-            turnId: string;
-            timer: ReturnType<typeof setTimeout>;
-        }>();
         let activeSafetyBufferingRequest: {
             requestId: string;
             threadId: string;
@@ -2272,7 +1907,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             waiter();
         };
 
-        session.queue.setOnMessage(() => wakeLoop());
         appServerClient.setTransportAbandonedHandler(() => {
             // The old process is gone; its foreground turn cannot deliver more
             // notifications. Let the loop recover on a fresh app-server.
@@ -2866,205 +2500,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             permissionHandler.cancelUserInputRequest(request.requestId, reason);
         };
 
-        const clearThreadIdleFallback = () => {
-            if (!pendingThreadIdleFallback) {
-                return;
-            }
-            clearTimeout(pendingThreadIdleFallback.timer);
-            pendingThreadIdleFallback = null;
-        };
-
-        const clearChildThreadIdleFallback = (threadId: string) => {
-            const fallback = pendingChildThreadIdleFallbacks.get(threadId);
-            if (!fallback) {
-                return;
-            }
-            clearTimeout(fallback.timer);
-            pendingChildThreadIdleFallbacks.delete(threadId);
-        };
-
-        const clearAllChildThreadIdleFallbacks = () => {
-            for (const fallback of pendingChildThreadIdleFallbacks.values()) {
-                clearTimeout(fallback.timer);
-            }
-            pendingChildThreadIdleFallbacks.clear();
-        };
-
-        const resetCurrentTurnState = () => {
-            clearThreadIdleFallback();
-            clearDeferredThreadStatusFailure();
-            cancelSafetyBufferingRequest('Session reset');
-            turnInFlight = false;
-            allowAnonymousTerminalEvent = false;
-            this.currentTurnId = null;
-            permissionHandler.reset();
-            reasoningProcessor.abort();
-            diffProcessor.reset();
-            appServerEventConverter.reset();
-            session.onThinkingChange(false);
-            this.conversationHistory.setBusy(false);
-        };
-        this.resetActiveTurnState = () => {
-            resetCurrentTurnState();
-            clearAllChildThreadIdleFallbacks();
-        };
-        this.hasActiveTurnState = () => (
-            turnPreparationInFlight
-            || turnInFlight
-            || recoveryInFlight
-            || this.activeChildTurns.size > 0
-        );
-        this.hasInFlightParentTurn = () => turnInFlight;
-
-        const settleActiveTurnFromThreadIdle = (threadId: string, turnId: string | null) => {
-            if (
-                !turnInFlight
-                || !this.currentThreadId
-                || this.currentThreadId !== threadId
-                || this.currentTurnId !== turnId
-            ) {
-                return;
-            }
-
-            const finalizedTurnId = this.currentTurnId ?? turnId;
-            const interruptConfirmation = this.abortConfirmation;
-            const matchingInterruptKind = (
-                interruptConfirmation?.threadId === threadId
-                && interruptConfirmation.turnId === finalizedTurnId
-            ) ? interruptConfirmation.kind : null;
-            const preserveRecoveryForSafetyRetry = matchingInterruptKind === 'safety-retry';
-            if (finalizedTurnId) {
-                lastFinalizedTurnId = finalizedTurnId;
-            }
-            clearDismissedSafetyBufferingForTurn(threadId, finalizedTurnId);
-            if (!preserveRecoveryForSafetyRetry) {
-                activeMessage = null;
-                recoveryInFlight = false;
-            }
-            sameThreadRetryAttempt = 0;
-            sameThreadCompactAttempt = 0;
-            childAgentActivityInCurrentTurn = false;
-            mcpTitleByCallId.clear();
-            pendingAgentToolInputByCallId.clear();
-            resetCurrentTurnState();
-            this.finishAbortConfirmation(true, {
-                threadId,
-                turnId: finalizedTurnId
-            });
-            if (matchingInterruptKind === 'admin') {
-                consumeInterruptedTurnReadySuppression(finalizedTurnId);
-            }
-            wakeLoop();
-            if (
-                !matchingInterruptKind
-                || (
-                    matchingInterruptKind === 'user-abort'
-                    && interruptConfirmation?.result === true
-                    && this.abortConfirmation !== interruptConfirmation
-                )
-            ) {
-                scheduleReadyAfterTurn?.();
-            }
-            logger.debug(
-                `[Codex] Recovered active turn from authoritative thread idle status; ` +
-                `threadId=${threadId} turnId=${finalizedTurnId ?? 'unknown'}`
-            );
-        };
-
-        const scheduleThreadIdleFallback = (threadId: string) => {
-            if (!turnInFlight || this.currentThreadId !== threadId) {
-                return;
-            }
-
-            clearThreadIdleFallback();
-            const fallback = {
-                threadId,
-                turnId: this.currentTurnId,
-                timer: setTimeout(() => {
-                    void (async () => {
-                        if (pendingThreadIdleFallback !== fallback) {
-                            return;
-                        }
-                        try {
-                            const response = await appServerClient.readThread({
-                                threadId: fallback.threadId,
-                                includeTurns: false
-                            });
-                            if (
-                                pendingThreadIdleFallback !== fallback
-                                || response.thread.status?.type !== 'idle'
-                            ) {
-                                return;
-                            }
-                        } catch (error) {
-                            logger.debug(
-                                `[Codex] Could not verify idle state for thread ${fallback.threadId}; `
-                                + `keeping the active turn: ${errorMessage(error)}`
-                            );
-                            return;
-                        }
-                        pendingThreadIdleFallback = null;
-                        settleActiveTurnFromThreadIdle(fallback.threadId, fallback.turnId);
-                    })();
-                }, THREAD_IDLE_TERMINAL_GRACE_MS)
-            };
-            fallback.timer.unref?.();
-            pendingThreadIdleFallback = fallback;
-        };
-
-        const scheduleChildThreadIdleFallback = (threadId: string, turnId: string) => {
-            clearChildThreadIdleFallback(threadId);
-            const fallback = {
-                turnId,
-                timer: setTimeout(() => {
-                    void (async () => {
-                        if (
-                            pendingChildThreadIdleFallbacks.get(threadId) !== fallback
-                            || this.activeChildTurns.get(threadId) !== turnId
-                        ) {
-                            return;
-                        }
-                        try {
-                            const response = await appServerClient.readThread({
-                                threadId,
-                                includeTurns: false
-                            });
-                            if (
-                                pendingChildThreadIdleFallbacks.get(threadId) !== fallback
-                                || response.thread.status?.type !== 'idle'
-                            ) {
-                                return;
-                            }
-                        } catch (error) {
-                            logger.debug(
-                                `[Codex] Could not verify idle state for child thread ${threadId}; `
-                                + `keeping the active turn: ${errorMessage(error)}`
-                            );
-                            return;
-                        }
-                        pendingChildThreadIdleFallbacks.delete(threadId);
-                        this.activeChildTurns.delete(threadId);
-                        this.finishChildAbortConfirmation(threadId, turnId);
-                        handleChildCodexEvent(threadId, {
-                            type: 'task_complete',
-                            thread_id: threadId,
-                            turn_id: turnId,
-                            terminal_source: 'thread_idle'
-                        });
-                        if (!turnInFlight && this.activeChildTurns.size === 0) {
-                            scheduleReadyAfterTurn?.();
-                        }
-                        logger.debug(
-                            `[Codex] Recovered child turn from verified thread idle status; `
-                            + `threadId=${threadId} turnId=${turnId}`
-                        );
-                    })();
-                }, THREAD_IDLE_TERMINAL_GRACE_MS)
-            };
-            fallback.timer.unref?.();
-            pendingChildThreadIdleFallbacks.set(threadId, fallback);
-        };
-
         const safetyBufferingTurnKey = (threadId: string, turnId: string) => `${threadId}\u0000${turnId}`;
         const safetyBufferingKey = (threadId: string, turnId: string, fasterModel: string) => {
             return `${safetyBufferingTurnKey(threadId, turnId)}\u0000${fasterModel}`;
@@ -3106,23 +2541,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             clearReadyAfterTurnTimer?.();
             let interrupted = false;
             try {
-                const confirmation = this.beginAbortConfirmation(request.threadId, request.turnId, 'safety-retry');
-                const interruptResult = await this.interruptActiveTurns('safety buffering retry');
-                this.markInitialInterruptDispatchSettled(confirmation);
-                const unresolvedFailedChild = interruptResult.failedChildTurns.some(({ threadId, turnId }) => (
-                    confirmation.childTurns.get(threadId) === turnId
-                ));
-                if (
-                    unresolvedFailedChild
-                    || (interruptResult.parentFailed > 0 && !confirmation.parentConfirmed)
-                ) {
-                    this.finishAbortConfirmation(false);
-                    throw new Error('Codex rejected the turn interrupt request');
-                }
-                const confirmed = confirmation.result ?? await confirmation.promise;
-                if (!confirmed) {
-                    throw new Error('Codex did not confirm that the active turn stopped');
-                }
+                await appServerClient.interruptTurn({
+                    threadId: request.threadId,
+                    turnId: request.turnId
+                });
                 interrupted = true;
                 await appServerClient.rollbackThread({
                     threadId: request.threadId,
@@ -3158,7 +2580,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     this.currentTurnId = null;
                     activeMessage = null;
                 } else {
-                    this.finishAbortConfirmation(false);
                     consumeInterruptedTurnReadySuppression(request.turnId);
                 }
                 const message = `Failed to retry with a faster model: ${errorMessage(error)}`;
@@ -3279,27 +2700,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         let codexEventQueue: Promise<void> | null = null;
-        const enqueueCodexWork = (work: () => Promise<void> | void): void => {
-            const previousQueue = codexEventQueue ?? Promise.resolve();
-            const nextQueue = previousQueue
-                .then(work)
-                .catch((error) => logger.debug(
-                    '[Codex] Failed to handle app-server event:',
-                    error instanceof Error ? error.message : String(error)
-                ));
-            const queued = nextQueue.finally(() => {
-                if (codexEventQueue === queued) {
-                    codexEventQueue = null;
-                }
-            });
-            codexEventQueue = queued;
-        };
-        const drainCodexEventQueue = async (): Promise<void> => {
-            while (codexEventQueue) {
-                await codexEventQueue;
-            }
-        };
-        this.drainCodexEvents = drainCodexEventQueue;
 
         const handleCodexEvent = async (msg: Record<string, unknown>): Promise<void> => {
             const msgType = asString(msg.type);
@@ -3307,7 +2707,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const eventTurnId = asString(msg.turn_id ?? msg.turnId);
             const eventThreadId = asString(msg.thread_id ?? msg.threadId);
             const isTerminalEvent = msgType === 'task_complete' || msgType === 'turn_aborted' || msgType === 'task_failed';
-            let acceptedTerminalTurnId: string | null = null;
 
             if (msgType === 'thread_started') {
                 const threadId = asString(msg.thread_id ?? msg.threadId);
@@ -3337,18 +2736,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return;
             }
 
-            if (msgType === 'thread_idle') {
-                if (eventThreadId) {
-                    const childTurnId = this.activeChildTurns.get(eventThreadId);
-                    if (childTurnId) {
-                        scheduleChildThreadIdleFallback(eventThreadId, childTurnId);
-                    } else {
-                        scheduleThreadIdleFallback(eventThreadId);
-                    }
-                }
-                return;
-            }
-
             if (msgType === 'task_started') {
                 recordManualCompactStarted(eventThreadId ?? this.currentThreadId, eventTurnId);
             } else if (msgType === 'task_complete') {
@@ -3372,38 +2759,16 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     `type=${msgType}, eventThreadId=${eventThreadId}, activeThread=${this.currentThreadId}`
                 );
                 if (msgType === 'task_started') {
-                    clearChildThreadIdleFallback(eventThreadId);
                     if (eventTurnId) {
                         this.activeChildTurns.set(eventThreadId, eventTurnId);
-                        clearReadyAfterTurnTimer?.();
-                        this.trackLateChildTurnForAbort(eventThreadId, eventTurnId);
                     } else {
                         logger.debug(`[Codex] Child task_started missing turn id; threadId=${eventThreadId}`);
                     }
                     linkPendingAgentStartFromChildTask(eventThreadId);
                 } else if (isTerminalEvent) {
-                    const activeChildTurnId = this.activeChildTurns.get(eventThreadId);
-                    if (activeChildTurnId && eventTurnId !== activeChildTurnId) {
-                        logger.debug(
-                            `[Codex] Ignoring stale child terminal event; ` +
-                            `threadId=${eventThreadId} eventTurn=${eventTurnId ?? 'none'} activeTurn=${activeChildTurnId}`
-                        );
-                        return;
-                    }
-                    clearChildThreadIdleFallback(eventThreadId);
                     this.activeChildTurns.delete(eventThreadId);
-                    if (eventTurnId) {
-                        this.finishChildAbortConfirmation(eventThreadId, eventTurnId);
-                    }
                 }
                 handleChildCodexEvent(eventThreadId, msg);
-                if (
-                    isTerminalEvent
-                    && !turnInFlight
-                    && this.activeChildTurns.size === 0
-                ) {
-                    scheduleReadyAfterTurn?.();
-                }
                 return;
             }
 
@@ -3436,9 +2801,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return;
             }
 
-            // Codex can immediately replay the just-finalized completion while
-            // a same-thread retry is being prepared. Treat that replay as the
-            // authoritative recovery terminal instead of leaving HAPI busy.
             const isStaleSameThreadRecoveryTerminal = msgType === 'task_complete'
                 && turnInFlight
                 && (sameThreadRetryAttempt > 0 || sameThreadCompactAttempt > 0)
@@ -3460,18 +2822,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
 
             if (msgType === 'task_started') {
-                clearThreadIdleFallback();
-                emptyCompletionNoticeTracker.onTaskStarted();
                 const turnId = eventTurnId;
                 agentMessageStartedForTurn = false;
                 dismissedSafetyBufferingKeys.clear();
                 if (turnId) {
                     this.currentTurnId = turnId;
                     allowAnonymousTerminalEvent = false;
-                    const threadId = eventThreadId ?? this.currentThreadId;
-                    if (threadId && this.trackLateParentTurnForAbort(threadId, turnId)) {
-                        clearReadyAfterTurnTimer?.();
-                    }
                 } else if (!this.currentTurnId) {
                     allowAnonymousTerminalEvent = true;
                 }
@@ -3552,21 +2908,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
             const isThreadStatusFailure = msgType === 'task_failed' && msg.terminal_source === 'thread_status';
             const error = msgType === 'task_failed' ? asString(msg.error) : null;
-            const isContextOverflowFailure = msgType === 'task_failed'
-                && isContextCompactRetryableCodexError(error);
-            const isPolicyBlockedFailure = msgType === 'task_failed'
-                && isPolicyBlockedCodexFailure(msg, error);
             const explicitlyNonRetryable = msgType === 'task_failed'
-                && (isPolicyBlockedFailure || (msg.retryable === false && !isContextOverflowFailure));
-            const terminalConfirmsControlledInterrupt = isTerminalEvent && this.isAbortConfirmationPending(
-                eventThreadId ?? this.currentThreadId,
-                eventTurnId ?? this.currentTurnId
-            );
-            const terminalConfirmsUserAbort = terminalConfirmsControlledInterrupt && this.isAbortConfirmationPending(
-                eventThreadId ?? this.currentThreadId,
-                eventTurnId ?? this.currentTurnId,
-                'user-abort'
-            );
+                && (msg.retryable === false || isPolicyBlockedCodexFailure(msg, error));
 
             if (deferredThreadStatusFailure && isTerminalEvent && !isThreadStatusFailure) {
                 const sameThread = !eventThreadId || eventThreadId === deferredThreadStatusFailure.threadId;
@@ -3620,11 +2963,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     }
                     deferredThreadStatusFailure = null;
                     recoveryInFlight = false;
-                    enqueueCodexWork(() => handleCodexEvent({
+                    void handleCodexEvent({
                         ...event,
                         turn_id: turnId,
                         deferred_thread_status: true
-                    }));
+                    }).catch((deferredError) => {
+                        logger.debug(`[Codex] Failed to handle deferred thread status: ${errorMessage(deferredError)}`);
+                    });
                 }, THREAD_STATUS_FAILURE_GRACE_MS);
                 deferredThreadStatusFailure = { event, threadId, turnId, timer };
                 recoveryInFlight = true;
@@ -3632,14 +2977,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
 
             const shouldCompactAndRetrySameThread = msgType === 'task_failed'
-                && !terminalConfirmsControlledInterrupt
                 && !explicitlyNonRetryable
-                && isContextOverflowFailure
+                && isContextCompactRetryableCodexError(error)
                 && Boolean(activeMessage)
                 && Boolean(this.currentThreadId)
                 && sameThreadCompactAttempt < SAME_THREAD_MAX_COMPACT_RETRIES;
             const shouldRetrySameThread = msgType === 'task_failed'
-                && !terminalConfirmsControlledInterrupt
                 && !explicitlyNonRetryable
                 && !shouldCompactAndRetrySameThread
                 && isSameThreadRetryableCodexError(error)
@@ -3670,9 +3013,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     );
                     return;
                 }
-                clearThreadIdleFallback();
                 const finalizedTurnId = eventTurnId ?? this.currentTurnId;
-                acceptedTerminalTurnId = finalizedTurnId;
                 if (finalizedTurnId) {
                     lastFinalizedTurnId = finalizedTurnId;
                 }
@@ -3776,37 +3117,15 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     logger.debug('thinking completed');
                     session.onThinkingChange(false);
                 }
-                permissionHandler.reset();
-                reasoningProcessor.abort();
                 diffProcessor.reset();
                 appServerEventConverter.reset();
                 mcpTitleByCallId.clear();
                 pendingAgentToolInputByCallId.clear();
                 childAgentActivityInCurrentTurn = false;
                 wakeLoop();
-                this.finishAbortConfirmation(true, {
-                    threadId: eventThreadId ?? this.currentThreadId,
-                    turnId: acceptedTerminalTurnId
-                });
-                if (terminalConfirmsUserAbort) {
-                    activeMessage = null;
-                    sameThreadRetryAttempt = 0;
-                    sameThreadCompactAttempt = 0;
-                    recoveryInFlight = false;
-                    clearCompactRecovery(compactRecovery);
-                }
             }
 
-            const waitingForChildInterruptConfirmation = Boolean(
-                this.abortConfirmation?.parentConfirmed
-                && this.abortConfirmation.childTurns.size > 0
-            );
-            if (
-                isTerminalEvent
-                && !turnInFlight
-                && !suppressReadyForThisTerminalEvent
-                && !waitingForChildInterruptConfirmation
-            ) {
+            if (isTerminalEvent && !turnInFlight && !suppressReadyForThisTerminalEvent) {
                 if (msg.deferred_thread_status === true) {
                     emitReadyIfIdle({
                         pending: pending ?? (recoveryInFlight ? activeMessage : null),
@@ -3827,10 +3146,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 recoveryInFlight = false;
                 clearCompactRecovery(compactRecovery);
                 activeMessage = null;
-                const notice = emptyCompletionNoticeTracker.maybeCreateNotice(msg);
-                if (notice) {
-                    session.sendAgentMessage(notice);
-                }
             }
 
             if (msgType === 'agent_reasoning_section_break') {
@@ -3851,17 +3166,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (msgType === 'agent_message') {
                 const message = asString(msg.message);
                 if (message) {
-                    const phase = normalizeAgentMessagePhase(msg.phase);
-                    emptyCompletionNoticeTracker.onConvertedMessage({
-                        type: 'message',
-                        message,
-                        ...(phase ? { phase } : {}),
-                        id: randomUUID()
-                    });
                     session.sendAgentMessage({
                         type: 'message',
                         message,
-                        ...(phase ? { phase } : {}),
                         id: randomUUID()
                     });
                 }
@@ -3889,8 +3196,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         source: {
                             ingress: 'tool_result',
                             flavor: 'codex',
-                            toolCallId: asString(msg.call_id ?? msg.callId)
-                        }
+                            toolCallId: asString(msg.call_id ?? msg.callId),
+                        },
                     });
                 }
             }
@@ -3902,13 +3209,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     delete inputs.call_id;
                     delete inputs.callId;
 
-                    emptyCompletionNoticeTracker.onConvertedMessage({
-                        type: 'tool-call',
-                        name: 'CodexBash',
-                        callId,
-                        input: inputs,
-                        id: randomUUID()
-                    });
                     session.sendAgentMessage({
                         type: 'tool-call',
                         name: 'CodexBash',
@@ -3928,12 +3228,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     output.stdout = output.output;
                     delete output.output;
 
-                    emptyCompletionNoticeTracker.onConvertedMessage({
-                        type: 'tool-call-result',
-                        callId,
-                        output,
-                        id: randomUUID()
-                    });
                     session.sendAgentMessage({
                         type: 'tool-call-result',
                         callId: callId,
@@ -3946,18 +3240,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadId = eventThreadId ?? this.currentThreadId;
                 session.sendAgentMessage({
                     ...addCodexEventScope(msg, 'parent', threadId),
+                    flavor: 'codex',
                     model: asString(msg.model) ?? usageModel,
                     id: randomUUID()
                 });
-            }
-            if (msgType === 'account_status') {
-                const accountStatus = asRecord(msg.accountStatus);
-                if (accountStatus) {
-                    session.sendSessionEvent({
-                        type: 'account-status',
-                        accountStatus: accountStatus as AgentAccountStatus
-                    });
-                }
             }
             if (msgType === 'context_compacted') {
                 const threadId = eventThreadId ?? this.currentThreadId;
@@ -3970,24 +3256,22 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 });
             }
             if (msgType === 'plan_update') {
-                const explanation = asString(msg.explanation);
-                const planSnapshot = {
-                    plan: Array.isArray(msg.plan) ? msg.plan : [],
-                    ...(explanation ? { explanation } : {}),
-                    source: 'codex'
-                };
                 session.sendAgentMessage({
                     type: 'tool-call',
                     name: 'update_plan',
                     callId: 'codex-plan-state',
-                    input: planSnapshot,
+                    input: {
+                        plan: Array.isArray(msg.plan) ? msg.plan : [],
+                        source: 'codex'
+                    },
                     id: randomUUID()
                 });
                 session.sendAgentMessage({
                     type: 'tool-call-result',
                     callId: 'codex-plan-state',
                     output: {
-                        ...planSnapshot,
+                        plan: Array.isArray(msg.plan) ? msg.plan : [],
+                        source: 'codex',
                         status: 'updated'
                     },
                     id: randomUUID()
@@ -4217,32 +3501,41 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const events = appServerEventConverter.handleNotification(method, params);
             for (const event of events) {
                 const eventRecord = asRecord(event) ?? { type: undefined };
-                // Always enqueue, including the first event. Handling the first
-                // event directly permits a nested notification (for example a
-                // synchronous turn/completed emitted by turn/interrupt inside
-                // task_started) to overtake and then be undone by its caller.
-                enqueueCodexWork(() => handleCodexEvent(eventRecord));
+                const msgType = asString(eventRecord.type);
+                const hasGeneratedImagePath = msgType === 'generated_image' && Boolean(asString(eventRecord.saved_path ?? eventRecord.savedPath));
+
+                if (codexEventQueue || hasGeneratedImagePath) {
+                    const previousQueue = codexEventQueue ?? Promise.resolve();
+                    const nextQueue = previousQueue
+                        .then(() => handleCodexEvent(eventRecord))
+                        .catch((error) => logger.debug('[Codex] Failed to handle app-server event:', error instanceof Error ? error.message : String(error)));
+                    const queued = nextQueue.finally(() => {
+                        if (codexEventQueue === queued) {
+                            codexEventQueue = null;
+                        }
+                    });
+                    codexEventQueue = queued;
+                } else {
+                    void handleCodexEvent(eventRecord).catch((error) => {
+                        logger.debug('[Codex] Failed to handle app-server event:', error instanceof Error ? error.message : String(error));
+                    });
+                }
             }
         });
 
         appServerClient.setStderrHandler((text) => {
             const spawnAgentError = extractSpawnAgentStartErrorFromStderr(text);
-            if (!spawnAgentError) {
+            if (!spawnAgentError || pendingAgentStartCardIds.size === 0) {
                 return;
             }
-            enqueueCodexWork(() => {
-                if (pendingAgentStartCardIds.size === 0) {
-                    return;
-                }
-                logger.debug(
-                    `[Codex] Failing ${pendingAgentStartCardIds.size} pending spawn_agent start(s) ` +
-                    `from app-server stderr: ${spawnAgentError}`
-                );
-                failPendingAgentStartsForSpawnArgumentError(spawnAgentError);
-            });
+            logger.debug(
+                `[Codex] Failing ${pendingAgentStartCardIds.size} pending spawn_agent start(s) ` +
+                `from app-server stderr: ${spawnAgentError}`
+            );
+            failPendingAgentStartsForSpawnArgumentError(spawnAgentError);
         });
 
-        const { server: happyServer, mcpServers } = await buildHapiMcpBridge(session.client, {
+        const { server: happyServer, mcpServers: hapiMcpServers } = await buildHapiMcpBridge(session.client, {
             // In app-server/collab mode, child agents share this MCP bridge.
             // If the MCP handler writes the title directly, child title calls
             // leak into the parent HAPI session. Defer the side effect until
@@ -4251,6 +3544,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             emitTitleSummary: false
         });
         this.happyServer = happyServer;
+        let mcpServers: CodexMcpServersConfig = hapiMcpServers;
 
         this.setupAbortHandlers(session.client.rpcHandlerManager, {
             onAbort: () => this.handleAbort(),
@@ -4273,78 +3567,96 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             session.sendSessionEvent({ type: 'ready' });
         };
 
-        const initializeAppServer = async () => {
-            await appServerClient.connect();
-            await appServerClient.initialize({
-                clientInfo: {
-                    name: 'hapi-codex-client',
-                    version: '1.0.0'
-                },
-                capabilities: {
-                    experimentalApi: true
-                }
-            });
-        };
-
-        const resumeAppServerThread = async (
-            params: Parameters<CodexAppServerClient['resumeThread']>[0],
-            options?: Parameters<CodexAppServerClient['resumeThread']>[1]
-        ) => {
-            try {
-                return await appServerClient.resumeThread(params, options);
-            } catch (error) {
-                if (!isCodexArchivedThreadError(error)) throw error;
-                logger.debug(`[Codex] Unarchiving fork handoff thread ${params.threadId}`);
-                await appServerClient.unarchiveThread({ threadId: params.threadId });
-                return await appServerClient.resumeThread(params, options);
+        await appServerClient.connect();
+        await appServerClient.initialize({
+            clientInfo: {
+                name: 'hapi-codex-client',
+                version: '1.0.0'
+            },
+            capabilities: {
+                experimentalApi: true
             }
-        };
+        });
 
-        await initializeAppServer();
+        let contextManagementConfig: CodexContextManagementConfig | undefined;
+        try {
+            const effectiveConfig = (await appServerClient.readConfig({
+                cwd: session.path,
+                includeLayers: false
+            })).config;
+            try {
+                const userMcpServers = extractCodexMcpServers(effectiveConfig);
+                const preparedMcpServers = await prepareCodexMcpServers(userMcpServers);
+                this.mcpProxyCleanup = preparedMcpServers.cleanup;
+                mcpServers = mergeCodexMcpServers(preparedMcpServers.servers, hapiMcpServers);
+                if (Object.keys(userMcpServers).length > 0) {
+                    logger.debug(`[Codex] Loaded ${Object.keys(userMcpServers).length} user MCP server(s)`);
+                }
+                if (preparedMcpServers.proxiedServerNames.length > 0) {
+                    logger.debug(
+                        `[Codex] Added stdio compatibility proxy for ${preparedMcpServers.proxiedServerNames.length} Windows MCP server(s)`
+                    );
+                }
+            } catch (error) {
+                logger.warn(`[Codex] Failed to merge user MCP servers; using HAPI bridge only: ${errorMessage(error)}`);
+            }
+            const modelContextWindow = effectiveConfig.model_context_window;
+            const modelAutoCompactTokenLimit = effectiveConfig.model_auto_compact_token_limit;
+            contextManagementConfig = {
+                ...(typeof modelContextWindow === 'number' && Number.isInteger(modelContextWindow) && modelContextWindow > 0
+                    ? { modelContextWindow }
+                    : {}),
+                ...(typeof modelAutoCompactTokenLimit === 'number'
+                    && Number.isInteger(modelAutoCompactTokenLimit)
+                    && modelAutoCompactTokenLimit > 0
+                    ? { modelAutoCompactTokenLimit }
+                    : {})
+            };
+            if (Object.keys(contextManagementConfig).length === 0) {
+                contextManagementConfig = undefined;
+            }
+        } catch (error) {
+            logger.debug('[Codex] Failed to read effective context management config; using app-server defaults', error);
+        }
 
         const publishConversationHistoryCapabilities = async () => {
-            const conversationHistory = this.conversationHistory.getCapabilitiesForMetadata()?.conversationHistory;
+            const conversationHistory = this.conversationHistory.getCapabilitiesForMetadata()?.conversationHistory
             try {
                 session.client.updateMetadata((metadata) => {
-                    const capabilities = { ...metadata?.capabilities };
-                    delete capabilities.conversationHistory;
+                    const capabilities = { ...metadata?.capabilities }
+                    delete capabilities.conversationHistory
                     if (conversationHistory) {
-                        capabilities.conversationHistory = conversationHistory;
+                        capabilities.conversationHistory = conversationHistory
                     }
                     return {
                         ...metadata,
                         path: metadata?.path ?? session.path,
                         host: metadata?.host ?? 'unknown',
                         capabilities
-                    };
-                });
+                    }
+                })
             } catch {
-                // Best effort: transient hub disconnects must not stop Codex.
+                // best-effort; tests and transient hub disconnects must not crash the loop
             }
-        };
-        this.conversationHistory.setPublishCapabilities(publishConversationHistoryCapabilities);
+        }
+        this.conversationHistory.setPublishCapabilities(publishConversationHistoryCapabilities)
         this.conversationHistory.restoreTurns(
             typeof session.client.getMetadata === 'function'
                 ? session.client.getMetadata()?.conversationHistoryTurns
                 : undefined
-        );
+        )
         session.client.rpcHandlerManager.registerHandler(RPC_METHODS.ForkConversation, async (payload: unknown) => {
-            const messageLocalId = payload && typeof payload === 'object'
-                && typeof (payload as { messageLocalId?: unknown }).messageLocalId === 'string'
+            const messageLocalId = payload && typeof payload === 'object' && typeof (payload as { messageLocalId?: unknown }).messageLocalId === 'string'
                 ? (payload as { messageLocalId: string }).messageLocalId
-                : undefined;
-            return await this.conversationHistory.fork(messageLocalId);
-        });
+                : undefined
+            return await this.conversationHistory.fork(messageLocalId)
+        })
         session.client.rpcHandlerManager.registerHandler(RPC_METHODS.RewindConversation, async (payload: unknown) => {
-            if (!payload || typeof payload !== 'object'
-                || typeof (payload as { messageLocalId?: unknown }).messageLocalId !== 'string') {
-                throw new Error('messageLocalId is required');
+            if (!payload || typeof payload !== 'object' || typeof (payload as { messageLocalId?: unknown }).messageLocalId !== 'string') {
+                throw new Error('messageLocalId is required')
             }
-            return await this.conversationHistory.rewind(
-                (payload as { messageLocalId: string }).messageLocalId
-            );
-        });
-
+            return await this.conversationHistory.rewind((payload as { messageLocalId: string }).messageLocalId)
+        })
         try {
             await refreshNativeSkills(false);
         } catch (error) {
@@ -4373,112 +3685,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         let hasThread = false;
         let pending: QueuedMessage | null = null;
         let suppressReadyForAdminCommand = false;
-        let appliedContextProfile: string | null = null;
-
-        const contextProfileForModel = (model: string | null | undefined): string => {
-            return JSON.stringify(buildHapiCodexModelContextConfig(model));
-        };
-
-        const markAppliedContextProfile = (mode: EnhancedMode) => {
-            appliedContextProfile = contextProfileForModel(mode.model);
-        };
-
-        const ensureContextProfile = async (mode: EnhancedMode): Promise<void> => {
-            if (!hasThread || !this.currentThreadId) {
-                return;
-            }
-            const desiredProfile = contextProfileForModel(mode.model);
-            if (appliedContextProfile === null) {
-                // Every thread created/resumed by this launcher receives the
-                // current context config. This guard only covers legacy paths
-                // that attached a thread before profile tracking existed.
-                appliedContextProfile = desiredProfile;
-                return;
-            }
-            if (appliedContextProfile === desiredProfile) {
-                return;
-            }
-
-            const threadId = this.currentThreadId;
-            const threadParams = buildThreadStartParams({
-                cwd: session.path,
-                mode,
-                mcpServers,
-                cliOverrides: session.codexCliOverrides
-            });
-
-            // app-server 0.150 accepts arbitrary `config` only on thread
-            // lifecycle methods. turn/start ignores it, and thread/resume on
-            // an already-loaded thread merely rejoins without rebuilding its
-            // context settings. Restart the idle transport, then resume the
-            // same durable thread with the requested context profile.
-            logger.debug(
-                `[Codex] Restarting app-server to apply context profile; ` +
-                `threadId=${threadId} model=${mode.model ?? 'auto'}`
-            );
-            await appServerClient.disconnect();
-            await initializeAppServer();
-            const resumeResponse = await resumeAppServerThread({
-                threadId,
-                ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
-                    ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
-                    : {}),
-                ...threadParams
-            }, {
-                signal: this.abortController.signal
-            });
-            const resumeRecord = asRecord(resumeResponse);
-            const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
-            const resumedThreadId = asString(resumeThread?.id) ?? threadId;
-            if (resumedThreadId !== threadId) {
-                throw new Error(
-                    `Codex resumed unexpected thread ${resumedThreadId} while applying context profile to ${threadId}`
-                );
-            }
-            applyResolvedModel(resumeRecord?.model, mode.model);
-            this.currentThreadId = threadId;
-            this.conversationHistory.setThreadId(threadId);
-            session.onSessionFound(threadId);
-            appliedContextProfile = desiredProfile;
-        };
-
-        this.cancelActiveRecovery = () => {
-            if (!recoveryInFlight || turnInFlight) {
-                return false;
-            }
-            clearCompactRecovery(compactRecovery);
-            clearDeferredThreadStatusFailure();
-            recoveryInFlight = false;
-            activeMessage = null;
-            this.abortController.abort();
-            this.abortController = new AbortController();
-            permissionHandler.reset();
-            reasoningProcessor.abort();
-            diffProcessor.reset();
-            appServerEventConverter.reset();
-            session.onThinkingChange(false);
-            wakeLoop();
-            return true;
-        };
-        this.cancelTurnPreparation = () => {
-            // Once turn/start has been dispatched, aborting only the local
-            // JSON-RPC wait can orphan a real server-side turn. Keep waiting
-            // for its authoritative id so handleAbort can interrupt that turn.
-            if (!turnPreparationInFlight || turnInFlight) {
-                return false;
-            }
-            turnPreparationInFlight = false;
-            activeMessage = null;
-            this.abortController.abort();
-            this.abortController = new AbortController();
-            permissionHandler.reset();
-            reasoningProcessor.abort();
-            diffProcessor.reset();
-            appServerEventConverter.reset();
-            session.onThinkingChange(false);
-            wakeLoop();
-            return true;
-        };
 
         clearReadyAfterTurnTimer = () => {
             if (!readyAfterTurnTimer) {
@@ -4495,14 +3701,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             readyAfterTurnTimer = setTimeout(() => {
                 readyAfterTurnTimer = null;
-                if (
-                    suppressReadyForAdminCommand
-                    || turnPreparationInFlight
-                    || turnInFlight
-                    || recoveryInFlight
-                    || this.activeChildTurns.size > 0
-                    || this.abortConfirmation?.result === null
-                ) {
+                if (suppressReadyForAdminCommand) {
                     return;
                 }
                 emitReadyIfIdle({
@@ -4514,7 +3713,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }, 120);
             readyAfterTurnTimer.unref?.();
         };
-        this.onUserAbortConfirmed = () => scheduleReadyAfterTurn?.();
 
         const sendVisibleStatus = (message: string) => {
             messageBuffer.addMessage(message, 'status');
@@ -4536,51 +3734,22 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             });
         };
 
-        const interruptActiveTurn = async (): Promise<boolean> => {
-            await drainCodexEventQueue();
-            const interruptedTurnId = this.currentTurnId;
-            const interruptedThreadId = this.currentThreadId;
-            const hasChildTurns = this.activeChildTurns.size > 0;
-            if (!turnInFlight && !hasChildTurns) {
-                return true;
-            }
-            if (turnInFlight && (!interruptedThreadId || !interruptedTurnId)) {
-                sendVisibleStatus('Command not applied because Codex has not reported the active turn id yet');
-                return false;
-            }
+        const resetCurrentTurnState = () => {
+            clearDeferredThreadStatusFailure();
+            cancelSafetyBufferingRequest('Session reset');
+            setTurnInFlight(false);
+            allowAnonymousTerminalEvent = false;
+            this.currentTurnId = null;
+            permissionHandler.reset();
+            reasoningProcessor.abort();
+            diffProcessor.reset();
+            appServerEventConverter.reset();
+            session.onThinkingChange(false);
+        };
 
-            suppressReadyForInterruptedTurn(interruptedTurnId);
-            const confirmation = this.beginAbortConfirmation(
-                turnInFlight ? interruptedThreadId : null,
-                turnInFlight ? interruptedTurnId : null,
-                'admin'
-            );
-            const result = await this.interruptActiveTurns('slash command');
-            this.markInitialInterruptDispatchSettled(confirmation);
-            const unresolvedFailedChild = result.failedChildTurns.some(({ threadId, turnId }) => (
-                confirmation.childTurns.get(threadId) === turnId
-            ));
-            if (
-                unresolvedFailedChild
-                || (result.parentFailed > 0 && !confirmation.parentConfirmed)
-                || result.attempted === 0
-            ) {
-                // The turn is still authoritative, so its eventual terminal
-                // event must emit the normal ready signal. Suppression only
-                // belongs to a successfully interrupted admin command.
-                this.finishAbortConfirmation(false);
-                consumeInterruptedTurnReadySuppression(interruptedTurnId);
-                sendVisibleStatus('Command not applied because the active Codex turn could not be stopped');
-                return false;
-            }
-
-            const confirmed = confirmation.result ?? await confirmation.promise;
-            if (!confirmed) {
-                consumeInterruptedTurnReadySuppression(interruptedTurnId);
-                sendVisibleStatus('Command not applied because Codex did not confirm the active turn stopped');
-                return false;
-            }
-            return true;
+        const interruptActiveTurn = async () => {
+            suppressReadyForInterruptedTurn(this.currentTurnId);
+            await this.interruptActiveTurns('slash command');
         };
 
         const resumeExistingThreadForCompact = async (mode: EnhancedMode): Promise<string | null> => {
@@ -4600,15 +3769,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 cwd: session.path,
                 mode,
                 mcpServers,
-                cliOverrides: session.codexCliOverrides
+                cliOverrides: session.codexCliOverrides,
+                contextManagementConfig
             });
 
             try {
-                const resumeResponse = await resumeAppServerThread({
+                const resumeResponse = await appServerClient.resumeThread({
                     threadId: resumeCandidate,
-                    ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
-                        ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
-                        : {}),
                     ...threadParams
                 }, {
                     signal: this.abortController.signal
@@ -4616,13 +3783,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const resumeRecord = asRecord(resumeResponse);
                 const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                 const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                applyResolvedModel(resumeRecord?.model, mode.model);
+                applyResolvedModel(resumeRecord?.model);
                 this.currentThreadId = threadId;
                 this.conversationHistory.setThreadId(threadId);
                 void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
-                markAppliedContextProfile(mode);
                 logger.debug(`[Codex] Resumed app-server thread ${threadId} for /compact`);
                 return threadId;
             } catch (error) {
@@ -4669,14 +3835,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     cwd: session.path,
                     mode,
                     mcpServers,
-                    cliOverrides: session.codexCliOverrides
+                    cliOverrides: session.codexCliOverrides,
+                    contextManagementConfig
                 });
                 try {
-                    const resumeResponse = await resumeAppServerThread({
+                    const resumeResponse = await appServerClient.resumeThread({
                         threadId: resumeCandidate,
-                        ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
-                            ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
-                            : {}),
                         ...threadParams
                     }, {
                         signal: this.abortController.signal
@@ -4684,13 +3848,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     const resumeRecord = asRecord(resumeResponse);
                     const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                     const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                    applyResolvedModel(resumeRecord?.model, mode.model);
+                    applyResolvedModel(resumeRecord?.model);
                     this.currentThreadId = threadId;
                     this.conversationHistory.setThreadId(threadId);
                     void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
-                    markAppliedContextProfile(mode);
                     return threadId;
                 } catch (error) {
                     logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate} for /goal`, error);
@@ -4704,7 +3867,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     cwd: session.path,
                     mode,
                     mcpServers,
-                    cliOverrides: session.codexCliOverrides
+                    cliOverrides: session.codexCliOverrides,
+                    contextManagementConfig
                 });
                 const threadResponse = await appServerClient.startThread({
                     ...threadParams,
@@ -4715,7 +3879,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadRecord = asRecord(threadResponse);
                 const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                 const threadId = asString(thread?.id);
-                applyResolvedModel(threadRecord?.model, mode.model);
+                applyResolvedModel(threadRecord?.model);
                 if (!threadId) {
                     throw new Error('app-server thread/start did not return thread.id');
                 }
@@ -4724,7 +3888,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 void this.conversationHistory.probeCapabilities().catch(() => {});
                 session.onSessionFound(threadId);
                 hasThread = true;
-                markAppliedContextProfile(mode);
                 return threadId;
             }
 
@@ -4757,7 +3920,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return false;
             }
 
-            if (!await interruptActiveTurn()) return true;
+            await interruptActiveTurn();
             resetCurrentTurnState();
 
             if (command.error) {
@@ -4834,14 +3997,14 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
 
             if (specialCommand.type === 'invalid') {
-                if (!await interruptActiveTurn()) return true;
+                await interruptActiveTurn();
                 resetCurrentTurnState();
                 sendVisibleStatus(specialCommand.message);
                 return true;
             }
 
             if (specialCommand.type === 'clear') {
-                if (!await interruptActiveTurn()) return true;
+                await interruptActiveTurn();
                 resetCurrentTurnState();
                 this.currentThreadId = null;
                 invalidThreadId = null;
@@ -4851,14 +4014,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return true;
             }
 
-            if (compactRecovery) {
-                sendVisibleStatus(
-                    'Compaction already in progress; the failed request will retry automatically when it finishes'
-                );
-                return true;
-            }
-
-            if (!await interruptActiveTurn()) return true;
+            await interruptActiveTurn();
             resetCurrentTurnState();
             const threadId = await resumeExistingThreadForCompact(message.mode);
             if (!threadId) {
@@ -4889,7 +4045,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         while (!this.shouldExit) {
-            await drainCodexEventQueue();
             logActiveHandles('loop-top');
             if (!appServerClient.isConnected() || !appServerClient.isInitialized()) {
                 await ensureAppServerInitialized();
@@ -4897,13 +4052,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (pendingSteerReconciliations.size > 0) {
                 await runSteerReconciliation();
             }
-            const pendingInterruptConfirmation = this.abortConfirmation;
-            if (pendingInterruptConfirmation?.result === null) {
-                await pendingInterruptConfirmation.promise;
-                continue;
-            }
-            const queuedRecoveryCommand = parseCodexSpecialCommand(session.queue.peekMessage() ?? '');
-            if (!pending && recoveryInFlight && queuedRecoveryCommand.type !== 'compact') {
+            if (!pending && recoveryInFlight) {
                 await waitForTurnOrRecovery(this.abortController.signal);
                 if (this.abortController.signal.aborted && !this.shouldExit) {
                     logger.debug('[codex]: Internal wait aborted while recovery was active; continuing');
@@ -4945,13 +4094,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 break;
             }
 
-            const interruptConfirmationAfterQueueWait = this.abortConfirmation;
-            if (interruptConfirmationAfterQueueWait?.result === null) {
-                pending = message;
-                await interruptConfirmationAfterQueueWait.promise;
-                continue;
-            }
-
             if (!isRetryMessage) {
                 messageBuffer.addMessage(message.message, 'user');
             }
@@ -4972,14 +4114,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     continue;
                 }
 
-                turnPreparationInFlight = true;
-
                 if (!hasThread) {
                     const threadParams = buildThreadStartParams({
                         cwd: session.path,
                         mode: message.mode,
                         mcpServers,
-                        cliOverrides: session.codexCliOverrides
+                        cliOverrides: session.codexCliOverrides,
+                        contextManagementConfig
                     });
 
                     const resumeCandidate = session.sessionId ?? null;
@@ -4998,11 +4139,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                                 }, {
                                     signal: this.abortController.signal
                                 })
-                                : await resumeAppServerThread({
+                                : await appServerClient.resumeThread({
                                     threadId: resumeCandidate,
-                                    ...(process.env.HAPI_CODEX_RESUME_PATH?.trim()
-                                        ? { path: process.env.HAPI_CODEX_RESUME_PATH.trim() }
-                                        : {}),
                                     ...threadParams
                                 }, {
                                     signal: this.abortController.signal
@@ -5010,29 +4148,18 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             const responseRecord = asRecord(response);
                             const responseThread = responseRecord ? asRecord(responseRecord.thread) : null;
                             threadId = asString(responseThread?.id) ?? resumeCandidate;
-                            applyResolvedModel(responseRecord?.model, message.mode.model);
+                            applyResolvedModel(responseRecord?.model);
                             logger.debug(shouldForkImportedSource
                                 ? `[Codex] Forked imported app-server thread ${resumeCandidate} -> ${threadId}`
                                 : `[Codex] Resumed app-server thread ${threadId}`);
                         } catch (error) {
-                            if (error instanceof Error && error.name === 'AbortError') {
-                                throw error;
-                            }
                             const resumeError = formatCodexResumeError(error);
-                            if (shouldStartFreshThreadAfterResumeFailure(error)) {
-                                logger.warn(`[Codex] Native thread ${resumeCandidate} cannot be resumed by this Codex runtime; starting a fresh thread in the same HAPI session`);
-                                const recoveryMessage = `旧 Codex 会话 ${resumeCandidate} 不支持当前运行时的历史恢复，已自动创建新的 Codex 会话继续。`;
-                                messageBuffer.addMessage(recoveryMessage, 'status');
-                                session.sendSessionEvent({ type: 'message', message: recoveryMessage });
-                                threadId = null;
-                            } else {
-                                logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate}; preserving old conversation boundary: ${resumeError}`, error);
-                                const failureMessage = `Task failed: Codex conversation ${resumeCandidate} could not be resumed; no new conversation was created. Reason: ${resumeError}`;
-                                messageBuffer.addMessage(failureMessage, 'status');
-                                session.sendSessionEvent({ type: 'message', message: failureMessage });
-                                pending = null;
-                                continue;
-                            }
+                            logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate}; preserving old conversation boundary: ${resumeError}`, error);
+                            const failureMessage = `Task failed: Codex conversation ${resumeCandidate} could not be resumed; no new conversation was created. Reason: ${resumeError}`;
+                            messageBuffer.addMessage(failureMessage, 'status');
+                            session.sendSessionEvent({ type: 'message', message: failureMessage });
+                            pending = null;
+                            continue;
                         }
                     }
 
@@ -5046,7 +4173,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         const threadRecord = asRecord(threadResponse);
                         const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                         threadId = asString(thread?.id);
-                        applyResolvedModel(threadRecord?.model, message.mode.model);
+                        applyResolvedModel(threadRecord?.model);
                         if (!threadId) {
                             throw new Error('app-server thread/start did not return thread.id');
                         }
@@ -5061,7 +4188,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     void this.conversationHistory.probeCapabilities().catch(() => {});
                     session.onSessionFound(threadId);
                     hasThread = true;
-                    markAppliedContextProfile(message.mode);
                 } else {
                     if (!this.currentThreadId) {
                         logger.debug('[Codex] Missing thread id; restarting app-server thread');
@@ -5071,11 +4197,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     }
                 }
 
+                setTurnInFlight(true);
+                this.conversationHistory.setBusy(true);
+                allowAnonymousTerminalEvent = false;
                 const mode = {
                     ...message.mode,
                     model: session.getModel() ?? message.mode.model
                 };
-                await ensureContextProfile(mode);
                 usageModel = typeof mode.model === 'string' && mode.model.trim()
                     ? mode.model.trim()
                     : null;
@@ -5084,23 +4212,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const clientUserMessageId = message.items
                     ?.map((item) => item.localId)
                     .find((id): id is string => typeof id === 'string' && id.length > 0);
-                const rememberConversationHistoryTurn = (turnId: string) => {
-                    if (!clientUserMessageId) return;
-                    this.conversationHistory.rememberLocalIdTurn(clientUserMessageId, turnId);
-                    session.client.updateMetadata((metadata) => ({
-                        ...metadata,
-                        path: metadata?.path ?? session.path,
-                        host: metadata?.host ?? 'unknown',
-                        conversationHistoryPoints: {
-                            ...metadata?.conversationHistoryPoints,
-                            [clientUserMessageId]: true as const
-                        },
-                        conversationHistoryTurns: {
-                            ...metadata?.conversationHistoryTurns,
-                            [clientUserMessageId]: turnId
-                        }
-                    }));
-                };
                 const buildParams = (suppressCollaborationMode: boolean) => buildTurnStartParams({
                     threadId: this.currentThreadId!,
                     message: message.message,
@@ -5113,74 +4224,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         ? { suppressCollaborationMode: true }
                         : undefined
                 });
-
-                // Messages that arrive while Codex is already working are
-                // steering input for the active turn, not a second turn. Using
-                // `turn/start` here makes app-server inject the text into the
-                // running turn but return a new provisional turn id. HAPI then
-                // replaces `currentTurnId` with that id and rejects the real
-                // terminal event, leaving the session permanently "thinking".
-                //
-                // `turn/steer` keeps the original turn id authoritative and
-                // adds an expected-turn precondition so a completion race
-                // cannot steer the wrong turn.
-                if (turnInFlight) {
-                    const expectedTurnId = this.currentTurnId;
-                    if (!expectedTurnId) {
-                        pending = message;
-                        await waitForTurnOrRecovery(this.abortController.signal);
-                        continue;
-                    }
-
-                    if (this.isAbortConfirmationPending(this.currentThreadId, expectedTurnId)) {
-                        pending = message;
-                        await waitForTurnOrRecovery(this.abortController.signal);
-                        continue;
-                    }
-
-                    const steerParams = buildParams(true);
-                    try {
-                        const steerRequest = await appServerClient.steerTurn({
-                            threadId: this.currentThreadId,
-                            expectedTurnId,
-                            input: steerParams.input
-                        }, {
-                            signal: this.abortController.signal
-                        });
-                        await steerRequest.dispatched;
-                        const steerResponse = await steerRequest.completed;
-                        if (steerResponse.turnId !== expectedTurnId) {
-                            logger.debug(
-                                `[Codex] turn/steer returned a different turn id; ` +
-                                `expected=${expectedTurnId}, returned=${steerResponse.turnId}`
-                            );
-                        }
-                        rememberConversationHistoryTurn(expectedTurnId);
-                    } catch (error) {
-                        if (error instanceof Error && error.name === 'AbortError') {
-                            throw error;
-                        }
-                        // The active turn may have completed between queue
-                        // collection and the expected-turn check. Preserve the
-                        // message and send it as a normal turn once idle.
-                        logger.debug(
-                            `[Codex] Could not steer active turn ${expectedTurnId}; ` +
-                            `queueing the message for the next turn: ${errorMessage(error)}`
-                        );
-                        pending = message;
-                        if (turnInFlight) {
-                            await waitForTurnOrRecovery(this.abortController.signal);
-                        }
-                    }
-                    continue;
-                }
-
-                turnInFlight = true;
-                this.conversationHistory.setBusy(true);
-                allowAnonymousTerminalEvent = false;
-                if (!session.thinking) {
-                    session.onThinkingChange(true);
-                }
                 if (
                     mode.collaborationMode === 'plan'
                     && !supportsTurnCollaborationMode
@@ -5205,19 +4248,27 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         throw error;
                     }
                 }
-                await drainCodexEventQueue();
                 const turnRecord = asRecord(turnResponse);
                 const turn = turnRecord ? asRecord(turnRecord.turn) : null;
                 const turnId = asString(turn?.id);
                 if (turnInFlight) {
                     if (turnId) {
                         this.currentTurnId = turnId;
-                        rememberConversationHistoryTurn(turnId);
-                        if (
-                            this.currentThreadId
-                            && this.trackLateParentTurnForAbort(this.currentThreadId, turnId)
-                        ) {
-                            clearReadyAfterTurnTimer?.();
+                        if (clientUserMessageId) {
+                            this.conversationHistory.rememberLocalIdTurn(clientUserMessageId, turnId);
+                            session.client.updateMetadata((metadata) => ({
+                                ...metadata,
+                                path: metadata?.path ?? session.path,
+                                host: metadata?.host ?? 'unknown',
+                                conversationHistoryPoints: {
+                                    ...metadata?.conversationHistoryPoints,
+                                    [clientUserMessageId]: true as const
+                                },
+                                conversationHistoryTurns: {
+                                    ...metadata?.conversationHistoryTurns,
+                                    [clientUserMessageId]: turnId
+                                }
+                            }))
                         }
                     } else if (!this.currentTurnId) {
                         allowAnonymousTerminalEvent = true;
@@ -5246,7 +4297,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     hasThread = false;
                 }
             } finally {
-                turnPreparationInFlight = false;
                 if (!turnInFlight) {
                     permissionHandler.reset();
                     reasoningProcessor.abort();
@@ -5275,10 +4325,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
         }
 
-        await drainCodexEventQueue();
         failPendingAgentStarts('spawn_agent did not return an agent id before the Codex session ended');
-        clearThreadIdleFallback();
-        clearAllChildThreadIdleFallbacks();
         clearDeferredThreadStatusFailure();
         cancelSafetyBufferingRequest('Session ended');
         cancelAllPendingThrottledAgentRunUpdates();
@@ -5294,17 +4341,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         logger.debug('[codex-remote]: cleanup start');
-        this.finishAbortConfirmation(false);
-        this.resetActiveTurnState?.();
-        this.resetActiveTurnState = null;
-        this.hasActiveTurnState = null;
-        this.hasInFlightParentTurn = null;
-        this.cancelActiveRecovery = null;
-        this.cancelTurnPreparation = null;
-        this.drainCodexEvents = null;
-        this.hasUndiscoveredChildWork = null;
-        this.onUserAbortConfirmed = null;
-        this.session.queue.setOnMessage(null);
         this.appServerClient.setTransportAbandonedHandler(null);
         this.appServerClient.setStderrHandler(null);
         try {
@@ -5318,6 +4354,15 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         if (this.happyServer) {
             this.happyServer.stop();
             this.happyServer = null;
+        }
+
+        if (this.mcpProxyCleanup) {
+            try {
+                await this.mcpProxyCleanup();
+            } catch (error) {
+                logger.debug('[codex-remote]: Error cleaning MCP proxy specs', error);
+            }
+            this.mcpProxyCleanup = null;
         }
 
         this.permissionHandler?.reset();

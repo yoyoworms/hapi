@@ -13,7 +13,6 @@ import {
     MARKDOWN_CLASSNAME,
     defaultComponents,
     denyOnlyTransform,
-    preprocessMarkdownText,
     UriConfirmProvider,
 } from '@/components/assistant-ui/markdown-text'
 import { SyntaxHighlighter } from '@/components/assistant-ui/shiki-highlighter'
@@ -87,7 +86,7 @@ function StandaloneMarkdownContent(props: MarkdownRendererProps) {
                     components={components}
                     urlTransform={denyOnlyTransform}
                 >
-                    {preprocessMarkdownText(props.content)}
+                    {props.content}
                 </ReactMarkdown>
             </div>
         </UriConfirmProvider>
@@ -103,7 +102,6 @@ function MarkdownContent(props: MarkdownRendererProps) {
         <UriConfirmProvider>
             <TextMessagePartProvider text={props.content}>
                 <MarkdownTextPrimitive
-                    preprocess={preprocessMarkdownText}
                     remarkPlugins={props.preserveSingleLineBreaks ? MARKDOWN_PLUGINS_WITH_BREAKS : MARKDOWN_PLUGINS}
                     rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
                     components={mergedComponents}

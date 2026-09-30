@@ -7,7 +7,6 @@ import { encodeBase64 } from '@/lib/utils'
 
 const mocks = vi.hoisted(() => ({
     navigate: vi.fn(),
-    appContext: null as null | { sharedMode: boolean },
 }))
 
 vi.mock('@tanstack/react-router', () => ({
@@ -16,10 +15,6 @@ vi.mock('@tanstack/react-router', () => ({
 
 vi.mock('@/components/AssistantChat/context', () => ({
     useOptionalHappyChatContext: () => ({ sessionId: 'session-1' }),
-}))
-
-vi.mock('@/lib/app-context', () => ({
-    useOptionalAppContext: () => mocks.appContext,
 }))
 
 const AnchorComponent = (defaultComponents as Record<string, unknown>).a as React.ComponentType<
@@ -40,8 +35,6 @@ function renderFileAnchor(filePath: string) {
 
 beforeEach(() => {
     mocks.navigate.mockReset()
-    mocks.appContext = null
-    window.history.replaceState({}, '', '/')
 })
 
 describe('chat file anchors', () => {
@@ -66,17 +59,5 @@ describe('chat file anchors', () => {
             },
             resetScroll: false,
         })
-    })
-
-    it('keeps the share capability in copyable and new-tab file links', () => {
-        mocks.appContext = { sharedMode: true }
-        window.history.replaceState({}, '', '/sessions/session-1?share=share-token')
-        const filePath = 'docs/guide.md'
-
-        renderFileAnchor(filePath)
-
-        const link = screen.getByRole('link', { name: filePath })
-        const href = new URL(link.getAttribute('href')!, 'https://hapi.example')
-        expect(href.searchParams.get('share')).toBe('share-token')
     })
 })

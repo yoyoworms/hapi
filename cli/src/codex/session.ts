@@ -19,7 +19,6 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
     readonly startingMode: 'local' | 'remote';
     readonly sourceSessionId?: string;
     localLaunchFailure: LocalLaunchFailure | null = null;
-    private readonly importedHistorySessionIds = new Set<string>();
 
     private transcriptPathCallbacks: Array<(path: string) => void> = [];
     private transcriptHistoryReplayPending: boolean;
@@ -146,14 +145,6 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
 
     recordLocalLaunchFailure = (message: string, exitReason: LocalLaunchExitReason): void => {
         this.localLaunchFailure = { message, exitReason };
-    };
-
-    shouldImportHistory = (sessionId: string): boolean => {
-        return !this.importedHistorySessionIds.has(sessionId);
-    };
-
-    markHistoryImported = (sessionId: string): void => {
-        this.importedHistorySessionIds.add(sessionId);
     };
 
     sendAgentMessage = (message: unknown): void => {

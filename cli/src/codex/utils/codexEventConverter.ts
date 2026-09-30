@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER, type InclusiveInputTokenUsageMarker } from '@hapi/protocol/usage';
-import { normalizeAgentMessagePhase, type AgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages';
 import { z } from 'zod';
 import { logger } from '@/ui/logger';
 
@@ -16,7 +15,6 @@ export type CodexMessage = {
     type: 'message';
     message: string;
     id: string;
-    phase?: AgentMessagePhase;
 } | {
     type: 'proposed_plan';
     plan: string;
@@ -54,10 +52,6 @@ export type CodexEventProjection = {
     turnId?: string;
     messages?: CodexMessage[];
     userMessage?: string;
-    sessionEvent?: {
-        type: 'message';
-        message: string;
-    };
     userActivity?: true;
     finishedTurnId?: string;
 };
@@ -70,12 +64,6 @@ export type CodexConversionAction = {
     message: string;
 } | {
     type: 'user-activity';
-} | {
-    type: 'session-event';
-    event: {
-        type: 'message';
-        message: string;
-    };
 } | {
     type: 'agent-message';
     message: CodexMessage;
@@ -99,23 +87,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | null {
     return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
-function asBoolean(value: unknown): boolean | null {
-    return typeof value === 'boolean' ? value : null;
-}
-
-function extractErrorMessage(payload: Record<string, unknown>): string | null {
-    const errorRecord = asRecord(payload.error);
-    return asString(payload.message)
-        ?? asString(payload.error)
-        ?? (errorRecord ? asString(errorRecord.message) : null)
-        ?? asString(payload.reason);
-}
-
-function formatVisibleErrorMessage(message: string): string {
-    const trimmed = message.trim();
-    return trimmed.startsWith('⚠') ? trimmed : `⚠ ${trimmed}`;
 }
 
 function normalizeItemType(value: unknown): string | null {
@@ -151,8 +122,7 @@ function extractTextContent(value: unknown): string {
 }
 
 function extractVisibleAssistantText(value: unknown): string {
-    const text = extractTextContent(value);
-    return (unwrapCodexResponseStepEnvelope(text) ?? text)
+    return extractTextContent(value)
         .replace(/(?:^|\n)<proposed_plan>[\s\S]*?<\/proposed_plan>(?=\n|$)/gi, '\n')
         .trim();
 }
@@ -203,7 +173,6 @@ type AssistantMessageProjection = {
     text: string;
     turnId: string | null;
     itemId: string | null;
-    phase: AgentMessagePhase | null;
 };
 
 type PendingResponseFinal = {
@@ -236,8 +205,7 @@ function extractAssistantMessageProjection(
             source: 'semantic',
             text,
             turnId: extractEventTurnId(event) ?? currentTurnId,
-            itemId: asString(payload.id),
-            phase: normalizeAgentMessagePhase(payload.phase)
+            itemId: asString(payload.id)
         };
     }
 
@@ -250,8 +218,7 @@ function extractAssistantMessageProjection(
             source: 'semantic',
             text,
             turnId: extractEventTurnId(event) ?? currentTurnId,
-            itemId: asString(item?.id),
-            phase: normalizeAgentMessagePhase(item?.phase ?? payload.phase)
+            itemId: asString(item?.id)
         };
     }
 
@@ -262,8 +229,7 @@ function extractAssistantMessageProjection(
             source: 'response',
             text,
             turnId: extractEventTurnId(event) ?? currentTurnId,
-            itemId: asString(payload.id),
-            phase: normalizeAgentMessagePhase(payload.phase)
+            itemId: asString(payload.id)
         };
     }
 
@@ -346,9 +312,6 @@ function convertProjectionToActions(
     } else if (projection.userActivity) {
         actions.push({ type: 'user-activity' });
     }
-    if (projection.sessionEvent) {
-        actions.push({ type: 'session-event', event: projection.sessionEvent });
-    }
 
     const turnId = projection.turnId ?? fallbackTurnId;
     for (const message of projection.messages ?? []) {
@@ -368,7 +331,6 @@ function confirmsPendingFinalVisibility(actions: CodexConversionAction[]): boole
     return actions.some((action) => (
         action.type === 'user-message'
         || action.type === 'user-activity'
-        || action.type === 'session-event'
         || (action.type === 'agent-message' && action.message.type !== 'token_count')
     ));
 }
@@ -546,13 +508,11 @@ export function convertCodexEvent(rawEvent: unknown): CodexEventProjection | nul
             if (!message) {
                 return null;
             }
-            const phase = normalizeAgentMessagePhase(payloadRecord.phase);
             return {
                 messages: [{
                     type: 'message',
                     message,
-                    id: randomUUID(),
-                    ...(phase ? { phase } : {})
+                    id: randomUUID()
                 }]
             };
         }
@@ -574,14 +534,12 @@ export function convertCodexEvent(rawEvent: unknown): CodexEventProjection | nul
             if (itemType === 'agentmessage') {
                 const message = extractVisibleAssistantText(item?.content ?? item?.message ?? item?.text);
                 if (!message) return null;
-                const phase = normalizeAgentMessagePhase(item?.phase ?? payloadRecord.phase);
                 return {
                     ...(turnId ? { turnId } : {}),
                     messages: [{
                         type: 'message',
                         message,
-                        id: asString(item?.id) ?? randomUUID(),
-                        ...(phase ? { phase } : {})
+                        id: asString(item?.id) ?? randomUUID()
                     }]
                 };
             }
@@ -600,33 +558,9 @@ export function convertCodexEvent(rawEvent: unknown): CodexEventProjection | nul
             };
         }
 
-        if (eventType === 'task_complete' || eventType === 'turn_aborted') {
+        if (eventType === 'task_complete' || eventType === 'turn_aborted' || eventType === 'task_failed') {
             const turnId = asString(payloadRecord.turn_id);
             return turnId ? { finishedTurnId: turnId } : null;
-        }
-
-        if (eventType === 'task_failed') {
-            const turnId = asString(payloadRecord.turn_id);
-            const errorRecord = asRecord(payloadRecord.error);
-            const willRetry = asBoolean(
-                payloadRecord.will_retry
-                ?? payloadRecord.willRetry
-                ?? errorRecord?.will_retry
-                ?? errorRecord?.willRetry
-            ) ?? false;
-            const message = willRetry ? null : extractErrorMessage(payloadRecord);
-            if (!turnId && !message) {
-                return null;
-            }
-            return {
-                ...(turnId ? { finishedTurnId: turnId } : {}),
-                ...(message ? {
-                    sessionEvent: {
-                        type: 'message' as const,
-                        message: formatVisibleErrorMessage(message)
-                    }
-                } : {})
-            };
         }
 
         if (eventType === 'agent_reasoning') {
@@ -671,31 +605,6 @@ export function convertCodexEvent(rawEvent: unknown): CodexEventProjection | nul
             };
         }
 
-        if (eventType === 'error' || eventType === 'stream_error') {
-            const errorRecord = asRecord(payloadRecord.error);
-            const willRetry = asBoolean(
-                payloadRecord.will_retry
-                ?? payloadRecord.willRetry
-                ?? errorRecord?.will_retry
-                ?? errorRecord?.willRetry
-            ) ?? false;
-            if (willRetry) {
-                return null;
-            }
-
-            const message = extractErrorMessage(payloadRecord);
-            if (!message) {
-                return null;
-            }
-
-            return {
-                sessionEvent: {
-                    type: 'message',
-                    message: formatVisibleErrorMessage(message)
-                }
-            };
-        }
-
         return null;
     }
 
@@ -716,14 +625,12 @@ export function convertCodexEvent(rawEvent: unknown): CodexEventProjection | nul
                 return null;
             }
             const turnId = extractResponseItemTurnId(payloadRecord);
-            const phase = normalizeAgentMessagePhase(payloadRecord.phase);
             return {
                 ...(turnId ? { turnId } : {}),
                 messages: [{
                     type: 'message',
                     message,
-                    id: asString(payloadRecord.id) ?? randomUUID(),
-                    ...(phase ? { phase } : {})
+                    id: asString(payloadRecord.id) ?? randomUUID()
                 }]
             };
         }

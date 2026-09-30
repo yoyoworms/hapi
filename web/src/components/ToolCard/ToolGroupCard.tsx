@@ -156,59 +156,6 @@ function codexActionLabel(
     return { title: t('toolGroup.friendly.genericCommand'), detail: null }
 }
 
-export function formatCodexExplorationSummary(
-    tools: ToolCallBlock[],
-    t: (key: string, params?: Record<string, string | number>) => string
-): string | null {
-    const readTargets: string[] = []
-    const listTargets: string[] = []
-    const otherLabels: string[] = []
-    for (const tool of tools) {
-        for (const action of getCodexCommandActions(tool)) {
-            const label = codexActionLabel(action, t)
-            if (action.type === 'read' && label.detail) {
-                if (!readTargets.includes(label.detail)) readTargets.push(label.detail)
-                continue
-            }
-            if (action.type === 'listFiles' && label.detail) {
-                if (!listTargets.includes(label.detail)) listTargets.push(label.detail)
-                continue
-            }
-            const text = label.detail ? `${label.title} ${label.detail}` : label.title
-            if (!otherLabels.includes(text)) otherLabels.push(text)
-        }
-    }
-
-    const entries: Array<{ text: string; count: number; shownCount: number }> = []
-    if (readTargets.length > 0) {
-        const shown = readTargets.slice(0, 2)
-        entries.push({
-            text: `${t('toolGroup.codex.read')} ${shown.join(', ')}`,
-            count: readTargets.length,
-            shownCount: shown.length,
-        })
-    }
-    if (listTargets.length > 0) {
-        const shown = listTargets.slice(0, 2)
-        entries.push({
-            text: `${t('toolGroup.codex.list')} ${shown.join(', ')}`,
-            count: listTargets.length,
-            shownCount: shown.length,
-        })
-    }
-    entries.push(...otherLabels.map((text) => ({ text, count: 1, shownCount: 1 })))
-
-    if (entries.length === 0) return null
-    const selected = entries.slice(0, 2)
-    const hiddenCount = selected.reduce((count, entry) => count + entry.count - entry.shownCount, 0)
-        + entries.slice(selected.length).reduce((count, entry) => count + entry.count, 0)
-    const visible = selected.map((entry) => entry.text)
-    if (hiddenCount > 0) {
-        visible.push(t('toolGroup.codex.more', { n: hiddenCount }))
-    }
-    return visible.join(' · ')
-}
-
 function CodexExplorationRows(props: {
     tools: ToolCallBlock[]
     onSelect: (toolId: string) => void
@@ -339,9 +286,6 @@ export function ToolGroupCard(props: {
     }, [selectedTool, props.metadata, t])
 
     const primaryTitle = formatGroupedHeaderTitle(props.block, t)
-    const activityDetail = props.block.presentationMode === 'codex-exploration'
-        ? formatCodexExplorationSummary(props.block.tools, t)
-        : null
     const subtitle = props.block.presentationMode === 'codex-exploration'
         ? null
         : formatGroupedHeaderSubtitle(props.block, t) ?? formatActionSummary(props.block, t)
@@ -351,7 +295,7 @@ export function ToolGroupCard(props: {
     const fileCount = props.block.summary.fileTargets.length
 
     return (
-        <Card className="overflow-clip rounded-[20px] bg-[var(--app-tool-group-bg)] shadow-none">
+        <Card className="overflow-hidden rounded-[20px] bg-[var(--app-tool-group-bg)] shadow-none">
             <CardHeader className={cn('space-y-0 p-3', subtitle ? 'pb-2' : null)}>
                 <button
                     type="button"
@@ -369,11 +313,6 @@ export function ToolGroupCard(props: {
                                     {primaryTitle}
                                 </CardTitle>
                             </div>
-                            {activityDetail ? (
-                                <CardDescription className="truncate whitespace-nowrap text-xs text-[var(--app-tool-card-subtitle)]">
-                                    {activityDetail}
-                                </CardDescription>
-                            ) : null}
                             <ToolTimingSummary
                                 startedAt={groupTiming.startedAt}
                                 completedAt={groupTiming.completedAt}

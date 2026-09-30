@@ -1,13 +1,10 @@
-import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
-import { addHapiCodexModelVariants } from '@/codex/hapiContextPolicy';
 import { getErrorMessage } from './rpcResponses';
 
 export interface ListCodexModelsRequest {
     includeHidden?: boolean;
-    accountId?: string;
 }
 
 export type ListCodexModelsResponse = CodexModelsResponse;
@@ -62,7 +59,7 @@ function normalizeServiceTiers(value: unknown): string[] | undefined {
     return tokens.size > 0 ? [...tokens] : undefined;
 }
 
-function normalizeModel(entry: unknown): CodexModelSummary | null {
+export function normalizeCodexModel(entry: unknown): CodexModelSummary | null {
     if (!entry || typeof entry !== 'object') {
         return null;
     }
@@ -95,42 +92,24 @@ interface CacheEntry {
 // involved. Cache successful lists for 5 minutes (same shape as the opencode
 // model cache) and coalesce concurrent requests into a single spawn.
 const CACHE_TTL_MS = 5 * 60_000;
-const cache = new Map<string, CacheEntry>();
-const inflight = new Map<string, Promise<CodexModelSummary[]>>();
+const cache = new Map<boolean, CacheEntry>();
+const inflight = new Map<boolean, Promise<CodexModelSummary[]>>();
 
-function getCacheKey(includeHidden: boolean, environment?: Record<string, string>): string {
-    if (!environment) {
-        return `${includeHidden}:default`;
-    }
-
-    // Model availability is account-scoped. Hash the complete selected-account
-    // environment so cached catalogs cannot leak across account/API switches,
-    // while avoiding retaining credentials as plain-text Map keys.
-    const environmentFingerprint = createHash('sha256')
-        .update(JSON.stringify(Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))))
-        .digest('hex');
-    return `${includeHidden}:${environmentFingerprint}`;
-}
-
-export async function listCodexModels(
-    includeHidden: boolean = false,
-    environment?: Record<string, string>
-): Promise<CodexModelSummary[]> {
-    const cacheKey = getCacheKey(includeHidden, environment);
-    const cached = cache.get(cacheKey);
+export async function listCodexModels(includeHidden: boolean = false): Promise<CodexModelSummary[]> {
+    const cached = cache.get(includeHidden);
     if (cached && cached.expiresAt > Date.now()) {
         return cached.models;
     }
 
-    const existing = inflight.get(cacheKey);
+    const existing = inflight.get(includeHidden);
     if (existing) {
         return existing;
     }
 
-    const promise = fetchCodexModelsFromAppServer(includeHidden, environment)
+    const promise = fetchCodexModelsFromAppServer(includeHidden)
         .then((models) => {
             if (models.length > 0) {
-                cache.set(cacheKey, {
+                cache.set(includeHidden, {
                     expiresAt: Date.now() + CACHE_TTL_MS,
                     models
                 });
@@ -138,20 +117,17 @@ export async function listCodexModels(
             return models;
         })
         .finally(() => {
-            inflight.delete(cacheKey);
+            inflight.delete(includeHidden);
         });
 
-    inflight.set(cacheKey, promise);
+    inflight.set(includeHidden, promise);
     return promise;
 }
 
-async function fetchCodexModelsFromAppServer(
-    includeHidden: boolean,
-    environment?: Record<string, string>
-): Promise<CodexModelSummary[]> {
+async function fetchCodexModelsFromAppServer(includeHidden: boolean): Promise<CodexModelSummary[]> {
     // Model discovery is account-scoped. Never inherit a session/runner cwd:
     // project config or a deleted worktree must not alter or break the catalog.
-    const client = new CodexAppServerClient({ cwd: homedir(), env: environment });
+    const client = new CodexAppServerClient({ cwd: homedir() });
 
     try {
         await client.connect();
@@ -166,13 +142,9 @@ async function fetchCodexModelsFromAppServer(
         });
 
         const response = await client.listModels({ includeHidden });
-        if (!Array.isArray(response.data)) {
-            return [];
-        }
-        const models = response.data
-            .map(normalizeModel)
-            .filter((model): model is CodexModelSummary => model !== null);
-        return addHapiCodexModelVariants(models);
+        return Array.isArray(response.data)
+            ? response.data.map(normalizeCodexModel).filter((model): model is CodexModelSummary => model !== null)
+            : [];
     } catch (error) {
         throw new Error(getErrorMessage(error, 'Failed to list Codex models'));
     } finally {

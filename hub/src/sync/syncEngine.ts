@@ -7,15 +7,16 @@
  * - No E2E encryption; data is stored as JSON in SQLite
  */
 
-import { isKnownFlavor, isSteeringSupportedForSession, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
-import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import { isKnownFlavor, isLiveLifecycleState, isSteeringSupportedForSession, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
 import {
     cliBinaryUpdatedOnDisk,
     isMachineCapabilitySkewed,
 } from '@hapi/protocol/runnerCapabilities'
+import type { CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
-import type { AgentAccountStatus, AgentFlavor, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
-import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
+import type { ImplementCodexPlanResult } from '@hapi/protocol/apiTypes'
+import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+import { hasConversationMessageContent, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
 import type { Server } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import type { Store, CancelQueuedMessageResult } from '../store'
@@ -30,6 +31,8 @@ import { MachineCache, type Machine } from './machineCache'
 import { MessageService, type RetryIndeterminateMessageResult } from './messageService'
 import { createTitleSuggestionService, type TitleSuggestionService } from './titleSuggestion'
 import { selectForkTranscriptPrefix } from './forkTranscript'
+import { buildForkSessionSummary } from './forkSessionSummary'
+import { isMachineSpawnPreallocatedStub } from '../store/sessions'
 import {
     RpcGateway,
     RpcTargetMissingError,
@@ -41,15 +44,16 @@ import {
     type RpcListDirectoryResponse,
     type RpcStatFilesResponse,
     type RpcListAgyModelsResponse,
-    type RpcListClaudeModelsResponse,
     type RpcListPiModelsResponse,
     type RpcListCodexModelsResponse,
     type RpcListPiSessionsResponse,
     type RpcArchiveCodexSessionResponse,
     type RpcListCursorModelsResponse,
     type RpcListOpencodeModelsResponse,
+    type RpcListOpencodeModelVariantsResponse,
     type RpcListGrokModelsResponse,
     type RpcListCopilotModelsResponse,
+    type RpcListKimiModelsResponse,
     type RpcListGrokReasoningEffortOptionsResponse,
     type RpcListOpencodeReasoningEffortOptionsResponse,
     type RpcCursorModel,
@@ -61,33 +65,9 @@ import {
 } from './rpcGateway'
 import { SessionCache } from './sessionCache'
 import { ingestNotifySummaryFromMessage } from './workGraphNotifyIngest'
-import {
-    AutoArchiveService,
-    getAutoArchiveBlockReason,
-    type AutoArchiveGuard
-} from './autoArchive'
 
 type PiResumeAttempt = NonNullable<NonNullable<Session['metadata']>['piResumeAttempt']>
 type PtyResumeAttempt = NonNullable<NonNullable<Session['metadata']>['ptyResumeAttempt']>
-
-export interface SyncEngineOptions {
-    autoArchiveIdleHours?: number
-}
-
-function hasNativeAgentSessionId(metadata: NonNullable<Session['metadata']>): boolean {
-    return Boolean(
-        metadata.codexSessionId
-        ?? metadata.claudeSessionId
-        ?? metadata.geminiSessionId
-        ?? metadata.opencodeSessionId
-        ?? metadata.grokSessionId
-        ?? metadata.cursorSessionId
-        ?? metadata.piSessionId
-        ?? metadata.kimiSessionId
-        ?? metadata.agySessionId
-        ?? metadata.copilotSessionId
-    )
-}
 
 export type { Session, SyncEvent } from '@hapi/protocol/types'
 export type { Machine } from './machineCache'
@@ -100,14 +80,15 @@ export type {
     RpcListDirectoryResponse,
     RpcStatFilesResponse,
     RpcListAgyModelsResponse,
-    RpcListClaudeModelsResponse,
     RpcListPiModelsResponse,
     RpcListCodexModelsResponse,
     RpcListPiSessionsResponse,
     RpcListCursorModelsResponse,
     RpcListOpencodeModelsResponse,
+    RpcListOpencodeModelVariantsResponse,
     RpcListGrokModelsResponse,
     RpcListCopilotModelsResponse,
+    RpcListKimiModelsResponse,
     RpcListGrokReasoningEffortOptionsResponse,
     RpcListOpencodeReasoningEffortOptionsResponse,
     RpcCursorModel,
@@ -133,7 +114,7 @@ export type LocalResumeTargetResult =
 
 export type LocalHandoffResult =
     | { type: 'success' }
-    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'handoff_failed' }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'handoff_failed' | 'control_mode_not_applicable' }
 
 export type ClearOpencodeSessionResult =
     | { type: 'success'; sessionId: string }
@@ -203,7 +184,6 @@ export class SyncEngine {
     private readonly messageService: MessageService
     private readonly titleSuggestionService: TitleSuggestionService
     private readonly rpcGateway: RpcGateway
-    private readonly autoArchiveService: AutoArchiveService | null
     private inactivityTimer: NodeJS.Timeout | null = null
     /** Sessions that emitted `session-ready` (Cursor ACP or validated Pi get_state). */
     private readonly sessionReadyIds = new Set<string>()
@@ -223,8 +203,6 @@ export class SyncEngine {
     private readonly opencodeClearTails = new Map<string, Promise<ClearOpencodeSessionResult>>()
     /** Serialize fork/rewind per session so concurrent native rollbacks cannot stack. */
     private readonly historyActionsInFlight = new Set<string>()
-    /** Prevent accepting a prompt after the final idle check reserved a session for archive. */
-    private readonly autoArchivingSessionIds = new Set<string>()
     /**
      * Hub owner id for accountable work-graph principals (A2A P1/P3).
      * Defaults to "1" for unit tests; startHub overwrites with getOrCreateOwnerId().
@@ -236,10 +214,19 @@ export class SyncEngine {
         private readonly io: Server,
         rpcRegistry: RpcRegistry,
         sseManager: SSEManager,
-        options: SyncEngineOptions = {}
     ) {
         this.eventPublisher = new EventPublisher(sseManager, (event) => this.resolveNamespace(event))
         this.sessionCache = new SessionCache(store, this.eventPublisher)
+        this.eventPublisher.subscribe((event) => {
+            if (event.type === 'message-received') {
+                if (!this.sessionCache.getSession(event.sessionId)?.hasConversationContent
+                    && hasConversationMessageContent(event.message.content)) {
+                    this.sessionCache.refreshConversationContent(event.sessionId)
+                }
+            } else if (event.type === 'message-cancelled' || event.type === 'messages-invalidated') {
+                this.sessionCache.refreshConversationContent(event.sessionId)
+            }
+        })
         this.machineCache = new MachineCache(store, this.eventPublisher)
         this.messageService = new MessageService(
             store,
@@ -249,23 +236,8 @@ export class SyncEngine {
         )
         this.titleSuggestionService = createTitleSuggestionService(store)
         this.rpcGateway = new RpcGateway(io, rpcRegistry)
-        const autoArchiveIdleHours = options.autoArchiveIdleHours ?? 0
-        this.autoArchiveService = autoArchiveIdleHours > 0
-            ? new AutoArchiveService({
-                idleHours: autoArchiveIdleHours,
-                getSessions: () => this.getSessions(),
-                getSession: (sessionId) => this.getSession(sessionId),
-                hasQueuedMessages: (sessionId) => this.store.messages.getUninvokedLocalMessages(sessionId).length > 0,
-                archiveSession: (sessionId, reason, guard) => this.archiveSessionIfStillIdle(
-                    sessionId,
-                    reason,
-                    guard
-                )
-            })
-            : null
         this.reloadAll()
         this.inactivityTimer = setInterval(() => this.expireInactive(), 5_000)
-        this.autoArchiveService?.start()
     }
 
     setHubOwnerUserId(ownerUserId: string | number): void {
@@ -277,7 +249,6 @@ export class SyncEngine {
             clearInterval(this.inactivityTimer)
             this.inactivityTimer = null
         }
-        this.autoArchiveService?.stop()
     }
 
     subscribe(listener: SyncEventListener): () => void {
@@ -424,20 +395,6 @@ export class SyncEngine {
         return this.machineCache.getMachineByNamespace(machineId, namespace)
     }
 
-    async getUsage(namespace: string): Promise<unknown> {
-        const machines = this.machineCache.getOnlineMachinesByNamespace(namespace)
-        for (const machine of machines) {
-            try {
-                const result = await this.rpcGateway.getOAuthUsage(machine.id)
-                if (result) return result
-            } catch {
-                // Try the next online runner; account usage is best-effort and
-                // the route can serve its namespace-scoped cache on failure.
-            }
-        }
-        return null
-    }
-
     getOnlineMachines(): Machine[] {
         return this.machineCache.getOnlineMachines()
     }
@@ -581,17 +538,10 @@ export class SyncEngine {
         effort?: string | null
         serviceTier?: string | null
         collaborationMode?: CodexCollaborationMode
-        copilotAgentMode?: CopilotAgentMode
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }): boolean {
-        if (!this.sessionCache.handleSessionAlive(payload)) {
-            return false
-        }
+    }): void {
+        this.sessionCache.handleSessionAlive(payload)
         this.messageService.replayImmediateQueuedMessages(payload.sid)
         this.triggerDedupIfNeeded(payload.sid)
-        return true
     }
 
     handleSessionReady(payload: { sid: string; time: number }): void {
@@ -612,81 +562,26 @@ export class SyncEngine {
         this.sessionCache.clearQueuedThinkingGrace(sessionId)
     }
 
-    handleSessionEnd(payload: {
-        sid: string
-        time: number
-        reason?: SessionEndReason
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }, hubAuthoritative: boolean = false): boolean {
+    handleSessionEnd(payload: { sid: string; time: number; reason?: SessionEndReason }): void {
         const before = this.sessionCache.getSession(payload.sid)
-        const ownsPiAttempt = before?.metadata?.piResumeAttempt !== undefined
-        const ownsPtyAttempt = before?.metadata?.ptyResumeAttempt !== undefined
-        const isPiAttemptChild = this.sessionCache.getSessions().some(
-            (session) => session.metadata?.piResumeAttempt?.childSessionId === payload.sid
-        )
-        const restorePiArchive = ownsPiAttempt && !this.sessionReadyIds.has(payload.sid)
-        const isCursorAcp = before?.metadata?.flavor === 'cursor'
-            && before.metadata.cursorSessionProtocol === 'acp'
-        const shouldRetryDedup = !ownsPiAttempt && !isPiAttemptChild && (!isCursorAcp || this.sessionReadyIds.has(payload.sid))
-
-        // Runtime ownership is the authority boundary. A stale end must not
-        // trigger *any* OpenCode/Pi/PTY cleanup or terminal side effects for
-        // the replacement runtime.
-        const acceptedEndAt = hubAuthoritative
-            ? this.sessionCache.handleHubSessionEnd(payload)
-            : this.sessionCache.handleSessionEnd(payload)
-        if (acceptedEndAt === null) {
-            return false
-        }
-
         if (before?.metadata?.opencodeClearOperation?.state === 'reserved' && payload.reason !== 'cleared') {
             const operation = before.metadata.opencodeClearOperation
             if (this.transitionClearOperation(payload.sid, before.namespace, operation, 'abort-needed')) {
                 this.abortOpenCodeClearSession(payload.sid, before.namespace, operation.replacementSessionId, 'abort-needed')
             }
         }
+        const ownsPiAttempt = before?.metadata?.piResumeAttempt !== undefined
+        const ownsPtyAttempt = before?.metadata?.ptyResumeAttempt !== undefined
+        const isPiAttemptChild = this.sessionCache.getSessions().some(
+            (session) => session.metadata?.piResumeAttempt?.childSessionId === payload.sid
+        )
+        const restorePiArchive = ownsPiAttempt && !this.sessionReadyIds.has(payload.sid)
+        const restorePtyArchive = ownsPtyAttempt && !this.sessionReadyIds.has(payload.sid)
+        const isCursorAcp = before?.metadata?.flavor === 'cursor'
+            && before.metadata.cursorSessionProtocol === 'acp'
+        const shouldRetryDedup = !ownsPiAttempt && !isPiAttemptChild && (!isCursorAcp || this.sessionReadyIds.has(payload.sid))
 
-        // RunnerLifecycle normally persists archive metadata immediately before
-        // emitting session-end. An old client or a dropped metadata ACK can
-        // leave the durable row split-brained (inactive but lifecycle=running).
-        // Only an accepted explicit end gets this fallback; socket disconnect
-        // and generic liveness expiry intentionally do not archive sessions.
-        const latest = this.sessionCache.getSession(payload.sid)
-        const runtimeAuthoritative = typeof payload.runtimeId === 'string'
-            && Number.isSafeInteger(payload.runtimeGeneration)
-        if (
-            latest
-            && latest.metadata?.lifecycleState !== 'archived'
-            && (runtimeAuthoritative || latest.metadata?.lifecycleState === 'running')
-        ) {
-            const archiveReason = payload.reason === 'completed'
-                ? 'Session completed'
-                : payload.reason === 'terminated'
-                    ? 'Session terminated'
-                    : payload.reason === 'error'
-                        ? 'Session ended with error'
-                        : payload.reason === 'handoff'
-                            ? 'Handed off to local terminal'
-                            : payload.reason === 'cleared'
-                                ? 'Cleared by /clear'
-                                : 'Session ended'
-            try {
-                this.sessionCache.markSessionArchivedFromHub(
-                    payload.sid,
-                    archiveReason,
-                    runtimeAuthoritative
-                        ? undefined
-                        : { onlyRunningSinceAtOrBefore: acceptedEndAt }
-                )
-            } catch (error) {
-                // Socket.IO end events have no request/response caller. Keep
-                // publishing the accepted stopped state; explicit archive can retry.
-                console.error('session-end lifecycle reconciliation failed', error)
-            }
-        }
-
+        this.sessionCache.handleSessionEnd(payload)
         this.eventPublisher.emit({
             type: 'session-ended',
             sessionId: payload.sid,
@@ -705,7 +600,7 @@ export class SyncEngine {
             void this.clearPiAttemptForEndedSession(payload.sid, restorePiArchive)
         }
         if (ownsPtyAttempt) {
-            void this.writePtyResumeAttempt(payload.sid, before!.namespace, null).catch(() => {})
+            void this.writePtyResumeAttempt(payload.sid, before!.namespace, null, restorePtyArchive).catch(() => {})
         }
 
         // Notify agent-terminal subscribers so the web UI shows a clear
@@ -718,17 +613,6 @@ export class SyncEngine {
             })
         }
         clearAgentTerminalBuffer(payload.sid)
-        return true
-    }
-
-    isSessionMetadataUpdateAllowed(payload: {
-        sid: string
-        metadata: unknown
-        runtimeId: string
-        runtimeGeneration: number
-        clockOffset?: number
-    }): boolean {
-        return this.sessionCache.isRuntimeMetadataUpdateAllowed(payload)
     }
 
     handleBackgroundTaskDelta(sessionId: string, delta: { started: number; completed: number }): void {
@@ -739,59 +623,14 @@ export class SyncEngine {
         this.sessionCache.recordSessionActivity(sessionId, updatedAt)
     }
 
-    handleSessionUsage(payload: {
-        sid: string
-        totalCostUsd: number
-        totalInputTokens: number
-        totalOutputTokens: number
-    }): void {
-        this.sessionCache.handleSessionUsage(payload)
-    }
-
-    handleSessionAccountStatus(payload: { sid: string; accountStatus: AgentAccountStatus }): void {
-        this.sessionCache.handleSessionAccountStatus(payload)
-    }
-
-    async handleSessionMetadataUpdated(payload: {
-        sid: string
-        namespace: string
-        metadata: unknown
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }): Promise<void> {
-        const current = this.store.sessions.getSessionByNamespace(payload.sid, payload.namespace)
-        if (!current) {
-            return
-        }
-
-        // The metadata write is durable before this callback. Refresh before
-        // applying ownership so cache metadata and the runtime fence advance
-        // together, even for runtimes without a native agent session id yet.
-        const refreshed = this.sessionCache.refreshSession(payload.sid)
-        if (
-            typeof payload.runtimeId === 'string'
-            && Number.isSafeInteger(payload.runtimeGeneration)
-        ) {
-            this.sessionCache.recordRuntimeMetadataUpdate({
-                sid: payload.sid,
-                metadata: payload.metadata,
-                runtimeId: payload.runtimeId,
-                runtimeGeneration: payload.runtimeGeneration as number
-            })
-        }
-        if (!refreshed?.metadata || !hasNativeAgentSessionId(refreshed.metadata)) {
-            return
-        }
-
-        // Central dedup deliberately preserves two active rows during a bad
-        // resume/account handoff. Do not merge directly from the write callback.
-        if (!this.canRunCursorDedup(refreshed)) {
-            return
-        }
-        await this.sessionCache.deduplicateByAgentSessionId(payload.sid).catch(() => {
-            // Best-effort: web-side safety net hides any remaining duplicate.
-        })
+    /**
+     * tiann/hapi#1820: any message on the wire is agent progress, whichever
+     * side authored it. Separate from `recordSessionActivity`, which also
+     * bumps `updatedAt` and is deliberately restricted to human turns so the
+     * session list keeps ordering by human interaction.
+     */
+    recordAgentProgress(sessionId: string, at: number): void {
+        this.sessionCache.recordAgentProgress(sessionId, at)
     }
 
     /**
@@ -1122,6 +961,10 @@ export class SyncEngine {
             this.triggerDedupIfNeeded(session.id)
         }
         this.machineCache.expireInactive?.()
+        // tiann/hapi#1820: `activeAt` expiry above only catches sessions whose
+        // socket went quiet. Keepalive-only zombies keep `activeAt` fresh
+        // forever, so reconcile their agent-health signal separately.
+        this.sessionCache.reconcileKeepaliveIdle()
         // Piggybacked on the inactivity tick; not a logical part of expireInactive
         // but shares its 5s cadence (avoids a second timer).
         this.messageService.releaseMatureScheduledMessages(Date.now(), this.historyActionsInFlight)
@@ -1179,6 +1022,28 @@ export class SyncEngine {
         )
     }
 
+    adoptPreallocatedSession(
+        id: string,
+        tag: string,
+        metadata: unknown,
+        agentState: unknown,
+        namespace: string,
+        model?: string,
+        effort?: string,
+        modelReasoningEffort?: string
+    ): Session {
+        return this.sessionCache.adoptPreallocatedSession(
+            id,
+            tag,
+            metadata,
+            agentState,
+            namespace,
+            model,
+            effort,
+            modelReasoningEffort
+        )
+    }
+
     getOrCreateMachine(id: string, metadata: unknown, runnerState: unknown, namespace: string): Machine {
         return this.machineCache.getOrCreateMachine(id, metadata, runnerState, namespace)
     }
@@ -1201,73 +1066,12 @@ export class SyncEngine {
             deliveryMode?: MessageDeliveryMode
         }
     ): Promise<void> {
-        if (this.autoArchivingSessionIds.has(sessionId)) {
-            throw new Error('Session is being auto-archived')
-        }
         if (this.historyActionsInFlight.has(sessionId)) {
             throw new Error('Conversation history action already in progress')
         }
-
-        // Record acceptance before flushMessages' first await. Otherwise an
-        // already-started POST can remain invisible to the auto-archive guard,
-        // then persist into a killed session after archive dispatch.
-        this.sessionCache.recordSessionActivity(sessionId, Date.now())
-
-        // Drain pending agent output before assigning the new user message a
-        // sequence number. This prevents a late assistant reply from sorting
-        // after the next user prompt on another client.
-        await this.rpcGateway.flushMessages(sessionId)
-        const {
-            actualSessionId,
-            createdAt: activeTurnStartedAt,
-            deliveredImmediately
-        } = await this.messageService.sendMessage(sessionId, payload)
-        if (deliveredImmediately) {
-            this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
-        }
+        const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
+        this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
-    }
-
-    private async archiveSessionIfStillIdle(
-        sessionId: string,
-        reason: string,
-        guard: AutoArchiveGuard
-    ): Promise<boolean> {
-        if (this.autoArchivingSessionIds.has(sessionId)) {
-            return false
-        }
-
-        const latest = this.getSession(sessionId)
-        if (!latest) {
-            return false
-        }
-        if (
-            latest.updatedAt !== guard.updatedAt
-            || latest.metadataVersion !== guard.metadataVersion
-            || latest.agentStateVersion !== guard.agentStateVersion
-        ) {
-            return false
-        }
-
-        const blockReason = getAutoArchiveBlockReason(
-            latest,
-            guard.checkedAt,
-            guard.idleMs,
-            this.store.messages.getUninvokedLocalMessages(sessionId).length > 0
-        )
-        if (blockReason) {
-            return false
-        }
-
-        // Synchronous reservation closes the post-check window: sendMessage
-        // refuses a prompt until the archive RPC has settled.
-        this.autoArchivingSessionIds.add(sessionId)
-        try {
-            await this.archiveSession(sessionId, { reason })
-            return true
-        } finally {
-            this.autoArchivingSessionIds.delete(sessionId)
-        }
     }
 
     async cancelQueuedMessage(
@@ -1302,7 +1106,7 @@ export class SyncEngine {
         if (!isSteeringSupportedForSession(session.metadata)) {
             return { status: 'failed', error: 'Steering is only supported for Pi, Codex, and Cursor ACP sessions', localId: null }
         }
-        if (session.agentState?.controlledByUser === true) {
+        if (session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
             return { status: 'failed', error: 'Steering is only available for remote sessions', localId: null }
         }
 
@@ -1383,7 +1187,7 @@ export class SyncEngine {
         if (!session.active) {
             throw new Error('Session must be active')
         }
-        if (session.agentState?.controlledByUser === true) {
+        if (session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
             throw new Error('Conversation history actions require a remote session')
         }
         if (session.thinking) {
@@ -1406,6 +1210,36 @@ export class SyncEngine {
         if (!boundary) {
             throw new Error('History boundary message not found or not yet invoked')
         }
+    }
+
+    /**
+     * Claude `--fork-session` materializes only after the child process starts.
+     * Poll until the child metadata has a native id distinct from the source.
+     */
+    private async waitForClaudeForkBound(
+        childId: string,
+        sourceNativeSessionId: string,
+        timeoutMs: number = 60_000
+    ): Promise<boolean> {
+        const startedAt = Date.now()
+        while (Date.now() - startedAt < timeoutMs) {
+            this.sessionCache.refreshSession(childId)
+            const child = this.sessionCache.getSession(childId)
+            const boundId = child?.metadata?.claudeSessionId
+            if (
+                typeof boundId === 'string'
+                && boundId.length > 0
+                && boundId !== sourceNativeSessionId
+            ) {
+                return true
+            }
+            // Give the runner a few seconds to come up before treating inactivity as failure.
+            if (child && !child.active && Date.now() - startedAt > 5_000) {
+                return false
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250))
+        }
+        return false
     }
 
     /**
@@ -1617,6 +1451,11 @@ export class SyncEngine {
         if (!rpcResult?.nativeSessionId) {
             return { type: 'error', message: 'Native fork did not return a session id' }
         }
+        if (rpcResult.sessionId) {
+            const child = await this.validateSharedChild(source, rpcResult.sessionId, rpcResult.nativeSessionId)
+            if (!child || child.metadata?.forkedFrom !== sessionId) return { type: 'error', message: 'Invalid shared-runtime fork binding' }
+            return { type: 'success', sessionId: child.id }
+        }
 
         // Native fork RPC can race CLI metadata/transcript updates. Construct
         // the child only from a fresh source snapshot, never the pre-RPC row.
@@ -1637,11 +1476,13 @@ export class SyncEngine {
         const copiedLocalIds = new Set(
             prefix.flatMap((message) => (message.localId ? [message.localId] : []))
         )
+        const forkSummary = buildForkSessionSummary(source.metadata)
         const childMetadata: Record<string, unknown> = {
             path: directory,
             host: source.metadata?.host ?? 'unknown',
             machineId,
             flavor,
+            ...(forkSummary ? { summary: forkSummary } : {}),
             forkedFrom: sessionId,
             startedBy: 'runner',
             capabilities: source.metadata?.capabilities,
@@ -1733,10 +1574,16 @@ export class SyncEngine {
                 throw new Error(spawn.message)
             }
 
-            // Claude Code materializes --fork-session when the child receives
-            // its first prompt in stream-json mode. The runner child is already
-            // tracked and will bind claudeSessionId asynchronously on that
-            // prompt, so do not block the fork RPC waiting for system/init.
+            // Claude fork is spawn+flag, not an RPC-time snapshot. Keep the
+            // source history lock (caller holds historyActionsInFlight) until
+            // the child binds a distinct native id — otherwise the source can
+            // advance before --fork-session materializes.
+            if (flavor === 'claude' && rpcResult.forkSession === true) {
+                const bound = await this.waitForClaudeForkBound(childId, rpcResult.nativeSessionId)
+                if (!bound) {
+                    throw new Error('Claude fork did not materialize before timeout')
+                }
+            }
 
             // Grok forks at RPC time, but spawn may still fall back to a blank
             // session if load fails. Do not report success until the child is
@@ -1781,7 +1628,7 @@ export class SyncEngine {
     ): Promise<void> {
         if (spawnAttempted) {
             const status = await this.rpcGateway.stopRunnerSession(machineId, childId)
-            if (status === 'still_alive') {
+            if (status === 'still_alive' || status === 'unknown') {
                 throw new Error('Fork child termination was not confirmed')
             }
         }
@@ -1796,7 +1643,7 @@ export class SyncEngine {
         sessionId: string,
         namespace: string,
         messageLocalId: string
-    ): Promise<{ type: 'success' } | { type: 'error'; message: string; hydrateFailed?: boolean }> {
+    ): Promise<{ type: 'success' } | { type: 'error'; message: string; code?: RewindConversationErrorCode; hydrateFailed?: boolean }> {
         if (this.historyActionsInFlight.has(sessionId)) {
             return { type: 'error', message: 'Conversation history action already in progress' }
         }
@@ -1812,7 +1659,7 @@ export class SyncEngine {
         sessionId: string,
         namespace: string,
         messageLocalId: string
-    ): Promise<{ type: 'success' } | { type: 'error'; message: string; hydrateFailed?: boolean }> {
+    ): Promise<{ type: 'success' } | { type: 'error'; message: string; code?: RewindConversationErrorCode; hydrateFailed?: boolean }> {
         const access = this.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return { type: 'error', message: access.reason === 'not-found' ? 'Session not found' : 'Access denied' }
@@ -1848,7 +1695,11 @@ export class SyncEngine {
         }
 
         if (rpcResult?.success !== true) {
-            return { type: 'error', message: rpcResult?.error ?? 'Native rewind failed' }
+            return {
+                type: 'error',
+                message: rpcResult?.error ?? 'Native rewind failed',
+                ...(rpcResult?.success === false && rpcResult.code ? { code: rpcResult.code } : {})
+            }
         }
 
         try {
@@ -1859,7 +1710,13 @@ export class SyncEngine {
             )
             this.scrubHistoryLocators(sessionId, namespace)
             this.sessionCache.rebuildTodosFromTranscript(sessionId)
-            this.eventPublisher.emit({ type: 'messages-invalidated', sessionId, namespace })
+            this.eventPublisher.emit({
+                type: 'messages-invalidated',
+                sessionId,
+                namespace,
+                reason: 'rewind',
+                truncateFromLocalId: rpcResult.truncateFromLocalId ?? messageLocalId
+            })
             this.sessionCache.refreshSession(sessionId)
             return { type: 'success' }
         } catch (error) {
@@ -1873,42 +1730,148 @@ export class SyncEngine {
         }
     }
 
-    async archiveSession(sessionId: string, options?: { reason?: string }): Promise<void> {
-        // tiann/hapi#916: when the CLI is already gone (e.g. after a
-        // hub-restart cascade SIGTERMed the runner but the in-memory
-        // `active` flag has not been reconciled yet) the kill-RPC throws
-        // and the route used to surface that as HTTP 500. Treat the
-        // missing target as a benign condition: still flip the session's
-        // lifecycleState to `archived` in the hub-side metadata so the
-        // UI does not see a half-cleaned zombie, and continue to mark
-        // it inactive in the cache. Real RPC errors (timeout, protocol
-        // failure) still propagate as 5xx.
+    async archiveSession(sessionId: string): Promise<void> {
+        // tiann/hapi#916 / #1910: KillSession is a session-socket RPC. A missing
+        // target does not prove the runner child is dead (stale registration,
+        // mid-reconnect, id rotation on resume). Always fall through to the
+        // machine-level StopSession RPC when we know a machineId, and refuse
+        // to archive while the runner reports still_alive / unknown.
+        let cliUnreachable = false
+        let killPid: number | undefined
+        let killProcessStartMarker: string | undefined
         try {
-            if (options?.reason) {
-                await this.rpcGateway.killSession(sessionId, options.reason)
-            } else {
-                await this.rpcGateway.killSession(sessionId)
-            }
+            const killResult = (await this.rpcGateway.killSession(sessionId)) ?? {}
+            killPid = killResult.pid
+            killProcessStartMarker = killResult.processStartMarker
         } catch (error) {
             if (error instanceof RpcTargetMissingError) {
-                this.sessionCache.markSessionArchivedFromHub(
-                    sessionId,
-                    options?.reason ?? 'Archived from hub (CLI unreachable)'
-                )
+                cliUnreachable = true
             } else {
                 throw error
             }
         }
-        if (options?.reason) {
-            // Runners normally stamp this themselves. Hub-side stamping covers
-            // generic ACP runners and makes automatic archive deterministic.
-            this.sessionCache.markSessionArchivedFromHub(sessionId, options.reason)
+
+        const sessionMeta = this.sessionCache.getSession(sessionId)?.metadata
+        const machineId = sessionMeta?.machineId
+        const runnerSpawned = sessionMeta?.startedBy === 'runner'
+            || sessionMeta?.startedFromRunner === true
+        if (machineId && runnerSpawned) {
+            let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
+            try {
+                status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
+            } catch (stopError) {
+                // Machine RPC missing is NOT proof the detached CLI is gone
+                // (KillMode=process children survive runner death). Refuse to
+                // archive on any StopSession failure — including when KillSession
+                // was also unreachable. Both targets missing still leaves a
+                // possible live orphan; retry StopSession when the runner
+                // reconnects (#1911 bot Major).
+                void stopError
+                status = 'still_alive'
+            }
+            // KillSession acknowledges before cleanupAndExit finishes, and socket
+            // loss is not exit proof. When the runner cannot find the HAPI id,
+            // confirm the KillSession-reported OS pid + start marker.
+            const killPidConfirmable = (
+                typeof killPid === 'number'
+                && killPid > 0
+                && typeof killProcessStartMarker === 'string'
+                && killProcessStartMarker.length > 0
+            )
+            if (status === 'unknown' && killPidConfirmable) {
+                try {
+                    status = await this.rpcGateway.stopRunnerSession(machineId, `PID-${killPid}`, {
+                        processStartMarker: killProcessStartMarker,
+                    })
+                } catch (pidStopError) {
+                    void pidStopError
+                    status = 'still_alive'
+                }
+            }
+            // Estate dogfood (#1911 / Peer #1820): KillSession often supplies no
+            // pid+marker when the CLI socket is already gone. If session-id stop
+            // is unknown, ask the runner about metadata.hostPid as a tombstone —
+            // without a start marker the runner returns already_gone only when
+            // the OS pid is dead (alive → unknown; never tree-kills). Refuse
+            // still_alive / unknown on that confirm.
+            if (status === 'unknown' && !killPidConfirmable) {
+                const hostPid = sessionMeta?.hostPid
+                if (typeof hostPid === 'number' && hostPid > 0) {
+                    try {
+                        status = await this.rpcGateway.stopRunnerSession(machineId, `PID-${hostPid}`)
+                    } catch (hostPidStopError) {
+                        void hostPidStopError
+                        status = 'still_alive'
+                    }
+                }
+            }
+            // Ambiguous machine-spawn keep-stub: startedBy=runner, no hostPid, still
+            // tagged machine-spawn:<id>. StopSession returns unknown forever (nothing
+            // tracked). There is no OS child to confirm — allow hub archive so the
+            // ghost is not permanent while the runner is online (#1911 Opus Major).
+            // A late-booting child that later hits reopen must not resurrect: CLI
+            // bootstrapExistingSession refuses archived rows (#1911 cold-read M1).
+            if (status === 'unknown') {
+                const stored = this.store.sessions.getSession(sessionId)
+                if (
+                    stored
+                    && isMachineSpawnPreallocatedStub(stored)
+                    && !(typeof sessionMeta?.hostPid === 'number' && sessionMeta.hostPid > 0)
+                ) {
+                    status = 'already_gone'
+                }
+            }
+            if (status === 'still_alive' || status === 'unknown') {
+                throw new Error('Session process is still running and could not be stopped')
+            }
+        } else if (machineId && !runnerSpawned) {
+            // Terminal / non-runner sessions: KillSession is the primary stop.
+            // Best-effort machine StopSession when a runner is connected; do not
+            // refuse archive when no runner exists (#1911 bot Major).
+            try {
+                await this.rpcGateway.stopRunnerSession(machineId, sessionId)
+            } catch {
+                // ignore — terminal archive proceeds after KillSession
+            }
         }
-        this.handleSessionEnd({ sid: sessionId, time: Date.now() }, true)
+
+        // KillSession cleanup writes archive metadata asynchronously; StopSession
+        // may terminate the CLI mid-flush. If the row is still not archived,
+        // hub-author the metadata so we do not leave lifecycleState=running.
+        const lifecycleState = this.sessionCache.getSession(sessionId)?.metadata?.lifecycleState
+        if (lifecycleState !== 'archived') {
+            this.sessionCache.markSessionArchivedFromHub(
+                sessionId,
+                cliUnreachable
+                    ? 'Archived from hub (CLI unreachable)'
+                    : 'Archived from hub (CLI stopped before archive metadata)'
+            )
+            this.emitCliSessionMetadataUpdate(sessionId)
+        }
+        this.handleSessionEnd({ sid: sessionId, time: Date.now() })
     }
 
-    runAutoArchiveSweep(now: number = Date.now()): Promise<string[]> {
-        return this.autoArchiveService?.sweep(now) ?? Promise.resolve([])
+    /**
+     * Broadcast versioned session metadata to CLI sockets in `session:<id>`.
+     * Mirrors the shape used by update-metadata handlers so ApiSessionClient
+     * applies the same hub-archived detection path.
+     */
+    private emitCliSessionMetadataUpdate(sessionId: string): void {
+        const session = this.sessionCache.getSession(sessionId)
+        if (!session?.metadata) return
+        if (typeof this.io.of !== 'function') return
+        const update = {
+            id: randomUUID(),
+            seq: Date.now(),
+            createdAt: Date.now(),
+            body: {
+                t: 'update-session' as const,
+                sid: sessionId,
+                metadata: { version: session.metadataVersion, value: session.metadata },
+                agentState: null as null
+            }
+        }
+        this.io.of('/cli').to(`session:${sessionId}`).emit('update', update)
     }
 
     /**
@@ -1971,11 +1934,13 @@ export class SyncEngine {
             // running forever and any downstream code that filters by
             // lifecycleState (not the cache active flag) would keep
             // treating archived ACP sessions as live.
+            // tiann/hapi#1820: 'idle' is the same stale-live case as 'running'
+            // once the row is inactive, so clear it the same way.
             const oldLifecycle = typeof latest.metadata.lifecycleState === 'string' ? latest.metadata.lifecycleState : undefined
             const nextMetadata: typeof latest.metadata = {
                 ...latest.metadata,
                 cursorSessionProtocol: 'acp' as const,
-                ...(oldLifecycle === 'running' ? { lifecycleState: 'archived' as const } : {})
+                ...(isLiveLifecycleState(oldLifecycle) ? { lifecycleState: 'archived' as const } : {})
             }
             // Drop the migration-in-progress flag in the same write (see
             // header comment). Safe whether or not it was set.
@@ -2080,7 +2045,46 @@ export class SyncEngine {
         })
     }
 
+    private async validateSharedChild(source: Session, id: string, nativeId?: string): Promise<Session | null> {
+        if (!source.metadata?.capabilities?.concurrentClients || id === source.id) return null
+        const deadline = Date.now() + 5_000
+        do {
+            const child = this.sessionCache.refreshSession(id)
+            if (child && child.namespace === source.namespace
+                && child.metadata?.machineId === source.metadata.machineId
+                && child.metadata?.hostPid === source.metadata.hostPid
+                && child.metadata?.capabilities?.concurrentClients
+                && child.metadata.codexSessionId && (!nativeId || child.metadata.codexSessionId === nativeId)) return child
+            await new Promise(resolve => setTimeout(resolve, 50))
+        } while (Date.now() < deadline)
+        return null
+    }
+
+    async clearConversation(sessionId: string, namespace: string): Promise<{ sessionId: string }> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok || !access.session.active || !access.session.metadata?.capabilities?.concurrentClients) {
+            throw new Error('Clear requires an active shared session')
+        }
+        const result = await this.rpcGateway.clearConversation(access.sessionId)
+        const child = await this.validateSharedChild(access.session, result.sessionId)
+        if (!child) throw new Error('Invalid shared-runtime clear binding')
+        // No superseded-session redirect: only the initiating client navigates.
+        return { sessionId: child.id }
+    }
+
+    async implementCodexPlan(sessionId: string, namespace: string, planId: string): Promise<ImplementCodexPlanResult> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok || !access.session.active || access.session.metadata?.flavor !== 'codex'
+            || !access.session.metadata.capabilities?.concurrentClients) {
+            return { ok: false, code: 'unavailable', error: 'Plan implementation requires an active shared Codex session' }
+        }
+        // CLI validates native history and deduplicates already accepted actions.
+        // A stale Hub plan id must not prevent a safe retry of a lost RPC reply.
+        return await this.rpcGateway.implementCodexPlan(access.sessionId, planId)
+    }
+
     async switchSession(sessionId: string, to: 'remote' | 'local'): Promise<void> {
+        if (this.getSession(sessionId)?.metadata?.capabilities?.concurrentClients) throw new Error('control_mode_not_applicable')
         if (this.historyActionsInFlight.has(sessionId)) {
             throw new Error('Conversation history action already in progress')
         }
@@ -2175,58 +2179,126 @@ export class SyncEngine {
         collaborationMode?: CodexCollaborationMode,
         copilotAgentMode?: CopilotAgentMode,
         startingMode?: 'remote' | 'pty',
-        sandbox?: boolean,
-        continueLatest?: boolean,
-        codexAccountId?: string,
-        codexSourceAccountId?: string
+        // Required for fresh machine spawns so the runner stamps the HAPI id on
+        // argv before the first webhook (#1911 Major: unreapable window).
+        namespace?: string
     ): ReturnType<RpcGateway['spawnSession']> {
-        return await this.rpcGateway.spawnSession(
-            machineId,
-            directory,
-            agent,
-            model,
-            modelReasoningEffort,
-            yolo,
-            sessionType,
-            worktreeName,
-            resumeSessionId,
-            effort,
-            permissionMode,
-            serviceTier,
-            existingSessionId,
-            collaborationMode,
-            copilotAgentMode,
-            startingMode,
-            undefined,
-            sandbox,
-            continueLatest,
-            codexAccountId,
-            codexSourceAccountId
-        )
-    }
+        // Fresh machine spawns historically omitted existingSessionId, so
+        // buildCliArgs could not stamp --hapi-session-id / --existing-session-id.
+        // A runner restart before the first webhook then left no persisted PID
+        // map and no argv id — StopSession returned unknown. Preallocate the
+        // hub row (same pattern as fork / OpenCode clear) and pass that id.
+        let allocatedSessionId = existingSessionId
+        let preallocated = false
+        if (!allocatedSessionId && namespace) {
+            const machine = this.getMachineByNamespace(machineId, namespace)
+                ?? this.getMachine(machineId)
+            allocatedSessionId = randomUUID()
+            this.sessionCache.getOrCreateSession(
+                `machine-spawn:${allocatedSessionId}`,
+                {
+                    path: directory,
+                    host: machine?.metadata?.host ?? 'unknown',
+                    flavor: agent,
+                    machineId,
+                    startedBy: 'runner',
+                    startedFromRunner: true,
+                },
+                null,
+                namespace,
+                model,
+                effort,
+                modelReasoningEffort,
+                allocatedSessionId
+            )
+            preallocated = true
+        }
 
-    async listCodexAccountsForMachine(machineId: string) {
-        return await this.rpcGateway.listCodexAccountsForMachine(machineId)
-    }
+        let result: Awaited<ReturnType<RpcGateway['spawnSession']>>
+        try {
+            result = await this.rpcGateway.spawnSession(
+                machineId,
+                directory,
+                agent,
+                model,
+                modelReasoningEffort,
+                yolo,
+                sessionType,
+                worktreeName,
+                resumeSessionId,
+                effort,
+                permissionMode,
+                serviceTier,
+                // Fresh prealloc stubs must not go down reopen (--existing-session-id):
+                // Codex would demand a thread binding that does not exist yet (#1911).
+                preallocated ? undefined : allocatedSessionId,
+                collaborationMode,
+                copilotAgentMode,
+                startingMode,
+                undefined,
+                preallocated ? allocatedSessionId : undefined
+            )
+        } catch (error) {
+            // Ambiguous post-dispatch failure — keep the stub (child may exist).
+            if (preallocated && allocatedSessionId) {
+                return {
+                    type: 'error',
+                    message: error instanceof Error ? error.message : String(error),
+                }
+            }
+            throw error
+        }
 
-    async startCodexAccountLogin(machineId: string) {
-        return await this.rpcGateway.startCodexAccountLogin(machineId)
-    }
+        if (result.type !== 'success' && preallocated && allocatedSessionId) {
+            const deleteStubIfStillPrealloc = async (): Promise<void> => {
+                try {
+                    // Session wire type has no tag — read the store row for stub check.
+                    const stored = this.store.sessions.getSession(allocatedSessionId!)
+                    if (!stored || !isMachineSpawnPreallocatedStub(stored)) return
+                    const row = this.sessionCache.refreshSession(allocatedSessionId!)
+                    if (!row) return
+                    if (row.active) {
+                        this.handleSessionEnd({ sid: allocatedSessionId!, time: Date.now(), reason: 'error' })
+                    }
+                    await this.deleteSession(allocatedSessionId!)
+                } catch {
+                    // Leave the stub visible rather than claiming cleanup succeeded.
+                }
+            }
 
-    async addCodexApiEndpoint(machineId: string, input: AddCodexApiEndpointRequest) {
-        return await this.rpcGateway.addCodexApiEndpoint(machineId, input)
-    }
+            // Pre-exec rejection: runner never started an OS child — safe to delete.
+            if (result.childStarted === false) {
+                await deleteStubIfStillPrealloc()
+                return result
+            }
 
-    async getCodexAccountLoginStatus(machineId: string, attemptId: string) {
-        return await this.rpcGateway.getCodexAccountLoginStatus(machineId, attemptId)
-    }
+            // Ambiguous (RPC timeout, post-exec failure, etc.): keep the stub.
+            // Do NOT call stopRunnerSession — that would kill a healthy late-booting
+            // CLI — and do NOT deleteSession (ON DELETE CASCADE wipes transcript).
+            // Matches the throw-path keep-stub policy above (#1911 Critical).
+            // Archive of these stubs is allowed via isMachineSpawnPreallocatedStub
+            // hatch in archiveSession (no hostPid → no process to confirm).
+            return result
+        }
 
-    async setDefaultCodexAccount(machineId: string, accountId: string) {
-        return await this.rpcGateway.setDefaultCodexAccount(machineId, accountId)
-    }
+        // Runner must bind the preallocated id — a divergent success id leaves
+        // the stub as a silent ghost (#1911 Opus robustness note).
+        if (
+            result.type === 'success'
+            && preallocated
+            && allocatedSessionId
+            && result.sessionId !== allocatedSessionId
+        ) {
+            console.warn(
+                `[spawn] runner reported sessionId ${result.sessionId} but prealloc was ${allocatedSessionId}; treating as error and keeping stub`
+            )
+            return {
+                type: 'error',
+                message: `Runner reported unexpected session id ${result.sessionId} (expected ${allocatedSessionId})`,
+            }
+        }
 
-    async removeCodexAccount(machineId: string, accountId: string) {
-        return await this.rpcGateway.removeCodexAccount(machineId, accountId)
+        return result
     }
 
     /**
@@ -2297,9 +2369,11 @@ export class SyncEngine {
         const operation = access.session.metadata?.opencodeClearOperation
         if (!operation) return { type: 'error', message: 'Clear reservation not found', code: 'clear_unavailable' }
         if (operation.state === 'aborted') {
-            return replacementSessionId === operation.replacementSessionId
-                ? { type: 'success', sessionId }
-                : { type: 'error', message: 'Clear reservation not found', code: 'clear_unavailable' }
+            if (replacementSessionId !== operation.replacementSessionId) {
+                return { type: 'error', message: 'Clear reservation not found', code: 'clear_unavailable' }
+            }
+            this.sessionCache.refreshConversationContent(operation.replacementSessionId)
+            return { type: 'success', sessionId }
         }
         const required = { replacementSessionId, state: expectedState, requireInactive }
         for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -2308,6 +2382,7 @@ export class SyncEngine {
             const current = latest.metadata.opencodeClearOperation
             if (!current) break
             if (current.replacementSessionId === required.replacementSessionId && current.state === 'aborted') {
+                this.sessionCache.refreshConversationContent(current.replacementSessionId)
                 return { type: 'success', sessionId }
             }
             if ((required.requireInactive && latest.active)
@@ -2319,6 +2394,7 @@ export class SyncEngine {
             }, latest.metadataVersion, namespace, required)
             if (result.result === 'success') {
                 this.sessionCache.refreshSession(sessionId)
+                this.sessionCache.refreshConversationContent(current.replacementSessionId)
                 return { type: 'success', sessionId }
             }
             if (result.result !== 'version-mismatch') break
@@ -3037,7 +3113,7 @@ export class SyncEngine {
         if (session.active || operation?.state !== 'reserved' || !machineId) return false
         try {
             const status = await this.rpcGateway.stopRunnerSession(machineId, session.id)
-            if (status === 'still_alive') return false
+            if (status === 'still_alive' || status === 'unknown') return false
             return this.abortOpenCodeClearSession(
                 session.id, namespace, operation.replacementSessionId, 'reserved', true
             ).type === 'success'
@@ -3046,11 +3122,7 @@ export class SyncEngine {
         }
     }
 
-    async resumeSession(sessionId: string, namespace: string, opts?: {
-        permissionMode?: PermissionMode
-        resumeWithSessionId?: string
-        codexAccountId?: string
-    }): Promise<ResumeSessionResult> {
+    async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode }): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -3096,27 +3168,8 @@ export class SyncEngine {
             this.ptyResumeQuarantinedIds.delete(access.sessionId)
             initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
-        if (
-            initialSession.active
-            && this.resolveFlavor(initialSession) === 'pi'
-            && this.isPiResumeBlocked(access.sessionId)
-        ) {
-            return { type: 'error', message: 'Pi resume is already in progress', code: 'resume_failed' }
-        }
         if (initialSession.active) {
-            // Restart and Codex account-switch actions use the resume endpoint
-            // even while the old runtime is alive. End that runtime first, then
-            // relaunch against the same native conversation.
-            try {
-                await this.archiveSession(access.sessionId)
-            } catch (error) {
-                return {
-                    type: 'error',
-                    message: error instanceof Error ? error.message : 'Failed to stop the active session',
-                    code: 'resume_failed'
-                }
-            }
-            initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
+            return { type: 'success', sessionId: access.sessionId }
         }
 
         // tiann/hapi#824 — invisible, automatic, per-session ACP migration on
@@ -3138,18 +3191,6 @@ export class SyncEngine {
             directory = targetResult.target.directory
         } else if (
             targetResult.code === 'resume_unavailable'
-            && opts?.resumeWithSessionId
-            && session.metadata
-            && typeof session.metadata.path === 'string'
-            && session.metadata.path.length > 0
-        ) {
-            // An explicit picker choice is itself a valid native resume target,
-            // even when this HAPI row never persisted its original agent id.
-            flavor = this.resolveFlavor(session)
-            resumeToken = opts.resumeWithSessionId
-            directory = session.metadata.path
-        } else if (
-            targetResult.code === 'resume_unavailable'
             && this.canFreshSpawnNeverStartedSession(session, access.sessionId, namespace)
         ) {
             const metadata = session.metadata!
@@ -3162,12 +3203,6 @@ export class SyncEngine {
 
         const metadata = session.metadata!
 
-        // A caller may select a specific native conversation from the resume
-        // picker instead of the id currently recorded on the HAPI row.
-        if (opts?.resumeWithSessionId) {
-            resumeToken = opts.resumeWithSessionId
-        }
-
         const targetMachine = this.resolveOnlineMachineForSession(
             session,
             namespace,
@@ -3175,32 +3210,6 @@ export class SyncEngine {
         )
         if (!targetMachine) {
             return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
-        }
-
-        // Claude/Cursor/Gemini support their native "continue latest" mode
-        // when this HAPI row never acquired an explicit native conversation id.
-        // New PTY/Pi flavors intentionally do not receive --continue.
-        const useContinue = !resumeToken
-            && (flavor === 'claude' || flavor === 'cursor' || flavor === 'gemini')
-
-        // Agents without native --continue support get one best-effort local
-        // discovery pass. This also preserves the pre-upstream Codex/OpenCode
-        // fallback without weakening the Pi exact-session lifecycle gates.
-        if (!resumeToken && !useContinue) {
-            try {
-                const scanResult = await this.rpcGateway.listAgentSessions(
-                    targetMachine.id,
-                    directory,
-                    flavor
-                )
-                const discovered = scanResult.success
-                    ? scanResult.sessions?.find((candidate) => candidate.valid)
-                    : undefined
-                if (discovered) resumeToken = discovered.sessionId
-            } catch {
-                // Discovery is optional; the runner will surface a launch error
-                // if the flavor cannot start without a native session id.
-            }
         }
 
         if (flavor === 'pi' && resumeToken && targetMachine.runnerState?.capabilities?.piExistingSessionResume !== true) {
@@ -3266,15 +3275,6 @@ export class SyncEngine {
             : opts?.permissionMode
                 ?? session.permissionMode
                 ?? metadataPermissionMode
-        const sourceCodexAccountId = flavor === 'codex'
-            ? metadata.codexAccountId ?? 'system'
-            : undefined
-        const targetCodexAccountId = flavor === 'codex'
-            ? opts?.codexAccountId ?? sourceCodexAccountId
-            : undefined
-        const switchingCodexAccount = flavor === 'codex'
-            && opts?.codexAccountId !== undefined
-            && targetCodexAccountId !== sourceCodexAccountId
         const resumedStartingMode =
             (session.agentState as { startingMode?: 'local' | 'remote' | 'pty' } | null)?.startingMode === 'pty'
                 ? 'pty'
@@ -3291,6 +3291,12 @@ export class SyncEngine {
                     state: 'resuming',
                     machineId: targetMachine.id,
                     startedAt: Date.now(),
+                    archiveSnapshot: {
+                        lifecycleState: metadata.lifecycleState,
+                        lifecycleStateSince: metadata.lifecycleStateSince,
+                        archivedBy: metadata.archivedBy,
+                        archiveReason: metadata.archiveReason,
+                    },
                 })
             } catch {
                 this.ptyResumeInFlightIds.delete(access.sessionId)
@@ -3302,31 +3308,40 @@ export class SyncEngine {
             this.sessionReadyIds.delete(access.sessionId)
         }
         let piResumeSucceeded = false
-        const spawnResumeChild = () => this.rpcGateway.spawnSession(
-            targetMachine.id,
-            directory,
-            flavor,
-            session.model ?? undefined,
-            session.modelReasoningEffort ?? undefined,
-            undefined,
-            undefined,
-            undefined,
-            resumeToken,
-            session.effort ?? undefined,
-            preferredPermissionMode,
-            session.serviceTier ?? undefined,
-            access.sessionId,
-            session.collaborationMode ?? undefined,
-            session.copilotAgentMode ?? undefined,
-            resumedStartingMode,
-            undefined,
-            undefined,
-            useContinue || undefined,
-            targetCodexAccountId,
-            switchingCodexAccount ? sourceCodexAccountId : undefined
-        )
+        let ptyResumeSucceeded = false
         try {
-            let spawnResult = await spawnResumeChild()
+            // #1911 M1: clear archived lifecycle immediately before spawn so the
+            // CLI is not refused / cannot CAS-resurrect. Pi/PTY attempt rows
+            // above already captured archiveSnapshot while the row was archived.
+            const liveBeforeSpawn = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
+                ?? this.sessionCache.refreshSession(access.sessionId)
+            if (liveBeforeSpawn?.metadata?.lifecycleState === 'archived') {
+                try {
+                    await this.sessionCache.clearSessionArchiveMetadata(access.sessionId)
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : 'Failed to clear archive metadata'
+                    return { type: 'error', message, code: 'resume_failed' }
+                }
+            }
+
+            const spawnResult = await this.rpcGateway.spawnSession(
+                targetMachine.id,
+                directory,
+                flavor,
+                session.model ?? undefined,
+                session.modelReasoningEffort ?? undefined,
+                undefined,
+                undefined,
+                undefined,
+                resumeToken,
+                session.effort ?? undefined,
+                preferredPermissionMode,
+                session.serviceTier ?? undefined,
+                access.sessionId,
+                session.collaborationMode ?? undefined,
+                session.copilotAgentMode ?? undefined,
+                resumedStartingMode
+            )
 
             if (spawnResult.type !== 'success') {
                 if (requiresPiNativeReady) {
@@ -3364,7 +3379,7 @@ export class SyncEngine {
                 }
             }
 
-            let becameActive = await this.waitForSessionActive(spawnResult.sessionId)
+            const becameActive = await this.waitForSessionActive(spawnResult.sessionId)
             if (!becameActive) {
                 if (resumedStartingMode === 'pty') {
                     const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
@@ -3392,62 +3407,7 @@ export class SyncEngine {
                         return { type: 'error', message: 'Pi resume failed and the child is still active', code: 'resume_failed', rollbackSafe: false }
                     }
                 }
-                if (resumedStartingMode !== 'pty' && !requiresPiNativeReady) {
-                    // A generic runner child may have been spawned
-                    // successfully even though its lifecycle
-                    // webhook/heartbeat never reached the Hub.  Do not leave
-                    // that child orphaned while reopen rolls the archived row
-                    // back.  The runner's stop response is not enough for
-                    // `stopped`: wait until the Hub observes the child as
-                    // inactive before allowing rollback.
-                    const termination = await this.terminateFailedResumeChild(
-                        targetMachine.id,
-                        spawnResult.sessionId
-                    )
-                    if (termination === 'unconfirmed') {
-                        return {
-                            type: 'error',
-                            message: 'Session failed to become active and the child is still active',
-                            code: 'resume_failed',
-                            rollbackSafe: false,
-                        }
-                    }
-
-                    // A runner restored after restart can briefly retain the
-                    // previous generation's successful spawn acknowledgement.
-                    // In that case no new child is launched, the Hub active
-                    // barrier expires, and stop-session answers `already_gone`
-                    // from its verified-exit tombstone. The stop reconciles and
-                    // releases that stale generation, so one bounded retry is
-                    // safe and makes Reopen remain a one-click action. Do not
-                    // retry a child that was actually started and stopped: an
-                    // immediate crash is a real launch failure, not stale dedupe.
-                    if (termination === 'already_gone') {
-                        const retrySpawnResult = await spawnResumeChild()
-                        if (retrySpawnResult.type !== 'success') {
-                            return { type: 'error', message: retrySpawnResult.message, code: 'resume_failed' }
-                        }
-                        spawnResult = retrySpawnResult
-                        becameActive = await this.waitForSessionActive(spawnResult.sessionId)
-                        if (!becameActive) {
-                            const retryTermination = await this.terminateFailedResumeChild(
-                                targetMachine.id,
-                                spawnResult.sessionId
-                            )
-                            if (retryTermination === 'unconfirmed') {
-                                return {
-                                    type: 'error',
-                                    message: 'Session failed to become active and the child is still active',
-                                    code: 'resume_failed',
-                                    rollbackSafe: false,
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!becameActive) {
-                    return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
-                }
+                return { type: 'error', message: 'Session failed to become active', code: 'resume_failed' }
             }
 
             const needsReadyBeforeSuccess = resumedStartingMode === 'pty'
@@ -3461,7 +3421,7 @@ export class SyncEngine {
                 const readyResult = await this.waitForSessionReady(spawnResult.sessionId)
                 if (readyResult !== 'ready') {
                     if (resumedStartingMode === 'pty' && readyResult === 'timeout') {
-                        let status: 'stopped' | 'already_gone' | 'still_alive'
+                        let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
                         try {
                             status = await this.rpcGateway.stopRunnerSession(
                                 targetMachine.id,
@@ -3483,7 +3443,10 @@ export class SyncEngine {
                         if (!inactive) {
                             this.ptyResumeQuarantinedIds.add(access.sessionId)
                             try {
+                                const existingAttempt = this.sessionCache.getSession(access.sessionId)
+                                    ?.metadata?.ptyResumeAttempt
                                 await this.writePtyResumeAttempt(access.sessionId, namespace, {
+                                    ...existingAttempt,
                                     state: 'quarantined',
                                     machineId: targetMachine.id,
                                     startedAt: Date.now(),
@@ -3513,7 +3476,9 @@ export class SyncEngine {
                     }
                     if (resumedStartingMode === 'pty') {
                         try {
-                            await this.writePtyResumeAttempt(access.sessionId, namespace, null)
+                            // Child stopped after timeout — restore archive from
+                            // the attempt snapshot (clear-before-spawn already ran).
+                            await this.writePtyResumeAttempt(access.sessionId, namespace, null, true)
                         } catch {
                             this.ptyResumeQuarantinedIds.add(access.sessionId)
                             return {
@@ -3558,6 +3523,7 @@ export class SyncEngine {
                 try {
                     await this.writePtyResumeAttempt(access.sessionId, namespace, null)
                     this.ptyResumeQuarantinedIds.delete(access.sessionId)
+                    ptyResumeSucceeded = true
                 } catch {
                     this.ptyResumeQuarantinedIds.add(access.sessionId)
                     return {
@@ -3572,6 +3538,17 @@ export class SyncEngine {
         } finally {
             if (resumedStartingMode === 'pty') {
                 this.ptyResumeInFlightIds.delete(access.sessionId)
+                // Do not clear a deliberate fail-closed `resuming` marker left
+                // when quarantine write failed or still_alive refused stop —
+                // those paths add ptyResumeQuarantinedIds and keep the durable
+                // attempt (with archiveSnapshot) as the restart-safe truth.
+                if (
+                    !ptyResumeSucceeded
+                    && !this.ptyResumeQuarantinedIds.has(access.sessionId)
+                    && this.sessionCache.getSession(access.sessionId)?.metadata?.ptyResumeAttempt?.state === 'resuming'
+                ) {
+                    await this.writePtyResumeAttempt(access.sessionId, namespace, null, true).catch(() => {})
+                }
             }
             if (requiresPiNativeReady) {
                 this.piResumeInFlightIds.delete(access.sessionId)
@@ -3697,23 +3674,10 @@ export class SyncEngine {
                 lifecycleStateSince: metadata.lifecycleStateSince
             }
 
-            let applied: { cursorSessionProtocol?: 'acp' | 'stream-json' } = {}
-            // Pi and PTY resumes both reuse the original HAPI row. Keep the archive
-            // snapshot persisted until the CLI successfully bootstraps that row as
-            // running; this avoids an inactive, non-archived gap if the Hub restarts
-            // before spawn — the in-memory snapshot below cannot survive that, and
-            // ptyResumeAttempt carries no copy of it. The CLI's sessionFactory
-            // re-stamps lifecycleState='running' on boot and does not carry over
-            // archivedBy/archiveReason, so the row still leaves the archived state.
-            if (metadata.flavor !== 'pi' && !isPtyResume) {
-                try {
-                    applied = await this.sessionCache.clearSessionArchiveMetadata(access.sessionId)
-                } catch (error) {
-                    const message = error instanceof Error ? error.message : 'Failed to clear archive metadata'
-                    return { type: 'error', message, code: 'metadata_conflict' }
-                }
-            }
-
+            // #1911 M1: clear runs inside resumeSession immediately before spawn
+            // (after Pi/PTY attempt rows capture archiveSnapshot). Hub restart
+            // between clear and spawn leaves a non-archived inactive row;
+            // archiveSnapshot still rolls back on resume failure while alive.
             const resumeResult = await this.resumeSession(access.sessionId, namespace)
             if (resumeResult.type === 'error') {
                 // Never restore archived metadata over a live Pi child. A live
@@ -3729,11 +3693,17 @@ export class SyncEngine {
                 return resumeResult
             }
 
+            const after = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)?.metadata
+            const cursorSessionProtocol = after?.flavor === 'cursor'
+                && (after.cursorSessionProtocol === 'acp' || after.cursorSessionProtocol === 'stream-json')
+                ? after.cursorSessionProtocol
+                : undefined
+
             return {
                 type: 'success',
                 sessionId: resumeResult.sessionId,
                 resumed: true,
-                ...(applied.cursorSessionProtocol ? { cursorSessionProtocol: applied.cursorSessionProtocol } : {})
+                ...(cursorSessionProtocol ? { cursorSessionProtocol } : {})
             }
         }
 
@@ -3758,11 +3728,14 @@ export class SyncEngine {
             }
         }
 
+        if (access.session.metadata?.capabilities?.concurrentClients) {
+            return { type: 'error', message: 'Shared sessions attach without handoff', code: 'control_mode_not_applicable' }
+        }
         if (!access.session.active) {
             return { type: 'success' }
         }
 
-        if (access.session.agentState?.controlledByUser === true) {
+        if (access.session.agentState?.controlledByUser === true && !access.session.metadata?.capabilities?.concurrentClients) {
             return {
                 type: 'error',
                 message: 'Session is already controlled by a local terminal',
@@ -3792,51 +3765,6 @@ export class SyncEngine {
         return { type: 'success' }
     }
 
-    async listResumeOptions(sessionId: string, namespace: string): Promise<
-        | {
-            type: 'success'
-            sessions: Array<{ sessionId: string; modifiedAt: number; sizeBytes: number; valid: boolean }>
-            currentSessionId: string | null
-        }
-        | { type: 'error'; message: string; code: string }
-    > {
-        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
-        if (!access.ok) {
-            return {
-                type: 'error',
-                message: access.reason === 'access-denied' ? 'Session access denied' : 'Session not found',
-                code: access.reason === 'access-denied' ? 'access_denied' : 'session_not_found'
-            }
-        }
-
-        const metadata = access.session.metadata
-        if (!metadata || typeof metadata.path !== 'string') {
-            return { type: 'error', message: 'Session metadata missing path', code: 'resume_unavailable' }
-        }
-        const targetMachine = this.resolveOnlineMachineForSession(access.session, namespace)
-        if (!targetMachine) {
-            return { type: 'error', message: 'No machine online', code: 'no_machine_online' }
-        }
-
-        const scanResult = await this.rpcGateway.listAgentSessions(
-            targetMachine.id,
-            metadata.path,
-            this.resolveFlavor(access.session)
-        )
-        if (!scanResult.success || !scanResult.sessions) {
-            return {
-                type: 'error',
-                message: scanResult.error ?? 'Failed to scan sessions',
-                code: 'resume_failed'
-            }
-        }
-        return {
-            type: 'success',
-            sessions: scanResult.sessions,
-            currentSessionId: this.resolveAgentResumeId(access.session, namespace)
-        }
-    }
-
     private recoverClaudeSessionIdFromMessages(sessionId: string, namespace: string): string | null {
         const messages = this.messageService.getMessages(sessionId, 200)
         for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -3850,27 +3778,14 @@ export class SyncEngine {
 
     private recoverCodexSessionIdFromMessages(sessionId: string, namespace: string): string | null {
         const messages = this.messageService.getMessages(sessionId, 200)
-        let legacyChildParentId: string | null = null
         for (let i = messages.length - 1; i >= 0; i -= 1) {
             const content = messages[i].content
             if (this.isCodexContextResetMessage(content)) return null
 
             const found = this.extractCodexParentThreadId(content)
-            if (found) {
-                return this.persistRecoveredAgentSessionId(sessionId, namespace, 'codexSessionId', found)
-            }
+            if (!found) continue
 
-            const legacy = this.extractLegacyCodexThreadCandidate(content)
-            if (!legacy) continue
-            if (legacy.kind === 'child-parent') {
-                legacyChildParentId ??= legacy.id
-                continue
-            }
-            // An unscoped legacy output is only authoritative when a newer
-            // child event independently names the same parent thread.
-            if (legacyChildParentId === legacy.id) {
-                return this.persistRecoveredAgentSessionId(sessionId, namespace, 'codexSessionId', legacy.id)
-            }
+            return this.persistRecoveredAgentSessionId(sessionId, namespace, 'codexSessionId', found)
         }
         return null
     }
@@ -3910,49 +3825,6 @@ export class SyncEngine {
         }
         const uniqueThreadIds = [...new Set(threadIds)]
         return uniqueThreadIds.length === 1 ? uniqueThreadIds[0] : null
-    }
-
-    /**
-     * Compatibility for messages persisted before Codex emitted an explicit
-     * parent scope. Never trust an unscoped thread id by itself: pair it with
-     * a newer child event that independently identifies the same parent.
-     */
-    private extractLegacyCodexThreadCandidate(
-        value: unknown
-    ): { kind: 'child-parent' | 'unscoped'; id: string } | null {
-        const message = asRecord(value)
-        const content = asRecord(message?.content)
-        const event = asRecord(content?.data)
-        if (message?.role !== 'agent' || content?.type !== 'codex' || !event) {
-            return null
-        }
-
-        const visit = (candidate: unknown): { kind: 'child-parent' | 'unscoped'; id: string } | null => {
-            const record = asRecord(candidate)
-            if (!record) return null
-            const scope = asRecord(record.scope)
-            const scopeRole = record.scopeRole ?? record.scope_role ?? scope?.role
-            if (scopeRole === 'child') {
-                const id = this.normalizeAgentSessionId(scope?.parentThreadId)
-                    ?? this.normalizeAgentSessionId(scope?.parent_thread_id)
-                    ?? this.normalizeAgentSessionId(record.parentThreadId)
-                    ?? this.normalizeAgentSessionId(record.parent_thread_id)
-                return id ? { kind: 'child-parent', id } : null
-            }
-            if (scopeRole !== undefined) return null
-
-            const direct = this.normalizeAgentSessionId(record.thread_id)
-                ?? this.normalizeAgentSessionId(record.threadId)
-            if (direct) return { kind: 'unscoped', id: direct }
-
-            for (const key of ['data', 'output']) {
-                const nested = visit(record[key])
-                if (nested) return nested
-            }
-            return null
-        }
-
-        return visit(event)
     }
 
     private extractClaudeSessionId(value: unknown): string | null {
@@ -4068,44 +3940,6 @@ export class SyncEngine {
         return this.sessionReadyIds.has(session.id)
     }
 
-    /**
-     * Stop a generic resume child after it failed the Hub active-state
-     * barrier.  A successful runner stop is only rollback-safe once the Hub
-     * has observed the child as inactive; otherwise a late heartbeat could
-     * revive the row after reopen restores its archive metadata.
-     */
-    private async terminateFailedResumeChild(
-        machineId: string,
-        sessionId: string
-    ): Promise<'stopped' | 'already_gone' | 'unconfirmed'> {
-        let status: 'stopped' | 'already_gone' | 'still_alive'
-        try {
-            status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
-        } catch {
-            return 'unconfirmed'
-        }
-
-        if (status === 'still_alive') {
-            return 'unconfirmed'
-        }
-
-        // `already_gone` is a verified runner tombstone.  There may still be
-        // an active bit in the Hub cache waiting for its end event; reconcile
-        // it locally so the archive rollback can proceed without a dangling
-        // active row.
-        if (status === 'already_gone') {
-            const current = this.sessionCache.getSession(sessionId)
-            if (current?.active) {
-                this.handleSessionEnd({ sid: sessionId, time: Date.now(), reason: 'error' })
-            }
-            return this.sessionCache.getSession(sessionId)?.active
-                ? 'unconfirmed'
-                : 'already_gone'
-        }
-
-        return await this.waitForSessionInactive(sessionId) ? 'stopped' : 'unconfirmed'
-    }
-
     private async terminateInPlacePiResume(
         machineId: string,
         sessionId: string,
@@ -4118,7 +3952,7 @@ export class SyncEngine {
             machineId,
             startedAt: Date.now(),
         })
-        let status: 'stopped' | 'already_gone' | 'still_alive'
+        let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
         try {
             status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
         } catch {
@@ -4128,7 +3962,7 @@ export class SyncEngine {
         await new Promise((resolve) => setTimeout(resolve, 0))
         const session = this.sessionCache.refreshSession(sessionId) ?? this.sessionCache.getSession(sessionId)
         const attemptClearedByEnd = session?.metadata?.piResumeAttempt === undefined
-        if (status === 'still_alive') {
+        if (status === 'still_alive' || status === 'unknown') {
             if (attemptClearedByEnd) return true
             return false
         }
@@ -4152,7 +3986,7 @@ export class SyncEngine {
             startedAt: Date.now(),
             childSessionId: sessionId,
         })
-        let status: 'stopped' | 'already_gone' | 'still_alive'
+        let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
         try {
             status = await this.rpcGateway.stopRunnerSession(machineId, sessionId)
         } catch {
@@ -4163,7 +3997,7 @@ export class SyncEngine {
         const session = this.sessionCache.refreshSession(sessionId) ?? this.sessionCache.getSession(sessionId)
         const original = this.sessionCache.refreshSession(originalSessionId) ?? this.sessionCache.getSession(originalSessionId)
         const attemptClearedByEnd = original?.metadata?.piResumeAttempt === undefined
-        if (status === 'still_alive' && !attemptClearedByEnd) {
+        if ((status === 'still_alive' || status === 'unknown') && !attemptClearedByEnd) {
             await this.writePiResumeAttempt(originalSessionId, namespace, {
                 ...existingAttempt,
                 state: 'quarantined',
@@ -4252,7 +4086,8 @@ export class SyncEngine {
     private async writePtyResumeAttempt(
         sessionId: string,
         namespace: string,
-        attempt: PtyResumeAttempt | null
+        attempt: PtyResumeAttempt | null,
+        restoreArchive = false
     ): Promise<void> {
         for (let i = 0; i < 5; i += 1) {
             const current = this.sessionCache.getSessionByNamespace(sessionId, namespace)
@@ -4260,7 +4095,20 @@ export class SyncEngine {
             if (!current?.metadata) throw new Error('PTY resume attempt session metadata is unavailable')
             const next = { ...current.metadata }
             if (attempt) next.ptyResumeAttempt = attempt
-            else delete next.ptyResumeAttempt
+            else {
+                const snapshot = current.metadata.ptyResumeAttempt?.archiveSnapshot
+                delete next.ptyResumeAttempt
+                if (restoreArchive && snapshot) {
+                    if (snapshot.lifecycleState === undefined) delete next.lifecycleState
+                    else next.lifecycleState = snapshot.lifecycleState
+                    if (snapshot.lifecycleStateSince === undefined) delete next.lifecycleStateSince
+                    else next.lifecycleStateSince = snapshot.lifecycleStateSince
+                    if (snapshot.archivedBy === undefined) delete next.archivedBy
+                    else next.archivedBy = snapshot.archivedBy
+                    if (snapshot.archiveReason === undefined) delete next.archiveReason
+                    else next.archiveReason = snapshot.archiveReason
+                }
+            }
             const result = this.store.sessions.updateSessionMetadata(
                 sessionId,
                 next,
@@ -4281,20 +4129,22 @@ export class SyncEngine {
     private async reconcilePersistedPtyResumeAttempt(session: Session): Promise<boolean> {
         const attempt = session.metadata?.ptyResumeAttempt
         if (!attempt) return true
-        let status: 'stopped' | 'already_gone' | 'still_alive'
+        let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
         try {
             status = await this.rpcGateway.stopRunnerSession(attempt.machineId, session.id)
         } catch {
             return false
         }
-        if (status === 'still_alive') return false
+        if (status === 'still_alive' || status === 'unknown') return false
 
         const current = this.sessionCache.getSession(session.id)
         if (current?.active) {
             this.handleSessionEnd({ sid: session.id, time: Date.now(), reason: 'error' })
         }
         try {
-            await this.writePtyResumeAttempt(session.id, session.namespace, null)
+            // Restore archive from the attempt snapshot when cleaning a failed
+            // resume (clear-before-spawn already dropped live archive fields).
+            await this.writePtyResumeAttempt(session.id, session.namespace, null, true)
             this.ptyResumeQuarantinedIds.delete(session.id)
             return true
         } catch {
@@ -4307,13 +4157,13 @@ export class SyncEngine {
         const attempt = session.metadata?.piResumeAttempt
         if (!attempt) return true
         const childSessionId = attempt.childSessionId ?? session.id
-        let status: 'stopped' | 'already_gone' | 'still_alive'
+        let status: 'stopped' | 'already_gone' | 'still_alive' | 'unknown'
         try {
             status = await this.rpcGateway.stopRunnerSession(attempt.machineId, childSessionId)
         } catch {
             return false
         }
-        if (status === 'still_alive') return false
+        if (status === 'still_alive' || status === 'unknown') return false
 
         const child = this.sessionCache.getSession(childSessionId)
         if (child?.active) this.handleSessionEnd({ sid: childSessionId, time: Date.now(), reason: 'error' })
@@ -4422,14 +4272,6 @@ export class SyncEngine {
         return await this.rpcGateway.uploadFile(sessionId, filename, content, mimeType)
     }
 
-    async uploadFileFromHub(sessionId: string, filename: string, downloadUrl: string, mimeType: string): Promise<RpcUploadFileResponse> {
-        return await this.rpcGateway.uploadFileFromHub(sessionId, filename, downloadUrl, mimeType)
-    }
-
-    hasSessionMethod(sessionId: string, method: string): boolean {
-        return this.rpcGateway.hasSessionMethod(sessionId, method)
-    }
-
     async deleteUploadFile(sessionId: string, path: string): Promise<RpcDeleteUploadResponse> {
         return await this.rpcGateway.deleteUploadFile(sessionId, path)
     }
@@ -4450,28 +4292,31 @@ export class SyncEngine {
         return await this.rpcGateway.listSkills(sessionId, flavor)
     }
 
-    async listAgyModelsForMachine(machineId: string): Promise<RpcListAgyModelsResponse> {
-        return await this.rpcGateway.listAgyModelsForMachine(machineId)
+    async listAgyModelsForMachine(
+        machineId: string,
+        options?: { refresh?: boolean }
+    ): Promise<RpcListAgyModelsResponse> {
+        return await this.rpcGateway.listAgyModelsForMachine(machineId, options)
     }
 
     async listPiModelsForMachine(machineId: string): Promise<RpcListPiModelsResponse> {
         return await this.rpcGateway.listPiModelsForMachine(machineId)
     }
 
-    async listClaudeModelsForMachine(machineId: string): Promise<RpcListClaudeModelsResponse> {
-        return await this.rpcGateway.listClaudeModelsForMachine(machineId)
+    async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {
+        return await this.rpcGateway.listCodexModelsForMachine(machineId)
     }
 
-    async listCodexModelsForMachine(machineId: string, accountId?: string): Promise<RpcListCodexModelsResponse> {
-        return await this.rpcGateway.listCodexModelsForMachine(machineId, accountId)
+    async listOpencodeModelVariantsForMachine(machineId: string, cwd?: string | null): Promise<RpcListOpencodeModelVariantsResponse> {
+        return await this.rpcGateway.listOpencodeModelVariantsForMachine(machineId, cwd)
     }
 
     async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
         return await this.rpcGateway.listCodexModelsForSession(sessionId)
     }
 
-    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[], codexAccountId?: string | null) {
-        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds, codexAccountId)
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]) {
+        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds)
     }
 
     async listPiSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListPiSessionsResponse> {
@@ -4516,6 +4361,14 @@ export class SyncEngine {
 
     async listCopilotModelsForSession(sessionId: string): Promise<RpcListCopilotModelsResponse> {
         return await this.rpcGateway.listCopilotModelsForSession(sessionId)
+    }
+
+    async listKimiModelsForCwd(machineId: string, cwd: string): Promise<RpcListKimiModelsResponse> {
+        return await this.rpcGateway.listKimiModelsForCwd(machineId, cwd)
+    }
+
+    async listKimiModelsForSession(sessionId: string): Promise<RpcListKimiModelsResponse> {
+        return await this.rpcGateway.listKimiModelsForSession(sessionId)
     }
 
     /** Generic Pi RPC — delegates to rpcGateway.callPiRpc. */

@@ -1,5 +1,4 @@
 const FILE_PATH_HREF_PREFIX = 'hapi-file:'
-const FILE_DOWNLOAD_HREF_PREFIX = 'hapi-file-download:'
 // Encoded Windows abs handoff: raw `C:\…` is URI-normalized to `%5C` before <A>,
 // which breaks drive detection. Candidate scheme preserves the path through hast.
 const FILE_PATH_CANDIDATE_HREF_PREFIX = 'hapi-file-candidate:'
@@ -16,20 +15,11 @@ const TRAILING_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?'])
 // are deliberately excluded so URLs like "example.org" don't autolink.
 export const COMMON_FILE_EXTENSIONS = new Set([
     'adoc', 'astro', 'avif', 'bat', 'bmp', 'c', 'cfg', 'cjs', 'conf', 'cpp', 'css', 'csv',
-    'doc', 'docx', 'env', 'gif', 'go', 'gql', 'gradle', 'graphql', 'gz', 'h', 'hpp', 'html',
-    'ico', 'ini', 'java', 'jpeg', 'jpg', 'js', 'json', 'jsx', 'kt', 'lock', 'md', 'mdx', 'mjs',
-    'mmd', 'ods', 'odt', 'pdf', 'php', 'png', 'ppt', 'pptx', 'prisma', 'properties', 'proto',
-    'ps1', 'puml', 'py', 'rar', 'rb', 'rs', 'rst', 'scss', 'sh', 'sql', 'svelte', 'svg',
-    'swift', 'tar', 'tex', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'vue', 'webp', 'xls', 'xlsm',
-    'xlsx', 'xml', 'yaml', 'yml', 'zip', 'zsh'
-])
-
-// Binary/output artifacts are not useful in the text file viewer. Explicit
-// absolute links to these formats should keep the local authenticated-download
-// behavior from before the upstream file-link rewrite.
-const DOWNLOADABLE_ARTIFACT_EXTENSIONS = new Set([
-    'doc', 'docx', 'gz', 'ods', 'odt', 'pdf', 'ppt', 'pptx', 'rar', 'tar',
-    'xls', 'xlsm', 'xlsx', 'zip'
+    'env', 'gif', 'go', 'gql', 'gradle', 'graphql', 'h', 'hpp', 'html', 'ico', 'ini', 'java',
+    'jpeg', 'jpg', 'js', 'json', 'jsx', 'kt', 'lock', 'md', 'mdx', 'mjs', 'mmd', 'php', 'png',
+    'prisma', 'properties', 'proto', 'ps1', 'puml', 'py', 'rb', 'rs', 'rst', 'scss', 'sh',
+    'sql', 'svelte', 'svg', 'swift', 'tex', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'vue', 'webp',
+    'xml', 'yaml', 'yml', 'zsh'
 ])
 
 type MarkdownNode = {
@@ -44,23 +34,10 @@ function createFileHref(path: string): string {
     return `${FILE_PATH_HREF_PREFIX}${encodeURIComponent(path)}`
 }
 
-function createFileDownloadHref(path: string): string {
-    return `${FILE_DOWNLOAD_HREF_PREFIX}${encodeURIComponent(path)}`
-}
-
 export function decodeFilePathHref(href: string): string | null {
     if (!href.startsWith(FILE_PATH_HREF_PREFIX)) return null
     try {
         return decodeURIComponent(href.slice(FILE_PATH_HREF_PREFIX.length))
-    } catch {
-        return null
-    }
-}
-
-export function decodeFileDownloadHref(href: string): string | null {
-    if (!href.startsWith(FILE_DOWNLOAD_HREF_PREFIX)) return null
-    try {
-        return decodeURIComponent(href.slice(FILE_DOWNLOAD_HREF_PREFIX.length))
     } catch {
         return null
     }
@@ -132,12 +109,6 @@ function hasKnownFileExtension(value: string): boolean {
     return COMMON_FILE_EXTENSIONS.has(ext)
 }
 
-function hasDownloadableArtifactExtension(value: string): boolean {
-    const path = stripLineSuffix(value).toLowerCase()
-    const ext = path.slice(path.lastIndexOf('.') + 1)
-    return DOWNLOADABLE_ARTIFACT_EXTENSIONS.has(ext)
-}
-
 function isWindowsAbsolutePath(value: string): boolean {
     return /^[A-Za-z]:[\\/]/.test(value)
 }
@@ -153,44 +124,6 @@ function shouldLinkPath(value: string): boolean {
     if (isWindowsAbsolutePath(path)) return hasKnownFileExtension(path)
     if (path.includes('/')) return hasKnownFileExtension(path)
     return hasKnownFileExtension(path)
-}
-
-/**
- * Resolve explicit links that intentionally point at a local artifact. These
- * links cannot be fetched by normal browser navigation because the Hub may be
- * remote and authentication is required. Keep relative repository links on
- * the upstream file-viewer path; only explicit absolute/file/sandbox targets
- * use the authenticated download endpoint.
- */
-function decodeExplicitLocalArtifactPath(value: string): string | null {
-    let path = value.trim()
-    if (!path) return null
-
-    try {
-        path = decodeURIComponent(path)
-    } catch {
-        // A literal percent sign is valid in a filesystem path.
-    }
-
-    let explicitLocalScheme = false
-    if (path.startsWith('file://')) {
-        path = path.slice('file://'.length)
-        explicitLocalScheme = true
-    } else if (path.startsWith('sandbox:')) {
-        path = path.slice('sandbox:'.length)
-        explicitLocalScheme = true
-    }
-
-    path = stripLineSuffix(path)
-    if (!hasKnownFileExtension(path)) return null
-    if (explicitLocalScheme) return path
-
-    // Keep upstream's Windows-path behavior: route it to the session file
-    // viewer, where the session host validates the path. A plain POSIX path is
-    // only rewritten for binary artifacts; source/documentation paths such as
-    // `/abs/path.md` remain untouched as upstream intended.
-    if (path.startsWith('/') && hasDownloadableArtifactExtension(path)) return path
-    return null
 }
 
 /** Autolink href: Windows abs uses candidate encoding so backslashes survive hast. */
@@ -282,17 +215,7 @@ function rewriteFileLinkNode(node: MarkdownNode): void {
     if (node.type !== 'link') return
     const url = node.url
     if (!url) return
-    if (
-        url.startsWith(FILE_PATH_HREF_PREFIX)
-        || url.startsWith(FILE_DOWNLOAD_HREF_PREFIX)
-        || url.startsWith(FILE_PATH_CANDIDATE_HREF_PREFIX)
-    ) return
-
-    const artifactPath = decodeExplicitLocalArtifactPath(url)
-    if (artifactPath) {
-        node.url = createFileDownloadHref(artifactPath)
-        return
-    }
+    if (url.startsWith(FILE_PATH_HREF_PREFIX)) return
 
     // Strip #fragment / ?query so `file.md#section` can still rewrite.
     const hashIdx = url.indexOf('#')

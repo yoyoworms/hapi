@@ -34,8 +34,9 @@ data class VersionedValue<T>(
  *   an explicit wire `null` clears the target field while absence leaves it
  *   untouched.
  *
- * `activeTurnStartedAt` is applied (and explicit null clears it), while
- * `scratchlistUpdatedAt` is only a refetch trigger.
+ * Note `activeTurnStartedAt` and `scratchlistUpdatedAt` are carried but never
+ * assigned by `applySessionDetailPatch` — replicating the reference client
+ * (see `app.hapi.protocol.patch.SessionPatching`).
  */
 data class SessionPatch(
     val active: Boolean? = null,

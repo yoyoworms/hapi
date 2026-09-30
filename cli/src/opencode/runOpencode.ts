@@ -27,6 +27,8 @@ export async function runOpencode(opts: {
     modelReasoningEffort?: string | null;
     resumeSessionId?: string;
     existingSessionId?: string;
+    /** Fresh machine-spawn stub (`--hapi-session-id`); adopt via bootstrapSession. */
+    reservedSessionId?: string;
     workingDirectory?: string;
 } = {}): Promise<void> {
     const workingDirectory = opts.workingDirectory ?? getInvokedCwd();
@@ -69,7 +71,8 @@ export async function runOpencode(opts: {
             workingDirectory,
             agentState: initialState,
             model: initialModel ?? undefined,
-            modelReasoningEffort: initialModelReasoningEffort ?? undefined
+            modelReasoningEffort: initialModelReasoningEffort ?? undefined,
+            reservedSessionId: opts.reservedSessionId
         });
     const { api, session } = bootstrap;
 
@@ -126,7 +129,7 @@ export async function runOpencode(opts: {
     // harmless/stale otherwise since the mode check alone already rejects a
     // genuinely local-mode session regardless of this flag's value.
     let compactTeardownInProgress = false;
-    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'yolo';
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'default';
     let sessionModel: string | null = initialModel;
     let sessionModelReasoningEffort: string | null = initialModelReasoningEffort;
     const hookServer = await startOpencodeHookServer({
@@ -150,7 +153,7 @@ export async function runOpencode(opts: {
     });
 
     lifecycle.registerProcessHandlers();
-    registerKillSessionHandler(session.rpcHandlerManager, lifecycle);
+    registerKillSessionHandler(session.rpcHandlerManager, lifecycle, session);
     registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle);
 
     const syncSessionMode = () => {
@@ -529,6 +532,9 @@ export async function runOpencode(opts: {
                     compactTeardownInProgress = false;
                 }
                 notifyHubModeChange(mode);
+            },
+            onModelRollback: (model) => {
+                sessionModel = model;
             },
             onReasoningEffortRollback: (effort) => {
                 sessionModelReasoningEffort = effort;

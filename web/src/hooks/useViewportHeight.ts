@@ -113,11 +113,29 @@ export function useViewportHeight(): void {
             for (const timer of focusTimers.splice(0)) {
                 window.clearTimeout(timer)
             }
+            // iOS may pan the document before the first visualViewport resize
+            // event. Reset immediately on focus, then repeat after WebKit has
+            // finished its keyboard animation; otherwise the composer can be
+            // left above the keyboard with only the keyboard and blank space
+            // visible.
+            resetWindowScroll()
             scheduleUpdate()
-            focusTimers.push(window.setTimeout(scheduleUpdate, 50))
-            focusTimers.push(window.setTimeout(scheduleUpdate, 250))
-            focusTimers.push(window.setTimeout(scheduleUpdate, 500))
-            focusTimers.push(window.setTimeout(scheduleUpdate, 1000))
+            focusTimers.push(window.setTimeout(() => {
+                resetWindowScroll()
+                scheduleUpdate()
+            }, 50))
+            focusTimers.push(window.setTimeout(() => {
+                resetWindowScroll()
+                scheduleUpdate()
+            }, 250))
+            focusTimers.push(window.setTimeout(() => {
+                resetWindowScroll()
+                scheduleUpdate()
+            }, 500))
+            focusTimers.push(window.setTimeout(() => {
+                resetWindowScroll()
+                scheduleUpdate()
+            }, 1000))
         }
 
         function handleFocusOut(event: FocusEvent) {

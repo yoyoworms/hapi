@@ -21,26 +21,6 @@ async function flushAsyncWork(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function simulateRuntimeBootstrap(store: Store, engine: SyncEngine, sessionId: string): void {
-    const current = store.sessions.getSession(sessionId)
-    if (!current?.metadata) throw new Error('session metadata unavailable')
-    const result = store.sessions.updateSessionMetadata(
-        sessionId,
-        {
-            ...current.metadata,
-            lifecycleState: 'running',
-            lifecycleStateSince: Date.now()
-        },
-        current.metadataVersion,
-        current.namespace,
-        { touchUpdatedAt: false }
-    )
-    if (result.result !== 'success') throw new Error('failed to simulate runtime bootstrap')
-    ;(engine as unknown as { sessionCache: { refreshSession(id: string): unknown } })
-        .sessionCache.refreshSession(sessionId)
-    engine.handleSessionAlive({ sid: sessionId, time: Date.now() })
-}
-
 function productionCodexMessage(event: Record<string, unknown>): Record<string, unknown> {
     return {
         role: 'agent',
@@ -600,21 +580,57 @@ describe('session model', () => {
                 _machineId: string,
                 _directory: string,
                 agent: string,
-                model?: string
+                model?: string,
+                _modelReasoningEffort?: string,
+                _yolo?: boolean,
+                _sessionType?: string,
+                _worktreeName?: string,
+                _resumeSessionId?: string,
+                _effort?: string,
+                _permissionMode?: string,
+                _serviceTier?: string,
+                existingSessionId?: string,
+                _collaborationMode?: string,
+                _copilotAgentMode?: string,
+                _startingMode?: string,
+                _forkSession?: boolean,
+                reservedSessionId?: string
             ) => {
                 capturedModel = model
-                return { type: 'success', sessionId: 'spawned-cursor-session' }
+                return {
+                    type: 'success',
+                    sessionId: reservedSessionId ?? existingSessionId ?? 'spawned-cursor-session',
+                }
             }
 
             const result = await engine.spawnSession(
                 'machine-cursor',
                 '/tmp/project',
                 'cursor',
-                'composer-2.5[fast=false]'
+                'composer-2.5[fast=false]',
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                'default'
             )
 
-            expect(result).toEqual({ type: 'success', sessionId: 'spawned-cursor-session' })
+            expect(result.type).toBe('success')
             expect(capturedModel).toBe('composer-2.5[fast=false]')
+            if (result.type === 'success') {
+                expect(typeof result.sessionId).toBe('string')
+                expect(result.sessionId.length).toBeGreaterThan(0)
+                const meta = store.sessions.getSession(result.sessionId)?.metadata as { flavor?: string } | null
+                expect(meta?.flavor).toBe('cursor')
+            }
         } finally {
             engine.stop()
         }
@@ -849,7 +865,7 @@ describe('session model', () => {
         }
     })
 
-    it('records completion activity and broadcasts ready without persisting it as chat history', () => {
+    it('records CLI user text activity but stores and broadcasts ready without recording activity', () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []
         const cache = new SessionCache(store, createPublisher(events))
@@ -877,8 +893,7 @@ describe('session model', () => {
             emitAccessError: () => {},
             onSessionActivity: (sessionId, updatedAt) => {
                 activity.push({ sessionId, updatedAt })
-            },
-            onWebappEvent: (event) => events.push(event)
+            }
         })
 
         handlers.get('message')?.({
@@ -897,13 +912,11 @@ describe('session model', () => {
         })
 
         const messages = store.messages.getMessages(session.id)
-        expect(messages).toHaveLength(1)
-        expect(roomEvents).toHaveLength(1)
-        expect(activity).toHaveLength(2)
+        expect(messages).toHaveLength(2)
+        expect(roomEvents).toHaveLength(2)
+        expect(activity).toHaveLength(1)
         expect(activity[0].sessionId).toBe(session.id)
         expect(activity[0].updatedAt).toBe(messages[0]?.createdAt)
-        expect(activity[1].sessionId).toBe(session.id)
-        expect(events.some((event) => event.type === 'message-received')).toBe(true)
     })
 
     it('records activity only for the first messages-consumed transition while retaining duplicate acknowledgements', () => {
@@ -965,11 +978,10 @@ describe('session model', () => {
             expect(invoked?.invokedAt).toBe(2_000)
             expect(activity).toEqual([
                 { sessionId: session.id, updatedAt: 2_000 },
-                { sessionId: session.id, updatedAt: 2_000 },
-                { sessionId: session.id, updatedAt: 4_000 }
+                { sessionId: session.id, updatedAt: 2_000 }
             ])
-            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(4_000)
-            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(2)
+            expect(store.sessions.getSession(session.id)?.updatedAt).toBe(2_000)
+            expect(events.filter((event) => event.type === 'session-updated')).toHaveLength(1)
             expect(webEvents.filter((event) => event.type === 'messages-consumed')).toHaveLength(2)
         } finally {
             Date.now = originalDateNow
@@ -2363,7 +2375,7 @@ describe('session model', () => {
             ;(engine as any).sessionCache.mergeSessions = async () => { merges += 1 }
             ;(engine as any).rpcGateway.spawnSession = async (...args: Parameters<SyncEngine['spawnSession']>) => {
                 existing = args[12]
-                simulateRuntimeBootstrap(store, engine, session.id)
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
                 engine.handleSessionReady({ sid: session.id, time: Date.now() })
                 return { type: 'success', sessionId: session.id }
             }
@@ -2412,7 +2424,7 @@ describe('session model', () => {
             engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
             engine.handleSessionEnd({ sid: session.id, time: Date.now() })
             ;(engine as any).rpcGateway.spawnSession = async () => {
-                simulateRuntimeBootstrap(store, engine, session.id)
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
                 return { type: 'success', sessionId: session.id }
             }
             ;(engine as any).waitForSessionReady = async () => 'timeout'
@@ -2420,9 +2432,9 @@ describe('session model', () => {
             const result = await engine.reopenSession(session.id, 'default')
             expect(result).toMatchObject({ type: 'error', message: expect.stringContaining('still active') })
             expect(engine.getSessionByNamespace(session.id, 'default')?.active).toBe(true)
-            // A bootstrapped child owns the row and remains live when stop fails;
-            // do not overwrite its newer running lifecycle with the old snapshot.
-            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('running')
+            // #1911 M1: reopen clears archive before spawn; a live Pi child that
+            // failed stop stays active and must not be re-archived from memory.
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).not.toBe('archived')
             expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt?.state).toBe('quarantined')
             expect(await engine.reopenSession(session.id, 'default')).toMatchObject({ type: 'error', message: 'Pi resume is already in progress' })
 
@@ -2474,7 +2486,11 @@ describe('session model', () => {
                 type: 'error', message: 'webhook timeout'
             })
             expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt?.state).toBe('quarantined')
-            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).toBe('archived')
+            // #1911 M1: archive cleared before spawn; quarantine refuses reopen
+            // rollback (rollbackSafe:false). Snapshot lives on the attempt.
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.lifecycleState).not.toBe('archived')
+            expect(engine.getSessionByNamespace(session.id, 'default')?.metadata?.piResumeAttempt?.archiveSnapshot)
+                .toMatchObject({ lifecycleState: 'archived', archivedBy: 'cli' })
             expect(await engine.reopenSession(session.id, 'default')).toMatchObject({
                 type: 'error', message: 'Pi resume is already in progress'
             })

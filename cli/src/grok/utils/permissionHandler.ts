@@ -1,7 +1,7 @@
 import type { ApiSessionClient } from '@/api/apiSession'
 import type { AgentBackend, PermissionRequest, PermissionResponse } from '@/agent/types'
 import type { GrokPermissionMode } from '@hapi/protocol/types'
-import { deriveToolName } from '@/agent/utils'
+import { deriveToolInput, deriveToolName } from '@/agent/utils'
 import { logger } from '@/ui/logger'
 import {
     BasePermissionHandler,
@@ -9,14 +9,12 @@ import {
     type PendingPermissionRequest,
     type PermissionCompletion
 } from '@/modules/common/permission/BasePermissionHandler'
-import type { GrokPermissionResponse } from './grokExtensionAdapter'
 
-interface PermissionResponseMessage extends GrokPermissionResponse {
+interface PermissionResponseMessage {
+    id: string
+    approved: boolean
+    decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort'
     reason?: string
-}
-
-function deriveToolInput(request: PermissionRequest): unknown {
-    return request.rawInput !== undefined ? request.rawInput : request.rawOutput
 }
 
 function pickOptionId(
@@ -60,8 +58,7 @@ export class GrokPermissionHandler extends BasePermissionHandler<PermissionRespo
     constructor(
         session: ApiSessionClient,
         private readonly backend: AgentBackend,
-        private readonly getPermissionMode: () => GrokPermissionMode | undefined,
-        private readonly interceptPermissionResponse?: (response: GrokPermissionResponse) => Promise<boolean>
+        private readonly getPermissionMode: () => GrokPermissionMode | undefined
     ) {
         super(session)
         this.backend.onPermissionRequest((request) => this.handlePermissionRequest(request))
@@ -169,14 +166,6 @@ export class GrokPermissionHandler extends BasePermissionHandler<PermissionRespo
     }
 
     protected handleMissingPendingResponse(response: PermissionResponseMessage): void {
-        if (this.interceptPermissionResponse) {
-            void this.interceptPermissionResponse(response).then((handled) => {
-                if (!handled) {
-                    logger.debug('[Grok] Permission response received for unknown request', response.id)
-                }
-            })
-            return
-        }
         logger.debug('[Grok] Permission response received for unknown request', response.id)
     }
 

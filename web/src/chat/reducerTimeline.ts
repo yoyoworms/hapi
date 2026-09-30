@@ -1,6 +1,5 @@
 import type { AgentEventBlock, AgentReasoningBlock, AgentTextBlock, ChatBlock, CliOutputBlock, CodexReviewBlock, RoundSummary, ToolCallBlock, ToolPermission, UserTextBlock } from '@/chat/types'
 import type { TracedMessage } from '@/chat/tracer'
-import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import { createCliOutputBlock, isCliOutputText, mergeCliOutputBlocks } from '@/chat/reducerCliOutput'
 import { parseMessageAsEvent } from '@/chat/reducerEvents'
 import { collectTitleChanges, ensureToolBlock, extractTitleFromChangeTitleInput, isChangeTitleToolName, type PermissionEntry } from '@/chat/reducerTools'
@@ -9,6 +8,14 @@ import { asString, isObject } from '@hapi/protocol'
 
 function getEventString(event: Record<string, unknown>, key: string): string | null {
     return asString(event[key])
+}
+
+// Stream identity must match the wire-level semantics in @hapi/protocol
+// (blank ids are not streams): a blank value falls back to row-derived ids
+// instead of colliding every blank-id row onto one block identity.
+function nonBlank(value: unknown): string | null {
+    const raw = asString(value)
+    return raw !== null && raw.trim().length > 0 ? raw : null
 }
 
 function getEventNumber(event: Record<string, unknown>, key: string): number | null {
@@ -69,6 +76,26 @@ function mapAgentRunStatusToToolState(status: string | null): ToolCallBlock['too
     ) return 'error'
     if (status === 'pending') return 'pending'
     return 'running'
+}
+
+function attachCodexRoundSummaryToLatestGroup(blocks: ChatBlock[], summary: RoundSummary): void {
+    type SummaryTargetBlock = Exclude<ChatBlock, UserTextBlock | AgentEventBlock>
+    const isSummaryTarget = (block: ChatBlock): block is SummaryTargetBlock =>
+        block.kind !== 'user-text'
+        && block.kind !== 'agent-event'
+        && !(block.kind === 'cli-output' && block.source === 'user')
+
+    let firstIndex = -1
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+        if (!isSummaryTarget(blocks[index])) break
+        firstIndex = index
+    }
+    if (firstIndex === -1) return
+
+    const firstBlock = blocks[firstIndex]
+    if (isSummaryTarget(firstBlock)) {
+        firstBlock.roundSummary = summary
+    }
 }
 
 function isTerminalAgentRunState(state: ToolCallBlock['tool']['state']): boolean {
@@ -206,19 +233,11 @@ function normalizeTraceMessage(
     }
 
     if (data.type === 'message' && typeof data.message === 'string') {
-        const phase = normalizeAgentMessagePhase(data.phase)
-        const message = unwrapCodexResponseStepEnvelope(data.message) ?? data.message
         return [{
             ...base,
             id: traceId,
             role: 'agent',
-            content: [{
-                type: 'text',
-                text: message,
-                uuid: traceId,
-                ...(phase ? { phase } : {}),
-                parentUUID: null
-            }]
+            content: [{ type: 'text', text: data.message, uuid: traceId, parentUUID: null }]
         } as TracedMessage]
     }
 
@@ -485,6 +504,38 @@ export function reduceTimeline(
                 continue
             }
             if (msg.content.type === 'token-count') {
+                const tokenCount = msg.content as {
+                    type: 'token-count'
+                    provider?: 'codex'
+                    model?: string | null
+                }
+                if (
+                    tokenCount.provider === 'codex'
+                    && msg.usage
+                    && msg.usage.scope_role !== 'child'
+                ) {
+                    const model = tokenCount.model ?? undefined
+                    const displayUsage = model
+                        ? msg.usage
+                        : {
+                            ...msg.usage,
+                            cache_creation_input_tokens: undefined,
+                            cache_read_input_tokens: undefined
+                        }
+                    attachCodexRoundSummaryToLatestGroup(blocks, {
+                        provider: 'codex',
+                        usage: displayUsage,
+                        modelUsage: model
+                            ? {
+                                [model]: {
+                                    inputTokens: msg.usage.input_tokens,
+                                    outputTokens: msg.usage.output_tokens
+                                }
+                            }
+                            : {},
+                        numTurns: 1
+                    })
+                }
                 continue
             }
             // abort-restore is a side-effect signal for the web composer,
@@ -797,12 +848,11 @@ export function reduceTimeline(
                         }))
                         continue
                     }
-                    const streamId = asString(c.streamId)
+                    const streamId = nonBlank(c.streamId)
                     if (streamId) {
                         const existing = textBlocksByStreamId.get(streamId)
                         if (existing) {
                             existing.text = c.text
-                            existing.phase = c.phase
                             existing.usage = msg.usage
                             existing.model = msg.model
                             existing.meta = msg.meta
@@ -813,14 +863,19 @@ export function reduceTimeline(
 
                     const block: AgentTextBlock = {
                         kind: 'agent-text',
-                        id: `${msg.id}:${idx}`,
+                        // Streamed snapshots under one stream id arrive as
+                        // separate message rows that the window keeps swapping
+                        // for newer rows. Deriving the id from the stream id
+                        // (unique per stream) keeps the block identity stable
+                        // across snapshots so the rendered component is
+                        // updated in place instead of being remounted.
+                        id: streamId ?? `${msg.id}:${idx}`,
                         localId: msg.localId,
                         createdAt: msg.createdAt,
                         invokedAt: msg.invokedAt,
                         usage: msg.usage,
                         model: msg.model,
                         text: c.text,
-                        phase: c.phase,
                         meta: msg.meta
                     }
                     blocks.push(block)
@@ -847,7 +902,7 @@ export function reduceTimeline(
                 }
 
                 if (c.type === 'reasoning') {
-                    const streamId = asString(c.streamId)
+                    const streamId = nonBlank(c.streamId)
                     if (streamId) {
                         const existing = reasoningBlocksByStreamId.get(streamId)
                         if (existing) {
@@ -862,7 +917,11 @@ export function reduceTimeline(
 
                     const block: AgentReasoningBlock = {
                         kind: 'agent-reasoning',
-                        id: `${msg.id}:${idx}`,
+                        // Same as agent-text above: a stream-stable id keeps
+                        // the reasoning panel mounted while its snapshots
+                        // arrive, so the smooth streaming continues from the
+                        // previous text instead of replaying from a remount.
+                        id: streamId ?? `${msg.id}:${idx}`,
                         localId: msg.localId,
                         createdAt: msg.createdAt,
                         invokedAt: msg.invokedAt,
@@ -1037,8 +1096,7 @@ export function reduceTimeline(
                         // time — so toolDurationMs never subtracts two clocks.
                         // Null here leaves the tool on the hub-time fallback.
                         execCompletedAt: msg.agentTimestamp ?? null,
-                        state: c.is_error ? 'error' : 'completed',
-                        ...(c.cosFileUrl ? { cosFileUrl: c.cosFileUrl } : {})
+                        state: c.is_error ? 'error' : 'completed'
                     }
                     continue
                 }

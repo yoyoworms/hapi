@@ -5,17 +5,12 @@ export function downloadBase64File(fileName: string, base64Content: string, mime
         bytes[index] = byteChars.charCodeAt(index)
     }
 
-    downloadBlobFile(fileName, new Blob([bytes], { type: mimeType ?? 'application/octet-stream' }))
-}
-
-export function downloadBlobFile(fileName: string, blob: Blob): void {
-    const url = URL.createObjectURL(blob)
+    const url = URL.createObjectURL(new Blob([bytes], { type: mimeType ?? 'application/octet-stream' }))
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = fileName
     document.body.appendChild(anchor)
     anchor.click()
     anchor.remove()
-    // Safari/iOS PWA may consume the blob URL after the synthetic click returns.
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    URL.revokeObjectURL(url)
 }

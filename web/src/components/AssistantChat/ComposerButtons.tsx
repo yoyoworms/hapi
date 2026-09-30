@@ -6,7 +6,7 @@ import { ScheduleTimePicker } from './ScheduleTimePicker'
 import type { PendingSchedule } from './ScheduleTimePicker'
 import { useFue } from '@/lib/use-fue'
 import { FueCallout, FueDot } from '@/components/Fue'
-import { Children, isValidElement, useEffect, useRef, useState, type ReactElement, type ReactNode, type Ref } from 'react'
+import { Children, isValidElement, useRef, useState, type ReactElement, type ReactNode, type Ref } from 'react'
 import { useComposerToolbarLayout, type ComposerToolbarItemId, type ComposerToolbarLayout } from '@/hooks/useComposerToolbarLayout'
 import { useNarrowViewport } from '@/hooks/useNarrowViewport'
 import type { ComposerSendIntent } from '@/lib/messageDelivery'
@@ -243,7 +243,6 @@ export function ComposerExpandButton(props: {
     return (
         <button
             type="button"
-            onPointerDown={(event) => event.preventDefault()}
             aria-label={label}
             title={label}
             aria-pressed={props.expanded}
@@ -473,8 +472,6 @@ function LoadingIcon() {
 
 export function UnifiedButton(props: {
     canSend: boolean
-    /** Text or attachments exist even if uploads are not send-ready yet. */
-    hasContent?: boolean
     voiceStatus: ConversationStatus
     voiceEnabled: boolean
     controlsDisabled: boolean
@@ -499,15 +496,15 @@ export function UnifiedButton(props: {
     const isConnecting = props.voiceStatus === 'connecting'
     const isConnected = props.voiceStatus === 'connected'
     const isVoiceActive = isConnecting || isConnected
-    const hasContent = props.hasContent ?? props.canSend
+    const hasText = props.canSend
     const routesToScratchlist = props.routesToScratchlist ?? false
 
     const handleClick = () => {
         if (isVoiceActive) {
             props.onVoiceToggle() // Stop voice
-        } else if (props.canSend) {
+        } else if (hasText) {
             props.onSend('default') // Send message (or scratchlist add — wrapper decides)
-        } else if (!hasContent && props.voiceEnabled && !routesToScratchlist) {
+        } else if (props.voiceEnabled && !routesToScratchlist) {
             props.onVoiceToggle() // Start voice (suppressed in scratchlist mode)
         }
     }
@@ -531,7 +528,7 @@ export function UnifiedButton(props: {
         icon = <SendIcon />
         className = 'bg-amber-500 text-white hover:bg-amber-600'
         ariaLabel = t('scratchlist.sendToScratchlist')
-    } else if (hasContent) {
+    } else if (hasText) {
         icon = <SendIcon />
         className = 'bg-black text-white'
         ariaLabel = t('composer.send')
@@ -551,25 +548,19 @@ export function UnifiedButton(props: {
     // empty-text. (When attachments / schedule force a chat fallback the
     // normal chat-send disable rules apply.)
     const isDisabled = props.controlsDisabled || (
-        isVoiceActive
-            ? false
-            : hasContent
-                ? !props.canSend
-                : routesToScratchlist || !props.voiceEnabled
+        routesToScratchlist
+            ? !hasText
+            : !hasText && !props.voiceEnabled && !isVoiceActive
     )
-    const preservesEditorFocus = !isVoiceActive && props.canSend
 
     return (
         <button
             type="button"
-            onPointerDown={(event) => {
-                if (!isDisabled && preservesEditorFocus) event.preventDefault()
-            }}
             onClick={handleClick}
             disabled={isDisabled}
             aria-label={ariaLabel}
             title={ariaLabel}
-            className={`ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
+            className={`ml-1 flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
         >
             {icon}
         </button>
@@ -609,7 +600,6 @@ export function DictationButton(props: {
 
 export function ComposerButtons(props: {
     canSend: boolean
-    hasContent?: boolean
     controlsDisabled: boolean
     showSettingsButton: boolean
     settingsButtonRef?: Ref<HTMLButtonElement>
@@ -685,19 +675,11 @@ export function ComposerButtons(props: {
     const hasAttachments = props.hasAttachments ?? false
     const toolbarJustifyContent = getComposerToolbarJustifyContent(layout.mode)
 
-    useEffect(() => {
-        if (hasAttachments || props.controlsDisabled) setShowSchedulePicker(false)
-    }, [hasAttachments, props.controlsDisabled])
-
     return (
         <div className="flex shrink-0 items-center gap-1 px-2 pb-2">
             <div
-                data-testid="composer-toolbar-scroll"
-                className="min-w-0 flex-1 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-            >
-            <div
                 data-testid="composer-toolbar-items"
-                className="flex w-max min-w-full items-center gap-1"
+                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
                 style={{ justifyContent: toolbarJustifyContent }}
             >
                 <OrderedToolbarItems layout={effectiveLayout}>
@@ -706,7 +688,7 @@ export function ComposerButtons(props: {
                     aria-label={t('composer.attach')}
                     title={t('composer.attach')}
                     disabled={props.controlsDisabled || hasSchedule}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-50"
+                    className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                     <AttachmentIcon />
                 </ComposerPrimitive.AddAttachment>
@@ -742,7 +724,7 @@ export function ComposerButtons(props: {
                         type="button"
                         aria-label={props.modelValueLabel}
                         title={props.modelValueLabel}
-                        className={`flex h-8 max-w-32 shrink-0 items-center gap-1 rounded-full px-3 text-xs font-medium transition-colors ${
+                        className={`flex h-8 items-center gap-1 rounded-full px-3 text-xs font-medium transition-colors ${
                             props.modelValueOpen
                                 ? 'bg-[var(--app-secondary-bg)] text-[var(--app-link)]'
                                 : 'text-[var(--app-fg)]/60 hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
@@ -750,8 +732,8 @@ export function ComposerButtons(props: {
                         onClick={props.onModelValueToggle}
                         disabled={props.modelValueDisabled}
                     >
-                        <span className="min-w-0 truncate">{props.modelValueLabel}</span>
-                        <span className="shrink-0"><ChevronIcon /></span>
+                        {props.modelValueLabel}
+                        <ChevronIcon />
                     </button>
                 ) : null}
                 </ToolbarItemSlot>
@@ -763,7 +745,7 @@ export function ComposerButtons(props: {
                         type="button"
                         aria-label={props.effortValueLabel}
                         title={props.effortValueLabel}
-                        className={`flex h-8 max-w-32 shrink-0 items-center gap-1 rounded-full px-3 text-xs font-medium transition-colors ${
+                        className={`flex h-8 items-center gap-1 rounded-full px-3 text-xs font-medium transition-colors ${
                             props.effortValueOpen
                                 ? 'bg-[var(--app-secondary-bg)] text-[var(--app-link)]'
                                 : 'text-[var(--app-fg)]/60 hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
@@ -771,8 +753,8 @@ export function ComposerButtons(props: {
                         onClick={props.onEffortValueToggle}
                         disabled={props.effortValueDisabled}
                     >
-                        <span className="min-w-0 truncate">{props.effortValueLabel}</span>
-                        <span className="shrink-0"><ChevronIcon /></span>
+                        {props.effortValueLabel}
+                        <ChevronIcon />
                     </button>
                 ) : null}
                 </ToolbarItemSlot>
@@ -873,7 +855,7 @@ export function ComposerButtons(props: {
                             type="button"
                             aria-label={t('composer.scheduleSend')}
                             title={t('composer.scheduleSend')}
-                            disabled={props.controlsDisabled || (hasAttachments && !hasSchedule)}
+                            disabled={props.controlsDisabled || hasAttachments}
                             onClick={() => {
                                 if (hasSchedule && props.onClearSchedule) {
                                     props.onClearSchedule()
@@ -881,7 +863,7 @@ export function ComposerButtons(props: {
                                     setShowSchedulePicker((v) => !v)
                                 }
                             }}
-                            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                            className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                                 hasSchedule
                                     ? 'bg-blue-500 text-white hover:bg-blue-600'
                                     : 'text-[var(--app-fg)]/60 hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
@@ -893,10 +875,6 @@ export function ComposerButtons(props: {
                             <ScheduleTimePicker
                                 anchorRef={scheduleButtonRef}
                                 onSchedule={(pending) => {
-                                    if (hasAttachments || props.controlsDisabled) {
-                                        setShowSchedulePicker(false)
-                                        return
-                                    }
                                     props.onSchedule!(pending)
                                     setShowSchedulePicker(false)
                                 }}
@@ -908,7 +886,6 @@ export function ComposerButtons(props: {
                 ) : null}
                 </ToolbarItemSlot>
                 </OrderedToolbarItems>
-            </div>
             </div>
 
             <DictationButton
@@ -922,7 +899,6 @@ export function ComposerButtons(props: {
 
             <UnifiedButton
                 canSend={props.canSend}
-                hasContent={props.hasContent}
                 voiceStatus={props.voiceStatus}
                 voiceEnabled={props.voiceEnabled}
                 controlsDisabled={props.controlsDisabled}

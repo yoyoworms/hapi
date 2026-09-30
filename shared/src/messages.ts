@@ -1,125 +1,11 @@
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from './modes'
 import { isObject } from './utils'
 
-export type AgentMessagePhase = 'commentary' | 'final_answer'
-
-const CODEX_RESPONSE_STEP_PREFIX = '{"steps":[{"kind":"output","value":'
-const CODEX_TOOL_CALLS_STEP_MARKER = '{"kind":"tool_calls","value":'
-const CODEX_EXECUTE_REPORT_STEP_MARKER = '{"kind":"execute_report","value":'
-
-function unwrapTruncatedCodexResponseStepEnvelope(text: string): string | null {
-    if (!text.startsWith(CODEX_RESPONSE_STEP_PREFIX)) return null
-
-    const valueStart = CODEX_RESPONSE_STEP_PREFIX.length
-    if (text[valueStart] !== '"') return null
-
-    let escaped = false
-    for (let index = valueStart + 1; index < text.length; index += 1) {
-        const char = text[index]
-        if (escaped) {
-            escaped = false
-            continue
-        }
-        if (char === '\\') {
-            escaped = true
-            continue
-        }
-        if (char !== '"') continue
-
-        const remainder = text.slice(index + 1)
-        if (!remainder.startsWith('},')) return null
-        if (!remainder.includes(CODEX_TOOL_CALLS_STEP_MARKER)) return null
-        if (!remainder.includes(CODEX_EXECUTE_REPORT_STEP_MARKER)) return null
-
-        try {
-            const output: unknown = JSON.parse(text.slice(valueStart, index + 1))
-            return typeof output === 'string' && output.trim() ? output.trim() : null
-        } catch {
-            return null
-        }
-    }
-    return null
-}
-
-/**
- * Some Codex gateways return the assistant turn as a JSON-encoded step
- * envelope inside the otherwise plain-text agent message. The native client
- * consumes that envelope, but older HAPI runners persisted it verbatim.
- *
- * Keep detection deliberately strict: ordinary JSON must remain visible. A
- * recognized complete envelope contains only known step kinds, at least one
- * non-empty output string, and at least one protocol marker (`tool_calls` or
- * `execute_report`). Old persisted messages can be truncated inside a large
- * tool-call payload; for that exact compact protocol prefix, both control-step
- * markers are required and only the first complete output string is recovered.
- * `null` means "not this envelope"; callers should preserve the original text.
- */
-export function unwrapCodexResponseStepEnvelope(text: string): string | null {
-    const trimmed = text.trim()
-    if (!trimmed.startsWith('{"steps"')) return null
-    if (!trimmed.endsWith('}')) return unwrapTruncatedCodexResponseStepEnvelope(trimmed)
-
-    let parsed: unknown
-    try {
-        parsed = JSON.parse(trimmed)
-    } catch {
-        return unwrapTruncatedCodexResponseStepEnvelope(trimmed)
-    }
-    if (!isObject(parsed) || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
-        return null
-    }
-
-    const outputs: string[] = []
-    let hasProtocolMarker = false
-    for (const value of parsed.steps) {
-        if (!isObject(value) || typeof value.kind !== 'string' || !('value' in value)) {
-            return null
-        }
-
-        if (value.kind === 'output') {
-            if (typeof value.value !== 'string') return null
-            const output = value.value.trim()
-            if (output) outputs.push(output)
-            continue
-        }
-        if (value.kind === 'tool_calls') {
-            if (!Array.isArray(value.value)) return null
-            hasProtocolMarker = true
-            continue
-        }
-        if (value.kind === 'execute_report') {
-            if (typeof value.value !== 'string') return null
-            hasProtocolMarker = true
-            continue
-        }
-        return null
-    }
-
-    if (!hasProtocolMarker || outputs.length === 0) return null
-    return outputs.join('\n\n')
-}
-
-/** Normalize Codex/app-server phase spellings without exposing wire drift. */
-export function normalizeAgentMessagePhase(value: unknown): AgentMessagePhase | null {
-    if (typeof value !== 'string') return null
-    const normalized = value.trim().toLowerCase().replace(/[\s_-]/g, '')
-    if (normalized === 'commentary') return 'commentary'
-    if (normalized === 'finalanswer') return 'final_answer'
-    return null
-}
-
 type RoleWrappedRecord = {
     role: string
     content: unknown
     meta?: unknown
 }
-
-const VISIBLE_CLAUDE_MESSAGE_TYPES = new Set([
-    'assistant',
-    'user',
-    'summary',
-    'system'
-])
 
 const VISIBLE_CLAUDE_SYSTEM_SUBTYPES = new Set([
     'api_error',
@@ -160,8 +46,7 @@ export function isClaudeChatVisibleSystemSubtype(subtype: unknown): subtype is s
 }
 
 export function isClaudeChatVisibleMessage(message: { type: unknown; subtype?: unknown }): boolean {
-    // Only known message types are visible (whitelist subsumes upstream's rate_limit_event block)
-    if (typeof message.type !== 'string' || !VISIBLE_CLAUDE_MESSAGE_TYPES.has(message.type)) {
+    if (message.type === 'rate_limit_event') {
         return false
     }
 
@@ -260,8 +145,9 @@ export function extractAssistantPlainText(content: unknown): string | null {
     if (content.type === 'codex') {
         const data = isObject(content.data) ? content.data : null
         if (!data || data.type !== 'message') return null
-        if (typeof data.message !== 'string' || data.message.length === 0) return null
-        return unwrapCodexResponseStepEnvelope(data.message) ?? data.message
+        return typeof data.message === 'string' && data.message.length > 0
+            ? data.message
+            : null
     }
 
     if (content.type === 'output') {
@@ -291,6 +177,53 @@ export function extractAssistantPlainText(content: unknown): string | null {
     }
 
     return null
+}
+
+function hasConversationBlock(value: unknown): boolean {
+    if (typeof value === 'string') return value.trim().length > 0
+    if (Array.isArray(value)) return value.some(hasConversationBlock)
+    if (!isObject(value)) return false
+    if (value.type === 'text') {
+        return hasConversationBlock(value.text)
+            || (Array.isArray(value.attachments) && value.attachments.length > 0)
+    }
+    if (value.type === 'thinking') return hasConversationBlock(value.thinking)
+    if (value.type === 'image' || value.type === 'document') return isObject(value.source)
+    if (value.type === 'tool_use') return typeof value.name === 'string' && value.name.trim().length > 0
+    if (value.type === 'tool_result') return hasConversationBlock(value.content)
+    return false
+}
+
+/** Conversation payloads, not launch/status/usage events or display titles. */
+export function hasConversationMessageContent(value: unknown): boolean {
+    const record = unwrapRoleWrappedRecordEnvelope(value)
+    if (record?.role === 'user') return hasConversationBlock(record.content)
+    if (record?.role !== 'agent' || !isObject(record.content)) return false
+    const content = record.content
+    if (extractAssistantPlainText(content)?.trim()) return true
+    const data = isObject(content.data) ? content.data : null
+    if (!data) return false
+    if (content.type === 'output') {
+        if (data.type === 'assistant' || data.type === 'user') {
+            return isObject(data.message) && hasConversationBlock(data.message.content)
+        }
+        return data.type === 'agy_tool_action' && hasConversationBlock(data.content)
+    }
+    if (content.type === 'event') {
+        return data.type === 'compact-summary' && hasConversationBlock(data.summary)
+    }
+    if (content.type !== AGENT_MESSAGE_PAYLOAD_TYPE) return false
+    if (data.type === 'reasoning') return hasConversationBlock(data.message)
+    if (data.type === 'compact-summary') return hasConversationBlock(data.summary)
+    if (data.type === 'tool-call' || data.type === 'tool-call-result') {
+        return typeof data.callId === 'string' && data.callId.trim().length > 0
+    }
+    if (data.type === 'generated-image') return hasConversationBlock(data.imageId ?? data.image_id)
+    if (data.type === 'plan' || data.type === 'plan_update') {
+        const entries = data.entries ?? data.plan ?? data.update ?? data.items ?? data.steps
+        return Array.isArray(entries) && entries.length > 0
+    }
+    return false
 }
 
 const NOTIFY_SUMMARY_PREFIX = 'AGENT_NOTIFY_SUMMARY '

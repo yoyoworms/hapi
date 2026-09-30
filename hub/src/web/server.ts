@@ -17,7 +17,6 @@ import { createAuthMiddleware, type WebAppEnv } from './middleware/auth'
 import { createAuthRoutes } from './routes/auth'
 import { createBindRoutes } from './routes/bind'
 import { createEventsRoutes } from './routes/events'
-import { createSharesRoutes } from './routes/shares'
 import { createSessionsRoutes } from './routes/sessions'
 import { createMessagesRoutes } from './routes/messages'
 import { createPermissionsRoutes } from './routes/permissions'
@@ -44,12 +43,6 @@ import type { WebSocketData } from '@socket.io/bun-engine'
 import { loadEmbeddedAssetMap, type EmbeddedWebAsset } from './embeddedAssets'
 import { isBunCompiled } from '../utils/bunCompiled'
 import type { Store } from '../store'
-import type { PushService } from '../push/pushService'
-
-// One-time bearer tokens for internal Hub → runner upload downloads. The
-// authenticated upload route creates and expires them; the download endpoint
-// consumes each token exactly once before auth middleware.
-export const uploadDownloadTokens = new Set<string>()
 
 // Normalise upstream close codes before forwarding to the browser client.
 // Codes 1005/1006/1015 are reserved and cannot be sent in a close frame;
@@ -224,25 +217,23 @@ function serveEmbeddedAsset(asset: EmbeddedWebAsset): Response {
     })
 }
 
-export function createWebApp(options: {
+function createWebApp(options: {
     getSyncEngine: () => SyncEngine | null
     getSseManager: () => SSEManager | null
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
     vapidPublicKey: string
-    pushService: PushService
     corsOrigins?: string[]
     embeddedAssetMap: Map<string, EmbeddedWebAsset> | null
     relayMode?: boolean
     officialWebUrl?: string
-    configurationOverride?: Pick<ReturnType<typeof getConfiguration>, 'corsOrigins' | 'dataDir' | 'dbPath'>
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
     app.use('*', logger())
 
-    const configuration = options.configurationOverride ?? getConfiguration()
+    const configuration = getConfiguration()
     const corsOrigins = options.corsOrigins ?? configuration.corsOrigins
     const corsOriginOption = corsOrigins.includes('*') ? '*' : corsOrigins
     const corsMiddleware = cors({
@@ -293,46 +284,15 @@ export function createWebApp(options: {
     app.route('/api', createAuthRoutes(options.jwtSecret, options.store))
     app.route('/api', createBindRoutes(options.jwtSecret, options.store))
 
-    // Internal upload download endpoint (no JWT; protected by one-time token).
-    app.get('/api/sessions/:id/upload/download/:filename', async (c) => {
-        const token = c.req.query('token')
-        if (!token || !uploadDownloadTokens.has(token)) {
-            return c.json({ error: 'Invalid or expired token' }, 401)
-        }
-        uploadDownloadTokens.delete(token)
-
-        const { resolve, sep } = await import('node:path')
-        const { tmpdir } = await import('node:os')
-        const { rm } = await import('node:fs/promises')
-        const hubBlobsDir = join(tmpdir(), 'hapi-hub-blobs')
-        const filePath = join(hubBlobsDir, c.req.param('id'), c.req.param('filename'))
-        const resolvedPath = resolve(filePath)
-        const resolvedDir = resolve(hubBlobsDir)
-        if (!resolvedPath.startsWith(resolvedDir + sep)) {
-            return c.json({ error: 'Invalid path' }, 400)
-        }
-
-        const file = Bun.file(filePath)
-        if (!await file.exists()) {
-            return c.json({ error: 'File not found' }, 404)
-        }
-        const arrayBuffer = await file.arrayBuffer()
-        await rm(filePath, { force: true }).catch(() => {})
-        return new Response(arrayBuffer, {
-            headers: { 'content-type': 'application/octet-stream' }
-        })
-    })
-
-    app.use('/api/*', createAuthMiddleware(options.jwtSecret, options.store))
+    app.use('/api/*', createAuthMiddleware(options.jwtSecret))
     app.route('/api', createEventsRoutes(options.getSseManager, options.getSyncEngine, options.getVisibilityTracker))
-    app.route('/api', createSharesRoutes(options.getSyncEngine, options.store, options.jwtSecret))
     app.route('/api', createSessionsRoutes(options.getSyncEngine))
     app.route('/api', createMessagesRoutes(options.getSyncEngine))
     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createStorageRoutes(configuration.dbPath))
     app.route('/api', createHubSettingsRoutes(configuration.dataDir))
-    app.route('/api', createUsageRoutes(options.store, options.getSyncEngine))
+    app.route('/api', createUsageRoutes(options.store))
     app.route('/api', createGitRoutes(options.getSyncEngine))
     // 中文注释：这里提供两类 Codex 辅助能力：扫描本地 transcript 以导入到 Hapi，以及按需重启 Codex Desktop 客户端。
     app.route('/api', createCodexDesktopRoutes({
@@ -343,12 +303,7 @@ export function createWebApp(options: {
         store: options.store,
         getSyncEngine: options.getSyncEngine
     }))
-    app.route('/api', createPushRoutes({
-        store: options.store,
-        vapidPublicKey: options.vapidPublicKey,
-        pushService: options.pushService,
-        getSseManager: options.getSseManager
-    }))
+    app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
     app.route('/api', createDevicesRoutes(options.store))
     app.route('/api', createVoiceRoutes({ dataDir: configuration.dataDir }))
     // Path is intentionally NOT `/api/events` — that route is the SSE stream.
@@ -464,7 +419,6 @@ export async function startWebServer(options: {
     jwtSecret: Uint8Array
     store: Store
     vapidPublicKey: string
-    pushService: PushService
     socketEngine: SocketEngine
     corsOrigins?: string[]
     relayMode?: boolean
@@ -479,7 +433,6 @@ export async function startWebServer(options: {
         jwtSecret: options.jwtSecret,
         store: options.store,
         vapidPublicKey: options.vapidPublicKey,
-        pushService: options.pushService,
         corsOrigins: options.corsOrigins,
         embeddedAssetMap,
         relayMode: options.relayMode,

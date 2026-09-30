@@ -105,23 +105,6 @@ describe('UnifiedButton — routesToScratchlist visual state', () => {
         const btn = getButton('Send')
         expect(btn.className).not.toContain('bg-amber-500')
     })
-
-    it('keeps a blocked non-empty draft as disabled send instead of turning into voice', () => {
-        renderInProviders(
-            <UnifiedButton
-                canSend={false}
-                hasContent
-                voiceStatus="disconnected"
-                voiceEnabled
-                controlsDisabled={false}
-                onSend={noop}
-                onVoiceToggle={noop}
-            />,
-        )
-        const btn = getButton('Send')
-        expect(btn).toBeDisabled()
-        expect(screen.queryByRole('button', { name: 'Voice assistant' })).not.toBeInTheDocument()
-    })
 })
 
 describe('UnifiedButton — default send intent', () => {
@@ -165,7 +148,7 @@ describe('UnifiedButton — default send intent', () => {
         fireEvent.touchEnd(button, { changedTouches: [{ clientX: 10, clientY: 10 }] })
         fireEvent.click(button)
 
-        const pointerDownWasNotPrevented = fireEvent.pointerDown(button, { button: 0, clientX: 10, clientY: 10 })
+        fireEvent.mouseDown(button, { button: 0, clientX: 10, clientY: 10 })
         act(() => vi.advanceTimersByTime(500))
         fireEvent.mouseUp(button, { button: 0, clientX: 10, clientY: 10 })
         fireEvent.click(button)
@@ -174,7 +157,6 @@ describe('UnifiedButton — default send intent', () => {
         expect(onSend).toHaveBeenCalledTimes(2)
         expect(onSend).toHaveBeenNthCalledWith(1, 'default')
         expect(onSend).toHaveBeenNthCalledWith(2, 'default')
-        expect(pointerDownWasNotPrevented).toBe(false)
         expect(contextMenuWasNotPrevented).toBe(true)
     })
 })
@@ -195,7 +177,7 @@ describe('DictationButton', () => {
             />,
         )
 
-        fireEvent.click(getButton('Dictate'))
+        fireEvent.click(getButton(/^Dictate/))
         expect(onVoiceToggle).toHaveBeenCalledOnce()
     })
 })
@@ -263,10 +245,8 @@ describe('ComposerButtons responsive toolbar', () => {
             </RuntimeProviders>,
         )
 
-        const scroller = screen.getByTestId('composer-toolbar-scroll')
         const toolbar = screen.getByTestId('composer-toolbar-items')
-        expect(scroller.className).toContain('overflow-x-auto')
-        expect(toolbar.className).toContain('w-max')
+        expect(toolbar.className).toContain('overflow-x-auto')
         const toolbarButtons = within(toolbar).getAllByRole('button')
         expect(toolbarButtons.length).toBeGreaterThanOrEqual(8)
         for (const button of toolbarButtons) {

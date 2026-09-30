@@ -83,11 +83,11 @@ function MachineHealthHint() {
             id={tooltipId}
             target={target}
             side="bottom"
-            align="row"
+            align="start"
             open={clickOpen}
             containerRef={containerRef}
             hoverGroup="help"
-            tooltipClassName="pointer-events-auto min-w-0"
+            tooltipClassName="pointer-events-auto w-56"
         >
             {t('machine.health.tooltip.hint')}
         </HoverTooltip>

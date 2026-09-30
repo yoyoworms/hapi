@@ -4,9 +4,11 @@ import { registerBashHandlers } from './handlers/bash'
 import { registerCodexModelHandlers } from './handlers/codexModels'
 import { registerCursorModelHandlers } from './handlers/cursorModels'
 import { registerOpencodeModelHandlers } from './handlers/opencodeModels'
+import { registerOpencodeModelVariantsHandlers } from './handlers/opencodeModelVariants'
 import { registerPiModelHandlers } from './handlers/piModels'
 import { registerGrokModelHandlers } from './handlers/grokModels'
 import { registerCopilotModelHandlers } from './handlers/copilotModels'
+import { registerKimiModelHandlers } from './handlers/kimiModels'
 import { registerDirectoryHandlers } from './handlers/directories'
 import { registerDifftasticHandlers } from './handlers/difftastic'
 import { registerFileHandlers } from './handlers/files'
@@ -15,29 +17,18 @@ import { registerRipgrepHandlers } from './handlers/ripgrep'
 import { registerSlashCommandHandlers } from './handlers/slashCommands'
 import { registerSkillsHandlers } from './handlers/skills'
 import { registerUploadHandlers } from './handlers/uploads'
-import { registerAgentSessionHandlers } from './handlers/agentSessions'
-import { registerCodexAccountHandlers } from './handlers/codexAccounts'
-import { registerClaudeModelHandlers } from './handlers/claudeModels'
 
-export interface RegisterCommonHandlerOptions {
-    codexModelsMachineScoped?: boolean
-    codexAccountsMachineScoped?: boolean
-}
-
-export function registerCommonHandlers(
-    rpcHandlerManager: RpcHandlerManager,
-    workingDirectory: string,
-    options?: RegisterCommonHandlerOptions
-): void {
+export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string): void {
     registerAgyModelHandlers(rpcHandlerManager)
-    registerClaudeModelHandlers(rpcHandlerManager)
     registerBashHandlers(rpcHandlerManager, workingDirectory)
-    registerCodexModelHandlers(rpcHandlerManager, options?.codexModelsMachineScoped === true)
+    registerCodexModelHandlers(rpcHandlerManager)
     registerCursorModelHandlers(rpcHandlerManager)
     registerOpencodeModelHandlers(rpcHandlerManager)
+    registerOpencodeModelVariantsHandlers(rpcHandlerManager)
     registerPiModelHandlers(rpcHandlerManager)
     registerGrokModelHandlers(rpcHandlerManager)
     registerCopilotModelHandlers(rpcHandlerManager)
+    registerKimiModelHandlers(rpcHandlerManager)
     registerFileHandlers(rpcHandlerManager, workingDirectory)
     registerDirectoryHandlers(rpcHandlerManager, workingDirectory)
     registerRipgrepHandlers(rpcHandlerManager, workingDirectory)
@@ -46,8 +37,4 @@ export function registerCommonHandlers(
     registerSkillsHandlers(rpcHandlerManager, workingDirectory)
     registerGitHandlers(rpcHandlerManager, workingDirectory)
     registerUploadHandlers(rpcHandlerManager)
-    registerAgentSessionHandlers(rpcHandlerManager)
-    if (options?.codexAccountsMachineScoped === true) {
-        registerCodexAccountHandlers(rpcHandlerManager)
-    }
 }

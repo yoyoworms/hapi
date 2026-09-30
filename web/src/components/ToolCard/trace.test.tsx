@@ -16,7 +16,6 @@ vi.mock('@/lib/use-translation', () => ({
                 'tool.trace.callsSuffix': 'calls',
                 'tool.input': 'Input',
                 'tool.result': 'Result',
-                'toolGroup.friendly.runCommands': 'Run project commands',
             }
             return map[key] ?? key
         },
@@ -326,6 +325,11 @@ describe('TraceSection', () => {
         expect(screen.getByText(/3 calls/)).toBeInTheDocument()
     })
 
+    it('uses compact units for long trace durations', () => {
+        expect(getTraceSummaryText(1, null, 60_000, 'calls')).toBe('1 calls · 1m')
+        expect(getTraceSummaryText(1, null, 3_600_000, 'calls')).toBe('1 calls · 1h')
+    })
+
     it('shows Input section when a child row is expanded', () => {
         const block = makeTaskBlock([makeChild('c1', 'Bash')], 'running')
         const { container } = render(<TraceSection block={block} metadata={null} />)
@@ -349,7 +353,7 @@ describe('TraceSection', () => {
 
         expect(container.querySelector('button[aria-expanded="true"]')).not.toBeNull()
         expect(container.querySelector('.border-l')).toBeNull()
-        expect(container.textContent).toContain('Run project commands')
+        expect(container.textContent).toContain('Terminal')
         expect(container.textContent).toContain('file-c2.ts')
         expect(container.textContent).not.toContain('Input')
         expect(container.textContent).not.toContain('Result')

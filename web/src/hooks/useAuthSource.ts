@@ -27,45 +27,6 @@ function getTokenFromUrlParams(): string | null {
     return query.get('token')
 }
 
-const SHARE_TOKEN_KEY = 'hapi_share_token'
-
-/** Extract the share token from a `/s/<token>` URL, if present. */
-export function getShareTokenFromPath(): string | null {
-    if (typeof window === 'undefined') return null
-    const m = window.location.pathname.match(/^\/s\/([^/]+)\/?$/)
-    if (!m) return null
-    try {
-        return decodeURIComponent(m[1] ?? '') || null
-    } catch {
-        return null
-    }
-}
-
-/** Extract the capability retained on canonical session subroutes. */
-export function getShareTokenFromSearch(): string | null {
-    if (typeof window === 'undefined') return null
-    return new URLSearchParams(window.location.search).get('share') || null
-}
-
-/** Per-tab fallback for links opened before share-aware URLs were introduced.
- *  New navigation retains the capability in the URL itself; sessionStorage
- *  remains scoped to this tab and never clobbers an owner's access token. */
-function getStoredShareToken(): string | null {
-    try {
-        return sessionStorage.getItem(SHARE_TOKEN_KEY)
-    } catch {
-        return null
-    }
-}
-
-function storeShareToken(token: string): void {
-    try {
-        sessionStorage.setItem(SHARE_TOKEN_KEY, token)
-    } catch {
-        // ignore
-    }
-}
-
 function getAccessTokenKey(baseUrl: string): string {
     return `${ACCESS_TOKEN_PREFIX}${baseUrl}`
 }
@@ -114,16 +75,6 @@ export function useAuthSource(baseUrl: string): {
         setIsTelegram(false)
         setIsLoading(true)
 
-        // An explicit share capability in the current URL always takes
-        // precedence over owner auth. It redeems to a single-session JWT.
-        const explicitShareToken = getShareTokenFromPath() ?? getShareTokenFromSearch()
-        if (explicitShareToken) {
-            storeShareToken(explicitShareToken)
-            setAuthSource({ type: 'shareToken', token: explicitShareToken })
-            setIsLoading(false)
-            return
-        }
-
         const telegramInitData = getTelegramInitData()
 
         if (telegramInitData) {
@@ -147,16 +98,6 @@ export function useAuthSource(baseUrl: string): {
         const storedToken = getStoredAccessToken(accessTokenKey)
         if (storedToken) {
             setAuthSource({ type: 'accessToken', token: storedToken })
-            setIsLoading(false)
-            return
-        }
-
-        // Legacy fallback for a tab that opened an old share link before the
-        // address bar retained its capability. Never let it override explicit
-        // Telegram or owner authentication on a bare owner URL.
-        const storedShareToken = getStoredShareToken()
-        if (storedShareToken) {
-            setAuthSource({ type: 'shareToken', token: storedShareToken })
             setIsLoading(false)
             return
         }

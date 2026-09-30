@@ -30,17 +30,12 @@ export function DragDropZone({
             if (disabled) return
             const files = Array.from(e.dataTransfer.files)
             if (files.length === 0) return
-            // Upload adapters base64-encode files. Sequential processing keeps
-            // multi-file drops from allocating every large payload at once,
-            // while the per-file catch still lets later files continue.
-            for (const file of files) {
-                try {
+            try {
+                for (const file of files) {
                     await api.composer().addAttachment(file)
-                } catch (error) {
-                    // Keep processing the remaining files. assistant-ui's file
-                    // picker follows the same per-file failure isolation.
-                    console.error('Error adding dragged file:', error)
                 }
+            } catch (error) {
+                console.error('Error adding dragged file:', error)
             }
         },
         [api, disabled]

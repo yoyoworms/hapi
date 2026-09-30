@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { useNavigate } from '@tanstack/react-router'
+import { useQueryClient } from '@tanstack/react-query'
 import { PRESERVE_SESSION_SIDEBAR_SCROLL } from '@/lib/sessionNavigation'
 import { AssistantRuntimeProvider, useAui, useAuiState } from '@assistant-ui/react'
 import { DragDropZone } from '@/components/AssistantChat/DragDropZone'
-import type { ApiClient } from '@/api/client'
+import { ApiError, type ApiClient } from '@/api/client'
 import type {
+    AgyModelSummary,
     AttachmentMetadata,
     CodexCollaborationMode,
+    CodexModelSummary,
     CopilotAgentMode,
     DecryptedMessage,
     PermissionMode,
@@ -22,8 +25,6 @@ import { reduceChatBlocks } from '@/chat/reducer'
 import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
 import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
-import { getLatestPlanProgress, getPersistedPlanProgress } from '@/chat/planProgress'
-import { getLatestCodexCommentaryProgress } from '@/chat/codexProgress'
 import { useUnseenBlockCount } from '@/hooks/useUnseenBlockCount'
 import { useCodexExplorationCollapse } from '@/hooks/useCodexExplorationCollapse'
 import { isQueuedForInvocation } from '@/lib/messages'
@@ -34,15 +35,16 @@ import {
 } from '@/lib/codexModelCapabilities'
 import { createSerialAsyncQueue } from '@/lib/serialAsyncQueue'
 import { HappyComposer, type ComposerSendError } from '@/components/AssistantChat/HappyComposer'
+import {
+    isDictateHotkeyBlockedTarget,
+    isDictateToggleHotkey,
+} from '@/lib/composerDictateShortcut'
 import { codexModelAdvertisesFastTier, getEffectiveCodexServiceTier } from '@/components/AssistantChat/codexFastMode'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { HappyThread } from '@/components/AssistantChat/HappyThread'
 import { QueuedMessagesBar } from '@/components/AssistantChat/QueuedMessagesBar'
-import {
-    canPromoteScratchlistEntryAttachments,
-    ScratchlistDrawer,
-} from '@/components/AssistantChat/ScratchlistPanel'
+import { ScratchlistDrawer } from '@/components/AssistantChat/ScratchlistPanel'
 import { useHubScratchlist } from '@/lib/use-hub-scratchlist'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { getSessionTitle } from '@/lib/sessionTitle'
@@ -59,8 +61,8 @@ import {
 } from '@/lib/messageDelivery'
 import type { MessageDeliveryMode } from '@hapi/protocol'
 import { isSteeringSupportedForSession } from '@hapi/protocol'
-import type { OlderLoadOutcome } from '@/lib/message-window-store'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
+import { rewindMessageWindow, type OlderLoadOutcome } from '@/lib/message-window-store'
 import { ShareSeedConsumer } from '@/components/ShareSeedConsumer'
 import {
     createScratchlistAttachmentAdapter,
@@ -81,7 +83,6 @@ import {
     type AttachmentDraftInput,
 } from '@/lib/composer-attachment-drafts'
 import { useTranslation } from '@/lib/use-translation'
-import { useOptionalAppContext } from '@/lib/app-context'
 import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutations/useSendMessage'
 import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { SessionHeader } from '@/components/SessionHeader'
@@ -94,6 +95,7 @@ import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useCodexModels } from '@/hooks/queries/useCodexModels'
 import { useCursorModels } from '@/hooks/queries/useCursorModels'
 import { useCursorModelsForMachine } from '@/hooks/queries/useCursorModelsForMachine'
+import { useAgyModels } from '@/hooks/queries/useAgyModels'
 import {
     mergeCursorCliModelSkus,
     resolveCursorBaseFromWire
@@ -111,17 +113,39 @@ import { buildCursorEffortPickerOptionsWithDefaultFirst } from '@/lib/cursorMode
 import { useOpencodeModels } from '@/hooks/queries/useOpencodeModels'
 import { useGrokModels } from '@/hooks/queries/useGrokModels'
 import { useCopilotModels } from '@/hooks/queries/useCopilotModels'
+import { useKimiModelsForSession } from '@/hooks/queries/useKimiModelsForSession'
+import { buildKimiSessionModelOptions } from '@/components/NewSession/grokModels'
 import { useGrokReasoningEffortOptions } from '@/hooks/queries/useGrokReasoningEffortOptions'
 import { usePiModels } from '@/hooks/queries/usePiModels'
-import { useClaudeModelsForMachine } from '@/hooks/queries/useClaudeModelsForMachine'
 import { useOpencodeReasoningEffortOptions } from '@/hooks/queries/useOpencodeReasoningEffortOptions'
+import { queryKeys } from '@/lib/query-keys'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { AgentTerminalView } from '@/components/AgentTerminal/AgentTerminalView'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { VoiceBackendSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
-import { installComposerWheelBridge } from '@/lib/composerWheel'
 
 type SessionModelSelection = { provider: string; modelId: string } | string | null
+
+/**
+ * Query key to invalidate after a successful model switch on an opencode
+ * session, or null for other flavors. The effort-options query caches per
+ * session (not per model), so without invalidation a stale option list from
+ * the previous model survives the switch.
+ */
+export function opencodeEffortOptionsInvalidationKey(
+    agentFlavor: string | null | undefined,
+    sessionId: string
+): readonly unknown[] | null {
+    if (agentFlavor !== 'opencode') {
+        return null
+    }
+    return queryKeys.sessionOpencodeReasoningEffortOptions(sessionId)
+}
+
+export function isRewindForkFallbackError(error: unknown): boolean {
+    return error instanceof ApiError && error.code === 'ambiguous_native_boundary_fork_safe'
+}
 
 export function resolvePiContextWindow(
     models: PiModelSummary[] | undefined,
@@ -136,6 +160,24 @@ export function resolvePiContextWindow(
         : models?.find((candidate) => candidate.modelId === legacyModelId)
 
     return model?.contextWindow
+}
+
+/**
+ * Composer options for an agy session, from the same machine catalog New Session
+ * reads. `undefined` until the machine answers, so the picker falls back to the
+ * built-in list rather than rendering empty.
+ */
+export function buildAgyComposerModelOptions(
+    availableModels: AgyModelSummary[]
+): Array<{ value: string; label: string }> | undefined {
+    if (availableModels.length === 0) {
+        return undefined
+    }
+
+    return availableModels.map((model) => ({
+        value: model.modelId,
+        label: model.name ?? model.modelId
+    }))
 }
 
 export async function applyModelChangeWithReasoningRollback(args: {
@@ -161,6 +203,26 @@ export async function applyModelChangeWithReasoningRollback(args: {
         }
         throw error
     }
+}
+
+export function shouldClearReasoningEffortForModelChange(args: {
+    agentFlavor: string | null | undefined
+    previousModelReasoningEffort: string | null
+    codexModels: readonly CodexModelSummary[]
+    model: SessionModelSelection
+}): boolean {
+    if (!args.previousModelReasoningEffort) {
+        return false
+    }
+    if (args.agentFlavor === 'opencode') {
+        return false
+    }
+    return args.agentFlavor === 'codex'
+        && supportsCodexReasoningEffort(
+            args.codexModels,
+            args.model,
+            args.previousModelReasoningEffort
+        ) === false
 }
 
 /**
@@ -404,28 +466,16 @@ export function ScratchlistDrawerHost(props: {
     ) => Promise<boolean | SendMessageAcceptance>
     onExitScratchlistMode: () => void
     disabled?: boolean
-    attachmentsSupported?: boolean
 }) {
     const assistantApi = useAui()
-    const composerText = useAuiState((state) => state.composer.text)
-    const composerAttachments = useAuiState((state) => state.composer.attachments)
-    const { t } = useTranslation()
-    const composerHasDraftText = composerText.length > 0
-    const composerHasAttachments = composerAttachments.length > 0
-    const composerDestinationLocked = composerHasDraftText || composerHasAttachments
     const handlePromoteToComposer = useCallback(async (entry: ScratchlistEntry) => {
         if (props.disabled) return
-        if (!canPromoteScratchlistEntryAttachments(entry, props.attachmentsSupported)) return
-        // Re-check the live runtime state at click time. The rendered disabled
-        // state can lag a just-typed draft or just-added attachment by one tick.
-        const composerState = assistantApi.composer().getState()
-        if (composerState.text.length > 0 || composerState.attachments.length > 0) return
+        assistantApi.composer().setText(entry.text)
         // Exit scratchlist mode before rehydrating attachments so addAttachment
         // uses the normal chat upload adapter (not the scratchlist hub adapter).
         flushSync(() => {
             props.onExitScratchlistMode()
         })
-        assistantApi.composer().setText(entry.text)
         if (entry.attachments && entry.attachments.length > 0) {
             await rehydrateScratchlistAttachmentsToComposer(
                 props.api,
@@ -434,12 +484,9 @@ export function ScratchlistDrawerHost(props: {
                 assistantApi.composer()
             )
         }
-    }, [assistantApi, props.api, props.attachmentsSupported, props.disabled, props.onExitScratchlistMode, props.sessionId])
+    }, [assistantApi, props.api, props.disabled, props.onExitScratchlistMode, props.sessionId])
     const handlePromoteToQueue = useCallback(async (entry: ScratchlistEntry) => {
         if (props.disabled) return false
-        // Inactive composers cannot safely restore parked attachment blobs.
-        // Keep the durable entry intact rather than staging a partial payload.
-        if (!canPromoteScratchlistEntryAttachments(entry, props.attachmentsSupported)) return false
         let attachments: AttachmentMetadata[] | undefined
         if (entry.attachments && entry.attachments.length > 0) {
             attachments = await stageScratchlistAttachmentsForComposeSend(
@@ -450,25 +497,12 @@ export function ScratchlistDrawerHost(props: {
         }
         // This action is explicitly labelled “Send to queue”. It must retain
         // that contract even when the Pi session is actively thinking.
-        let accepted = false
-        try {
-            accepted = Boolean(await props.onSend(entry.text, attachments, undefined, 'queue'))
-            if (accepted) {
-                props.onExitScratchlistMode()
-            }
-            return accepted
-        } finally {
-            // Scratchlist blobs remain durable on failure. Remove only the
-            // temporary CLI-side staging copies so retries do not leak uploads.
-            if (!accepted && attachments) {
-                await Promise.allSettled(
-                    attachments.map((attachment) => (
-                        props.api.deleteUploadFile(props.sessionId, attachment.path)
-                    ))
-                )
-            }
+        const accepted = await props.onSend(entry.text, attachments, undefined, 'queue')
+        if (accepted) {
+            props.onExitScratchlistMode()
         }
-    }, [props.api, props.attachmentsSupported, props.disabled, props.onSend, props.onExitScratchlistMode, props.sessionId])
+        return Boolean(accepted)
+    }, [props.api, props.disabled, props.onSend, props.onExitScratchlistMode, props.sessionId])
     return (
         <ScratchlistDrawer
             entries={props.entries}
@@ -479,16 +513,6 @@ export function ScratchlistDrawerHost(props: {
             onPromoteToComposer={handlePromoteToComposer}
             onPromoteToQueue={handlePromoteToQueue}
             disabled={props.disabled}
-            promoteToComposerDisabled={composerDestinationLocked}
-            promoteToComposerDisabledReason={composerHasAttachments
-                ? t('scratchlist.modeLockedByAttachments')
-                : composerHasDraftText
-                    ? t('scratchlist.modeLockedByDraft')
-                    : undefined}
-            attachmentsSupported={props.attachmentsSupported}
-            attachmentsUnsupportedReason={props.attachmentsSupported === false
-                ? t('composer.attachUnavailableInactive')
-                : undefined}
         />
     )
 }
@@ -556,7 +580,7 @@ type SessionChatProps = {
     historyVersion: number
     tailRevision: number
     onBack: () => void
-    onRefresh: () => void
+    onRefresh: () => void | Promise<void>
     onLoadMore: (onBeforeApply?: (historyVersion: number) => boolean) => Promise<OlderLoadOutcome>
     onCancelLoadMore: () => void
     // Returns the accepted mutation's attempt id, or false when
@@ -612,11 +636,10 @@ export function SessionChat(props: SessionChatProps) {
 function SessionChatInner(props: SessionChatProps) {
     const { haptic } = usePlatform()
     const { t } = useTranslation()
-    const sharedMode = useOptionalAppContext()?.sharedMode ?? false
-    const ownerApi = sharedMode ? null : props.api
     const { codexExplorationCollapsed } = useCodexExplorationCollapse()
     const navigate = useNavigate()
     const [historyActionPending, setHistoryActionPending] = useState(false)
+    const [rewindForkFallback, setRewindForkFallback] = useState<string | null>(null)
 
     const onForkConversation = useCallback(async (messageLocalId?: string) => {
         setHistoryActionPending(true)
@@ -636,13 +659,31 @@ function SessionChatInner(props: SessionChatProps) {
         setHistoryActionPending(true)
         try {
             await props.api.rewindConversation(props.session.id, messageLocalId)
-            props.onRefresh()
+            // Apply the deterministic local part immediately so the removed
+            // suffix cannot flash back while the authoritative refresh runs.
+            rewindMessageWindow(props.session.id, messageLocalId)
+            await props.onRefresh()
+            // Force the same tail behavior as a successful send after the
+            // refreshed message window has been committed.
+            setForceScrollToken((token) => token + 1)
+        } catch (error) {
+            if (isRewindForkFallbackError(error)) {
+                setRewindForkFallback(messageLocalId)
+                return
+            }
+            throw error
         } finally {
             setHistoryActionPending(false)
         }
     }, [props.api, props.onRefresh, props.session.id])
+
+    const onRewindForkFallback = useCallback(async () => {
+        if (!rewindForkFallback) return
+        await onForkConversation(rewindForkFallback)
+        setRewindForkFallback(null)
+    }, [onForkConversation, rewindForkFallback])
     const sessionInactive = !props.session.active
-    const inactiveCanResume = !sharedMode && inactiveSessionCanResume(
+    const inactiveCanResume = inactiveSessionCanResume(
         props.session,
         props.messages.length,
         props.cursorChatOnDisk
@@ -654,8 +695,9 @@ function SessionChatInner(props: SessionChatProps) {
     // misleadingly "connected" view. Matches the composer terminal button, which
     // is likewise gated on `session.active`.
     const canViewAgentTerminal =
-        !sharedMode && props.session.metadata?.startingMode === 'pty' && props.session.active
+        props.session.metadata?.startingMode === 'pty' && props.session.active
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
+    const focusComposerRef = useRef<(() => void) | null>(null)
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
     const [rememberedTailBoundary, setRememberedTailBoundary] = useState<{
@@ -681,12 +723,9 @@ function SessionChatInner(props: SessionChatProps) {
     // after a later explicit variant click and overwrite it.
     const enqueueCursorModelApply = useMemo(() => createSerialAsyncQueue(), [])
     const lastSyncedCursorModelRef = useRef<string | null | undefined>(undefined)
-    const scratchlist = useHubScratchlist(props.session.id, ownerApi)
-    const { sessions: ownerSessions } = useSessions(ownerApi)
-    // `enabled: false` does not hide an existing TanStack Query cache entry.
-    // Do not resolve cross-session mention metadata from an owner cache while
-    // rendering a share-scoped session.
-    const allSessions = sharedMode ? [] : ownerSessions
+    const scratchlist = useHubScratchlist(props.session.id, props.api)
+    const queryClient = useQueryClient()
+    const { sessions: allSessions } = useSessions(props.api)
     const resolveSessionMentionTooltip = useCallback((id: string, title: string) => {
         const hit = allSessions.find((s) => s.id === id) ?? null
         if (!hit) {
@@ -732,6 +771,7 @@ function SessionChatInner(props: SessionChatProps) {
         if (isScratchlistParking) return
         setScratchlistMode((m) => !m)
     }, [isScratchlistParking])
+    const dictateHotkeyRef = useRef<(() => void) | null>(null)
     /**
      * Global keyboard shortcut: Ctrl/Cmd + Shift + S toggles scratchlist
      * mode (open/close drawer + flip composer routing).
@@ -765,6 +805,26 @@ function SessionChatInner(props: SessionChatProps) {
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
     }, [isScratchlistParking])
+    /**
+     * Global keyboard shortcut: Ctrl/Cmd + Shift + D toggles composer
+     * dictation (Settings → Voice mode: dictation) or voice assistant,
+     * using the same effective toggle as the mic / dictate buttons in
+     * HappyComposer. Skipped for dialog / single-line input targets;
+     * rich composer input is allowed (see isDictateHotkeyBlockedTarget).
+     */
+    useEffect(() => {
+        const onKeyDown = (e: globalThis.KeyboardEvent) => {
+            if (e.repeat) return
+            if (!isDictateToggleHotkey(e)) return
+            if (isDictateHotkeyBlockedTarget(e.target)) return
+            const invoke = dictateHotkeyRef.current
+            if (!invoke) return
+            e.preventDefault()
+            invoke()
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+    }, [])
     /**
      * Global select-all takeover: see applyGlobalSelectAll. Bound at
      * window scope because the broken case is focus on the page body /
@@ -906,19 +966,40 @@ function SessionChatInner(props: SessionChatProps) {
                 }
                 return accepted
             }
+            if (!scratchlistMode && scheduledAt == null && !attachments?.length
+                && props.session.metadata?.capabilities?.concurrentClients && /^\/(clear|new)\s*$/.test(text.trim())) {
+                const result = await props.api.clearConversation(props.session.id)
+                await navigate({ to: '/sessions/$sessionId', params: { sessionId: result.sessionId }, ...PRESERVE_SESSION_SIDEBAR_SCROLL })
+                return { attemptId: null }
+            }
             return props.onSend(text, attachments, scheduledAt, deliveryMode)
         },
-        [props.onSend, props.api, props.session.id, scratchlist, scratchlistMode],
+        [props.onSend, props.api, props.session.id, props.session.metadata?.capabilities?.concurrentClients, navigate, scratchlist, scratchlistMode],
     )
     const agentFlavor = props.session.metadata?.flavor ?? null
-    const controlledByUser = props.session.agentState?.controlledByUser === true
-    const codexCollaborationModeSupported = !sharedMode && agentFlavor === 'codex' && !controlledByUser
+    // The effort-options query is keyed by session only, so a stale option
+    // list from the previous model would survive a switch. Reset when the
+    // session model changes. `session.model` is updated by the hub at REST-ack
+    // time, ahead of the CLI's inline ACP switch — the invalidation alone
+    // would refetch the old model's options, and the hook's pending-switch
+    // polling (currentModelId mismatch) is what actually converges the picker.
+    // The key is built inside the effect: computing it during render yields a
+    // fresh array every render, and putting that in the deps would invalidate
+    // on every streaming re-render.
+    const sessionModel = props.session.model
+    const sessionId = props.session.id
+    useEffect(() => {
+        const effortInvalidationKey = opencodeEffortOptionsInvalidationKey(agentFlavor, sessionId)
+        if (!effortInvalidationKey || sessionModel === undefined) return
+        void queryClient.resetQueries({ queryKey: effortInvalidationKey, exact: true })
+    }, [agentFlavor, sessionId, sessionModel, queryClient])
+    const controlledByUser = props.session.agentState?.controlledByUser === true && !props.session.metadata?.capabilities?.concurrentClients
+    const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
     const codexModelsState = useCodexModels({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
         machineId: props.session.metadata?.machineId ?? null,
-        accountId: props.session.metadata?.codexAccountId ?? null,
-        enabled: !sharedMode && agentFlavor === 'codex' && props.session.active && !controlledByUser
+        enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
     })
     const effectiveCodexServiceTier = agentFlavor === 'codex'
         ? getEffectiveCodexServiceTier(
@@ -952,14 +1033,15 @@ function SessionChatInner(props: SessionChatProps) {
         [codexSupportedReasoningEfforts]
     )
     const opencodeModelsState = useOpencodeModels({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'opencode' && props.session.active
+        enabled: agentFlavor === 'opencode' && props.session.active
     })
     const opencodeReasoningEffortState = useOpencodeReasoningEffortOptions({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'opencode' && props.session.active
+        enabled: agentFlavor === 'opencode' && props.session.active,
+        sessionModel: props.session.model
     })
     const opencodeModelOptions = useMemo(() => {
         if (agentFlavor !== 'opencode') {
@@ -972,14 +1054,14 @@ function SessionChatInner(props: SessionChatProps) {
         }))
     }, [agentFlavor, opencodeModelsState.availableModels])
     const grokModelsState = useGrokModels({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'grok' && props.session.active && !controlledByUser
+        enabled: agentFlavor === 'grok' && props.session.active && !controlledByUser
     })
     const grokEffortState = useGrokReasoningEffortOptions({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'grok' && props.session.active && !controlledByUser
+        enabled: agentFlavor === 'grok' && props.session.active && !controlledByUser
     })
     const grokModelOptions = useMemo(() => (
         agentFlavor === 'grok'
@@ -993,9 +1075,9 @@ function SessionChatInner(props: SessionChatProps) {
             : undefined
     ), [agentFlavor, grokModelsState.availableModels])
     const copilotModelsState = useCopilotModels({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'copilot' && props.session.active && !controlledByUser
+        enabled: agentFlavor === 'copilot' && props.session.active && !controlledByUser
     })
     const copilotModelOptions = useMemo(() => (
         agentFlavor === 'copilot'
@@ -1011,15 +1093,28 @@ function SessionChatInner(props: SessionChatProps) {
             : undefined
     ), [agentFlavor, copilotModelsState.availableModels])
     const cursorModelsState = useCursorModels({
-        api: ownerApi,
+        api: props.api,
         sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'cursor' && props.session.active
+        enabled: agentFlavor === 'cursor' && props.session.active
     })
     const sessionMachineId = props.session.metadata?.machineId ?? null
+    // A running session discovers its models over its own connection (kimi
+    // provider list --json), so this works without a background runner;
+    // switching itself still goes through the existing ACP setModel path.
+    const kimiModelsState = useKimiModelsForSession({
+        api: props.api,
+        sessionId: props.session.id,
+        enabled: agentFlavor === 'kimi' && props.session.active
+    })
+    const kimiModelOptions = useMemo(() => (
+        agentFlavor === 'kimi' && kimiModelsState.availableModels.length > 0
+            ? buildKimiSessionModelOptions(kimiModelsState.availableModels)
+            : undefined
+    ), [agentFlavor, kimiModelsState.availableModels])
     const machineCursorModelsState = useCursorModelsForMachine({
-        api: ownerApi,
+        api: props.api,
         machineId: sessionMachineId,
-        enabled: !sharedMode && agentFlavor === 'cursor' && props.session.active && Boolean(sessionMachineId)
+        enabled: agentFlavor === 'cursor' && props.session.active && Boolean(sessionMachineId)
     })
     const sessionCliModelSkus = useMemo(() => (
         mergeCursorCliModelSkus(
@@ -1037,7 +1132,8 @@ function SessionChatInner(props: SessionChatProps) {
             machineModels: machineCursorModelsState.availableModels,
             cliModelSkus: sessionCliModelSkus,
             sessionModel: props.session.model,
-            sessionCurrentModelId: cursorModelsState.currentModelId
+            sessionCurrentModelId: cursorModelsState.currentModelId,
+            autoRestartLabel: t('session.modelChange.cursorAutoRestart')
         })
     }, [
         agentFlavor,
@@ -1045,22 +1141,27 @@ function SessionChatInner(props: SessionChatProps) {
         cursorModelsState.currentModelId,
         machineCursorModelsState.availableModels,
         sessionCliModelSkus,
-        props.session.model
+        props.session.model,
+        t
     ])
-    const piModelsState = usePiModels({
-        api: ownerApi,
-        sessionId: props.session.id,
-        enabled: !sharedMode && agentFlavor === 'pi' && props.session.active
-    })
-    const claudeModelsState = useClaudeModelsForMachine({
-        api: ownerApi,
+    const agyModelsState = useAgyModels({
+        api: props.api,
         machineId: sessionMachineId,
-        enabled: !sharedMode && agentFlavor === 'claude' && Boolean(sessionMachineId)
+        enabled: agentFlavor === 'agy' && props.session.active && Boolean(sessionMachineId)
     })
-    const claudeModelOptions = useMemo(() => {
-        if (claudeModelsState.availableModels.length === 0) return undefined
-        return claudeModelsState.availableModels.map((entry) => ({ value: entry.modelId, label: entry.name ?? entry.modelId }))
-    }, [claudeModelsState.availableModels])
+    // Options only: the composer has no surface for a catalog warning, so a
+    // machine whose sign-in has lapsed shows its last known list here and New
+    // Session is where that gets explained.
+    const agyModelOptions = useMemo(() => (
+        agentFlavor === 'agy'
+            ? buildAgyComposerModelOptions(agyModelsState.availableModels)
+            : undefined
+    ), [agentFlavor, agyModelsState.availableModels])
+    const piModelsState = usePiModels({
+        api: props.api,
+        sessionId: props.session.id,
+        enabled: agentFlavor === 'pi' && props.session.active
+    })
     // Fallback to cached models from metadata when session is inactive
     const piMetadata = props.session.metadata as Record<string, unknown> | null
     const piCachedModels = piMetadata?.piAvailableModels as PiModelSummary[] | undefined ?? []
@@ -1191,7 +1292,6 @@ function SessionChatInner(props: SessionChatProps) {
 
     // Register session store for voice client tools
     useEffect(() => {
-        if (sharedMode) return
         registerSessionStore({
             getSession: () => props.session as { agentState?: { requests?: Record<string, unknown> } } | null,
             sendMessage: (_sessionId: string, message: string) => props.onSend(message),
@@ -1204,25 +1304,20 @@ function SessionChatInner(props: SessionChatProps) {
                 props.onRefresh()
             }
         })
-    }, [props.session, props.api, props.onSend, props.onRefresh, sharedMode])
+    }, [props.session, props.api, props.onSend, props.onRefresh])
 
     useEffect(() => {
-        if (sharedMode) return
         registerVoiceHooksStore(
             (sessionId) => (sessionId === props.session.id ? props.session : null),
             (sessionId) => (sessionId === props.session.id ? props.messages : [])
         )
-    }, [props.session, props.messages, sharedMode])
+    }, [props.session, props.messages])
 
     // Track and report new messages to voice assistant
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
     const prevMessagesRef = useRef<DecryptedMessage[]>([])
 
     useEffect(() => {
-        if (sharedMode) {
-            prevMessagesRef.current = props.messages
-            return
-        }
         const prevIds = new Set(prevMessagesRef.current.map(m => m.id))
         const newMessages = props.messages.filter(m => !prevIds.has(m.id))
 
@@ -1231,24 +1326,20 @@ function SessionChatInner(props: SessionChatProps) {
         }
 
         prevMessagesRef.current = props.messages
-    }, [props.messages, props.session.id, sharedMode])
+    }, [props.messages, props.session.id])
 
     // Report ready event when thinking stops
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
     const prevThinkingRef = useRef(props.session.thinking)
 
     useEffect(() => {
-        if (sharedMode) {
-            prevThinkingRef.current = props.session.thinking
-            return
-        }
         // Detect transition: thinking → not thinking
         if (prevThinkingRef.current && !props.session.thinking) {
             voiceHooks.onReady(props.session.id)
         }
 
         prevThinkingRef.current = props.session.thinking
-    }, [props.session.thinking, props.session.id, sharedMode])
+    }, [props.session.thinking, props.session.id])
 
     // Report permission requests to voice assistant
     // Note: voiceHooks internally checks isVoiceSessionStarted() so we don't need to check voice.status here
@@ -1257,11 +1348,6 @@ function SessionChatInner(props: SessionChatProps) {
     useEffect(() => {
         const requests = props.session.agentState?.requests ?? {}
         const currentIds = new Set(Object.keys(requests))
-
-        if (sharedMode) {
-            prevRequestIdsRef.current = currentIds
-            return
-        }
 
         for (const [requestId, request] of Object.entries(requests)) {
             if (!prevRequestIdsRef.current.has(requestId)) {
@@ -1275,7 +1361,7 @@ function SessionChatInner(props: SessionChatProps) {
         }
 
         prevRequestIdsRef.current = currentIds
-    }, [props.session.agentState?.requests, props.session.id, sharedMode])
+    }, [props.session.agentState?.requests, props.session.id])
 
     const handleVoiceToggle = useCallback(async () => {
         if (!voice) return
@@ -1374,20 +1460,12 @@ function SessionChatInner(props: SessionChatProps) {
             tasks: props.session.todos,
             blocks: reconciled.blocks,
             messages: normalizedMessages,
-            agentFlavor,
-            active: props.session.active,
-            thinking: props.session.thinking,
-            pendingRequestsCount: Object.keys(props.session.agentState?.requests ?? {}).length,
             backgroundTaskCount: props.session.backgroundTaskCount
         }),
         [
             reduced.latestGoal,
             props.session.todos,
-            props.session.active,
-            props.session.thinking,
-            props.session.agentState?.requests,
             props.session.backgroundTaskCount,
-            agentFlavor,
             reconciled.blocks,
             normalizedMessages
         ]
@@ -1408,27 +1486,6 @@ function SessionChatInner(props: SessionChatProps) {
             codexExplorationCollapsed
         }),
         [reconciled.blocks, props.hasMoreMessages, codexExplorationCollapsed]
-    )
-    const currentTurnStartedAt = useMemo(
-        () => reconciled.blocks.reduce(
-            (latest, block) => block.kind === 'user-text'
-                ? Math.max(latest, block.createdAt)
-                : latest,
-            0
-        ),
-        [reconciled.blocks]
-    )
-    const latestPlanProgress = useMemo(() => {
-        if (agentFlavor !== 'codex') return null
-        return getLatestPlanProgress(
-            reconciled.blocks.filter((block) => block.createdAt >= currentTurnStartedAt)
-        ) ?? getPersistedPlanProgress(props.session.todos)
-    }, [agentFlavor, props.session.todos, reconciled.blocks, currentTurnStartedAt])
-    const codexActivityText = useMemo(
-        () => agentFlavor === 'codex' && props.session.thinking
-            ? getLatestCodexCommentaryProgress(reconciled.blocks, currentTurnStartedAt)
-            : null,
-        [agentFlavor, props.session.thinking, reconciled.blocks, currentTurnStartedAt]
     )
 
     // Fork-current must compare against assistant-ui message ids (`kind:id`),
@@ -1519,13 +1576,12 @@ function SessionChatInner(props: SessionChatProps) {
     // Model mode change handler
     const handleModelChange = useCallback(async (model: SessionModelSelection) => {
         const previousModelReasoningEffort = props.session.modelReasoningEffort
-        const shouldClearReasoningEffort = agentFlavor === 'codex'
-            && Boolean(previousModelReasoningEffort)
-            && supportsCodexReasoningEffort(
-                codexModelsState.models,
-                model,
-                previousModelReasoningEffort
-            ) === false
+        const shouldClearReasoningEffort = shouldClearReasoningEffortForModelChange({
+            agentFlavor,
+            previousModelReasoningEffort,
+            codexModels: codexModelsState.models,
+            model
+        })
 
         try {
             await applyModelChangeWithReasoningRollback({
@@ -1818,31 +1874,19 @@ function SessionChatInner(props: SessionChatProps) {
         viewMode: props.viewMode,
         isSyncingTail: props.isSyncingTail,
         isLoadingMore: props.isLoadingMoreMessages,
+        isSending: props.isSending,
         isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
         attachmentOrderRef,
         onAbort: handleAbort,
         attachmentAdapter,
-        allowSendWhenInactive: !sharedMode,
+        allowSendWhenInactive: true,
         pendingScheduleRef,
         pendingSendIntentRef,
     })
 
-    const composerAreaRef = useRef<HTMLDivElement>(null)
-    useEffect(() => {
-        const boundary = composerAreaRef.current
-        if (!boundary) return
-        return installComposerWheelBridge(boundary, () => {
-            // Expanded composer owns the visible vertical surface; do not move
-            // hidden chat history behind it when its editor reaches an edge.
-            if (boundary.querySelector('[data-expanded="true"]')) return null
-            const sessionRoot = boundary.closest<HTMLElement>('[data-session-chat-root]')
-            return sessionRoot?.querySelector<HTMLElement>('.chat-scroll-y') ?? null
-        })
-    }, [])
-
     return (
-        <div data-session-chat-root className="flex h-full min-h-0 min-w-0 w-full overflow-clip flex-col">
+        <div className="flex h-full min-h-0 flex-col">
             <SessionHeader
                 session={props.session}
                 serviceTier={effectiveCodexServiceTier}
@@ -1883,7 +1927,7 @@ function SessionChatInner(props: SessionChatProps) {
             )}
 
             {sessionInactive ? (
-                <div className="mx-auto w-full max-w-content bg-[var(--app-subtle-bg)] p-3 text-sm text-[var(--app-hint)]">
+                <div className="mx-auto w-full max-w-content bg-[var(--app-subtle-bg)] p-3 text-center text-sm text-[var(--app-hint)]">
                     {inactiveCanResume
                         ? t('session.inactive.autoResume')
                         : t('session.inactive.cannotResume')}
@@ -1916,14 +1960,13 @@ function SessionChatInner(props: SessionChatProps) {
                         serviceTier={effectiveCodexServiceTier}
                         sessionId={props.session.id}
                         metadata={props.session.metadata}
-                        disabled={sessionInactive || sharedMode}
-                        machineDiscoveryEnabled={!sharedMode}
-                        hubSettingsEnabled={!sharedMode}
+                        disabled={sessionInactive}
                         onRefresh={props.onRefresh}
                         onRetryMessage={props.onRetryMessage}
+                        onContinuePlan={() => focusComposerRef.current?.()}
                         historyActionPending={historyActionPending}
-                        onForkConversation={sharedMode || controlledByUser ? undefined : onForkConversation}
-                        onRewindConversation={sharedMode || controlledByUser ? undefined : onRewindConversation}
+                        onForkConversation={controlledByUser ? undefined : onForkConversation}
+                        onRewindConversation={controlledByUser ? undefined : onRewindConversation}
                         isLatestCompletedBoundary={isLatestCompletedBoundary}
                         onViewModeChange={props.onViewModeChange}
                         isSyncingTail={props.isSyncingTail}
@@ -1944,7 +1987,7 @@ function SessionChatInner(props: SessionChatProps) {
                     />
                     </div>
 
-                    <div ref={composerAreaRef} className={outlineOpen ? 'max-sm:hidden' : undefined}>
+                    <div className={outlineOpen ? 'max-sm:hidden' : undefined}>
                         {codexCollaborationModeSupported && codexModelsState.error ? (
                             <div className="px-3 pb-2">
                                 <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-red-600">
@@ -1961,12 +2004,10 @@ function SessionChatInner(props: SessionChatProps) {
                          * Auto-renders nothing unless `migrationStatus ===
                          * 'completed'`.
                          */}
-                        {!sharedMode ? (
-                            <ScratchlistMigrationBanner
-                                migrationStatus={scratchlist.migrationStatus}
-                                onDismiss={scratchlist.dismissMigrationBanner}
-                            />
-                        ) : null}
+                        <ScratchlistMigrationBanner
+                            migrationStatus={scratchlist.migrationStatus}
+                            onDismiss={scratchlist.dismissMigrationBanner}
+                        />
 
                         <div className="px-3">
                             {/*
@@ -1976,7 +2017,7 @@ function SessionChatInner(props: SessionChatProps) {
                              * useScratchlist hook above (so the toolbar counter
                              * and the drawer share one source of truth).
                              */}
-                            {!sharedMode && scratchlistMode ? (
+                            {scratchlistMode ? (
                                 <ScratchlistDrawerHost
                                     sessionId={props.session.id}
                                     api={props.api}
@@ -1986,7 +2027,6 @@ function SessionChatInner(props: SessionChatProps) {
                                     onSend={props.onSend}
                                     onExitScratchlistMode={() => setScratchlistMode(false)}
                                     disabled={props.isSending || isScratchlistParking}
-                                    attachmentsSupported={props.session.active}
                                 />
                             ) : null}
                             <QueuedMessagesBar
@@ -2007,6 +2047,7 @@ function SessionChatInner(props: SessionChatProps) {
                         </div>
 
                         <HappyComposer
+                        focusInputRef={focusComposerRef}
                         key={`composer-${props.session.id}`}
                         sessionId={props.session.id}
                         canRestoreAttachments={props.session.active}
@@ -2015,7 +2056,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }}
                         attachmentOrderRef={attachmentOrderRef}
                         resolveSessionMentionTooltip={resolveSessionMentionTooltip}
-                        sendPending={props.isSending}
+                        disabled={props.isSending}
                         pendingSchedule={pendingSchedule}
                         sendAcceptance={sendAcceptance}
                         sendSettlement={props.sendSettlement}
@@ -2023,18 +2064,14 @@ function SessionChatInner(props: SessionChatProps) {
                         onClearSchedule={() => updatePendingSchedule(null)}
                         permissionMode={props.session.permissionMode}
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
-                        threadGoal={reduced.latestGoal}
-                        planProgress={latestPlanProgress}
                         copilotAgentMode={agentFlavor === 'copilot' ? props.session.copilotAgentMode : undefined}
                         model={props.session.model}
                         modelReasoningEffort={agentFlavor === 'codex' || agentFlavor === 'opencode' ? props.session.modelReasoningEffort : undefined}
                         effort={props.session.effort}
                         agentFlavor={agentFlavor}
-                        activityText={codexActivityText}
+                        concurrentClients={props.session.metadata?.capabilities?.concurrentClients}
                         availableModelOptions={
-                            sharedMode
-                                ? undefined
-                                : agentFlavor === 'codex'
+                            agentFlavor === 'codex'
                                 ? codexModelOptions
                                 : agentFlavor === 'cursor'
                                     ? (
@@ -2046,12 +2083,14 @@ function SessionChatInner(props: SessionChatProps) {
                                     )
                                     : agentFlavor === 'opencode'
                                         ? opencodeModelOptions
-                                        : agentFlavor === 'claude'
-                                            ? claudeModelOptions
                                         : agentFlavor === 'grok'
                                             ? grokModelOptions
                                         : agentFlavor === 'copilot'
                                             ? copilotModelOptions
+                                            : agentFlavor === 'kimi'
+                                                ? kimiModelOptions
+                                            : agentFlavor === 'agy'
+                                                ? agyModelOptions
                                         // Pi gets its provider-qualified model list from the piModels prop;
                                         // feeding piModelOptions here would make the generic Ctrl/Cmd+M
                                         // cycler (getNextModelForFlavor) post a bare modelId string,
@@ -2060,64 +2099,58 @@ function SessionChatInner(props: SessionChatProps) {
                                         // so Pi model changes go through the settings sheet only.
                                         : undefined
                         }
-                        piModels={sharedMode ? undefined : piModels}
-                        piSelectedModel={!sharedMode && agentFlavor === 'pi' ? piSelectedModel : undefined}
+                        piModels={piModels}
+                        piSelectedModel={agentFlavor === 'pi' ? piSelectedModel : undefined}
                         availableModelReasoningEffortOptions={
-                            sharedMode
-                                ? undefined
-                                : agentFlavor === 'codex'
+                            agentFlavor === 'codex'
                                 ? codexReasoningEffortOptions
                                 : agentFlavor === 'opencode' && opencodeReasoningEffortState.options.length > 0
                                     ? opencodeReasoningEffortState.options
                                     : undefined
                         }
                         availableEffortOptions={
-                            !sharedMode && agentFlavor === 'grok' && grokEffortState.options.length > 0
+                            agentFlavor === 'grok' && grokEffortState.options.length > 0
                                 ? grokEffortState.options
                                 : undefined
                         }
                         active={props.session.active}
-                        allowSendWhenInactive={!sharedMode}
+                        allowSendWhenInactive
                         onResumeStoredDraft={() => handleSend('', undefined, null)}
                         thinking={props.session.thinking}
                         agentState={props.session.agentState}
                         backgroundTaskCount={props.session.backgroundTaskCount}
                         contextSize={reduced.latestUsage?.contextSize}
-                        latestUsage={reduced.latestUsage}
-                        usage={props.session.usage}
-                        accountStatus={props.session.accountStatus}
                         contextCacheRead={reduced.latestUsage?.cacheRead}
                         contextWindow={reduced.latestUsage?.contextWindow ?? piContextWindow}
                         contextModel={reduced.latestUsage?.model ?? props.session.model}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
-                            !sharedMode && codexCollaborationModeSupported && props.session.active && !controlledByUser
+                            codexCollaborationModeSupported && props.session.active && !controlledByUser
                                 ? handleCollaborationModeChange
                                 : undefined
                         }
                         onCopilotAgentModeChange={
-                            !sharedMode && agentFlavor === 'copilot' && props.session.active && !controlledByUser
+                            agentFlavor === 'copilot' && props.session.active && !controlledByUser
                                 ? handleCopilotAgentModeChange
                                 : undefined
                         }
                         onPermissionModeChange={
-                            sharedMode || (agentFlavor === 'copilot' && controlledByUser)
+                            agentFlavor === 'copilot' && controlledByUser
                                 ? undefined
                                 : handlePermissionModeChange
                         }
                         selectedModelBase={
-                            !sharedMode && agentFlavor === 'cursor' && cursorPicker
+                            agentFlavor === 'cursor' && cursorPicker
                                 ? cursorSelectedBaseValue
                                 : undefined
                         }
                         selectedModelVariant={
-                            !sharedMode && agentFlavor === 'cursor' && !cursorCatalogPending
+                            agentFlavor === 'cursor' && !cursorCatalogPending
                                 ? cursorVariantSelectValue
                                 : undefined
                         }
                         modelEffortOptions={
-                            !sharedMode
-                                && agentFlavor === 'cursor'
+                            agentFlavor === 'cursor'
                                 && !cursorCatalogPending
                                 && cursorPicker?.mode === 'dual'
                                 && cursorModelEffortOptions
@@ -2126,13 +2159,12 @@ function SessionChatInner(props: SessionChatProps) {
                                 : undefined
                         }
                         resolveModelVariantsForBase={
-                            !sharedMode && agentFlavor === 'cursor' && cursorPicker?.mode === 'dual'
+                            agentFlavor === 'cursor' && cursorPicker?.mode === 'dual'
                                 ? resolveCursorVariantsForBase
                                 : undefined
                         }
-                        onModelChange={sharedMode
-                            ? undefined
-                            : agentFlavor === 'codex'
+                        onModelChange={
+                            agentFlavor === 'codex'
                                 ? (props.session.active && !controlledByUser && !codexModelsState.error ? handleModelChange : undefined)
                                 : agentFlavor === 'cursor'
                                     ? (props.session.active
@@ -2156,8 +2188,7 @@ function SessionChatInner(props: SessionChatProps) {
                                         : handleModelChange
                         }
                         onModelEffortChange={
-                            !sharedMode
-                                && agentFlavor === 'cursor'
+                            agentFlavor === 'cursor'
                                 && props.session.active
                                 && !controlledByUser
                                 && !cursorCatalogPending
@@ -2166,17 +2197,15 @@ function SessionChatInner(props: SessionChatProps) {
                                 : undefined
                         }
                         onModelReasoningEffortChange={
-                            !sharedMode
-                                && (agentFlavor === 'codex' || agentFlavor === 'opencode')
+                            (agentFlavor === 'codex' || agentFlavor === 'opencode')
                                 && props.session.active
                                 && !controlledByUser
                                 && (agentFlavor !== 'opencode' || opencodeReasoningEffortState.options.length > 0)
                                 ? handleModelReasoningEffortChange
                                 : undefined
                         }
-                        onEffortChange={sharedMode
-                            ? undefined
-                            : agentFlavor === 'grok'
+                        onEffortChange={
+                            agentFlavor === 'grok'
                                 ? (props.session.active && !controlledByUser && grokEffortState.options.length > 0
                                     ? handleEffortChange
                                     : undefined)
@@ -2184,8 +2213,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }
                         serviceTier={effectiveCodexServiceTier}
                         onServiceTierChange={
-                            !sharedMode
-                                && agentFlavor === 'codex'
+                            agentFlavor === 'codex'
                                 && props.session.active
                                 && !controlledByUser
                                 && !codexModelsState.error
@@ -2193,20 +2221,21 @@ function SessionChatInner(props: SessionChatProps) {
                                 ? handleServiceTierChange
                                 : undefined
                         }
-                        onSwitchToRemote={sharedMode ? undefined : handleSwitchToRemote}
-                        onTerminal={!sharedMode && props.session.active && terminalSupported ? handleViewTerminal : undefined}
-                        terminalUnsupported={!sharedMode && props.session.active && !terminalSupported}
+                        onSwitchToRemote={handleSwitchToRemote}
+                        onTerminal={props.session.active && terminalSupported ? handleViewTerminal : undefined}
+                        terminalUnsupported={props.session.active && !terminalSupported}
                         autocompleteSuggestions={props.autocompleteSuggestions}
-                        voiceStatus={sharedMode ? undefined : voice?.status}
-                        voiceMicMuted={sharedMode ? undefined : voice?.micMuted}
-                        onVoiceToggle={!sharedMode && voice && voiceBackendReady ? handleVoiceToggle : undefined}
-                        onVoiceMicToggle={!sharedMode && voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
-                        voiceTranscriptionApi={sharedMode ? undefined : props.api}
-                        scratchlistMode={sharedMode ? undefined : scratchlistMode}
-                        scratchlistCount={sharedMode ? undefined : scratchlist.entries.length}
-                        onScratchlistToggle={sharedMode ? undefined : handleScratchlistToggle}
-                        onParkScratchlist={sharedMode ? undefined : onParkScratchlist}
-                        onScratchlistParkingChange={sharedMode ? undefined : setIsScratchlistParking}
+                        voiceStatus={voice?.status}
+                        voiceMicMuted={voice?.micMuted}
+                        onVoiceToggle={voice && voiceBackendReady ? handleVoiceToggle : undefined}
+                        onVoiceMicToggle={voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
+                        voiceTranscriptionApi={props.api}
+                        scratchlistMode={scratchlistMode}
+                        scratchlistCount={scratchlist.entries.length}
+                        onScratchlistToggle={handleScratchlistToggle}
+                        onParkScratchlist={onParkScratchlist}
+                        onScratchlistParkingChange={setIsScratchlistParking}
+                        dictateHotkeyRef={dictateHotkeyRef}
                         sendError={props.sendError ?? null}
                         onClearSendError={handleClearSendError}
                         onSuppressSendErrorRestore={props.onSuppressSendErrorRestore}
@@ -2219,7 +2248,7 @@ function SessionChatInner(props: SessionChatProps) {
             </div>
 
             {/* Voice session component - renders nothing but initializes voice backend */}
-            {!sharedMode && voice && (
+            {voice && (
                 <VoiceBackendSession
                     api={props.api}
                     micMuted={voice.micMuted}
@@ -2227,6 +2256,19 @@ function SessionChatInner(props: SessionChatProps) {
                     onReadyChange={setVoiceBackendReady}
                 />
             )}
+
+            <ConfirmDialog
+                isOpen={rewindForkFallback !== null}
+                onClose={() => {
+                    if (!historyActionPending) setRewindForkFallback(null)
+                }}
+                title={t('message.rewind.fallbackTitle')}
+                description={t('message.rewind.fallbackDescription')}
+                confirmLabel={t('message.rewind.fallbackFork')}
+                confirmingLabel={t('message.rewind.fallbackForking')}
+                isPending={historyActionPending}
+                onConfirm={onRewindForkFallback}
+            />
         </div>
     )
 }

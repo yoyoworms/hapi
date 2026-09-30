@@ -12,7 +12,7 @@ import { readSessionSummaryContractEnabled } from '../../config/sessionSummaryCo
 import { constantTimeEquals } from '../../utils/crypto'
 import { parseAccessToken } from '../../utils/accessToken'
 import type { Machine, Session, SyncEngine } from '../../sync/syncEngine'
-import { SessionIdentityConflictError } from '../../store/sessions'
+import { SessionIdentityConflictError, SessionNotAdoptableError } from '../../store/sessions'
 
 const bearerSchema = z.string().regex(/^Bearer\s+(.+)$/i)
 
@@ -119,16 +119,27 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         }
 
         try {
-            const session = engine.getOrCreateSession(
-                parsed.data.tag,
-                parsed.data.metadata,
-                parsed.data.agentState ?? null,
-                namespace,
-                parsed.data.model,
-                parsed.data.effort,
-                parsed.data.modelReasoningEffort,
-                parsed.data.id
-            )
+            const session = parsed.data.adopt === true && parsed.data.id
+                ? engine.adoptPreallocatedSession(
+                    parsed.data.id,
+                    parsed.data.tag,
+                    parsed.data.metadata,
+                    parsed.data.agentState ?? null,
+                    namespace,
+                    parsed.data.model,
+                    parsed.data.effort,
+                    parsed.data.modelReasoningEffort
+                )
+                : engine.getOrCreateSession(
+                    parsed.data.tag,
+                    parsed.data.metadata,
+                    parsed.data.agentState ?? null,
+                    namespace,
+                    parsed.data.model,
+                    parsed.data.effort,
+                    parsed.data.modelReasoningEffort,
+                    parsed.data.id
+                )
             const sessionSummaryContract = await readSessionSummaryContractEnabled(
                 getConfiguration().dataDir
             )
@@ -136,6 +147,10 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         } catch (error) {
             if (error instanceof SessionIdentityConflictError) {
                 return c.json({ error: error.message }, 409)
+            }
+            if (error instanceof SessionNotAdoptableError) {
+                const status = error.message === 'Session not found' ? 404 : 409
+                return c.json({ error: error.message }, status)
             }
             throw error
         }
@@ -182,7 +197,7 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         if (result.type === 'error') {
             const status = result.code === 'access_denied' ? 403
                 : result.code === 'session_not_found' ? 404
-                    : result.code === 'already_local' ? 409
+                    : result.code === 'already_local' || result.code === 'control_mode_not_applicable' ? 409
                         : 500
             return c.json({ error: result.message, code: result.code }, status)
         }
@@ -355,33 +370,6 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
             return c.json({ error: resolved.error }, resolved.status)
         }
         return c.json({ machine: resolved.machine })
-    })
-
-    // File upload to COS
-    app.post('/files/upload', async (c) => {
-        const { uploadToCos, isCosConfigured } = await import('../../services/cosUpload')
-        if (!isCosConfigured()) {
-            return c.json({ error: 'COS not configured' }, 503)
-        }
-
-        const buffer = Buffer.from(await c.req.arrayBuffer())
-        if (buffer.length === 0) {
-            return c.json({ error: 'Empty file' }, 400)
-        }
-        if (buffer.length > 50 * 1024 * 1024) {
-            return c.json({ error: 'File too large' }, 413)
-        }
-
-        const filename = c.req.header('x-filename') || undefined
-        const mimeType = c.req.header('x-mime-type') || c.req.header('content-type')?.split(';')[0] || undefined
-        const namespace = c.get('namespace')
-
-        const result = await uploadToCos(buffer, { filename, mimeType, namespace })
-        if (!result.success) {
-            return c.json({ error: result.error }, 500)
-        }
-
-        return c.json({ url: result.url, key: result.key })
     })
 
     return app

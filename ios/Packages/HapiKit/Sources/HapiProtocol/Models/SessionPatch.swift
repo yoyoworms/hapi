@@ -48,7 +48,8 @@ public enum PatchField<Value: Codable & Equatable & Sendable>: Equatable, Sendab
 public struct SessionPatch: Equatable, Sendable {
     public var active: Bool?
     public var thinking: Bool?
-    /// Applied by `applySessionDetailPatch`; `.null` clears the turn boundary.
+    /// Carried on the wire but NOT applied by `applySessionDetailPatch`
+    /// (mirroring `web/src/lib/sessionPatch.ts`).
     public var activeTurnStartedAt: PatchField<Int>?
     public var activeAt: Int?
     public var updatedAt: Int?

@@ -10,8 +10,6 @@
 
 import { getSettingsFile, updateSettings } from './settings'
 
-export const DEFAULT_AUTO_ARCHIVE_IDLE_HOURS = 48
-
 const OLD_SETTINGS_FIELDS = ['webappHost', 'webappPort', 'webappUrl'] as const
 
 /**
@@ -21,6 +19,7 @@ const OLD_SETTINGS_FIELDS = ['webappHost', 'webappPort', 'webappUrl'] as const
  */
 const PUSH_SETTING_KEYS = [
     ['fcmServiceAccountPath', 'FCM_SERVICE_ACCOUNT_PATH'],
+    ['androidPushMode', 'HAPI_ANDROID_PUSH'],
     ['iosPushMode', 'HAPI_IOS_PUSH'],
     ['iosPushRelayUrl', 'HAPI_PUSH_RELAY_URL'],
     ['apnsKeyP8Path', 'APNS_KEY_P8_PATH'],
@@ -42,7 +41,7 @@ export interface ServerSettings {
     listenPort: number
     publicUrl: string
     corsOrigins: string[]
-    autoArchiveIdleHours: number
+    androidPushMode: string | null
     fcmServiceAccountPath: string | null
     iosPushMode: string | null
     iosPushRelayUrl: string | null
@@ -65,7 +64,6 @@ export interface ServerSettingsResult {
         listenPort: 'env' | 'file' | 'default'
         publicUrl: 'env' | 'file' | 'default'
         corsOrigins: 'env' | 'file' | 'default'
-        autoArchiveIdleHours: 'env' | 'file' | 'default'
     } & Record<PushSettingKey, 'env' | 'file' | 'default'>
     savedToFile: boolean
 }
@@ -106,18 +104,6 @@ function deriveCorsOrigins(publicUrl: string): string[] {
     }
 }
 
-function parseAutoArchiveIdleHours(value: unknown, source: string): number {
-    const parsed = typeof value === 'number'
-        ? value
-        : typeof value === 'string' && /^\d+$/.test(value.trim())
-            ? Number(value)
-            : Number.NaN
-    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 8_760) {
-        throw new Error(`${source} must be an integer between 0 and 8760 (0 disables auto-archive)`)
-    }
-    return parsed
-}
-
 function rejectOldSettingsFields(settings: object, settingsFile: string): void {
     const oldFields = OLD_SETTINGS_FIELDS.filter((field) => field in settings)
     if (oldFields.length === 0) {
@@ -149,7 +135,7 @@ export async function loadServerSettings(dataDir: string): Promise<ServerSetting
             listenPort: 'default',
             publicUrl: 'default',
             corsOrigins: 'default',
-            autoArchiveIdleHours: 'default',
+            androidPushMode: 'default',
             fcmServiceAccountPath: 'default',
             iosPushMode: 'default',
             iosPushRelayUrl: 'default',
@@ -293,29 +279,10 @@ export async function loadServerSettings(dataDir: string): Promise<ServerSetting
             corsOrigins = deriveCorsOrigins(publicUrl)
         }
 
-        // autoArchiveIdleHours: env > file > 48. Set 0 to disable.
-        let autoArchiveIdleHours = DEFAULT_AUTO_ARCHIVE_IDLE_HOURS
-        if (process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS !== undefined) {
-            autoArchiveIdleHours = parseAutoArchiveIdleHours(
-                process.env.HAPI_AUTO_ARCHIVE_IDLE_HOURS,
-                'HAPI_AUTO_ARCHIVE_IDLE_HOURS'
-            )
-            sources.autoArchiveIdleHours = 'env'
-            if (settings.autoArchiveIdleHours === undefined) {
-                settings.autoArchiveIdleHours = autoArchiveIdleHours
-                needsSave = true
-            }
-        } else if (settings.autoArchiveIdleHours !== undefined) {
-            autoArchiveIdleHours = parseAutoArchiveIdleHours(
-                settings.autoArchiveIdleHours,
-                'settings.json autoArchiveIdleHours'
-            )
-            sources.autoArchiveIdleHours = 'file'
-        }
-
         // Push settings: env > file > null, env persisted on first sight —
         // one loop instead of nine copies of the per-field block above.
         const push: Record<PushSettingKey, string | null> = {
+            androidPushMode: null,
             fcmServiceAccountPath: null,
             iosPushMode: null,
             iosPushRelayUrl: null,
@@ -354,7 +321,6 @@ export async function loadServerSettings(dataDir: string): Promise<ServerSetting
                     listenPort,
                     publicUrl,
                     corsOrigins,
-                    autoArchiveIdleHours,
                     ...push,
                 },
                 sources,

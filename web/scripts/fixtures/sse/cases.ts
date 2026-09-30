@@ -228,8 +228,8 @@ export const sseFixtureCases: SseFixtureCase[] = [
         ]
     },
     {
-        name: 'active-turn-started-at-applied',
-        description: 'An activeTurnStartedAt patch updates the cached current-turn boundary, including explicit null clears, so live status remains synchronized without a full-session refetch.',
+        name: 'active-turn-started-at-not-applied',
+        description: 'Pins actual web behavior: applySessionDetailPatch has no branch for activeTurnStartedAt, so a patch carrying only it is a no-op, and in a mixed patch the other fields apply while activeTurnStartedAt keeps its cached value. (Clients relying on this field must take it from full-session payloads.)',
         initialSession: baseSession(),
         patches: [
             { activeTurnStartedAt: T0 + 5_000 },

@@ -30,7 +30,6 @@ export type Usage = z.infer<typeof UsageSchema>
 
 export type {
     AgentState,
-    AgentAccountStatus,
     AttachmentMetadata,
     ClaudePermissionMode,
     CodexCollaborationMode,
@@ -72,6 +71,8 @@ export type {
 
 export const MessageMetaSchema = z.object({
     sentFrom: z.string().optional(),
+    // Shared Codex queue mirrors are replayable input, not transcript echoes.
+    isNativeQueuedMessage: z.boolean().optional(),
     // Claude jsonl echoes the remote (web/telegram) prompt as a second user row.
     // Hub notify ingest skips these so they do not consume a work_ad cause slot.
     isTranscriptEcho: z.boolean().optional(),

@@ -10,7 +10,6 @@ import { PushStore } from './pushStore'
 import { FcmStore } from './fcmStore'
 import { ScratchlistStore } from './scratchlistStore'
 import { SessionStore } from './sessionStore'
-import { ShareStore } from './shareStore'
 import { UserStore } from './userStore'
 import { UsageStore } from './usageStore'
 import { WorkGraphStore } from './workGraphStore'
@@ -34,7 +33,6 @@ export { PushStore } from './pushStore'
 export { FcmStore } from './fcmStore'
 export { ScratchlistStore } from './scratchlistStore'
 export { SessionStore } from './sessionStore'
-export { ShareStore } from './shareStore'
 export { UserStore } from './userStore'
 export { UsageStore } from './usageStore'
 export { WorkGraphStore } from './workGraphStore'
@@ -44,8 +42,6 @@ export {
     WorkGraphValidationError
 } from './workGraph'
 
-// v24 is the convergence point between upstream's v23 usage/work-graph/pin
-// ladder and the local content-UUID/session-share schema.
 const SCHEMA_VERSION: number = 26
 const REQUIRED_TABLES = [
     'sessions',
@@ -56,7 +52,6 @@ const REQUIRED_TABLES = [
     'push_subscriptions',
     'fcm_devices',
     'session_scratchlist',
-    'session_shares',
     'usage_events',
     'usage_scan_state',
     'events',
@@ -67,7 +62,6 @@ export class Store {
     private db: Database
     private readonly _dbPath: string
     private closed: boolean = false
-    private maintenanceTimer: ReturnType<typeof setInterval> | null = null
 
     readonly sessions: SessionStore
     readonly machines: MachineStore
@@ -76,7 +70,6 @@ export class Store {
     readonly push: PushStore
     readonly fcm: FcmStore
     readonly scratchlist: ScratchlistStore
-    readonly shares: ShareStore
     readonly usage: UsageStore
     readonly workGraph: WorkGraphStore
 
@@ -113,8 +106,6 @@ export class Store {
         this.db.exec('PRAGMA synchronous = NORMAL')
         this.db.exec('PRAGMA foreign_keys = ON')
         this.db.exec('PRAGMA busy_timeout = 5000')
-        // Keep the WAL below its historical high-water mark after checkpoints.
-        this.db.exec('PRAGMA journal_size_limit = 67108864')
         this.initSchema()
 
         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
@@ -133,38 +124,8 @@ export class Store {
         this.push = new PushStore(this.db)
         this.fcm = new FcmStore(this.db)
         this.scratchlist = new ScratchlistStore(this.db)
-        this.shares = new ShareStore(this.db)
         this.usage = new UsageStore(this.db)
         this.workGraph = new WorkGraphStore(this.db)
-
-        if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
-            this.startMaintenance()
-        }
-    }
-
-    // Bound persistent history growth without touching queued prompts. Operators
-    // can disable retention with HAPI_MAX_MESSAGES_PER_SESSION=0.
-    private startMaintenance(): void {
-        const raw = process.env.HAPI_MAX_MESSAGES_PER_SESSION
-        const cap = raw === undefined || raw === '' ? 5000 : Number(raw)
-        if (!Number.isFinite(cap) || cap <= 0) return
-
-        const run = () => {
-            if (this.closed) return
-            try {
-                const pruned = this.messages.pruneOldMessages(cap)
-                if (pruned > 0) {
-                    console.log(`[store] retention: pruned ${pruned} old messages (cap ${cap}/session)`)
-                    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-                }
-            } catch (error) {
-                console.error('[store] retention prune failed:', error)
-            }
-        }
-
-        this.maintenanceTimer = setInterval(run, 6 * 60 * 60 * 1000)
-        this.maintenanceTimer.unref?.()
-        setTimeout(run, 60_000).unref?.()
     }
 
     /**
@@ -178,20 +139,10 @@ export class Store {
         localIds: string[],
         invokedAt: number,
         namespace: string
-    ): { updatedAt: number; todosCleared: boolean } {
+    ): number {
         return this.db.transaction(() => {
-            const before = this.sessions.getSessionByNamespace(sessionId, namespace)
-            if (!before) {
-                throw new Error('session not found after messages-consumed transition')
-            }
-
             const changes = this.messages.markMessagesInvoked(sessionId, localIds, invokedAt)
-            // A consumed prompt begins a new turn. Clear the previous plan in the
-            // same transaction so every terminal observes the same todo state.
-            const todosCleared = Array.isArray(before.todos) && before.todos.length > 0
-                ? this.sessions.setSessionTodos(sessionId, [], invokedAt, namespace)
-                : false
-            if (changes > 0 && !todosCleared) {
+            if (changes > 0) {
                 this.sessions.touchSessionUpdatedAt(sessionId, invokedAt, namespace)
             }
 
@@ -203,7 +154,7 @@ export class Store {
                 throw new Error('session activity was not persisted after messages-consumed transition')
             }
 
-            return { updatedAt: session.updatedAt, todosCleared }
+            return session.updatedAt
         })()
     }
 
@@ -353,10 +304,6 @@ export class Store {
 
     close(): void {
         if (this.closed) return
-        if (this.maintenanceTimer) {
-            clearInterval(this.maintenanceTimer)
-            this.maintenanceTimer = null
-        }
         this.db.close()
         this.closed = true
 
@@ -500,15 +447,11 @@ export class Store {
                 local_id TEXT,
                 invoked_at INTEGER,
                 scheduled_at INTEGER,
-                content_uuid TEXT,
                 delivery_state TEXT NOT NULL DEFAULT 'queued',
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(session_id, local_id) WHERE local_id IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
-                ON messages(session_id, content_uuid)
-                WHERE content_uuid IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_session_position
                 ON messages(session_id, COALESCE(invoked_at, created_at) DESC, seq DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_scheduled_pending
@@ -575,17 +518,6 @@ export class Store {
             );
             CREATE INDEX IF NOT EXISTS idx_session_scratchlist_session_created
                 ON session_scratchlist(session_id, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS session_shares (
-                token TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_shares_session
-                ON session_shares(session_id, namespace);
 
             CREATE TABLE IF NOT EXISTS usage_events (
                 session_id TEXT NOT NULL,
@@ -666,18 +598,6 @@ export class Store {
                 ON event_links(namespace, from_event_id);
             CREATE INDEX IF NOT EXISTS idx_event_links_namespace_to
                 ON event_links(namespace, to_event_id);
-        `)
-    }
-
-    /** v25→v26: make empty immediate-queue heartbeat replay an indexed lookup. */
-    private migrateFromV25ToV26(): void {
-        this.db.exec(`
-            CREATE INDEX IF NOT EXISTS idx_messages_immediate_queued
-                ON messages(session_id, seq)
-                WHERE invoked_at IS NULL
-                  AND local_id IS NOT NULL
-                  AND scheduled_at IS NULL
-                  AND delivery_state = 'queued';
         `)
     }
 
@@ -1048,12 +968,32 @@ export class Store {
         }
     }
 
+    /** v23→v24: add the iOS push envelope key. */
+    private migrateFromV23ToV24(): void {
+        const fcmColumns = this.db.prepare('PRAGMA table_info(fcm_devices)').all() as Array<{ name: string }>
+        if (fcmColumns.length > 0 && !fcmColumns.some((column) => column.name === 'push_key')) {
+            this.db.exec('ALTER TABLE fcm_devices ADD COLUMN push_key TEXT')
+        }
+    }
+
     /** v24→v25: add durable unknown-delivery state for steers. */
     private migrateFromV24ToV25(): void {
         const messageColumns = this.getMessageColumnNames()
         if (messageColumns.size > 0 && !messageColumns.has('delivery_state')) {
             this.db.exec("ALTER TABLE messages ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'")
         }
+    }
+
+    /** v25→v26: make empty immediate-queue heartbeat replay an indexed lookup. */
+    private migrateFromV25ToV26(): void {
+        this.db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_messages_immediate_queued
+                ON messages(session_id, seq)
+                WHERE invoked_at IS NULL
+                  AND local_id IS NOT NULL
+                  AND scheduled_at IS NULL
+                  AND delivery_state = 'queued';
+        `)
     }
 
     /**
@@ -1114,114 +1054,6 @@ export class Store {
         `)
     }
 
-    /**
-     * Converge local persistence additions with upstream schema v23. This step
-     * is deliberately idempotent so it can finish a partially migrated DB as
-     * well as upgrade either branch's last released schema.
-     */
-    private migrateFromV23ToV24(): void {
-        // V10/V11 were independently occupied on the two branches. Re-run the
-        // idempotent prerequisite steps so a local V11 database also gains
-        // upstream FCM/scratchlist/epoch columns before declaring convergence.
-        this.migrateFromV9ToV10()
-        this.migrateFromV10ToV11()
-        this.migrateFromV11ToV12()
-        this.migrateFromV12ToV13()
-        this.migrateFromV14ToV15()
-
-        const messageColumns = this.getMessageColumnNames()
-        if (messageColumns.size > 0) {
-            if (!messageColumns.has('content_uuid')) {
-                this.db.exec('ALTER TABLE messages ADD COLUMN content_uuid TEXT')
-            }
-            this.db.exec(`
-                CREATE INDEX IF NOT EXISTS idx_messages_content_uuid
-                    ON messages(session_id, content_uuid)
-                    WHERE content_uuid IS NOT NULL
-            `)
-        }
-
-        this.rebuildSessionSharesWithForeignKey()
-
-        // Local builds represented a per-session pin in metadata.pinnedAt.
-        // Preserve that user intent when adopting upstream's explicit column.
-        const sessionColumns = this.getSessionColumnNames()
-        if (sessionColumns.has('pinned') && sessionColumns.has('metadata')) {
-            const rows = this.db.prepare(`
-                SELECT id, namespace, metadata
-                FROM sessions
-                WHERE pinned = 0 AND metadata IS NOT NULL
-            `).all() as Array<{ id: string; namespace: string; metadata: string }>
-            const pin = this.db.prepare(
-                'UPDATE sessions SET pinned = 1 WHERE id = ? AND namespace = ? AND pinned = 0'
-            )
-            for (const row of rows) {
-                try {
-                    const metadata = JSON.parse(row.metadata) as { pinnedAt?: unknown }
-                    if (metadata.pinnedAt != null) {
-                        pin.run(row.id, row.namespace)
-                    }
-                } catch {
-                    // Malformed legacy metadata must not block the schema upgrade.
-                }
-            }
-        }
-
-        const fcmColumns = this.db.prepare('PRAGMA table_info(fcm_devices)').all() as Array<{ name: string }>
-        if (fcmColumns.length > 0 && !fcmColumns.some((column) => column.name === 'push_key')) {
-            this.db.exec('ALTER TABLE fcm_devices ADD COLUMN push_key TEXT')
-        }
-    }
-
-    /**
-     * Older local schemas created session_shares without a foreign key.
-     * Rebuild it and retain only rows whose namespace/session still exists.
-     */
-    private rebuildSessionSharesWithForeignKey(): void {
-        const hadShares = this.hasTable('session_shares')
-        const hasSessions = this.hasTable('sessions')
-
-        this.db.transaction(() => {
-            this.db.exec(`
-                DROP TABLE IF EXISTS session_shares_v24;
-                CREATE TABLE session_shares_v24 (
-                    token TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    revoked INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                );
-            `)
-
-            if (hadShares && hasSessions) {
-                this.db.exec(`
-                    INSERT INTO session_shares_v24 (
-                        token, session_id, namespace, revoked, created_at
-                    )
-                    SELECT shares.token,
-                           shares.session_id,
-                           shares.namespace,
-                           shares.revoked,
-                           shares.created_at
-                    FROM session_shares AS shares
-                    INNER JOIN sessions
-                        ON sessions.id = shares.session_id
-                       AND sessions.namespace = shares.namespace;
-                `)
-            }
-
-            if (hadShares) {
-                this.db.exec('DROP TABLE session_shares')
-            }
-            this.db.exec(`
-                ALTER TABLE session_shares_v24 RENAME TO session_shares;
-                CREATE INDEX idx_session_shares_session
-                    ON session_shares(session_id, namespace);
-            `)
-        })()
-    }
-
     private getSessionColumnNames(): Set<string> {
         const rows = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
         return new Set(rows.map((row) => row.name))
@@ -1251,13 +1083,6 @@ export class Store {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
         ).get() as { name?: string } | undefined
         return Boolean(row?.name)
-    }
-
-    private hasTable(name: string): boolean {
-        const row = this.db.prepare(
-            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
-        ).get(name) as { present: number } | undefined
-        return row?.present === 1
     }
 
     private assertRequiredTablesPresent(): void {

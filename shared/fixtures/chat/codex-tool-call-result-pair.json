@@ -46,36 +46,27 @@
             },
             {
                 "createdAt": 1755000001800,
-                "firstToolId": "call_9f2d81aa04",
-                "id": "tool-group:call_9f2d81aa04",
-                "kind": "tool-group",
-                "lastToolId": "call_9f2d81aa04",
-                "tools": [
-                    {
-                        "createdAt": 1755000001800,
-                        "id": "call_9f2d81aa04",
-                        "kind": "tool-call",
-                        "localId": null,
-                        "tool": {
-                            "id": "call_9f2d81aa04",
-                            "input": {
-                                "command": [
-                                    "bash",
-                                    "-lc",
-                                    "bun test"
-                                ],
-                                "cwd": "/repo"
-                            },
-                            "name": "CodexBash",
-                            "result": {
-                                "duration_seconds": 4.21,
-                                "exit_code": 0,
-                                "stdout": "420 pass\n0 fail\nRan 420 tests across 37 files. [4.21s]"
-                            },
-                            "state": "completed"
-                        }
-                    }
-                ]
+                "id": "call_9f2d81aa04",
+                "kind": "tool-call",
+                "localId": null,
+                "tool": {
+                    "id": "call_9f2d81aa04",
+                    "input": {
+                        "command": [
+                            "bash",
+                            "-lc",
+                            "bun test"
+                        ],
+                        "cwd": "/repo"
+                    },
+                    "name": "CodexBash",
+                    "result": {
+                        "duration_seconds": 4.21,
+                        "exit_code": 0,
+                        "stdout": "420 pass\n0 fail\nRan 420 tests across 37 files. [4.21s]"
+                    },
+                    "state": "completed"
+                }
             }
         ]
     },

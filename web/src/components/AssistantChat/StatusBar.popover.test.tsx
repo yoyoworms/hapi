@@ -1,15 +1,11 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/react'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { I18nProvider } from '@/lib/i18n-context'
 import { StatusBar } from './StatusBar'
 
 describe('StatusBar context details popover', () => {
     beforeEach(() => {
         localStorage.clear()
-    })
-
-    afterEach(() => {
-        vi.useRealTimers()
     })
 
     it('keeps stable connection labels in English and offsets the whole left status', () => {
@@ -53,36 +49,6 @@ describe('StatusBar context details popover', () => {
         expect(thinkingLabel.parentElement?.className.split(' ')).toContain('sm:top-0.5')
     })
 
-    it('shows meaningful Codex commentary instead of a random thinking label', () => {
-        const { rerender } = render(
-            <I18nProvider>
-                <StatusBar
-                    active
-                    thinking
-                    agentState={null}
-                    agentFlavor="codex"
-                    activityText="正在验证消息同步与折叠行为"
-                />
-            </I18nProvider>
-        )
-
-        expect(screen.getByText('正在验证消息同步与折叠行为')).toBeInTheDocument()
-
-        rerender(
-            <I18nProvider>
-                <StatusBar
-                    active
-                    thinking={false}
-                    agentState={null}
-                    agentFlavor="codex"
-                    activityText="已经过期的进度"
-                />
-            </I18nProvider>
-        )
-        expect(screen.queryByText('已经过期的进度')).not.toBeInTheDocument()
-        expect(screen.getByText('online')).toBeInTheDocument()
-    })
-
     it('uses an effort-only reasoning label on mobile and the full label on desktop', () => {
         render(
             <I18nProvider>
@@ -91,7 +57,6 @@ describe('StatusBar context details popover', () => {
                     thinking={false}
                     agentState={null}
                     agentFlavor="codex"
-                    model="gpt-5.6-sol"
                     modelReasoningEffort="xhigh"
                     effort="max"
                 />
@@ -102,77 +67,6 @@ describe('StatusBar context details popover', () => {
         const desktopLabel = screen.getByText('reasoning xhigh')
         expect(desktopLabel.className.split(' ')).toContain('hidden')
         expect(desktopLabel.className.split(' ')).toContain('sm:inline')
-        expect(screen.getByText('gpt-5.6-sol')).toBeInTheDocument()
-    })
-
-    it('renders the current account quota and session usage on the right side', () => {
-        render(
-            <I18nProvider>
-                <StatusBar
-                    active
-                    thinking={false}
-                    agentState={null}
-                    agentFlavor="codex"
-                    accountStatus={{
-                        provider: 'codex',
-                        accountLabel: 'current@example.com',
-                        window: { remainingMs: 3_600_000, remainingPercent: 72 },
-                        weekly: { remainingMs: 5 * 86_400_000 + 20 * 3_600_000, remainingPercent: 41 },
-                        updatedAt: 1
-                    }}
-                    usage={{
-                        totalCostUsd: 0.25,
-                        totalInputTokens: 1_000,
-                        totalOutputTokens: 200
-                    }}
-                />
-            </I18nProvider>
-        )
-
-        expect(screen.getByTestId('account-usage-status')).toHaveTextContent('current@example.com')
-        expect(screen.getByText('current@example.com').className.split(' ')).toContain('hidden')
-        const mobileAccountUsage = screen.getByTestId('account-usage-mobile')
-        expect(mobileAccountUsage).toHaveTextContent('5h 72% (1h)7d 41% (5d20h)')
-        expect(mobileAccountUsage.className.split(' ')).toContain('flex-col')
-        expect(mobileAccountUsage.className.split(' ')).toContain('sm:hidden')
-        const desktopAccountUsage = screen.getByTestId('account-usage-desktop')
-        expect(desktopAccountUsage).toHaveTextContent('5h 72% (1h) · 7d 41% (5d20h)')
-        expect(desktopAccountUsage.className.split(' ')).toContain('hidden')
-        expect(desktopAccountUsage.className.split(' ')).toContain('sm:inline')
-        const sessionUsage = screen.getByTestId('session-usage-status')
-        expect(sessionUsage).toHaveTextContent('$0.25 · 1k tok')
-        expect(sessionUsage.className.split(' ')).toContain('hidden')
-        expect(sessionUsage.className.split(' ')).toContain('sm:inline')
-    })
-
-    it('keeps the visible reset countdown moving while the session is idle', () => {
-        const now = new Date('2026-08-06T12:00:00+08:00')
-        vi.useFakeTimers()
-        vi.setSystemTime(now)
-        render(
-            <I18nProvider>
-                <StatusBar
-                    active
-                    thinking={false}
-                    agentState={null}
-                    agentFlavor="codex"
-                    accountStatus={{
-                        provider: 'codex',
-                        weekly: {
-                            remainingPercent: 100,
-                            resetAt: now.getTime() + 2 * 3_600_000
-                        },
-                        updatedAt: 1
-                    }}
-                />
-            </I18nProvider>
-        )
-
-        expect(screen.getByTestId('account-usage-mobile')).toHaveTextContent('7d 100% (2h)')
-        act(() => {
-            vi.advanceTimersByTime(61 * 60_000)
-        })
-        expect(screen.getByTestId('account-usage-mobile')).toHaveTextContent('7d 100% (59m)')
     })
 
     it('keeps the Codex default reasoning label when model effort is absent', () => {

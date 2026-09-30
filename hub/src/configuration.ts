@@ -16,7 +16,6 @@
  * - HAPI_LISTEN_PORT: Port for HTTP service (default: 3006)
  * - HAPI_PUBLIC_URL: Public URL for external access (e.g., Telegram Mini App)
  * - CORS_ORIGINS: Comma-separated CORS origins
- * - HAPI_AUTO_ARCHIVE_IDLE_HOURS: Archive safe, idle runner sessions after N hours (default: 48; 0 disables)
  * - HAPI_RELAY_API: Relay API domain for tunwg (default: relay.hapi.run)
  * - HAPI_RELAY_AUTH: Relay auth key override (default: per-hub key issued by the relay)
  * - HAPI_RELAY_FORCE_TCP: Force TCP relay mode when UDP is unavailable (true/1)
@@ -24,7 +23,8 @@
  * - FCM_SERVICE_ACCOUNT_PATH: Firebase service-account JSON for Android push (settings: fcmServiceAccountPath;
  *   the project id comes from the JSON itself)
  * - HAPI_IOS_PUSH: iOS push transport apns|relay|off (default: relay; settings: iosPushMode)
- * - HAPI_PUSH_RELAY_URL: iOS push relay URL (settings: iosPushRelayUrl)
+ * - HAPI_ANDROID_PUSH: Android push transport auto|relay|fcm|off (default: auto; settings: androidPushMode)
+ * - HAPI_PUSH_RELAY_URL: shared native push relay URL (settings: iosPushRelayUrl)
  * - APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, APNS_ENV:
  *   direct-APNs credentials (settings: apnsKeyP8Path, apnsKeyId, apnsTeamId, apnsBundleId, apnsEnv)
  * - HAPI_HOME: Data directory (default: ~/.hapi)
@@ -51,7 +51,7 @@ export interface ConfigSources {
     listenPort: ConfigSource
     publicUrl: ConfigSource
     corsOrigins: ConfigSource
-    autoArchiveIdleHours: ConfigSource
+    androidPushMode: ConfigSource
     fcmServiceAccountPath: ConfigSource
     iosPushMode: ConfigSource
     iosPushRelayUrl: ConfigSource
@@ -112,10 +112,9 @@ class Configuration {
     /** Allowed CORS origins for Mini App + Socket.IO (comma-separated env override) */
     public readonly corsOrigins: string[]
 
-    /** Safe runner-session auto-archive threshold in hours; 0 disables it */
-    public readonly autoArchiveIdleHours: number
     // Push delivery (FCM + iOS/APNs) — nullable strings interpreted by
     // fcm/fcmConfig.ts and push-ios/iosPushConfig.ts.
+    public readonly androidPushMode: string | null
     public readonly fcmServiceAccountPath: string | null
     public readonly iosPushMode: string | null
     public readonly iosPushRelayUrl: string | null
@@ -150,8 +149,7 @@ class Configuration {
         this.listenPort = serverSettings.listenPort
         this.publicUrl = serverSettings.publicUrl
         this.corsOrigins = serverSettings.corsOrigins
-        this.autoArchiveIdleHours = serverSettings.autoArchiveIdleHours
-        this.autoArchiveIdleHours = serverSettings.autoArchiveIdleHours
+        this.androidPushMode = serverSettings.androidPushMode
         this.fcmServiceAccountPath = serverSettings.fcmServiceAccountPath
         this.iosPushMode = serverSettings.iosPushMode
         this.iosPushRelayUrl = serverSettings.iosPushRelayUrl

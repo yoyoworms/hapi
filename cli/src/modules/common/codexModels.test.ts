@@ -39,46 +39,7 @@ describe('listCodexModels cwd', () => {
 
         await listCodexModels();
 
-        expect(constructorOptions).toEqual([{ cwd: '/neutral-home', env: undefined }]);
-    });
-
-    it('scopes discovery to the selected account environment', async () => {
-        listModelsMock.mockResolvedValue({ data: [] });
-
-        await listCodexModels(false, {
-            CODEX_HOME: '/managed/codex-home',
-            OPENAI_API_KEY: 'test-key'
-        });
-
-        expect(constructorOptions).toEqual([{
-            cwd: '/neutral-home',
-            env: {
-                CODEX_HOME: '/managed/codex-home',
-                OPENAI_API_KEY: 'test-key'
-            }
-        }]);
-    });
-
-    it('keeps model caches isolated across selected accounts', async () => {
-        listModelsMock
-            .mockResolvedValueOnce({ data: [{ id: 'account-a-model' }] })
-            .mockResolvedValueOnce({ data: [{ id: 'account-b-model' }] });
-
-        const accountA = { CODEX_HOME: '/managed/account-a', OPENAI_API_KEY: 'key-a' };
-        const accountB = { CODEX_HOME: '/managed/account-b', OPENAI_API_KEY: 'key-b' };
-
-        await expect(listCodexModels(false, accountA)).resolves.toEqual([
-            expect.objectContaining({ id: 'account-a-model' })
-        ]);
-        await expect(listCodexModels(false, accountA)).resolves.toEqual([
-            expect.objectContaining({ id: 'account-a-model' })
-        ]);
-        await expect(listCodexModels(false, accountB)).resolves.toEqual([
-            expect.objectContaining({ id: 'account-b-model' })
-        ]);
-
-        expect(constructorOptions).toHaveLength(2);
-        expect(listModelsMock).toHaveBeenCalledTimes(2);
+        expect(constructorOptions).toEqual([{ cwd: '/neutral-home' }]);
     });
 
     it('caches the model list within the TTL so repeat calls skip the app-server spawn', async () => {
@@ -90,21 +51,9 @@ describe('listCodexModels cwd', () => {
         const second = await listCodexModels();
 
         expect(first).toEqual([expect.objectContaining({
-            id: 'gpt-6-astra',
-            displayName: 'GPT-6 Astra',
-            isDefault: false
-        }), expect.objectContaining({
-            id: 'gpt-6-astra[1m]',
-            displayName: 'GPT-6 Astra (1M)',
-            isDefault: false
-        }), expect.objectContaining({
             id: 'gpt-5.6-sol',
             displayName: 'GPT-5.6-Sol',
             isDefault: true
-        }), expect.objectContaining({
-            id: 'gpt-5.6-sol[1m]',
-            displayName: 'GPT-5.6-Sol (1M)',
-            isDefault: false
         })]);
         expect(second).toEqual(first);
         expect(constructorOptions).toHaveLength(1);
@@ -140,7 +89,7 @@ describe('listCodexModels cwd', () => {
         expect(constructorOptions).toHaveLength(1);
         expect(listModelsMock).toHaveBeenCalledTimes(1);
         expect(first).toEqual(second);
-        expect(first).toHaveLength(4);
+        expect(first).toHaveLength(1);
     });
 
     it('expires the cache after the TTL so a later call respawns the app-server', async () => {

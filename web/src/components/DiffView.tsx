@@ -116,7 +116,7 @@ export function DiffView(props: {
 
     return (
         <Dialog>
-            <div className="overflow-clip rounded-2xl bg-[var(--app-code-bg)] transition-colors">
+            <div className="overflow-hidden rounded-2xl bg-[var(--app-code-bg)] transition-colors">
                 <div className="flex items-center gap-3 bg-[var(--app-code-header-bg)] px-3 py-2">
                     <DialogTrigger asChild>
                         <button
@@ -147,7 +147,7 @@ export function DiffView(props: {
                     </DialogTrigger>
                     <DiffWrapToggle />
                 </div>
-                <div className="max-h-40 overflow-clip">
+                <div className="max-h-40 overflow-hidden">
                     <DiffInlineView
                         oldString={props.oldString}
                         newString={props.newString}
@@ -208,7 +208,7 @@ function DiffInlineView(props: {
         <div
             className={cn(
                 codeWrap ? '' : 'overflow-x-auto',
-                props.scrollY ? 'overflow-y-auto' : 'overflow-y-clip'
+                props.scrollY ? 'overflow-y-auto' : 'overflow-y-hidden'
             )}
             style={props.scrollY ? { maxHeight: props.maxHeight ?? 420 } : undefined}
         >
@@ -255,7 +255,7 @@ function DiffInlineView(props: {
     )
 
     return (
-        <div className={cn('overflow-clip bg-[var(--app-code-bg)]', props.showHeader ? 'rounded-2xl' : 'rounded-none')}>
+        <div className={cn('overflow-hidden bg-[var(--app-code-bg)]', props.showHeader ? 'rounded-2xl' : 'rounded-none')}>
             {props.showHeader ? (
                 <div className="flex items-center justify-between gap-3 bg-[var(--app-code-header-bg)] px-3 py-2">
                     <div className="min-w-0 flex-1 truncate font-mono text-[11px] uppercase tracking-[0.08em] text-[var(--app-code-header-fg)]">{props.filePath ?? 'Diff'}</div>

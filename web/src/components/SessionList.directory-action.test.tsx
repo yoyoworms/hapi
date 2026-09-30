@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
@@ -188,7 +188,7 @@ describe('SessionList time filter', () => {
             />
         )
 
-        expect(screen.getAllByRole('button', { name: /Recent session/ })[0]).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: /Recent session/ })).toBeInTheDocument()
         expect(screen.getByRole('button', { name: /Old session/ })).toBeInTheDocument()
 
         const searchButton = screen.getByRole('button', { name: SEARCH_LABEL })
@@ -346,7 +346,7 @@ describe('SessionList action menu parity', () => {
             />
         )
 
-        fireEvent.contextMenu(screen.getAllByRole('button', { name: new RegExp(active ? 'Running session' : 'Closed session') })[0]!)
+        fireEvent.contextMenu(screen.getByRole('button', { name: new RegExp(active ? 'Running session' : 'Closed session') }))
         fireEvent.click(screen.getByRole('menuitem', { name: 'Export conversation' }))
 
         expect(screen.getByRole('dialog')).toBeInTheDocument()
@@ -381,13 +381,13 @@ describe('SessionList collapse behavior', () => {
         )
     }
 
-    function getProjectPanel(): HTMLElement {
+    function getProjectPanel(): Element {
         const header = screen.getByTitle('/work/hapi')
         const panel = header.nextElementSibling
         if (!panel) {
             throw new Error('Expected project collapse panel')
         }
-        return panel as HTMLElement
+        return panel
     }
 
     it('keeps a selected running path collapsed across live session-list refreshes', async () => {
@@ -497,7 +497,7 @@ describe('SessionList collapse behavior', () => {
 
         expect(screen.queryByTitle('In progress')).toBeNull()
         expect(getProjectPanel().getAttribute('data-open')).toBe('true')
-        expect(within(getProjectPanel()).getByRole('button', { name: /Pinned running task/ })).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: /Pinned running task/ })).toBeInTheDocument()
     })
 
     it('keeps In progress above project-pin groups; project pin stays first inside its group', () => {
@@ -539,11 +539,8 @@ describe('SessionList collapse behavior', () => {
         const inProgress = screen.getByTitle('In progress')
         const projectPinGroup = screen.getByTitle('/work/pinned-project')
         const otherGroup = screen.getByTitle('/work/other')
-        const globalPanel = globalSection.nextElementSibling as HTMLElement
-        const globalPinRow = within(globalPanel).getByRole('button', { name: /Global pin/ })
-        const projectPinPanel = projectPinGroup.nextElementSibling as HTMLElement
-        const projectPinRow = within(projectPinPanel).getByRole('button', { name: /Project pin/ })
-        const projectIdleRow = within(projectPinPanel).getByRole('button', { name: /Project idle/ })
+        const projectPinRow = screen.getByRole('button', { name: /Project pin/ })
+        const projectIdleRow = screen.getByRole('button', { name: /Project idle/ })
 
         // Section order: global pin band → In progress → directory groups
         // (project-pin groups may sort first among groups, but never above In progress).
@@ -552,8 +549,6 @@ describe('SessionList collapse behavior', () => {
         expect(projectPinGroup).toAppearBefore(otherGroup)
         // Intra-group: project pin stays first inside its folder.
         expect(projectPinRow).toAppearBefore(projectIdleRow)
-        expect(within(globalPinRow).getByLabelText('Pinned globally')).toBeInTheDocument()
-        expect(within(projectPinRow).getByLabelText('Pinned in project')).toBeInTheDocument()
         expect(screen.getByRole('button', { name: /Unpinned floater/ })).toBeInTheDocument()
     })
 
@@ -704,8 +699,8 @@ describe('SessionList collapse behavior', () => {
         render(renderSessionList(sessions, null))
 
         expect(getProjectPanel().getAttribute('data-open')).toBe('true')
-        expect(within(getProjectPanel()).getByRole('button', { name: /Pinned task/ })).toBeInTheDocument()
-        expect(within(getProjectPanel()).getByRole('button', { name: /Idle task/ })).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: /Pinned task/ })).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: /Idle task/ })).toBeInTheDocument()
     })
 
     it('toggles the Active section independently of In progress', () => {

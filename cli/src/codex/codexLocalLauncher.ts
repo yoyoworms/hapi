@@ -18,8 +18,6 @@ import { BaseLocalLauncher } from '@/modules/common/launcher/BaseLocalLauncher';
 import { createCodexTranscriptLocator, type CodexTranscriptLocator } from './utils/codexTranscriptLocator';
 import { CodexToolHookBridge, isCodexToolHookEvent } from './utils/codexToolHookBridge';
 import { countHookCoveredExecCalls } from './utils/codexExecWrapper';
-import { EmptyCompletionNoticeTracker } from './utils/emptyCompletionNotice';
-import { randomUUID } from 'node:crypto';
 
 type ProposedPlanMessage = Extract<CodexMessage, { type: 'proposed_plan' }>;
 type ToolCallMessage = Extract<CodexMessage, { type: 'tool-call' }>;
@@ -55,12 +53,19 @@ function extractTurnContextModel(event: CodexSessionEvent): string | null | unde
 
 export async function codexLocalLauncher(session: CodexSession): Promise<'switch' | 'exit'> {
     const resumeSessionId = session.sessionId;
-    const sessionMatchToken = resumeSessionId ? undefined : randomUUID();
     let primarySessionId = resumeSessionId;
     let primaryTranscriptPath: string | null = null;
     let scanner: CodexSessionScanner | null = null;
     let hookReady = false;
     let shuttingDown = false;
+    let readyTimer: ReturnType<typeof setTimeout> | null = null;
+    const completedTurns = new Set<string>();
+    const cancelReady = (): void => {
+        if (readyTimer !== null) {
+            clearTimeout(readyTimer);
+            readyTimer = null;
+        }
+    };
     let pendingScannerSetup: Promise<void> | null = null;
     let transcriptLocator: CodexTranscriptLocator | null = null;
     let scannerTranscriptPath: string | null = null;
@@ -70,7 +75,6 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
     const pendingPlansByTurnId = new Map<string, ProposedPlanMessage>();
     const pendingExecWrappers = new Map<string, PendingExecWrapper>();
     const toolHookBridge = new CodexToolHookBridge();
-    const emptyCompletionNoticeTracker = new EmptyCompletionNoticeTracker();
     const permissionMode = session.getPermissionMode();
     const managedPermissionMode = permissionMode === 'read-only' || permissionMode === 'safe-yolo' || permissionMode === 'yolo'
         ? permissionMode
@@ -195,13 +199,8 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                 }
                 continue;
             }
-            if (action.type === 'session-event') {
-                session.sendSessionEvent(action.event);
-                continue;
-            }
 
             const message = action.message;
-            emptyCompletionNoticeTracker.onConvertedMessage(message);
             if (message.type === 'proposed_plan') {
                 // Codex may complete the Plan item before emitting its final text preface.
                 pendingPlansByTurnId.set(message.turnId, message);
@@ -230,12 +229,13 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                         : primarySessionId
                             ? {
                                 ...message,
+                                flavor: 'codex',
                                 model: transcriptModel,
                                 threadId: primarySessionId,
                                 thread_id: primarySessionId,
                                 hapiUsageScope: 'managed'
                             }
-                            : { ...message, model: transcriptModel };
+                            : { ...message, flavor: 'codex', model: transcriptModel };
                 session.sendAgentMessage(scopedMessage);
             }
         }
@@ -323,19 +323,24 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                     session.setModelReasoningEffort(observedReasoningEffort);
                 }
                 dispatchTranscriptActions(convertTranscriptEvent(event), context);
-                const eventPayload = event.payload && typeof event.payload === 'object'
-                    ? event.payload as Record<string, unknown>
-                    : null;
-                if (event.type === 'event_msg' && typeof eventPayload?.type === 'string') {
-                    if (eventPayload.type === 'task_started') {
-                        emptyCompletionNoticeTracker.onTaskStarted();
-                    } else if (eventPayload.type === 'task_complete') {
-                        const notice = emptyCompletionNoticeTracker.maybeCreateNotice(eventPayload);
-                        if (notice) {
-                            session.sendAgentMessage(notice);
-                        }
-                    } else {
-                        emptyCompletionNoticeTracker.onRawEvent(eventPayload.type);
+                if (event.type === 'event_msg' && event.payload && typeof event.payload === 'object') {
+                    const payload = event.payload as Record<string, unknown>;
+                    if (payload.type === 'task_started' || payload.type === 'user_message'
+                        || payload.type === 'turn_aborted' || payload.type === 'task_failed') {
+                        cancelReady();
+                    } else if (payload.type === 'task_complete' && typeof payload.turn_id === 'string') {
+                        if (completedTurns.has(payload.turn_id)) return;
+                        completedTurns.add(payload.turn_id);
+                        if (context.replayedHistory || shuttingDown) return;
+                        cancelReady();
+                        // Finish forwarding this scan before notifying. A following turn in
+                        // the same batch cancels the alert; replay and shutdown never alert.
+                        readyTimer = setTimeout(() => {
+                            readyTimer = null;
+                            if (!shuttingDown && session.queue.size() === 0) {
+                                session.sendSessionEvent({ type: 'ready' });
+                            }
+                        }, 0);
                     }
                 }
             }
@@ -413,7 +418,6 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
             cwd: effectiveCodexCwd,
             startupTimestampMs: Date.now(),
             resumeSessionId,
-            sessionMatchToken,
             onLocated: ({ sessionId, transcriptPath }) => {
                 if (shuttingDown || hookReady || primaryTranscriptPath) {
                     return;
@@ -442,11 +446,9 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
                 path: session.path,
                 sessionId: resumeSessionId,
                 modelReasoningEffort: (session.getModelReasoningEffort() ?? undefined) as ReasoningEffort | undefined,
-                model: (session as unknown as { getModel?: () => string | null }).getModel?.() ?? undefined,
                 onSessionFound: handleSessionFound,
                 abort: abortSignal,
                 codexArgs,
-                sessionMatchToken,
                 mcpServers,
                 sessionHook: {
                     port: hookServer.port,
@@ -474,6 +476,7 @@ export async function codexLocalLauncher(session: CodexSession): Promise<'switch
         return await launcher.run();
     } finally {
         shuttingDown = true;
+        cancelReady();
         session.removeTranscriptPathCallback(handleTranscriptPathCallback);
         hookServer.stop();
         const activeLocator = transcriptLocator;

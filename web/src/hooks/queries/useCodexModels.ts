@@ -8,25 +8,23 @@ export function useCodexModels(args: {
     api: ApiClient | null
     sessionId?: string | null
     machineId?: string | null
-    accountId?: string | null
     enabled?: boolean
 }): {
     models: CodexModelSummary[]
     isLoading: boolean
     error: string | null
 } {
-    const { api, sessionId, machineId, accountId } = args
-    const accountScope = accountId?.trim() || 'default'
+    const { api, sessionId, machineId } = args
     const enabled = Boolean(args.enabled && api && (sessionId || machineId))
 
     const machineQuery = useQuery({
-        queryKey: queryKeys.machineCodexModels(machineId ?? 'unknown', accountScope),
+        queryKey: queryKeys.machineCodexModels(machineId ?? 'unknown'),
         queryFn: async () => {
             if (!api) {
                 throw new Error('API unavailable')
             }
             if (machineId) {
-                return await api.getMachineCodexModels(machineId, accountId)
+                return await api.getMachineCodexModels(machineId)
             }
             throw new Error('Codex models target unavailable')
         },
@@ -61,20 +59,6 @@ export function useCodexModels(args: {
         retry: false,
     })
     const query = useSessionFallback ? sessionQuery : machineQuery
-
-    // A disabled observer may still see data/error left in the shared React
-    // Query cache by an authenticated owner view. A null client means this
-    // caller has no catalog access (for example, a session-share viewer), so
-    // keep both cached capabilities and cached failures out of its result.
-    // Keep cached data available to ordinary owner views that are only
-    // temporarily disabled (for example while switching agent/machine).
-    if (!api) {
-        return {
-            models: [],
-            isLoading: false,
-            error: null,
-        }
-    }
 
     return {
         models: query.data?.models ?? [],

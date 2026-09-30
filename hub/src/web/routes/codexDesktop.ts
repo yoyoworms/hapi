@@ -4,7 +4,6 @@ import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
-import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages'
 import type { CodexCollaborationMode } from '@hapi/protocol/types'
 import { Hono } from 'hono'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
@@ -132,7 +131,6 @@ type SyncSessionRequestParseResult = {
     sessionIds: string[]
     cwd?: string | null
     machineId?: string | null
-    codexAccountId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null
@@ -173,6 +171,7 @@ type DuplicateSessionGroupCandidate = {
 const CODEX_DESKTOP_NOT_FOUND_ERROR = '尝试重启codex客户端失败，未安装/找不到codex客户端'
 const SCRIPT_TIMEOUT_ERROR = '执行超时'
 const NO_SYNC_SESSION_SELECTED_ERROR = '未选择需要导入的 Codex 会话'
+const CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR = 'Codex transcript import is not available outside the default namespace'
 const DEFAULT_SCRIPT_TIMEOUT_MS = 60_000
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 500
 const DARWIN_CODEX_APP_NAME = 'Codex'
@@ -286,8 +285,9 @@ function extractCodexText(value: unknown): string {
         return value
             .map((item) => {
                 const record = asRecord(item)
-                const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-                if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') return record.text
+                if (record?.type === 'text' && typeof record.text === 'string') return record.text
+                if (record?.type === 'input_text' && typeof record.text === 'string') return record.text
+                if (record?.type === 'output_text' && typeof record.text === 'string') return record.text
                 return null
             })
             .filter((part): part is string => Boolean(part))
@@ -295,8 +295,13 @@ function extractCodexText(value: unknown): string {
             .trim()
     }
     const record = asRecord(value)
-    const type = asString(record?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-    if ((type === 'text' || type === 'inputtext' || type === 'outputtext') && typeof record?.text === 'string') {
+    if (record?.type === 'text' && typeof record.text === 'string') {
+        return record.text.trim()
+    }
+    if (record?.type === 'input_text' && typeof record.text === 'string') {
+        return record.text.trim()
+    }
+    if (record?.type === 'output_text' && typeof record.text === 'string') {
         return record.text.trim()
     }
     return ''
@@ -649,30 +654,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
         }
 
         if (eventType === 'agent_message') {
-            const rawMessage = asString(payload.message)
-            const message = rawMessage ? (unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage) : null
-            const phase = normalizeAgentMessagePhase(payload.phase)
-            return message ? buildImportedAgentMessage({
-                type: 'message',
-                message,
-                ...(phase ? { phase } : {}),
-                id: randomUUID()
-            }) : null
-        }
-
-        if (eventType === 'item_completed') {
-            const item = asRecord(payload.item)
-            const itemType = asString(item?.type)?.toLowerCase().replace(/[\s_-]/g, '')
-            if (itemType !== 'agentmessage') return null
-            const rawMessage = extractCodexText(item?.content ?? item?.message ?? item?.text)
-            const message = unwrapCodexResponseStepEnvelope(rawMessage) ?? rawMessage
-            const phase = normalizeAgentMessagePhase(item?.phase ?? payload.phase)
-            return message ? buildImportedAgentMessage({
-                type: 'message',
-                message,
-                ...(phase ? { phase } : {}),
-                id: asString(item?.id) ?? randomUUID()
-            }) : null
+            const message = asString(payload.message)
+            return message ? buildImportedAgentMessage({ type: 'message', message, id: randomUUID() }) : null
         }
 
         if (eventType === 'agent_reasoning') {
@@ -701,10 +684,7 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
 
         if (itemType === 'message') {
             const role = asString(payload.role)
-            const rawText = extractCodexText(payload.content)
-            const text = role === 'assistant'
-                ? (unwrapCodexResponseStepEnvelope(rawText) ?? rawText)
-                : rawText
+            const text = extractCodexText(payload.content)
             if (!text) {
                 return null
             }
@@ -712,13 +692,7 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
                 return shouldIgnoreInjectedResponseUserMessage(text) ? null : buildImportedUserMessage(text)
             }
             if (role === 'assistant') {
-                const phase = normalizeAgentMessagePhase(payload.phase)
-                return buildImportedAgentMessage({
-                    type: 'message',
-                    message: text,
-                    ...(phase ? { phase } : {}),
-                    id: randomUUID()
-                })
+                return buildImportedAgentMessage({ type: 'message', message: text, id: randomUUID() })
             }
             return null
         }
@@ -796,7 +770,7 @@ function normalizeComparableAgentMessage(content: unknown): string | null {
     return stableSerialize({
         role: 'agent',
         type: 'message',
-        message: unwrapCodexResponseStepEnvelope(data.message) ?? data.message
+        message: data.message
     })
 }
 
@@ -983,13 +957,12 @@ async function listCodexSessionsViaMachine(options: {
     cwd?: string | null
     machineId?: string | null
     sessionIds?: string[]
-    codexAccountId?: string | null
 }): Promise<{ sessions: RemoteCodexSession[]; machineId?: string; error?: string }> {
     const machineId = resolveCodexImportMachineId(options.cwd, options.namespace, options.engine, options.machineId)
     if (!machineId || !options.engine) {
         return { sessions: [], error: 'No online machine available for Codex history import' }
     }
-    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds, options.codexAccountId)
+    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds)
     if (!result || typeof result !== 'object') {
         return { sessions: [], machineId, error: 'Unexpected Codex sessions RPC response' }
     }
@@ -1034,15 +1007,6 @@ function buildImportedSessionMetadata(
         codexSourceSessionId: typeof existingMetadata?.codexSourceSessionId === 'string'
             ? existingMetadata.codexSourceSessionId
             : data.id,
-        // Local history import currently enumerates the runner's system
-        // CODEX_HOME. Pin it explicitly so changing HAPI's default account
-        // cannot resume this thread from another isolated account home.
-        codexAccountId: typeof existingMetadata?.codexAccountId === 'string'
-            ? existingMetadata.codexAccountId
-            : 'system',
-        codexAccountLabel: typeof existingMetadata?.codexAccountLabel === 'string'
-            ? existingMetadata.codexAccountLabel
-            : 'System default',
         ...(permissionMode ? { preferredPermissionMode: permissionMode } : {}),
         ...(machineId ? { machineId } : {}),
         lifecycleState: typeof existingMetadata?.lifecycleState === 'string'
@@ -1083,16 +1047,6 @@ function normalizeComparableAgentData(value: unknown): unknown {
     const record = asRecord(value)
     if (!record) {
         return value
-    }
-
-    // `phase` is additive presentation metadata. A session imported before
-    // phase support must still be recognized as the same prefix when a newer
-    // transcript supplies commentary/final_answer for identical text.
-    if (record.type === 'message' && typeof record.message === 'string') {
-        return {
-            type: 'message',
-            message: unwrapCodexResponseStepEnvelope(record.message) ?? record.message
-        }
     }
 
     const normalized = { ...record }
@@ -1912,7 +1866,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         return { sessionIds: [] }
     }
 
-    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; codexAccountId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
+    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
     const rawSessionIds = bodyRecord.sessionIds
     if (!Array.isArray(rawSessionIds)) {
         return { sessionIds: [], error: 'Invalid sessionIds' }
@@ -1945,7 +1899,6 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         sessionIds: Array.from(new Set(sessionIds)),
         cwd: typeof bodyRecord.cwd === 'string' && bodyRecord.cwd.trim() ? bodyRecord.cwd.trim() : null,
         machineId: typeof bodyRecord.machineId === 'string' && bodyRecord.machineId.trim() ? bodyRecord.machineId.trim() : null,
-        codexAccountId: typeof bodyRecord.codexAccountId === 'string' && bodyRecord.codexAccountId.trim() ? bodyRecord.codexAccountId.trim() : null,
         model: hasModel ? (typeof bodyRecord.model === 'string' && bodyRecord.model.trim() ? bodyRecord.model.trim() : null) : undefined,
         modelReasoningEffort: hasModelReasoningEffort ? (typeof bodyRecord.modelReasoningEffort === 'string' && bodyRecord.modelReasoningEffort.trim() ? bodyRecord.modelReasoningEffort.trim() : null) : undefined,
         serviceTier: hasServiceTier ? bodyRecord.serviceTier as 'fast' | 'standard' | null : undefined,
@@ -2060,6 +2013,18 @@ function importSingleCodexSession(options: {
 
     try {
         const candidates = collectImportCandidates(options.store, options.namespace, options.getSyncEngine)
+        const activeCandidate = candidates.find((candidate) => (
+            candidate.active
+            && getCodexImportIds(candidate.metadata).includes(options.codexSessionId)
+            && (
+                !options.machineId
+                || typeof candidate.metadata?.machineId !== 'string'
+                || candidate.metadata.machineId === options.machineId
+            )
+        ))
+        if (activeCandidate) {
+            throw new Error('Cannot sync Codex transcript while the matching HAPI session is active')
+        }
         const target = selectImportTargetSession(
             options.store,
             candidates,
@@ -2129,7 +2094,9 @@ function importSingleCodexSession(options: {
         } else {
             options.store.sessions.touchSessionUpdatedAt(sessionId, latestMessageCreatedAt, options.namespace)
         }
-        if (!created) {
+        if (created) {
+            engine?.handleRealtimeEvent({ type: 'session-updated', sessionId })
+        } else {
             emitImportedMessageEvents(engine, sessionId, appendedMessages)
         }
 
@@ -2236,11 +2203,15 @@ export function createCodexDesktopRoutes(options: {
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
-    // Transcript import is namespace-scoped end to end: the selected Runner
-    // is resolved within the caller's namespace, and imported HAPI rows are
-    // persisted with that same namespace. Do not restrict this to `default` —
-    // managed HAPI accounts must be able to recover their own local Codex
-    // history as well.
+    app.use('/codex/*', async (c, next) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({
+                success: false,
+                error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR
+            }, 403)
+        }
+        return next()
+    })
 
     app.get('/codex/status', (c) => {
         const codexStatus = getCodexDesktopStatus()
@@ -2254,13 +2225,11 @@ export function createCodexDesktopRoutes(options: {
     app.get('/codex/sessions', async (c) => {
         const cwd = c.req.query('cwd')?.trim() || null
         const machineId = c.req.query('machineId')?.trim() || null
-        const codexAccountId = c.req.query('codexAccountId')?.trim() || null
         const remote = await listCodexSessionsViaMachine({
             engine: options.getSyncEngine(),
             namespace: c.get('namespace'),
             cwd,
-            machineId,
-            codexAccountId
+            machineId
         })
         if (remote.error) {
             return c.json({
@@ -2328,8 +2297,7 @@ export function createCodexDesktopRoutes(options: {
             namespace: c.get('namespace'),
             cwd: parsed.cwd,
             machineId: parsed.machineId,
-            sessionIds: parsed.sessionIds,
-            codexAccountId: parsed.codexAccountId
+            sessionIds: parsed.sessionIds
         })
         if (remote.error) {
             const { workspace } = getDirectImportRouteContext()

@@ -7,6 +7,7 @@ import {
     normalizeTitleSuggestion,
     OpenAICompatibleTitleProvider,
     readTitleProviderConfig,
+    readTitleProviderRequestLimits,
     readTitleSuggestionLimits,
     TitleSuggestionError,
     TitleSuggestionService
@@ -42,13 +43,11 @@ describe('title suggestion input preparation', () => {
             message(1, { role: 'user', content: { type: 'text', text: 'How do I deploy this app?' } }),
             message(2, { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'Use the deployment guide.\nAGENT_NOTIFY_SUMMARY {"summary":"done"}' } } }),
             message(3, { role: 'agent', content: { type: 'codex', data: { type: 'tool-call', name: 'shell', input: {} } } }),
-            message(4, { role: 'agent', content: { type: 'output', data: { type: 'agy_message', content: 'AGY can deploy it too.' } } }),
-            message(5, { role: 'user', content: { type: 'text', text: 'This queued prompt should not be used.' } }, null)
+            message(4, { role: 'user', content: { type: 'text', text: 'This queued prompt should not be used.' } }, null)
         ])
 
         expect(conversation).toContain('User: How do I deploy this app?')
         expect(conversation).toContain('Assistant: Use the deployment guide.')
-        expect(conversation).toContain('Assistant: AGY can deploy it too.')
         expect(conversation).not.toContain('AGENT_NOTIFY_SUMMARY')
         expect(conversation).not.toContain('queued prompt')
         expect(conversation).not.toContain('shell')
@@ -99,6 +98,55 @@ describe('OpenAI-compatible title provider', () => {
         expect(normalizeTitleSuggestion('Title: "A useful title"\nExtra text')).toBe('A useful title')
         expect(normalizeTitleSuggestion('   ')).toBeNull()
         expect(normalizeTitleSuggestion('x'.repeat(100))).toHaveLength(80)
+    })
+
+    it('honors env-tunable max_tokens and timeout', async () => {
+        expect(readTitleProviderRequestLimits({})).toEqual({ maxTokens: 64, timeoutMs: 10_000 })
+        expect(readTitleProviderRequestLimits({
+            HAPI_TITLE_PROVIDER_MAX_TOKENS: '4096',
+            HAPI_TITLE_PROVIDER_TIMEOUT_MS: '90000'
+        })).toEqual({ maxTokens: 4096, timeoutMs: 90_000 })
+        // Invalid values fall back to the defaults instead of breaking startup.
+        expect(readTitleProviderRequestLimits({ HAPI_TITLE_PROVIDER_MAX_TOKENS: '-5' })).toEqual({ maxTokens: 64, timeoutMs: 10_000 })
+
+        let request: Request | undefined
+        const provider = new OpenAICompatibleTitleProvider(
+            {
+                baseUrl: 'https://example.test/v1',
+                apiKey: 'secret',
+                model: 'small-model',
+                maxTokens: 4096
+            },
+            async (input, init) => {
+                request = new Request(String(input), init)
+                return new Response(JSON.stringify({
+                    choices: [{ message: { content: 'Title' } }]
+                }), { status: 200 })
+            }
+        )
+
+        await provider.suggest('Recent conversation')
+        expect(await request?.json()).toMatchObject({ max_tokens: 4096 })
+    })
+
+    it('aborts the request when the configured timeout elapses', async () => {
+        const provider = new OpenAICompatibleTitleProvider(
+            {
+                baseUrl: 'https://example.test/v1',
+                apiKey: 'secret',
+                model: 'small-model',
+                timeoutMs: 20
+            },
+            async (input, init) => {
+                return new Promise((resolve, reject) => {
+                    const signal = init?.signal
+                    if (!signal) throw new Error('expected an AbortSignal')
+                    signal.addEventListener('abort', () => reject(signal.reason))
+                })
+            }
+        )
+
+        await expect(provider.suggest('Recent conversation')).rejects.toMatchObject({ name: 'AbortError' })
     })
 })
 

@@ -17,8 +17,6 @@ export type {
     AgyModelSummary,
     CodexModelsResponse,
     CodexModelSummary,
-    ClaudeModelsResponse,
-    ClaudeModelSummary,
     CommandResponse,
     CursorModelsResponse,
     CursorModelSummary,
@@ -29,6 +27,8 @@ export type {
     GitCommandResponse,
     GrokModelsResponse,
     GrokModelSummary,
+    KimiModelsResponse,
+    KimiModelSummary,
     CopilotModelsResponse,
     CopilotModelSummary,
     GrokReasoningEffortResponse,
@@ -42,6 +42,7 @@ export type {
     MessagesResponse,
     OpencodeModelsResponse,
     OpencodeModelSummary,
+    OpencodeModelVariantsResponse,
     PathExistsResponse,
     PiModelSummary,
     PiModelsResponse,
@@ -57,7 +58,6 @@ export type {
 
 export type {
     AgentState,
-    AgentAccountStatus,
     AttachmentMetadata,
     CodexCollaborationMode,
     CopilotAgentMode,
@@ -124,12 +124,18 @@ export type HubHealthResponse = {
     }
 }
 
-export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed' | 'paused'
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
 
 export type DecryptedMessage = ProtocolDecryptedMessage & {
     status?: MessageStatus
     originalText?: string
     invokedAt?: number | null
+    /**
+     * Client-only: user force-dismissed an indeterminate queued row while the
+     * hub still reported busy. Hidden from QueuedMessagesBar but retained so a
+     * later messages-consumed SSE can mark it sent in the thread.
+     */
+    queueDismissed?: boolean
 }
 
 export type FileSearchItem = {
@@ -295,7 +301,6 @@ export type CodexDesktopSyncRequest = {
     sessionIds: string[]
     cwd?: string | null
     machineId?: string | null
-    codexAccountId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null
@@ -337,22 +342,6 @@ export type CodexMergeDuplicateSessionsResponse = {
 export type VisibilityPayload = {
     subscriptionId: string
     visibility: 'visible' | 'hidden'
-}
-
-export type UsageBucket = {
-    utilization: number
-    resets_at: string
-}
-
-export type UsageResponse = {
-    rate_limits?: Record<string, UsageBucket | undefined>
-    rateLimits?: Record<string, UsageBucket | undefined>
-    accountLabel?: string | null
-    subscriptionType?: string | null
-    five_hour?: UsageBucket
-    seven_day?: UsageBucket
-    seven_day_opus?: UsageBucket
-    seven_day_sonnet?: UsageBucket
 }
 
 export type SyncEvent = ProtocolSyncEvent

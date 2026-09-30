@@ -470,8 +470,13 @@ describe('SyncEngine.clearOpenCodeSession', () => {
                 }
                 return result
             }) as typeof store.abortOpenCodeClearOperation
-            expect(engine.abortOpenCodeClearSession(source.id, 'default', currentReplacementId(engine, source.id))).toEqual({ type: 'success', sessionId: source.id })
-            expect(engine.abortOpenCodeClearSession(source.id, 'default', currentReplacementId(engine, source.id))).toEqual({ type: 'success', sessionId: source.id })
+            const replacementId = currentReplacementId(engine, source.id)
+            expect(engine.getSessionByNamespace(replacementId, 'default')?.hasConversationContent).toBe(true)
+            expect(engine.abortOpenCodeClearSession(source.id, 'default', replacementId)).toEqual({ type: 'success', sessionId: source.id })
+            expect(engine.getSessionByNamespace(source.id, 'default')?.hasConversationContent).toBe(true)
+            expect(engine.getSessionByNamespace(replacementId, 'default')?.hasConversationContent).toBe(false)
+            expect(engine.abortOpenCodeClearSession(source.id, 'default', replacementId)).toEqual({ type: 'success', sessionId: source.id })
+            expect(engine.getSessionByNamespace(replacementId, 'default')?.hasConversationContent).toBe(false)
             expect(store.messages.getAllMessages(source.id)).toEqual([
                 expect.objectContaining({ localId: 'restore-once', invokedAt: null })
             ])
@@ -513,8 +518,12 @@ describe('SyncEngine.clearOpenCodeSession', () => {
             await engine.sendMessage(source.id, { text: 'held', localId: 'held' })
             expect(store.messages.getAllMessages(reserved.sessionId)).toHaveLength(1)
             expect(store.isOpenCodeClearDeliveryGated(reserved.sessionId)).toBe(true)
+            expect(engine.getSessionByNamespace(source.id, 'default')?.hasConversationContent).toBe(false)
+            expect(engine.getSessionByNamespace(reserved.sessionId, 'default')?.hasConversationContent).toBe(true)
             expect(engine.abortOpenCodeClearSession(source.id, 'default', currentReplacementId(engine, source.id))).toEqual({ type: 'success', sessionId: source.id })
             expect(store.isOpenCodeClearDeliveryGated(reserved.sessionId)).toBe(false)
+            expect(engine.getSessionByNamespace(source.id, 'default')?.hasConversationContent).toBe(true)
+            expect(engine.getSessionByNamespace(reserved.sessionId, 'default')?.hasConversationContent).toBe(false)
             expect(store.messages.getAllMessages(source.id).map((m) => m.localId)).toEqual(['held'])
             expect(engine.getSessionByNamespace(source.id, 'default')?.metadata?.opencodeClearOperation?.state).toBe('aborted')
             engine.handleSessionEnd({ sid: source.id, time: Date.now(), reason: 'error' })
@@ -529,7 +538,7 @@ describe('SyncEngine.clearOpenCodeSession', () => {
         try {
             const source = engine.getOrCreateSession('abort-retry-source', {
                 path: '/tmp/project', host: 'host', machineId: 'machine-1', flavor: 'opencode', startedBy: 'runner',
-                lifecycleState: 'running'
+                lifecycleState: 'archived', archiveReason: 'Archived before clear abort'
             }, null, 'default')
             engine.handleSessionAlive({ sid: source.id, time: Date.now() })
             expect(engine.reserveOpenCodeClearSession(source.id, 'default')).toMatchObject({ type: 'success' })
@@ -633,10 +642,7 @@ describe('SyncEngine.clearOpenCodeSession', () => {
                 undefined,
                 // startingMode — not applicable to an OpenCode clear replacement
                 undefined,
-                // forkSession, sandbox, continueLatest, and Codex account fields
-                undefined,
-                undefined,
-                undefined,
+                // forkSession / reservedSessionId — clear uses reopen existingSessionId
                 undefined,
                 undefined
             )
@@ -820,10 +826,7 @@ describe('SyncEngine.clearOpenCodeSession', () => {
     it('refuses before spawning while the source is still active', async () => {
         const { engine } = createEngine()
         try {
-            const source = createClearSource(engine, {
-                lifecycleState: 'running',
-                archiveReason: undefined
-            })
+            const source = createClearSource(engine)
             engine.handleSessionAlive({ sid: source.id, time: Date.now() })
             const spawnSession = mock(async () => ({ type: 'success' as const, sessionId: 'must-not-spawn' }))
             setSpawn(engine, spawnSession)

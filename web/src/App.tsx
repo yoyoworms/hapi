@@ -9,23 +9,24 @@ import { useAuth } from '@/hooks/useAuth'
 import { useAuthSource } from '@/hooks/useAuthSource'
 import { useServerUrl } from '@/hooks/useServerUrl'
 import { useSSE } from '@/hooks/useSSE'
+import { useSessions } from '@/hooks/queries/useSessions'
 import { useReconnectingState } from '@/hooks/useReconnectingState'
 import { useSyncingState } from '@/hooks/useSyncingState'
 import { usePushNotifications } from '@/hooks/usePushNotifications'
 import { useViewportHeight } from '@/hooks/useViewportHeight'
 import { useVisibilityReporter } from '@/hooks/useVisibilityReporter'
 import { queryKeys } from '@/lib/query-keys'
+import { refreshAllAgyCatalogs } from '@/lib/agyCatalogAnnouncement'
 import { AppContextProvider } from '@/lib/app-context'
-import { clearMessageWindow, syncTailMessages } from '@/lib/message-window-store'
+import { clearMessageWindow, rewindMessageWindow, syncTailMessages } from '@/lib/message-window-store'
 import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useTranslation } from '@/lib/use-translation'
+import { translateInputRequestTitle } from '@/lib/input-request-toast'
 import { VoiceProvider } from '@/lib/voice-context'
 import { requireHubUrlForLogin } from '@/lib/runtime-config'
-import {
-    getAppGlobalSseSubscription,
-    getAppSessionSseSubscription,
-    shouldEnableOwnerRealtimeFeatures,
-} from '@/lib/appSseSubscriptions'
+import { getAppGlobalSseSubscription, getAppSessionSseSubscription } from '@/lib/appSseSubscriptions'
+import { canUseAppBadging, useAppBadge } from '@/hooks/useAppBadge'
+import { useAppBadgePreference } from '@/hooks/useAppBadgePreference'
 import { reconcileQueuedStateAfterConnect } from '@/lib/queued-state-reconciliation'
 import { LoginPrompt } from '@/components/LoginPrompt'
 import { InstallPrompt } from '@/components/InstallPrompt'
@@ -44,20 +45,6 @@ import type { SyncEvent } from '@/types/api'
 type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
 
 const REQUIRE_SERVER_URL = requireHubUrlForLogin()
-
-/** Decode the `sid` claim from a session-share scoped JWT (client-side, unverified). */
-function decodeJwtSessionId(token: string | null): string | undefined {
-    if (!token) return undefined
-    const part = token.split('.')[1]
-    if (!part) return undefined
-    try {
-        const b64 = part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '=')
-        const payload = JSON.parse(globalThis.atob(b64)) as { sid?: unknown }
-        return typeof payload.sid === 'string' ? payload.sid : undefined
-    } catch {
-        return undefined
-    }
-}
 
 function withPwaBanner(content: ReactNode) {
     return (
@@ -81,11 +68,8 @@ export function App() {
 function AppInner() {
     const { t } = useTranslation()
     const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
-    const { authSource, isLoading: isAuthSourceLoading, setAccessToken, clearAuth } = useAuthSource(baseUrl)
+    const { authSource, isLoading: isAuthSourceLoading, setAccessToken } = useAuthSource(baseUrl)
     const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
-    const sharedMode = authSource?.type === 'shareToken'
-    const ownerRealtimeEnabled = shouldEnableOwnerRealtimeFeatures(sharedMode)
-    const sharedSessionId = useMemo(() => (sharedMode ? decodeJwtSessionId(token) : undefined), [sharedMode, token])
     const [titleSuggestionAvailable, setTitleSuggestionAvailable] = useState(false)
     const goBack = useAppGoBack()
     const pathname = useLocation({ select: (location) => location.pathname })
@@ -193,8 +177,21 @@ function AppInner() {
     const isFirstConnectRef = useRef(true)
     const baseUrlRef = useRef(baseUrl)
     const pushPromptedRef = useRef(false)
-    const pushApi = ownerRealtimeEnabled ? api : null
-    const { isSupported: isPushSupported, permission: pushPermission, requestPermission, subscribe } = usePushNotifications(pushApi)
+    const { appBadgeEnabled: appBadgePreferenceEnabled } = useAppBadgePreference()
+    const appBadgeEnabled = Boolean(api && token && appBadgePreferenceEnabled && canUseAppBadging())
+    const {
+        sessions: appBadgeSessions,
+        isLoading: appBadgeSessionsLoading,
+        error: appBadgeSessionsError,
+    } = useSessions(api, { enabled: appBadgeEnabled })
+    useAppBadge({
+        enabled: appBadgeEnabled,
+        scope: baseUrl,
+        sessions: appBadgeSessions,
+        isLoading: appBadgeSessionsLoading,
+        hasError: Boolean(appBadgeSessionsError),
+    })
+    const { isSupported: isPushSupported, permission: pushPermission, requestPermission, subscribe } = usePushNotifications(api)
 
     useEffect(() => {
         if (baseUrlRef.current === baseUrl) {
@@ -223,7 +220,7 @@ function AppInner() {
     }, [token, api, router])
 
     useEffect(() => {
-        if (!pushApi || !token) {
+        if (!api || !token) {
             pushPromptedRef.current = false
             return
         }
@@ -249,7 +246,7 @@ function AppInner() {
         }
 
         void run()
-    }, [isPushSupported, pushApi, pushPermission, requestPermission, subscribe, token])
+    }, [api, isPushSupported, pushPermission, requestPermission, subscribe, token])
 
     const handleSseConnect = useCallback((info: { resumed: boolean }) => {
         // Clear disconnected state on successful connection
@@ -275,19 +272,16 @@ function AppInner() {
         } else {
             startSync()
         }
-        const invalidations = sharedMode
-            ? selectedSessionId
-                ? [queryClient.invalidateQueries({ queryKey: queryKeys.session(selectedSessionId) })]
-                : []
-            : [
-                queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
-                // Invalidate ALL cached session-detail entries on reconnect, not just
-                // the selected one. With `SESSION_DETAIL_STALE_TIME_MS` extending the
-                // freshness window on `useSession`, a previously-viewed session that
-                // received updates during the SSE gap would otherwise serve stale
-                // cached data on remount. See tiann/hapi#884.
-                queryClient.invalidateQueries({ queryKey: ['session'] }),
-            ]
+        const invalidations = [
+            queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
+            // Invalidate ALL cached session-detail entries on reconnect, not just
+            // the selected one.  With `SESSION_DETAIL_STALE_TIME_MS` extending the
+            // freshness window on `useSession`, a previously-viewed session that
+            // received updates during the SSE gap would otherwise serve stale
+            // cached data on remount.  See tiann/hapi#884.
+            queryClient.invalidateQueries({ queryKey: ['session'] }),
+            refreshAllAgyCatalogs(queryClient)
+        ]
         const refreshMessages = (selectedSessionId && api)
             ? syncTailMessages(api, selectedSessionId)
             : Promise.resolve()
@@ -301,7 +295,7 @@ function AppInner() {
                     endSync()
                 }
             })
-    }, [api, queryClient, selectedSessionId, sharedMode, startSync, endSync, reportSseConnect])
+    }, [api, queryClient, selectedSessionId, startSync, endSync, reportSseConnect])
 
     const handleSseDisconnect = useCallback((reason: string) => {
         // Only show reconnecting banner if we've already connected once
@@ -317,18 +311,16 @@ function AppInner() {
         if (!api || event.sessionId !== selectedSessionId) {
             return
         }
-        clearMessageWindow(event.sessionId)
+        if (event.reason === 'rewind' && event.truncateFromLocalId) {
+            rewindMessageWindow(event.sessionId, event.truncateFromLocalId)
+        } else {
+            clearMessageWindow(event.sessionId)
+        }
         void syncTailMessages(api, event.sessionId)
     }, [api, selectedSessionId])
 
     const handleSessionSseConnect = useCallback((info: { resumed: boolean }) => {
         if (!api || !selectedSessionId) {
-            return
-        }
-        // Share viewers have no global connection. Let their only authorized
-        // stream own reconnect state and the full detail/message resync path.
-        if (sharedMode) {
-            handleSseConnect(info)
             return
         }
         // A resumed connection replayed messages-consumed/message events for
@@ -339,11 +331,15 @@ function AppInner() {
         void reconcileQueuedStateAfterConnect(api, selectedSessionId).catch((error) => {
             console.error('Failed to reconcile queued state after SSE connect:', error)
         })
-    }, [api, handleSseConnect, selectedSessionId, sharedMode])
+    }, [api, selectedSessionId])
 
     const translateIncomingToast = useCallback((title: string, body: string): { title: string; body: string } => {
         const normalizedTitle = title.trim()
         const normalizedBody = body.trim()
+        const inputTitle = translateInputRequestTitle(normalizedTitle, t)
+        if (inputTitle) {
+            return { title: inputTitle, body: normalizedBody }
+        }
 
         if (normalizedTitle === 'Ready for input') {
             const waitingMatch = normalizedBody.match(/^(.+)\s+is waiting in\s+(.+)$/i)
@@ -395,26 +391,19 @@ function AppInner() {
         })
     }, [addToast, translateIncomingToast])
 
-    const globalEventSubscription = useMemo(
-        () => getAppGlobalSseSubscription(sharedMode),
-        [sharedMode],
-    )
+    const globalEventSubscription = useMemo(() => getAppGlobalSseSubscription(), [])
     const sessionEventSubscription = useMemo(
-        () => getAppSessionSseSubscription(
-            selectedSessionId,
-            sharedMode ? sharedSessionId ?? null : undefined,
-        ),
-        [selectedSessionId, sharedMode, sharedSessionId]
+        () => getAppSessionSseSubscription(selectedSessionId),
+        [selectedSessionId]
     )
     const sseEnabled = Boolean(api && token)
-    const globalSseEnabled = sseEnabled && ownerRealtimeEnabled
     const showReconnectingBanner = sseDisconnected && !isSyncing
 
     const { subscriptionId: globalSubscriptionId } = useSSE({
-        enabled: globalSseEnabled,
+        enabled: sseEnabled,
         token: token ?? '',
         baseUrl,
-        subscription: globalEventSubscription ?? undefined,
+        subscription: globalEventSubscription,
         scope: 'global',
         onConnect: handleSseConnect,
         onDisconnect: handleSseDisconnect,
@@ -429,20 +418,19 @@ function AppInner() {
         subscription: sessionEventSubscription ?? undefined,
         scope: 'full',
         onConnect: handleSessionSseConnect,
-        onDisconnect: sharedMode ? handleSseDisconnect : undefined,
         onEvent: handleSseEvent
     })
 
     useVisibilityReporter({
         api,
         subscriptionId: globalSubscriptionId,
-        enabled: globalSseEnabled
+        enabled: sseEnabled
     })
 
     useVisibilityReporter({
         api,
         subscriptionId: sessionSubscriptionId,
-        enabled: ownerRealtimeEnabled && sseEnabled && Boolean(sessionEventSubscription)
+        enabled: sseEnabled && Boolean(sessionEventSubscription)
     })
 
     // Loading auth source
@@ -524,15 +512,7 @@ function AppInner() {
     }
 
     return (
-        <AppContextProvider value={{
-            api,
-            token,
-            baseUrl,
-            signOut: clearAuth,
-            sharedMode,
-            sharedSessionId,
-            titleSuggestionAvailable,
-        }}>
+        <AppContextProvider value={{ api, token, baseUrl, titleSuggestionAvailable }}>
             <VoiceProvider>
                 <PwaUpdateBannerWithStatusOffset
                     isSyncing={isSyncing}
@@ -545,11 +525,11 @@ function AppInner() {
                 />
                 <VoiceErrorBanner />
                 <OfflineBanner
-                    isHubConnected={(sharedMode ? sessionSubscriptionId : globalSubscriptionId) !== null}
+                    isHubConnected={globalSubscriptionId !== null}
                     isReconnecting={showReconnectingBanner}
                 />
-                {!sharedMode ? <RunnerVersionSkewBanner /> : null}
-                <div className="h-full min-h-0 overflow-hidden flex flex-col">
+                <RunnerVersionSkewBanner />
+                <div className="h-full min-h-0 flex flex-col">
                     <Outlet />
                 </div>
                 <ToastContainer />

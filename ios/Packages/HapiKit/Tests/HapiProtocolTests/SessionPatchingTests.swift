@@ -96,6 +96,33 @@ struct SessionPatchingTests {
 
     // MARK: - Version gates
 
+    @Test func codexPlanProposalDecodesAndWithdrawsWithVersionedState() throws {
+        let state = try JSONDecoder().decode(AgentState.self, from: Data(
+            #"{"codexPlanProposalId":"plan-1","requests":{}}"#.utf8
+        ))
+        #expect(state.codexPlanProposalId == "plan-1")
+        #expect(state.requests?.isEmpty == true)
+        #expect(try JSONDecoder().decode(AgentState.self, from: JSONEncoder().encode(state)) == state)
+        #expect(try JSONDecoder().decode(AgentState.self, from: Data("{}".utf8)).codexPlanProposalId == nil)
+        let session = makeSession(agentState: state, agentStateVersion: 3)
+        let patch = try JSONDecoder().decode(SessionPatch.self, from: Data(
+            #"{"agentState":{"version":4,"value":{"codexPlanProposalId":null}}}"#.utf8
+        ))
+        let cleared = try #require(applySessionDetailPatch(session: session, patch: patch))
+        #expect(cleared.agentState?.codexPlanProposalId == nil)
+        #expect(cleared.agentStateVersion == 4)
+        // Replayed SSE must not resurrect an executable historical proposal.
+        for version in [3, 4] {
+            #expect(applySessionDetailPatch(session: cleared, patch: SessionPatch(
+                agentState: VersionedValue(version: version, value: state)
+            )) == nil)
+        }
+        let next = try #require(applySessionDetailPatch(session: cleared, patch: SessionPatch(
+            agentState: VersionedValue(version: 5, value: AgentState(codexPlanProposalId: "plan-2"))
+        )))
+        #expect(next.agentState?.codexPlanProposalId == "plan-2")
+    }
+
     @Test func dropsStaleMetadataPatch() {
         let session = makeSession(metadataVersion: 5)
         let next = applySessionDetailPatch(session: session, patch: SessionPatch(
@@ -275,28 +302,25 @@ struct SessionPatchingTests {
         #expect(applySessionDetailPatch(session: session, patch: SessionPatch()) == nil)
     }
 
-    // MARK: - Optional patch fields
+    // MARK: - Replicated TS surprises
 
-    @Test func activeTurnStartedAtIsAppliedAndCleared() throws {
+    @Test func activeTurnStartedAtIsNeverApplied() throws {
+        // web/src/lib/sessionPatch.ts carries the field on the patch type but
+        // never assigns it; the port replicates that exactly.
         let session = makeSession()
         #expect(session.activeTurnStartedAt == nil)
 
-        let started = try #require(applySessionDetailPatch(session: session, patch: SessionPatch(
+        let alone = applySessionDetailPatch(session: session, patch: SessionPatch(
             activeTurnStartedAt: .value(5_000)
-        )))
-        #expect(started.activeTurnStartedAt == 5_000)
+        ))
+        #expect(alone == nil)
 
         let combined = try #require(applySessionDetailPatch(session: session, patch: SessionPatch(
             thinking: true,
             activeTurnStartedAt: .value(5_000)
         )))
         #expect(combined.thinking)
-        #expect(combined.activeTurnStartedAt == 5_000)
-
-        let cleared = try #require(applySessionDetailPatch(session: started, patch: SessionPatch(
-            activeTurnStartedAt: .null
-        )))
-        #expect(cleared.activeTurnStartedAt == nil)
+        #expect(combined.activeTurnStartedAt == nil)
     }
 
     @Test func scratchlistUpdatedAtIsARefetchTriggerOnly() {

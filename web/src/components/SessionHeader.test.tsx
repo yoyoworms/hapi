@@ -5,7 +5,6 @@ import type { Session } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { I18nProvider } from '@/lib/i18n-context'
 import { ToastProvider, useToast } from '@/lib/toast-context'
-import { AppContextProvider } from '@/lib/app-context'
 import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
 
 afterEach(() => {
@@ -59,6 +58,18 @@ function renderHeader(session: Session, extra?: { serviceTier?: string | null; t
     )
 }
 
+function renderHeaderWithApi(session: Session, api: ApiClient) {
+    return render(
+        <QueryClientProvider client={new QueryClient()}>
+            <ToastProvider>
+                <I18nProvider>
+                    <SessionHeader session={session} onBack={vi.fn()} api={api} />
+                </I18nProvider>
+            </ToastProvider>
+        </QueryClientProvider>
+    )
+}
+
 describe('resolveSessionHeaderMachineLabel', () => {
     it('prefers cached/display labels, then host, then short machine id', () => {
         expect(resolveSessionHeaderMachineLabel(
@@ -84,94 +95,36 @@ describe('resolveSessionHeaderMachineLabel', () => {
 })
 
 describe('SessionHeader', () => {
-    it('shows the current Codex account in the title metadata', () => {
-        renderHeader(baseSession({
-            metadata: {
-                flavor: 'codex',
-                path: '/repo',
-                host: 'machine',
-                codexAccountId: 'account-1',
-                codexAccountLabel: 'Work account',
-            },
-        }))
-
-        expect(screen.getByTestId('session-header-codex-account')).toHaveTextContent('Account: Work account')
-    })
-
-    it('labels the system Codex account when no account label was persisted', () => {
-        renderHeader(baseSession({
-            metadata: {
-                flavor: 'codex',
-                path: '/repo',
-                host: 'machine',
-                codexAccountId: 'system',
-            },
-        }))
-
-        expect(screen.getByTestId('session-header-codex-account')).toHaveTextContent('Account: System default')
-    })
-
-    it('does not query machines or expose owner actions in shared mode', async () => {
-        const getMachines = vi.fn().mockResolvedValue({ machines: [] })
-        const api = { getMachines } as unknown as ApiClient
-
-        render(
-            <QueryClientProvider client={new QueryClient()}>
-                <ToastProvider>
-                    <I18nProvider>
-                        <AppContextProvider value={{
-                            api,
-                            token: 'share-jwt',
-                            baseUrl: 'https://example.test',
-                            sharedMode: true,
-                            sharedSessionId: 'session-1',
-                        }}>
-                            <SessionHeader
-                                session={baseSession({
-                                    metadata: {
-                                        flavor: 'codex',
-                                        path: '/repo',
-                                        host: 'machine',
-                                        machineId: 'machine-1',
-                                    },
-                                })}
-                                onBack={vi.fn()}
-                                api={api}
-                            />
-                        </AppContextProvider>
-                    </I18nProvider>
-                </ToastProvider>
-            </QueryClientProvider>,
-        )
-
-        await Promise.resolve()
-        expect(getMachines).not.toHaveBeenCalled()
-        expect(screen.queryByRole('button', { name: /More/ })).not.toBeInTheDocument()
-    })
-
-    it('uses only the canReopen-gated Reopen action for inactive sessions', () => {
+    it('does not offer manual Codex sync while the HAPI session is active', () => {
         const api = {
             getMachines: vi.fn().mockResolvedValue({ machines: [] }),
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] }),
+            syncCodexSession: vi.fn()
         } as unknown as ApiClient
 
-        render(
-            <QueryClientProvider client={new QueryClient()}>
-                <ToastProvider>
-                    <I18nProvider>
-                        <SessionHeader
-                            session={baseSession({ active: false })}
-                            onBack={vi.fn()}
-                            api={api}
-                            canReopen={false}
-                        />
-                    </I18nProvider>
-                </ToastProvider>
-            </QueryClientProvider>,
-        )
+        renderHeaderWithApi(baseSession({
+            active: true,
+            metadata: { flavor: 'codex', path: '/repo', host: 'machine', codexSessionId: 'codex-thread-1' }
+        }), api)
 
         fireEvent.click(screen.getByRole('button', { name: /More/ }))
-        expect(screen.queryByRole('menuitem', { name: /Resume/ })).toBeNull()
-        expect(screen.queryByRole('menuitem', { name: /Reopen/ })).toBeNull()
+        expect(screen.queryByRole('menuitem', { name: /Sync Codex/ })).toBeNull()
+    })
+
+    it('keeps manual Codex sync available for an inactive imported thread', () => {
+        const api = {
+            getMachines: vi.fn().mockResolvedValue({ machines: [] }),
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] }),
+            syncCodexSession: vi.fn()
+        } as unknown as ApiClient
+
+        renderHeaderWithApi(baseSession({
+            active: false,
+            metadata: { flavor: 'codex', path: '/repo', host: 'machine', codexSessionId: 'codex-thread-1' }
+        }), api)
+
+        fireEvent.click(screen.getByRole('button', { name: /More/ }))
+        expect(screen.getByRole('menuitem', { name: /Sync Codex/ })).toBeInTheDocument()
     })
 
     it('hides title generation when the Hub does not advertise the capability', () => {

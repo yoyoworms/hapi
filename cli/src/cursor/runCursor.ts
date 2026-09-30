@@ -34,6 +34,8 @@ export async function runCursor(opts: {
     resumeSessionId?: string;
     model?: string;
     existingSessionId?: string;
+    /** Fresh-spawn reserved hub id from `--hapi-session-id` (create/getOrCreate). */
+    reservedSessionId?: string;
     workingDirectory?: string;
 }): Promise<void> {
     const workingDirectory = opts.workingDirectory ?? getInvokedCwd();
@@ -56,7 +58,8 @@ export async function runCursor(opts: {
             startedBy,
             workingDirectory,
             agentState: state,
-            model: opts.model
+            model: opts.model,
+            reservedSessionId: opts.reservedSessionId
         });
     const { api, session } = bootstrap;
 
@@ -73,7 +76,7 @@ export async function runCursor(opts: {
 
     const sessionWrapperRef: { current: CursorSession | null } = { current: null };
 
-    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'yolo';
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'default';
     let currentModel = opts.model;
 
     const lifecycle = createRunnerLifecycle({
@@ -83,7 +86,7 @@ export async function runCursor(opts: {
     });
 
     lifecycle.registerProcessHandlers();
-    registerKillSessionHandler(session.rpcHandlerManager, lifecycle);
+    registerKillSessionHandler(session.rpcHandlerManager, lifecycle, session);
     registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle);
 
     const syncSessionMode = () => {
@@ -100,7 +103,7 @@ export async function runCursor(opts: {
     session.onUserMessage((message, localId) => {
         const queuedModel = sessionWrapperRef.current?.getModel() ?? currentModel;
         const enhancedMode: EnhancedMode = {
-            permissionMode: currentPermissionMode ?? 'yolo',
+            permissionMode: currentPermissionMode ?? 'default',
             model: queuedModel
         };
         const formattedText = formatMessageWithAttachments(message.content.text, message.content.attachments);

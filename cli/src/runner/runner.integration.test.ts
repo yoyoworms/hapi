@@ -1,14 +1,14 @@
 /**
  * Integration tests for runner HTTP control system
- *
+ * 
  * Tests the full flow of runner startup, session tracking, and shutdown
- *
+ * 
  * IMPORTANT: These tests spawn real detached runner/session process trees
  * and MUST be run through the dedicated serial integration project:
- *
+ * 
  *   bun run test:integration            (runner lifecycle coverage)
  *   bun run test:integration:stress     (+ the 20-session stress test)
- *
+ * 
  * They are EXCLUDED from the default parallel unit-test suite
  * (`bun run test` / `vitest run`) — see vitest.config.ts and
  * vitest.integration.config.ts. Every process the suite spawns is registered
@@ -16,7 +16,7 @@
  * interrupted test still reaps its children (two-stage: logical stop first,
  * then bounded process-tree termination). The final audit lives in
  * globalSetup teardown and fails the run if any test-owned process survives.
- *
+ * 
  * The 20-session stress test is opt-in via HAPI_RUN_STRESS_TESTS=true.
  */
 
@@ -25,12 +25,12 @@ import { spawn } from 'child_process';
 import { existsSync, unlinkSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import path, { join } from 'path';
 import { configuration } from '@/configuration';
-import {
-  listRunnerSessions,
-  stopRunnerSession,
-  spawnRunnerSession,
-  stopRunnerHttp,
-  notifyRunnerSessionStarted,
+import { 
+  listRunnerSessions, 
+  stopRunnerSession, 
+  spawnRunnerSession, 
+  stopRunnerHttp, 
+  notifyRunnerSessionStarted, 
   stopRunner
 } from '@/runner/controlClient';
 import { readRunnerState, clearRunnerState } from '@/persistence';
@@ -78,7 +78,7 @@ async function isServerHealthy(): Promise<boolean> {
       console.log('[TEST] Bot health check failed: bot not ready (503)');
       return false;
     }
-
+    
     return true;
   } catch (error) {
     console.log('[TEST] Bot not reachable:', error);
@@ -86,12 +86,7 @@ async function isServerHealthy(): Promise<boolean> {
   }
 }
 
-const runnerIntegrationTestsEnabled = process.env.HAPI_RUNNER_INTEGRATION_TESTS === '1';
-const runnerIntegrationServerHealthy = runnerIntegrationTestsEnabled
-  ? await isServerHealthy()
-  : false;
-
-describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { timeout: 20_000 }, () => {
+describe.skipIf(!await isServerHealthy())('Runner Integration Tests', { timeout: 20_000 }, () => {
   let runnerPid: number;
 
   /** Spawn a runner session and register it in the test-owned registry immediately. */
@@ -106,7 +101,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
   beforeEach(async () => {
     // First ensure no runner is running by checking PID in metadata file
     await stopRunner()
-
+    
     // Start fresh runner for this test
     // This will return and start a background process - we don't need to wait for it
     const runnerLauncher = spawnHappyCLI(['runner', 'start'], {
@@ -118,7 +113,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     // Register immediately after spawn so cleanup runs even if this test fails
     // before reaching its happy-path teardown.
     trackChildProcess(runnerLauncher, 'runner-launcher');
-
+    
     // Wait for runner to write its state file (it needs to auth, setup, and start server)
     // Also require the PID to actually be alive: a SIGKILLed runner (or a
     // crashed one) can leave a stale runner.state.json behind, and reading it
@@ -127,7 +122,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
       const state = await readRunnerState();
       return state !== null && isProcessAlive(state.pid);
     }, 10_000, 250); // Wait up to 10 seconds, checking every 250ms
-
+    
     const runnerState = await readRunnerState();
     if (!runnerState) {
       throw new Error('Runner failed to start within timeout');
@@ -179,6 +174,17 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     expect(sessions).toEqual([]);
   });
 
+  it('preserves shared Codex support after a runner heartbeat', async () => {
+    const initial = await readRunnerState();
+    expect(initial?.sharedCodexRuntime).toBe(true);
+
+    await waitFor(async () => Boolean((await readRunnerState())?.lastHeartbeat), 35_000);
+
+    const afterHeartbeat = await readRunnerState();
+    expect(afterHeartbeat?.pid).toBe(initial?.pid);
+    expect(afterHeartbeat?.sharedCodexRuntime).toBe(true);
+  }, 40_000);
+
   it('should track session-started webhook from terminal session', async () => {
     // Simulate a terminal-started session reporting to runner
     const mockMetadata: Metadata = {
@@ -198,7 +204,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     // Verify session is tracked
     const sessions = await listRunnerSessions();
     expect(sessions).toHaveLength(1);
-
+    
     const tracked = sessions[0];
     expect(tracked.startedBy).toBe('hapi directly - likely by user from terminal');
     expect(tracked.happySessionId).toBe('test-session-123');
@@ -216,15 +222,18 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     const spawnedSession = sessions.find(
       (s: any) => s.happySessionId === response.sessionId
     );
-
+    
     expect(spawnedSession).toBeDefined();
     expect(spawnedSession.startedBy).toBe('runner');
-
+    
     // Clean up - stop the spawned session
     expect(spawnedSession.happySessionId).toBeDefined();
     expect(await stopRunnerSession(spawnedSession.happySessionId)).toBe('stopped');
     expect(await stopRunnerSession(spawnedSession.happySessionId)).toBe('already_gone');
-    expect(await stopRunnerSession('unknown-session-id')).toBe('still_alive');
+    // Distinct from 'still_alive': no PID matched this id and there is no
+    // verified-exit tombstone (and argv orphan scan found nothing), so the
+    // runner has no basis to call it either alive or dead.
+    expect(await stopRunnerSession('unknown-session-id')).toBe('unknown');
   });
 
   it.skipIf(process.env.HAPI_RUN_STRESS_TESTS !== 'true')(
@@ -254,7 +263,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     }
   );
 
-  it('should handle runner stop request gracefully', async () => {
+  it('should handle runner stop request gracefully', async () => {    
     await stopRunnerHttp();
 
     // Verify metadata file is cleaned up
@@ -264,6 +273,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
   it('should track both runner-spawned and terminal sessions', async () => {
     // Spawn a real hapi process that looks like it was started from terminal
     const terminalHappyProcess = spawnHappyCLI([
+      'claude',
       '--hapi-starting-mode', 'remote',
       '--started-by', 'terminal'
     ], {
@@ -297,14 +307,14 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
 
     expect(terminalSession).toBeDefined();
     expect(terminalSession.startedBy).toBe('hapi directly - likely by user from terminal');
-
+    
     expect(runnerSession).toBeDefined();
     expect(runnerSession.startedBy).toBe('runner');
 
     // Clean up both sessions
     await stopRunnerSession('terminal-session-aaa');
     await stopRunnerSession(runnerSession.happySessionId);
-
+    
     // Also kill the terminal process directly to be sure
     try {
       await killProcessByChildProcess(terminalHappyProcess);
@@ -364,7 +374,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     }
 
     const results = await Promise.all(promises);
-
+    
     // All should succeed
     results.forEach(res => {
       expect(res.success).toBe(true);
@@ -395,27 +405,27 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     // SIGKILL test - runner should die immediately
     const logsDir = configuration.logsDir;
     const { readdirSync } = await import('fs');
-
+    
     // Get initial log files
     const initialLogs = readdirSync(logsDir).filter(f => f.endsWith('-runner.log'));
-
+    
     // Send SIGKILL to runner (force kill)
     await killProcess(runnerPid, true);
-
+    
     // Wait for process to die
     await new Promise(resolve => setTimeout(resolve, 500));
-
+    
     // Check if process is dead
     const isDead = !isProcessAlive(runnerPid);
     expect(isDead).toBe(true);
-
+    
     // Check that log file exists (it was created when runner started)
     const finalLogs = readdirSync(logsDir).filter(f => f.endsWith('-runner.log'));
     expect(finalLogs.length).toBeGreaterThanOrEqual(initialLogs.length);
-
+    
     // The runner won't have time to write cleanup logs with SIGKILL
     console.log('[TEST] Runner killed with SIGKILL - no cleanup logs expected');
-
+    
     // Clean up state file manually since runner couldn't do it
     await clearRunnerState();
   });
@@ -426,7 +436,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     if (!logFile) {
       throw new Error('No log file found');
     }
-
+    
     if (isWindows()) {
       // Windows taskkill does not deliver SIGTERM/SIGBREAK to Node handlers.
       await stopRunnerHttp();
@@ -434,32 +444,32 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
       // Send SIGTERM to runner (graceful shutdown)
       await killProcess(runnerPid);
     }
-
+    
     // Wait for graceful shutdown
     await new Promise(resolve => setTimeout(resolve, 4_000));
-
+    
     // Check if process is dead
     const isDead = !isProcessAlive(runnerPid);
     expect(isDead).toBe(true);
-
+    
     // Read the log file to check for cleanup messages
     const logContent = readFileSync(logFile.path, 'utf8');
-
+    
     // Should contain cleanup messages
     if (!isWindows()) {
       expect(logContent).toContain('SIGTERM');
     }
     expect(logContent).toContain('cleanup');
-
+    
     console.log('[TEST] Runner terminated gracefully - cleanup logs written');
-
+    
     // Clean up state file if it still exists (should have been cleaned by SIGTERM handler)
     await clearRunnerState();
   });
 
   /**
    * Version mismatch detection test - control flow:
-   *
+   * 
    * 1. Test starts runner with original version (e.g., 0.9.0-6) compiled into dist/
    * 2. Test modifies package.json to new version (e.g., 0.0.0-integration-test-*)
    * 3. Test runs `yarn build` to recompile with new version
@@ -468,7 +478,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
    * 6. Runner spawns new runner via spawnHappyCLI(['runner', 'start'])
    * 7. New runner starts, reads runner.state.json, sees old version != its compiled version
    * 8. New runner calls stopRunner() to kill old runner, then takes over
-   *
+   * 
    * This simulates what happens during `npm upgrade hapi`:
    * - Running runner has OLD version loaded in memory (configuration.currentCliVersion)
    * - npm replaces node_modules/hapi/ with NEW version files
@@ -476,13 +486,13 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
    * - Runner reads package.json, detects mismatch, triggers self-update
    * - Key difference: npm atomically replaces the entire module directory, while
    *   our test must carefully rebuild to avoid missing entrypoint errors
-   *
+   * 
    * Critical timing constraints:
    * - Heartbeat must be long enough (30s) for yarn build to complete before runner tries to spawn
    * - If heartbeat fires during rebuild, spawn fails (entrypoint missing) and test fails
    * - pkgroll doesn't reliably update compiled version, must use full yarn build
    * - Test modifies package.json BEFORE rebuild to ensure new version is compiled in
-   *
+   * 
    * Common failure modes:
    * - Heartbeat too short: runner tries to spawn while dist/ is being rebuilt
    * - Using pkgroll alone: doesn't update compiled configuration.currentCliVersion
@@ -497,7 +507,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
     const testVersion = `0.0.0-integration-test-should-be-auto-cleaned-up-${Math.floor(Math.random() * 100000).toString().padStart(5, '0')}`;
 
     expect(originalVersion, 'Your current cli version was not cleaned up from previous test it seems').not.toBe(testVersion);
-
+    
     // Modify package.json version
     const modifiedPackage = { ...originalPackage, version: testVersion };
     writeFileSync(packagePath, JSON.stringify(modifiedPackage, null, 2));
@@ -513,7 +523,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
       // process reads package.json fresh and picks up the modified version automatically.
 
       console.log(`[TEST] Current runner running with version ${originalVersion}, PID: ${initialPid}`);
-
+      
       console.log(`[TEST] Changed package.json version to ${testVersion}`);
 
       // The runner should automatically detect the version mismatch and restart itself
@@ -549,6 +559,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
    */
   it('regression: registered detached child is reaped even when the test body never reaches its own cleanup', async () => {
     const child = spawnHappyCLI([
+      'claude',
       '--hapi-starting-mode', 'remote',
       '--started-by', 'terminal'
     ], {
@@ -602,7 +613,7 @@ describe.skipIf(!runnerIntegrationServerHealthy)('Runner Integration Tests', { t
   });
 
   // TODO: Add a test to see if a corrupted file will work
-
+  
   // TODO: Test npm uninstall scenario - runner should gracefully handle when hapi is uninstalled
   // Current behavior: runner tries to spawn new runner on version mismatch but entrypoint is gone
   // Expected: runner should detect missing entrypoint and either exit cleanly or at minimum not respawn infinitely

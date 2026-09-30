@@ -10,16 +10,6 @@ import { getCodexSystemPrompt } from './utils/systemPrompt';
 import type { ReasoningEffort } from './appServerTypes';
 import { resolveCodexCommand } from './utils/codexExecutable';
 import type { McpServersConfig } from './utils/buildHapiMcpBridge';
-import {
-    buildHapiCodexModelContextArgs,
-    prepareHapiCodexContextArgs,
-    resolveHapiCodexModel
-} from './hapiContextPolicy';
-
-export function appendSessionMatchToken(instructions: string, sessionMatchToken?: string): string {
-    if (!sessionMatchToken) return instructions;
-    return `${instructions}\n\nHAPI session match token: ${sessionMatchToken}`;
-}
 
 const CODEX_OPTIONS_WITH_VALUE = new Set([
     '-a',
@@ -128,7 +118,6 @@ export async function codexLocal(opts: {
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
     onSessionFound: (id: string) => void;
     codexArgs?: string[];
-    sessionMatchToken?: string;
     mcpServers?: McpServersConfig;
     sessionHook?: {
         port: number;
@@ -142,9 +131,8 @@ export async function codexLocal(opts: {
         opts.onSessionFound(opts.sessionId);
     }
 
-    const modelSpec = resolveHapiCodexModel(opts.model);
-    if (modelSpec?.model) {
-        args.push('--model', modelSpec.model);
+    if (opts.model) {
+        args.push('--model', opts.model);
     }
 
     if (opts.modelReasoningEffort) {
@@ -165,7 +153,7 @@ export async function codexLocal(opts: {
     }
 
     // Add developer instructions (system prompt)
-    args.push(...buildDeveloperInstructionsArg(appendSessionMatchToken(getCodexSystemPrompt(), opts.sessionMatchToken)));
+    args.push(...buildDeveloperInstructionsArg(getCodexSystemPrompt()));
 
     if (opts.codexArgs) {
         // Before the first launch, Codex still needs the user's selector (for
@@ -185,12 +173,10 @@ export async function codexLocal(opts: {
     }
 
     const codexCommand = resolveCodexCommand();
-    const contextArgs = prepareHapiCodexContextArgs(codexCommand, process.env);
 
-    const modelContextArgs = buildHapiCodexModelContextArgs(opts.model);
     await spawnWithTerminalGuard({
         command: codexCommand.command,
-        args: [...codexCommand.args, ...contextArgs, ...modelContextArgs, ...args],
+        args: [...codexCommand.args, ...args],
         cwd: opts.path,
         env: process.env,
         signal: opts.abort,

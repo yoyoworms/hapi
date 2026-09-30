@@ -15,18 +15,14 @@ import {
     type SyntheticEvent as ReactSyntheticEvent,
     useCallback,
     useEffect,
-    useLayoutEffect,
+    useImperativeHandle,
     useMemo,
     useRef,
     useState
 } from 'react'
 import { useNarrowViewport } from '@/hooks/useNarrowViewport'
-import {
-    mirrorComposerSegments,
-    parseComposerSegments,
-    resolveComposerPlaceholderKey,
-} from '@/lib/composerSegments'
-import { addComposerInputHistory, getComposerInputHistory } from '@/lib/composerInputHistory'
+import { shouldInvokeComposerDictateShortcut } from '@/lib/composerDictateShortcut'
+import { isRichComposerMentionsEnabled, resolveComposerPlaceholderKey } from '@/lib/composerSegments'
 import type { SessionMentionResolveResult } from '@/components/AssistantChat/RichComposerInput'
 import {
     RichComposerInput,
@@ -34,7 +30,7 @@ import {
 } from '@/components/AssistantChat/RichComposerInput'
 import { useFue } from '@/lib/use-fue'
 import { FueCallout, FueDot } from '@/components/Fue'
-import type { AgentState, CodexCollaborationMode, PermissionMode, PiModelSummary, ThreadGoal } from '@/types/api'
+import type { AgentState, CodexCollaborationMode, PermissionMode, PiModelSummary } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import type { ConversationStatus } from '@/realtime/types'
 import { useActiveWord } from '@/hooks/useActiveWord'
@@ -49,7 +45,6 @@ import { useComposerDraft } from '@/hooks/useComposerDraft'
 import type { AttachmentDraftInput } from '@/lib/composer-attachment-drafts'
 import { persistInactiveComposerAttachments, setComposerDraftSnapshot, updateComposerDraftTextSnapshot, attachmentDraftRevision, resetInactiveComposerAttachmentVisibility } from '@/lib/composer-draft-transfer'
 import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
-import { useComposerInputMode } from '@/hooks/useComposerInputMode'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
 import { StatusBar } from '@/components/AssistantChat/StatusBar'
@@ -70,19 +65,12 @@ import { useVoiceInputPreferences } from '@/hooks/useVoiceInputPreferences'
 import { useDictation } from '@/hooks/useDictation'
 import type { ComposerSendIntent } from '@/lib/messageDelivery'
 import type { MessageDeliveryMode } from '@hapi/protocol'
-import type { LatestUsage } from '@/chat/reducer'
-import type { PlanProgress } from '@/chat/planProgress'
-import { getClipboardImageFiles } from '@/lib/clipboardAttachments'
 import { moveAttachmentId, orderItemsById, reconcileAttachmentOrder, type AttachmentDropPosition } from '@/lib/attachmentOrder'
 
 export interface TextInputState {
     text: string
     selection: { start: number; end: number }
 }
-
-// Retain the former component exports for callers/tests while keeping storage
-// policy independent from the increasingly stateful composer implementation.
-export { addComposerInputHistory, getComposerInputHistory }
 
 export function getComposerEscapeAction(input: {
     hasSuggestions: boolean
@@ -295,6 +283,7 @@ export function ModelEffortSettingsSection(props: {
 
 export function HappyComposer(props: {
     sessionId?: string
+    focusInputRef?: MutableRefObject<(() => void) | null>
     onUploadDraftSnapshot?: (text: string, attachments: AttachmentDraftInput[]) => void
     canRestoreAttachments?: boolean
     disabled?: boolean
@@ -306,22 +295,17 @@ export function HappyComposer(props: {
     effort?: string | null
     active?: boolean
     allowSendWhenInactive?: boolean
-    /** A send request is in flight. Actions pause; the text input stays mounted and focused. */
-    sendPending?: boolean
     thinking?: boolean
     agentState?: AgentState | null
     backgroundTaskCount?: number
     contextSize?: number
-    latestUsage?: LatestUsage | null
-    usage?: { totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number } | null
-    accountStatus?: import('@/types/api').Session['accountStatus']
     contextCacheRead?: number
     contextWindow?: number | null
     /** Model for the context-window heuristic; see StatusBar.contextModel. */
     contextModel?: string | null
     controlledByUser?: boolean
+    concurrentClients?: boolean
     agentFlavor?: string | null
-    activityText?: string | null
     availableModelOptions?: Array<{ value: string | null; label: string }>
     /** Full Pi model data with thinkingLevelMap for provider grouping + thinking level filtering */
     piModels?: PiModelSummary[]
@@ -365,8 +349,6 @@ export function HappyComposer(props: {
     pendingSchedule?: PendingSchedule | null
     onSchedule?: (pending: PendingSchedule) => void
     onClearSchedule?: () => void
-    threadGoal?: ThreadGoal | null
-    planProgress?: PlanProgress | null
     // Scratchlist drawer props - SessionChat owns the state. Threaded
     // straight through to ComposerButtons. When undefined, the toggle
     // button doesn't render (back-compat for any other consumer).
@@ -383,6 +365,8 @@ export function HappyComposer(props: {
     ) => Promise<ScratchlistParkResult>
     /** Parent disables DragDropZone / scratchlist promote while park is in flight. */
     onScratchlistParkingChange?: (parking: boolean) => void
+    /** SessionChat binds Ctrl/Cmd+Shift+D; HappyComposer registers the effective voice toggle. */
+    dictateHotkeyRef?: MutableRefObject<(() => void) | null>
     // Set when the most recent send failed (4xx/5xx/network).  The composer
     // restores the original text once per `sendError.id` and renders an
     // inline error affordance until the user dismisses or starts editing.
@@ -421,7 +405,6 @@ export function HappyComposer(props: {
         effort: rawEffort,
         active = true,
         allowSendWhenInactive = false,
-        sendPending = false,
         thinking = false,
         agentState,
         backgroundTaskCount,
@@ -430,6 +413,7 @@ export function HappyComposer(props: {
         contextWindow,
         contextModel,
         controlledByUser = false,
+        concurrentClients = false,
         agentFlavor,
         availableModelOptions,
         piModels,
@@ -545,14 +529,8 @@ export function HappyComposer(props: {
         onScratchlistParkingChange?.(isParkingScratchlist)
     }, [isParkingScratchlist, onScratchlistParkingChange])
 
-    const inactiveEditorDisabled = !active && !allowSendWhenInactive
-    const configurationControlsDisabled = inactiveEditorDisabled || isParkingScratchlist
-    const editorDisabled = disabled || threadIsDisabled || inactiveEditorDisabled
-    // Keep the focused text client mounted while the request settles. `disabled`
-    // blurs native inputs/contenteditables and can detach third-party IMEs;
-    // read-only preserves focus without opening a second-draft race.
-    const editorReadOnly = sendPending || isParkingScratchlist
-    const controlsDisabled = editorDisabled || editorReadOnly
+    const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
+    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
     const hasAttachments = attachments.length > 0
@@ -615,8 +593,6 @@ export function HappyComposer(props: {
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const richInputRef = useRef<RichComposerInputHandle>(null)
-    const historyIndexRef = useRef<number | null>(null)
-    const historyDraftRef = useRef('')
     const richComposerFueAnchorRef = useRef<HTMLDivElement>(null)
     const settingsButtonRef = useRef<HTMLButtonElement>(null)
     const modelValueButtonRef = useRef<HTMLButtonElement>(null)
@@ -635,23 +611,15 @@ export function HappyComposer(props: {
         userScheduleGeneration: number
         userAttachmentGeneration: number
     } | null>(null)
-    const { composerInputMode } = useComposerInputMode()
-    const richMentionsEnabled = composerInputMode === 'rich'
+    // Kill-switch only (?richMentions=0 / localStorage=0 / VITE=false). Mount-time
+    // read — hard reload required, so no per-keystroke localStorage/URL parse.
+    const [richMentionsEnabled] = useState(() => isRichComposerMentionsEnabled())
     const {
         status: richComposerFueStatus,
         engage: engageRichComposerFue,
         dismiss: dismissRichComposerFue,
     } = useFue('rich-composer-mentions')
     const prevControlledByUser = useRef(controlledByUser)
-
-    const resetInputHistoryNavigation = useCallback(() => {
-        historyIndexRef.current = null
-        historyDraftRef.current = ''
-    }, [])
-
-    useEffect(() => {
-        resetInputHistoryNavigation()
-    }, [resetInputHistoryNavigation, sessionId])
 
     // Composer itself is the affordance: open the FUE callout once the rich
     // path is live. Relying on DOM focus alone is flaky (programmatic
@@ -661,18 +629,9 @@ export function HappyComposer(props: {
         engageRichComposerFue()
     }, [richMentionsEnabled, engageRichComposerFue])
 
-    // ComposerPrimitive.Input restores focus when a run starts. The custom
-    // contenteditable path must provide the same contract so pointer-clicking
-    // Send does not leave system IMEs without a focused text client.
-    useEffect(() => {
-        if (!richMentionsEnabled || editorDisabled) return
-        return api.on('thread.runStart', () => richInputRef.current?.focus())
-    }, [api, editorDisabled, richMentionsEnabled])
-
     const recordUserEdit = useCallback(() => {
         userEditGenerationRef.current += 1
-        resetInputHistoryNavigation()
-    }, [resetInputHistoryNavigation])
+    }, [])
 
     const handleUserEdit = useCallback(() => {
         recordUserEdit()
@@ -926,16 +885,13 @@ export function HappyComposer(props: {
             direction: currentInput.selectionDirection,
         } : null
 
-        if (richMentionsEnabled) {
-            // Keep this inside the trusted pointer/keyboard activation. An
-            // asynchronous focus can update activeElement without reactivating
-            // a system or third-party IME.
-            richInputRef.current?.focus()
-        }
         setIsExpanded((expanded) => !expanded)
         haptic('light')
-        if (richMentionsEnabled) return
         setTimeout(() => {
+            if (richMentionsEnabled) {
+                richInputRef.current?.focus()
+                return
+            }
             const input = textareaRef.current
             if (!input) return
             try {
@@ -954,8 +910,13 @@ export function HappyComposer(props: {
         }, 0)
     }, [haptic, richMentionsEnabled])
 
+    // Keep focus within the user's click gesture so mobile keyboards can open.
+    useImperativeHandle(props.focusInputRef, () => () => {
+        if (richMentionsEnabled) richInputRef.current?.focus()
+        else textareaRef.current?.focus()
+    }, [richMentionsEnabled])
+
     const handleSuggestionSelect = useCallback((index: number) => {
-        if (editorReadOnly) return
         const suggestion = suggestions[index]
         if (!suggestion) return
         if (suggestion.text.startsWith('$')) {
@@ -979,7 +940,9 @@ export function HappyComposer(props: {
                     autocompletePrefixes
                 )
             }
-            richInputRef.current.focus()
+            setTimeout(() => {
+                richInputRef.current?.focus()
+            }, 0)
             haptic('light')
             return
         }
@@ -1012,7 +975,7 @@ export function HappyComposer(props: {
         }, 0)
 
         haptic('light')
-    }, [api, suggestions, inputState, autocompletePrefixes, haptic, richMentionsEnabled, handleUserEdit, editorReadOnly])
+    }, [api, suggestions, inputState, autocompletePrefixes, haptic, richMentionsEnabled, handleUserEdit])
 
     const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
@@ -1052,8 +1015,8 @@ export function HappyComposer(props: {
     }, [switchDisabled, onSwitchToRemote, haptic])
 
     const permissionModeOptions = useMemo(
-        () => getPermissionModeOptionsForFlavor(agentFlavor),
-        [agentFlavor]
+        () => getPermissionModeOptionsForFlavor(agentFlavor).filter(option => !concurrentClients || option.mode !== 'safe-yolo'),
+        [agentFlavor, concurrentClients]
     )
     const collaborationModeOptions = useMemo(
         () => agentFlavor === 'codex' ? getCodexCollaborationModeOptions() : [],
@@ -1191,9 +1154,8 @@ export function HappyComposer(props: {
 
         // Rich chips must be serialized into composer.text before any send or
         // scratchlist park snapshot (RichComposerInput contract).
-        let textToRecord = composerTextRef.current
         if (richMentionsEnabled && richInputRef.current) {
-            textToRecord = richInputRef.current.flushSerializedText()
+            richInputRef.current.flushSerializedText()
         }
 
         // Scratchlist parks must not go through assistant-ui's send(): it
@@ -1256,8 +1218,6 @@ export function HappyComposer(props: {
             // Must be adjacent to send(): useHappyRuntime consumes and resets
             // this ref synchronously from assistant-ui's onNew callback.
             if (pendingSendIntentRef) pendingSendIntentRef.current = effectiveIntent
-            addComposerInputHistory(sessionId, textToRecord)
-            resetInputHistoryNavigation()
             api.composer().send()
         } catch (error) {
             resetPendingSendIntent()
@@ -1286,9 +1246,7 @@ export function HappyComposer(props: {
         props.onResumeStoredDraft,
         props.scratchlistMode,
         richMentionsEnabled,
-        resetInputHistoryNavigation,
         sendError,
-        sessionId,
         attachmentOrderRef,
         pendingSendIntentRef,
         resetPendingSendIntent,
@@ -1299,11 +1257,10 @@ export function HappyComposer(props: {
     }, [handleSend])
 
     const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
-        if (editorReadOnly) return
         const key = e.key
 
         // Avoid intercepting IME composition keystrokes (Enter, arrows, etc.)
-        if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+        if (e.nativeEvent.isComposing) {
             return
         }
 
@@ -1357,75 +1314,6 @@ export function HappyComposer(props: {
             }
         }
 
-        // Shell-style per-session history. Suggestions retain first refusal;
-        // IME was rejected above. Rich input selection lives in mirror space
-        // (mention chips are one atom), while stored values stay serialized so
-        // recalling a session reference recreates the chip instead of flattening
-        // it to visible text.
-        const inputHistory = getComposerInputHistory(sessionId)
-        if ((key === 'ArrowUp' || key === 'ArrowDown') && inputHistory.length > 0) {
-            const textarea = richMentionsEnabled ? null : textareaRef.current
-            const historyText = textarea?.value ?? inputState.text
-            const selection = textarea
-                ? { start: textarea.selectionStart, end: textarea.selectionEnd }
-                : inputState.selection
-            const selectionCollapsed = selection.start === selection.end
-            const caretOnFirstLine = !historyText.slice(0, selection.start).includes('\n')
-            const caretOnLastLine = !historyText.slice(selection.end).includes('\n')
-            const canNavigateUp = key === 'ArrowUp'
-                && selectionCollapsed
-                && caretOnFirstLine
-            const canNavigateDown = key === 'ArrowDown'
-                && selectionCollapsed
-                && historyIndexRef.current !== null
-                && caretOnLastLine
-
-            if (canNavigateUp || canNavigateDown) {
-                e.preventDefault()
-
-                if (key === 'ArrowUp') {
-                    if (historyIndexRef.current === null) {
-                        historyDraftRef.current = composerTextRef.current
-                        historyIndexRef.current = inputHistory.length - 1
-                    } else {
-                        historyIndexRef.current = Math.max(0, historyIndexRef.current - 1)
-                    }
-                } else if (historyIndexRef.current !== null) {
-                    if (historyIndexRef.current >= inputHistory.length - 1) {
-                        historyIndexRef.current = null
-                    } else {
-                        historyIndexRef.current += 1
-                    }
-                }
-
-                const nextText = historyIndexRef.current === null
-                    ? historyDraftRef.current
-                    : inputHistory[historyIndexRef.current] ?? ''
-                const mirrorText = richMentionsEnabled
-                    ? mirrorComposerSegments(parseComposerSegments(nextText))
-                    : nextText
-                const cursorPosition = mirrorText.length
-
-                flushTapSync(() => {
-                    api.composer().setText(nextText)
-                })
-                setInputState({
-                    text: mirrorText,
-                    selection: { start: cursorPosition, end: cursorPosition },
-                })
-                setTimeout(() => {
-                    if (richMentionsEnabled) {
-                        richInputRef.current?.focus()
-                        return
-                    }
-                    const input = textareaRef.current
-                    if (!input) return
-                    input.setSelectionRange(nextText.length, nextText.length)
-                }, 0)
-                return
-            }
-        }
-
         if (key === 'Escape') {
             // FUE callout also listens on window; dismiss it first so Escape
             // does not also abort a running thread or collapse the editor.
@@ -1473,16 +1361,12 @@ export function HappyComposer(props: {
         handleSend,
         haptic,
         composerEnterBehavior,
-        api,
-        inputState,
         richMentionsEnabled,
         richComposerFueStatus,
         dismissRichComposerFue,
         flushAndSend,
-        sessionId,
         isExpanded,
         handleExpandedToggle,
-        editorReadOnly,
     ])
 
     useEffect(() => {
@@ -1505,55 +1389,13 @@ export function HappyComposer(props: {
     }, [model, onModelChange, haptic, agentFlavor, availableModelOptions])
 
     const handleChange = useCallback((e: ReactChangeEvent<HTMLTextAreaElement>) => {
-        if (editorReadOnly) return
         const selection = {
             start: e.target.selectionStart,
             end: e.target.selectionEnd
         }
         setInputState({ text: e.target.value, selection })
         handleUserEdit()
-    }, [editorReadOnly, handleUserEdit])
-
-    // Keep the native textarea DOM-owned while the user is editing. iOS and
-    // third-party voice keyboards keep an internal provisional replacement
-    // range while refining the first words of a dictation. A React-controlled
-    // `value` write on every interim input destroys that range, so the next
-    // refinement is inserted beside the old prefix instead of replacing it
-    // (for example `在` -> `在在输入` -> `在在在输入框`).
-    //
-    // ComposerPrimitive.Input still owns the input/change handlers and writes
-    // every accepted DOM value into assistant-ui synchronously. We only push a
-    // value back into the DOM when composer state was changed externally
-    // (draft restore, history, suggestion, send clear, dictation button, etc.).
-    useLayoutEffect(() => {
-        if (richMentionsEnabled) return
-        const input = textareaRef.current
-        if (!input) return
-
-        if (input.value !== composerText) {
-            const hadFocus = document.activeElement === input
-            input.value = composerText
-            if (hadFocus) {
-                const position = composerText.length
-                input.setSelectionRange(position, position)
-            }
-        }
-        if (isExpanded) {
-            // The same DOM node survives compact/expanded transitions; remove
-            // the compact editor's measured inline height so `h-full` wins.
-            input.style.height = ''
-        } else {
-            input.style.height = 'auto'
-            input.style.height = `${input.scrollHeight}px`
-        }
-    }, [composerText, isExpanded, richMentionsEnabled])
-
-    const handleNativeInput = useCallback((e: ReactFormEvent<HTMLTextAreaElement>) => {
-        if (isExpanded) return
-        const input = e.currentTarget
-        input.style.height = 'auto'
-        input.style.height = `${input.scrollHeight}px`
-    }, [isExpanded])
+    }, [handleUserEdit])
 
     const handleSelect = useCallback((e: ReactSyntheticEvent<HTMLTextAreaElement>) => {
         const target = e.target as HTMLTextAreaElement
@@ -1564,21 +1406,10 @@ export function HappyComposer(props: {
     }, [])
 
     const handlePaste = useCallback(async (e: ReactClipboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
-        if (editorReadOnly) {
-            e.preventDefault()
-            return
-        }
-        const imageFiles = getClipboardImageFiles(e.clipboardData)
+        const files = Array.from(e.clipboardData?.files || [])
+        const imageFiles = files.filter(file => file.type.startsWith('image/'))
 
         if (imageFiles.length === 0) return
-
-        // Some clipboard sources expose an image and useful plain text at the
-        // same time. Consume the image as an attachment while leaving the rich
-        // input's plain-text insertion path alive for mixed payloads.
-        const pastedText = typeof e.clipboardData.getData === 'function'
-            ? e.clipboardData.getData('text/plain')
-            : ''
-        if (pastedText.length === 0) e.preventDefault()
 
         // The backend rejects scheduledAt + attachments (per-CLI upload dir is
         // torn down before a mature emit could read the files). The button-based
@@ -1586,19 +1417,20 @@ export function HappyComposer(props: {
         // paste path bypasses that — guard here so a pasted image while a
         // schedule is active cannot produce a submission the hub will reject.
         if (pendingSchedule != null) {
+            e.preventDefault()
             return
         }
 
-        // Sequential reads avoid large transient base64 allocations on mobile;
-        // isolate failures so one bad image does not block the remaining files.
-        for (const file of imageFiles) {
-            try {
+        e.preventDefault()
+
+        try {
+            for (const file of imageFiles) {
                 await api.composer().addAttachment(file)
-            } catch (error) {
-                console.error('Error adding pasted image:', error)
             }
+        } catch (error) {
+            console.error('Error adding pasted image:', error)
         }
-    }, [api, editorReadOnly, pendingSchedule])
+    }, [api, pendingSchedule])
 
     // Opens (or closes) the settings sheet. `section` anchors the sheet to a
     // single section ('model' / 'effort'); the gear passes nothing = full sheet.
@@ -1794,6 +1626,38 @@ export function HappyComposer(props: {
     )
     const showAbortButton = true
     const voiceEnabled = Boolean(effectiveVoiceToggle)
+    const routesToScratchlist = (props.scratchlistMode ?? false) && pendingSchedule == null
+
+    const invokeDictateHotkey = useCallback(() => {
+        if (!shouldInvokeComposerDictateShortcut({
+            controlsDisabled,
+            voiceEnabled,
+            dictationActive,
+            voiceStatus: effectiveVoiceStatus,
+            canSend,
+            routesToScratchlist,
+        })) {
+            return
+        }
+        effectiveVoiceToggle?.()
+    }, [
+        controlsDisabled,
+        voiceEnabled,
+        dictationActive,
+        effectiveVoiceStatus,
+        canSend,
+        routesToScratchlist,
+        effectiveVoiceToggle,
+    ])
+
+    useEffect(() => {
+        const ref = props.dictateHotkeyRef
+        if (!ref) return
+        ref.current = invokeDictateHotkey
+        return () => {
+            ref.current = null
+        }
+    }, [props.dictateHotkeyRef, invokeDictateHotkey])
 
     // Generic model/effort value buttons. The current value label doubles as
     // the button caption; clicking opens the settings sheet. Hidden on narrow
@@ -1816,10 +1680,9 @@ export function HappyComposer(props: {
         }
         if (modelOptions.length === 0) return undefined
         const rawKey = selectedModelBase !== undefined ? selectedModelBase : model
-        // `null` (default selection) and the `auto`/`default` wire values all
-        // mean "let the agent pick" — normalize them onto the `value: null`
-        // option so the localized option label is always found.
-        const normalizedKey = !rawKey || rawKey === 'auto' || rawKey === 'default' ? null : rawKey
+        const normalizedKey = agentFlavor === 'cursor'
+            ? (!rawKey || rawKey === 'auto' || rawKey === 'default' || rawKey === 'default[]' ? 'auto' : rawKey)
+            : (!rawKey || rawKey === 'auto' || rawKey === 'default' ? null : rawKey)
         const option = modelOptions.find((candidate) => candidate.value === normalizedKey)
         return option?.label ?? rawKey ?? undefined
     }, [isNarrowViewport, onModelChange, agentFlavor, selectedPiModel, model, modelOptions, selectedModelBase])
@@ -2240,7 +2103,7 @@ export function HappyComposer(props: {
                             </div>
                         ) : null}
 
-
+                        
                     </FloatingOverlay>
                 </div>
             )
@@ -2345,9 +2208,6 @@ export function HappyComposer(props: {
                         agentState={agentState}
                         backgroundTaskCount={backgroundTaskCount}
                         contextSize={contextSize}
-                        latestUsage={props.latestUsage}
-                        usage={props.usage}
-                        accountStatus={props.accountStatus}
                         contextCacheRead={contextCacheRead}
                         contextWindow={contextWindow}
                         contextModel={contextModel}
@@ -2357,11 +2217,8 @@ export function HappyComposer(props: {
                         serviceTier={serviceTier}
                         permissionMode={permissionMode}
                         collaborationMode={collaborationMode}
-                        threadGoal={props.threadGoal}
-                        planProgress={props.planProgress}
                         copilotAgentMode={copilotAgentMode}
                         agentFlavor={agentFlavor}
-                        activityText={props.activityText}
                         voiceStatus={effectiveVoiceStatus}
                     />
 
@@ -2434,13 +2291,12 @@ export function HappyComposer(props: {
                                     <RichComposerInput
                                         ref={richInputRef}
                                         value={composerText}
-                                        autoFocus={!editorDisabled && !isTouch}
+                                        autoFocus={!controlsDisabled && !isTouch}
                                         placeholder={t(resolveComposerPlaceholderKey({
                                             richMentionsEnabled: true,
                                             showContinueHint,
                                         }))}
-                                        disabled={editorDisabled}
-                                        readOnly={editorReadOnly}
+                                        disabled={controlsDisabled}
                                         onValueChange={handleRichValueChange}
                                         onMirrorChange={handleRichMirrorChange}
                                         onKeyDown={handleKeyDown}
@@ -2461,7 +2317,7 @@ export function HappyComposer(props: {
                                 <ComposerPrimitive.Input
                                     asChild
                                     ref={textareaRef}
-                                    autoFocus={!editorDisabled && !isTouch}
+                                    autoFocus={!controlsDisabled && !isTouch}
                                     submitOnEnter={false}
                                     cancelOnEscape={false}
                                     onChange={handleChange}
@@ -2470,46 +2326,32 @@ export function HappyComposer(props: {
                                     onPaste={handlePaste}
                                 >
                                     <textarea
-                                        // Radix Slot lets the child override the primitive's
-                                        // controlled value. See the layout effect above.
-                                        value={undefined}
-                                        defaultValue={composerText}
                                         placeholder={t(resolveComposerPlaceholderKey({
                                             richMentionsEnabled: false,
                                             showContinueHint,
                                         }))}
-                                        disabled={editorDisabled}
-                                        readOnly={editorReadOnly}
-                                        onInput={handleNativeInput}
+                                        disabled={controlsDisabled}
                                         className="h-full min-h-0 flex-1 resize-none overflow-y-auto bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                                     />
                                 </ComposerPrimitive.Input>
                             ) : (
                                 <ComposerPrimitive.Input
-                                    asChild
                                     ref={textareaRef}
-                                    autoFocus={!editorDisabled && !isTouch}
+                                    autoFocus={!controlsDisabled && !isTouch}
+                                    placeholder={t(resolveComposerPlaceholderKey({
+                                        richMentionsEnabled: false,
+                                        showContinueHint,
+                                    }))}
+                                    disabled={controlsDisabled}
+                                    maxRows={5}
                                     submitOnEnter={false}
                                     cancelOnEscape={false}
                                     onChange={handleChange}
                                     onSelect={handleSelect}
                                     onKeyDown={handleKeyDown}
                                     onPaste={handlePaste}
-                                >
-                                    <textarea
-                                        value={undefined}
-                                        defaultValue={composerText}
-                                        rows={1}
-                                        placeholder={t(resolveComposerPlaceholderKey({
-                                            richMentionsEnabled: false,
-                                            showContinueHint,
-                                        }))}
-                                        disabled={editorDisabled}
-                                        readOnly={editorReadOnly}
-                                        onInput={handleNativeInput}
-                                        className="max-h-[6.875rem] flex-1 resize-none overflow-y-auto bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                                    />
-                                </ComposerPrimitive.Input>
+                                    className="flex-1 resize-none bg-transparent text-base leading-snug text-[var(--app-fg)] placeholder-[var(--app-hint)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                                />
                             )}
                         </div>
                         {richMentionsEnabled && richComposerFueStatus === 'engaging' ? (
@@ -2526,7 +2368,6 @@ export function HappyComposer(props: {
 
                         <ComposerButtons
                             canSend={canSend}
-                            hasContent={hasText || hasAnyAttachments}
                             controlsDisabled={controlsDisabled}
                             showSettingsButton={showSettingsButton}
                             settingsButtonRef={settingsButtonRef}

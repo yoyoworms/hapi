@@ -5,9 +5,17 @@ import Foundation
 // docs/api/client-contract/sse.md "Versioned patch algorithm").
 //
 // Portability notes against the TS source:
-// - `activeTurnStartedAt` uses PatchField so an explicit null clears the
-//   cached turn boundary while an absent key leaves it unchanged.
-// - `scratchlistUpdatedAt` remains a bare refetch trigger and is not assigned.
+// - `activeTurnStartedAt` and `scratchlistUpdatedAt` are carried by
+//   `SessionPatch` but deliberately NEVER applied to the `Session`, exactly
+//   like the reference implementation (`scratchlistUpdatedAt` is a bare
+//   refetch trigger; `activeTurnStartedAt` is simply not assigned there).
+// - JS distinguishes a `null` and an *absent* `activeTurnStartedAt` on the
+//   cached session; Swift folds both into `nil`. The only observable
+//   difference is which side of the render-irrelevance gate a
+//   `activeTurnStartedAt: null` patch lands on — and since the field is never
+//   assigned, `applySessionDetailPatch` returns the same result either way
+//   unless the patch also carries other changed fields (then TS may
+//   additionally refresh a sub-minute `activeAt`; harmless keep-alive data).
 
 /// Version-monotonicity gate for structured patches carrying
 /// metadata / agentState / todos / teamState.
@@ -80,7 +88,6 @@ public func applySessionDetailPatch(session: Session, patch: SessionPatch) -> Se
 
     if let value = patch.active { assign(\.active, value) }
     if let value = patch.thinking { assign(\.thinking, value) }
-    if let field = patch.activeTurnStartedAt { assign(\.activeTurnStartedAt, field.wireValue) }
     if let value = patch.activeAt { assign(\.activeAt, value) }
     // Monotonic with the hub's applySessionPatch: a rejected stale
     // metadata/agentState replay must not rewind updatedAt.
@@ -124,7 +131,9 @@ public func applySessionDetailPatch(session: Session, patch: SessionPatch) -> Se
         changed = true
     }
 
-    // Deliberately NOT applied: patch.scratchlistUpdatedAt is a refetch trigger only.
+    // Deliberately NOT applied (mirrors web/src/lib/sessionPatch.ts):
+    // - patch.activeTurnStartedAt — the reference never assigns it.
+    // - patch.scratchlistUpdatedAt — refetch trigger only.
 
     return changed ? next : nil
 }

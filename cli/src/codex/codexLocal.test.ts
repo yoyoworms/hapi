@@ -20,7 +20,7 @@ vi.mock('@/ui/logger', () => ({
     }
 }));
 
-import { appendSessionMatchToken, codexLocal, filterResumeSubcommand } from './codexLocal';
+import { codexLocal, filterResumeSubcommand } from './codexLocal';
 
 const codexScriptPath = win32.join('toolchains', 'nodejs', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
 const hapiCommandPath = win32.join('hapi-bin', 'hapi.exe');
@@ -85,19 +85,6 @@ describe('filterResumeSubcommand', () => {
     it('preserves arguments after an option terminator in resume mode', () => {
         expect(filterResumeSubcommand(['resume', 'abc-123', '--', '--last']))
             .toEqual(['--', '--last']);
-    });
-});
-
-describe('appendSessionMatchToken', () => {
-    it('records visible text that can be recovered from Codex transcripts', () => {
-        const result = appendSessionMatchToken(
-            'base instructions',
-            '11111111-1111-4111-8111-111111111111'
-        );
-
-        expect(result).toContain('base instructions');
-        expect(result).toContain('HAPI session match token: 11111111-1111-4111-8111-111111111111');
-        expect(result).not.toContain('<!--');
     });
 });
 
@@ -180,26 +167,6 @@ describe('codexLocal', () => {
         expect(spawnOptions.args).toContain('-c');
         expect(spawnOptions.args).toContain('model_reasoning_effort="high"');
         expect(spawnOptions.args).not.toContain('--model-reasoning-effort');
-    });
-
-    it('maps the selectable Sol 1M variant to Codex model/config args', async () => {
-        const controller = new AbortController();
-
-        await codexLocal({
-            abort: controller.signal,
-            sessionId: null,
-            path: workspacePath,
-            model: 'gpt-5.6-sol[1m]',
-            onSessionFound: vi.fn()
-        });
-
-        const spawnOptions = spawnWithTerminalGuardMock.mock.calls[0][0] as {
-            args: string[];
-        };
-        expect(spawnOptions.args).toContain('--model');
-        expect(spawnOptions.args).toContain('gpt-5.6-sol');
-        expect(spawnOptions.args).toContain('model_context_window=1000000');
-        expect(spawnOptions.args).toContain('model_auto_compact_token_limit=900000');
     });
 
     it('passes resume --last through while Codex is resolving the initial session', async () => {

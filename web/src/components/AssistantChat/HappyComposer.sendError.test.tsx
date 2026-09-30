@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactElement, ReactNode, TextareaHTMLAttributes } from 'react'
+import type { ReactNode, TextareaHTMLAttributes } from 'react'
 import { useRef, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '@/lib/i18n-context'
@@ -66,39 +66,26 @@ vi.mock('@assistant-ui/react', async () => {
             ),
             Input: React.forwardRef<HTMLTextAreaElement, MockComposerInputProps>(
                 ({
-                    asChild,
-                    children,
+                    asChild: _asChild,
                     onChange,
                     maxRows: _maxRows,
                     submitOnEnter: _submitOnEnter,
                     cancelOnEscape: _cancelOnEscape,
                     ...props
-                }, ref) => {
-                    const handleChange: TextareaHTMLAttributes<HTMLTextAreaElement>['onChange'] = (event) => {
-                        runtime.setSnapshot!((current) => ({
-                            ...current,
-                            composer: { ...current.composer, text: event.target.value },
-                        }))
-                        onChange?.(event)
-                    }
-                    if (asChild && React.isValidElement(children)) {
-                        const child = children as ReactElement<TextareaHTMLAttributes<HTMLTextAreaElement>>
-                        return React.cloneElement(child, {
-                            ...props,
-                            ...child.props,
-                            ref,
-                            onChange: handleChange,
-                        } as TextareaHTMLAttributes<HTMLTextAreaElement> & { ref: typeof ref })
-                    }
-                    return (
-                        <textarea
-                            {...props}
-                            ref={ref}
-                            value={runtime.snapshot.composer.text}
-                            onChange={handleChange}
-                        />
-                    )
-                },
+                }, ref) => (
+                    <textarea
+                        {...props}
+                        ref={ref}
+                        value={runtime.snapshot.composer.text}
+                        onChange={(event) => {
+                            runtime.setSnapshot!((current) => ({
+                                ...current,
+                                composer: { ...current.composer, text: event.target.value },
+                            }))
+                            onChange?.(event)
+                        }}
+                    />
+                ),
             ),
             Attachments: () => null,
         },
@@ -127,7 +114,6 @@ vi.mock('@/components/AssistantChat/SortableComposerAttachments', () => ({
 vi.mock('@/components/AssistantChat/ComposerButtons', () => ({
     ComposerButtons: (props: {
         onSend: () => void
-        controlsDisabled: boolean
         onSchedule: (pending: PendingSchedule) => void
         onClearSchedule: () => void
         pendingSchedule: PendingSchedule | null
@@ -138,7 +124,7 @@ vi.mock('@/components/AssistantChat/ComposerButtons', () => ({
         onModelValueToggle?: () => void
     }) => (
         <div>
-            <button type="button" disabled={props.controlsDisabled} onClick={props.onSend}>send</button>
+            <button type="button" onClick={props.onSend}>send</button>
             <button type="button" onClick={props.onExpandedToggle}>
                 {props.expanded ? 'collapse' : 'expand'}
             </button>
@@ -238,7 +224,7 @@ function ComposerHarness(props: {
             <HappyComposer
                 key={composerKey}
                 sessionId={composerKey}
-                sendPending={isSending}
+                disabled={isSending}
                 pendingSchedule={schedule}
                 sendAcceptance={sendAcceptance}
                 sendSettlement={sendSettlement}
@@ -323,26 +309,6 @@ describe('HappyComposer send-error atomic restore', () => {
     afterEach(() => {
         cleanup()
         runtime.setSnapshot = null
-    })
-
-    it('keeps the native editor focused but read-only while a send request is pending', () => {
-        const controls = renderComposer('message', null)
-        const editor = input()
-        editor.focus()
-
-        act(() => controls.current!.acceptSend())
-
-        expect(editor).not.toBeDisabled()
-        expect(editor).toHaveProperty('readOnly', true)
-        expect(document.activeElement).toBe(editor)
-        expect(screen.getByRole('button', { name: 'send' })).toBeDisabled()
-
-        act(() => controls.current!.settleSend())
-        expect(editor).toHaveProperty('readOnly', false)
-        expect(document.activeElement).toBe(editor)
-
-        fireEvent.change(editor, { target: { value: 'next draft' } })
-        expect(editor).toHaveValue('next draft')
     })
 
     it('collapses an expanded composer only after an accepted send succeeds', async () => {
@@ -611,14 +577,6 @@ describe('HappyComposer send intent gestures', () => {
 
         expect(runtime.sentIntents).toEqual(['default'])
         expect(runtime.pendingSendIntentRef?.current).toBe('default')
-    })
-
-    it('does not send on the WebKit IME keyCode 229 fallback event', () => {
-        renderComposer('正在输入', null, true)
-
-        fireEvent.keyDown(input(), { key: 'Enter', isComposing: false, keyCode: 229 })
-
-        expect(runtime.sentIntents).toEqual([])
     })
 
     it('consumes a restored queue retry mark before resetting the shared ref', () => {

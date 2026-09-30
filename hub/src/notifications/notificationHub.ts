@@ -8,14 +8,9 @@ export class NotificationHub {
     private readonly channels: NotificationChannel[]
     private readonly readyCooldownMs: number
     private readonly permissionDebounceMs: number
-    private readonly taskDebounceMs: number
     private readonly lastKnownRequests: Map<string, Set<string>> = new Map()
     private readonly notificationDebounce: Map<string, NodeJS.Timeout> = new Map()
     private readonly lastReadyNotificationAt: Map<string, number> = new Map()
-    // Coalesce a burst of <task-notification> updates into a single push:
-    // store the most recent payload and let the timer flush it.
-    private readonly taskNotificationTimers: Map<string, NodeJS.Timeout> = new Map()
-    private readonly pendingTaskNotifications: Map<string, TaskNotification> = new Map()
     private unsubscribeSyncEvents: (() => void) | null = null
 
     constructor(
@@ -26,7 +21,6 @@ export class NotificationHub {
         this.channels = channels
         this.readyCooldownMs = options?.readyCooldownMs ?? 5000
         this.permissionDebounceMs = options?.permissionDebounceMs ?? 500
-        this.taskDebounceMs = options?.taskDebounceMs ?? 15000
         this.unsubscribeSyncEvents = this.syncEngine.subscribe((event) => {
             this.handleSyncEvent(event)
         })
@@ -42,11 +36,6 @@ export class NotificationHub {
             clearTimeout(timer)
         }
         this.notificationDebounce.clear()
-        for (const timer of this.taskNotificationTimers.values()) {
-            clearTimeout(timer)
-        }
-        this.taskNotificationTimers.clear()
-        this.pendingTaskNotifications.clear()
         this.lastKnownRequests.clear()
         this.lastReadyNotificationAt.clear()
     }
@@ -99,12 +88,6 @@ export class NotificationHub {
             clearTimeout(existingTimer)
             this.notificationDebounce.delete(sessionId)
         }
-        const taskTimer = this.taskNotificationTimers.get(sessionId)
-        if (taskTimer) {
-            clearTimeout(taskTimer)
-            this.taskNotificationTimers.delete(sessionId)
-        }
-        this.pendingTaskNotifications.delete(sessionId)
         this.lastKnownRequests.delete(sessionId)
         this.lastReadyNotificationAt.delete(sessionId)
     }
@@ -182,34 +165,12 @@ export class NotificationHub {
     }
 
     private async sendTaskNotification(sessionId: string, notification: TaskNotification): Promise<void> {
-        if (!this.getNotifiableSession(sessionId)) {
+        const session = this.getNotifiableSession(sessionId)
+        if (!session) {
             return
         }
 
-        // Always remember the latest notification — a long-running task can
-        // emit many <task-notification> tags in quick succession and we only
-        // want to push the most recent summary once the burst settles.
-        this.pendingTaskNotifications.set(sessionId, notification)
-
-        if (this.taskNotificationTimers.has(sessionId)) {
-            return
-        }
-
-        const timer = setTimeout(() => {
-            this.taskNotificationTimers.delete(sessionId)
-            const pending = this.pendingTaskNotifications.get(sessionId)
-            this.pendingTaskNotifications.delete(sessionId)
-            if (!pending) return
-
-            const currentSession = this.getNotifiableSession(sessionId)
-            if (!currentSession) return
-
-            this.notifyTask(currentSession, pending).catch((error) => {
-                console.error('[NotificationHub] Failed to send task notification:', error)
-            })
-        }, this.taskDebounceMs)
-
-        this.taskNotificationTimers.set(sessionId, timer)
+        await this.notifyTask(session, notification)
     }
 
     private async sendSessionCompletion(sessionId: string, reason: SessionEndReason): Promise<void> {

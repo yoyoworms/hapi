@@ -4,10 +4,6 @@ import type { DefaultEventsMap, Server, Socket } from 'socket.io'
 export type SocketData = {
     namespace?: string
     userId?: number
-    clockOffset?: number  // hubTime - clientTime (ms), used to normalize client timestamps to Hub time
-    /** Stable runner/client incarnation plus its Hub-local first-seen order. */
-    runtimeId?: string
-    runtimeGeneration?: number
 }
 
 export type SocketServer = Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, SocketData>

@@ -1,7 +1,7 @@
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { shareTargetPathnameFromBase } from './src/lib/sharePath'
 
@@ -23,7 +23,6 @@ function spaFallback(): Plugin {
 }
 
 const base = process.env.VITE_BASE_URL || '/'
-const manifestBase = base.endsWith('/') ? base : `${base}/`
 const shareAction = shareTargetPathnameFromBase(base)
 const hubTarget = process.env.VITE_HUB_PROXY || 'http://127.0.0.1:3006'
 const appVersion = readAppVersion()
@@ -38,15 +37,6 @@ function readAppVersion(): string {
     }
 
     return match[1]
-}
-
-function getBuildNumber(): number {
-    try {
-        const data = JSON.parse(readFileSync(resolve(__dirname, 'build-number.json'), 'utf-8'))
-        return data.build ?? 1
-    } catch {
-        return 1
-    }
 }
 
 function getVendorChunkName(id: string): string | undefined {
@@ -73,42 +63,19 @@ function getVendorChunkName(id: string): string | undefined {
     return undefined
 }
 
-function rejectDuplicateReactRuntimes(): Plugin {
+function copyKaTeXFonts(): Plugin {
     return {
-        name: 'reject-duplicate-react-runtimes',
+        name: 'copy-katex-fonts',
+        apply: 'build',
         generateBundle() {
-            const packageLocations = new Map<string, Set<string>>()
-
-            for (const moduleId of this.getModuleIds()) {
-                const normalizedId = moduleId.replaceAll('\0', '').replaceAll('\\', '/').split('?')[0]
-                const match = normalizedId.match(/\/node_modules\/(react(?:-dom)?)(?:\/|$)/)
-
-                if (!match || match.index === undefined) {
-                    continue
-                }
-
-                const packageName = match[1]
-                const packageRoot = normalizedId.slice(
-                    0,
-                    match.index + `/node_modules/${packageName}`.length
-                )
-                const locations = packageLocations.get(packageName) ?? new Set<string>()
-                locations.add(packageRoot)
-                packageLocations.set(packageName, locations)
-            }
-
-            const duplicates = [...packageLocations.entries()]
-                .filter(([, locations]) => locations.size > 1)
-                .map(([packageName, locations]) => {
-                    const paths = [...locations].map(location => `  - ${location}`).join('\n')
-                    return `${packageName}:\n${paths}`
+            const fontsDir = resolve(__dirname, 'node_modules/katex/dist/fonts')
+            for (const fileName of readdirSync(fontsDir)) {
+                if (!/\.(?:ttf|woff|woff2)$/i.test(fileName)) continue
+                this.emitFile({
+                    type: 'asset',
+                    fileName: `assets/fonts/${fileName}`,
+                    source: readFileSync(resolve(fontsDir, fileName))
                 })
-
-            if (duplicates.length > 0) {
-                throw new Error(
-                    `Duplicate React runtime packages detected:\n${duplicates.join('\n')}\n` +
-                    'Remove node_modules and reinstall from the lockfile before building.'
-                )
             }
         }
     }
@@ -117,8 +84,7 @@ function rejectDuplicateReactRuntimes(): Plugin {
 export default defineConfig({
     appType: 'spa',
     define: {
-        __APP_VERSION__: JSON.stringify(`${appVersion}.${getBuildNumber()}`),
-        __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+        __APP_VERSION__: JSON.stringify(appVersion),
     },
     server: {
         host: true,
@@ -135,9 +101,9 @@ export default defineConfig({
         }
     },
     plugins: [
-        rejectDuplicateReactRuntimes(),
         react(),
         spaFallback(),
+        copyKaTeXFonts(),
         VitePWA({
             // User-controlled reload avoids mid-session surprise reloads (autoUpdate reloads all tabs).
             registerType: 'prompt',
@@ -146,20 +112,24 @@ export default defineConfig({
             srcDir: 'src',
             filename: 'sw.ts',
             manifest: {
-                id: manifestBase,
-                name: 'LXAPI',
-                short_name: 'LXAPI',
+                name: 'HAPI',
+                short_name: 'HAPI',
                 description: 'AI-powered development assistant',
-                theme_color: '#ffffff',
+                // An installed Android WebAPK stores theme_color once at install time and uses it
+                // as a fixed toolbar color, so any value here pins the status bar to one appearance.
+                // With none, Chrome falls back to white in light mode and black in dark mode. That
+                // follows the Android system uiMode, not the in-app appearance setting, so the bar
+                // and the app diverge while an appearance override is active. `undefined` is
+                // explicit because the plugin fills in its own #42b883 default otherwise, and the
+                // resulting "theme_color is missing" build warning is wrong: theme_color is
+                // optional for installability.
+                theme_color: undefined,
+                // Splash background stays light; only the status bar needed to become adaptive.
                 background_color: '#ffffff',
                 display: 'standalone',
-                display_override: ['standalone', 'browser'],
                 orientation: 'portrait',
-                scope: manifestBase,
-                start_url: manifestBase,
-                launch_handler: {
-                    client_mode: ['navigate-existing', 'auto']
-                },
+                scope: base,
+                start_url: base,
                 icons: [
                     {
                         src: 'pwa-64x64.png',

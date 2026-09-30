@@ -96,8 +96,7 @@ export class SSEManager {
         this.visibilityTracker.registerConnection(
             subscription.id,
             subscription.namespace,
-            options.visibility ?? 'hidden',
-            subscription.sessionId
+            options.visibility ?? 'hidden'
         )
         this.ensureHeartbeat()
         return {
@@ -215,23 +214,13 @@ export class SSEManager {
         return this.connections.has(id)
     }
 
-    async sendToast(
-        namespace: string,
-        event: Extract<SyncEvent, { type: 'toast' }>,
-        options?: { includeHidden?: boolean }
-    ): Promise<number> {
+    async sendToast(namespace: string, event: Extract<SyncEvent, { type: 'toast' }>): Promise<number> {
         const deliveries: Array<Promise<{ id: string; ok: boolean }>> = []
         for (const connection of this.connections.values()) {
             if (connection.namespace !== namespace) {
                 continue
             }
-            // Shared-session viewers are scoped to exactly one session. Toasts
-            // use a dedicated delivery path, so repeat the normal SSE session
-            // boundary here instead of relying on broadcast().
-            if (connection.sessionId && connection.sessionId !== event.data.sessionId) {
-                continue
-            }
-            if (!options?.includeHidden && !this.visibilityTracker.isVisibleConnection(connection.id)) {
+            if (!this.visibilityTracker.isVisibleConnection(connection.id)) {
                 continue
             }
 

@@ -135,11 +135,7 @@ describe('permission mode persistence', () => {
             _worktreeName?: string,
             _resumeSessionId?: string,
             _effort?: string,
-            permissionMode?: string,
-            _serviceTier?: string,
-            _existingSessionId?: string,
-            _sandbox?: boolean,
-            _continueLatest?: boolean
+            permissionMode?: string
         ) => {
             capturedSpawnPermissionMode = permissionMode
             restartedEngine.handleSessionAlive({

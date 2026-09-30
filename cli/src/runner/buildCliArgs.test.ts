@@ -1,55 +1,11 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-    buildCliArgs,
-    classifyRecoveredProcessGeneration,
-    createSpawnDeduplicator,
-    releaseRecoveredSpawnDedupe,
-    resolveCodexAccountModelOverride
-} from './run'
-
-describe('resolveCodexAccountModelOverride', () => {
-    it('uses the API account model only as the Default/Auto fallback', () => {
-        expect(resolveCodexAccountModelOverride({
-            accountDefaultModel: 'gpt-5.6-sol'
-        })).toBe('gpt-5.6-sol')
-        expect(resolveCodexAccountModelOverride({
-            requestedModel: 'auto',
-            accountDefaultModel: 'gpt-5.6-sol'
-        })).toBe('gpt-5.6-sol')
-    })
-
-    it('keeps an explicit upstream-picker model on the same account', () => {
-        expect(resolveCodexAccountModelOverride({
-            requestedModel: 'gpt-5.6-terra',
-            accountDefaultModel: 'gpt-5.6-sol'
-        })).toBeUndefined()
-    })
-
-    it('resets to the target account default during an account switch', () => {
-        expect(resolveCodexAccountModelOverride({
-            requestedModel: 'gpt-5.6-terra',
-            accountDefaultModel: 'gpt-5.6-sol',
-            switchingAccount: true
-        })).toBe('gpt-5.6-sol')
-    })
-})
+import { buildCliArgs, classifyRecoveredProcessGeneration, createSpawnDeduplicator, releaseRecoveredSpawnDedupe } from './run'
 
 describe('buildCliArgs', () => {
-    it('passes continue-latest only to agents that support the generic flag', () => {
-        expect(buildCliArgs('claude', {
-            directory: '/tmp',
-            continueLatest: true
-        })).toContain('--continue')
-        expect(buildCliArgs('codex', {
-            directory: '/tmp',
-            continueLatest: true
-        })).not.toContain('--continue')
-    })
-
     it('adds --permission-mode for valid permission mode', () => {
         const args = buildCliArgs('claude', {
             directory: '/tmp',
@@ -169,8 +125,6 @@ describe('buildCliArgs', () => {
             'codex',
             'resume',
             'codex-thread-1',
-            '--hapi-starting-mode',
-            'remote',
             '--started-by',
             'runner',
             '--existing-session-id',
@@ -208,16 +162,17 @@ describe('buildCliArgs', () => {
         expect(args).not.toContain('--hapi-session-id')
     })
 
-    it('passes --existing-session-id for cursor resume when sessionId is set (#991)', () => {
+    it('passes --existing-session-id for cursor resume when existingSessionId is set (#991)', () => {
         const args = buildCliArgs('cursor', {
             directory: '/tmp',
             resumeSessionId: 'cursor-csid-1',
-            sessionId: 'hapi-session-991',
+            existingSessionId: 'hapi-session-991',
         })
         expect(args).toContain('--existing-session-id')
         expect(args).toContain('hapi-session-991')
         expect(args).toContain('--resume')
         expect(args).toContain('cursor-csid-1')
+        expect(args).not.toContain('--hapi-session-id')
     })
 
     it('does not pass --collaboration-mode for non-codex agents', () => {
@@ -414,13 +369,87 @@ describe('buildCliArgs', () => {
         ])
     })
 
-    it('does not emit --hapi-session-id for a non-pty flavor', () => {
+    it('stamps --hapi-session-id for local HTTP sessionId hints (reap / adopt-stub)', () => {
+        // sessionId alone is not reopen — that was the round-4 Major when we
+        // collapsed everything onto --existing-session-id.
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            sessionId: 'spawned-test-456',
+        })
+        expect(args).toContain('--hapi-session-id')
+        expect(args[args.indexOf('--hapi-session-id') + 1]).toBe('spawned-test-456')
+        expect(args).not.toContain('--existing-session-id')
+    })
+
+    it('does not stamp UUID local-HTTP sessionId as adopt (would 404/409)', () => {
+        // #1911 Opus Major: controlServer passes sessionId through; UUID entered
+        // resolveReservedHubSessionId → adoptPreallocatedSession against a
+        // non-stub / missing row.
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        })
+        expect(args).not.toContain('--hapi-session-id')
+        expect(args).not.toContain('--existing-session-id')
+    })
+
+    it('stamps --hapi-session-id for reservedSessionId (fresh machine-spawn stub)', () => {
+        const args = buildCliArgs('codex', {
+            directory: '/tmp',
+            reservedSessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            startingMode: 'remote',
+        })
+        expect(args).toContain('--hapi-session-id')
+        expect(args[args.indexOf('--hapi-session-id') + 1]).toBe('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+        expect(args).not.toContain('--existing-session-id')
+    })
+
+    it('stamps --existing-session-id for Claude reopen/resume (not adopt --hapi-session-id)', () => {
+        // #1911 Opus Critical: syncEngine resume passes access.sessionId as
+        // existingSessionId; adopt-stub stamp → SessionNotAdoptableError → 409.
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            existingSessionId: 'live-hub-row-uuid',
+            resumeSessionId: 'native-claude-resume-token',
+            startingMode: 'remote',
+        })
+        expect(args).toContain('--existing-session-id')
+        expect(args[args.indexOf('--existing-session-id') + 1]).toBe('live-hub-row-uuid')
+        expect(args).not.toContain('--hapi-session-id')
+        expect(args).toContain('--resume')
+    })
+
+    it('stamps --existing-session-id for kimi and copilot reopen (same adopt trap)', () => {
+        for (const agent of ['kimi', 'copilot'] as const) {
+            const args = buildCliArgs(agent, {
+                directory: '/tmp',
+                existingSessionId: 'live-hub-row-uuid',
+                startingMode: 'remote',
+            })
+            expect(args).toContain('--existing-session-id')
+            expect(args[args.indexOf('--existing-session-id') + 1]).toBe('live-hub-row-uuid')
+            expect(args).not.toContain('--hapi-session-id')
+        }
+    })
+
+    it('prefers existingSessionId over reservedSessionId when both are set', () => {
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            existingSessionId: 'live-row',
+            reservedSessionId: 'stub-row',
+        })
+        expect(args).toContain('--existing-session-id')
+        expect(args).not.toContain('--hapi-session-id')
+    })
+
+    it('does not emit --hapi-session-id for a non-pty flavor that already uses --existing-session-id', () => {
         const args = buildCliArgs('opencode', {
             directory: '/tmp',
             existingSessionId: 'existing-hub-id',
             startingMode: 'remote',
         })
         expect(args).not.toContain('--hapi-session-id')
+        expect(args).toContain('--existing-session-id')
     })
 
 })
@@ -443,88 +472,6 @@ describe('createSpawnDeduplicator', () => {
             type: 'error', errorMessage: 'Session fresh-hapi-session is still starting'
         })
         expect(calls).toBe(0)
-    })
-
-    it('spawns immediately when an inherited child exited before the heartbeat sweep', async () => {
-        let calls = 0
-        const generationProbe = vi.fn(() => false)
-        const dedupe = createSpawnDeduplicator(async () => {
-            calls += 1
-            return { type: 'success' as const, sessionId: 'fresh-hapi-session' }
-        }, generationProbe)
-        dedupe.recoverChild('fresh-hapi-session', {
-            type: 'success',
-            sessionId: 'fresh-hapi-session'
-        })
-
-        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
-            type: 'success', sessionId: 'fresh-hapi-session'
-        })
-        expect(generationProbe).toHaveBeenCalledOnce()
-        expect(calls).toBe(1)
-    })
-
-    it('keeps an inherited child deduped when its generation is current or uncertain', async () => {
-        let calls = 0
-        const generationProbe = vi.fn(() => true)
-        const dedupe = createSpawnDeduplicator(async () => {
-            calls += 1
-            return { type: 'success' as const, sessionId: 'duplicate' }
-        }, generationProbe)
-        dedupe.recoverChild('fresh-hapi-session', {
-            type: 'success',
-            sessionId: 'fresh-hapi-session'
-        })
-
-        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
-            type: 'success', sessionId: 'fresh-hapi-session'
-        })
-        expect(generationProbe).toHaveBeenCalledOnce()
-        expect(calls).toBe(0)
-    })
-
-    it('does not probe an inherited child while StopSession is in flight', async () => {
-        let calls = 0
-        const generationProbe = vi.fn(() => false)
-        const dedupe = createSpawnDeduplicator(async () => {
-            calls += 1
-            return { type: 'success' as const, sessionId: 'duplicate' }
-        }, generationProbe)
-        dedupe.recoverChild('fresh-hapi-session', {
-            type: 'success',
-            sessionId: 'fresh-hapi-session'
-        })
-        dedupe.markChildStopping('fresh-hapi-session')
-
-        await expect(dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })).resolves.toEqual({
-            type: 'success', sessionId: 'fresh-hapi-session'
-        })
-        expect(generationProbe).not.toHaveBeenCalled()
-        expect(calls).toBe(0)
-    })
-
-    it('never probes a normal in-flight spawn after its PID is registered', async () => {
-        let calls = 0
-        const generationProbe = vi.fn(() => false)
-        let resolveSpawn: ((result: { type: 'success'; sessionId: string }) => void) | undefined
-        let dedupe!: ReturnType<typeof createSpawnDeduplicator>
-        dedupe = createSpawnDeduplicator(async (options) => {
-            calls += 1
-            dedupe.markChildAlive(options.existingSessionId!)
-            return await new Promise<{ type: 'success'; sessionId: string }>((resolve) => {
-                resolveSpawn = resolve
-            })
-        }, generationProbe)
-
-        const options = { directory: '/tmp', existingSessionId: 'fresh-hapi-session' }
-        const first = dedupe(options)
-        const concurrentRetry = dedupe(options)
-
-        expect(calls).toBe(1)
-        expect(generationProbe).not.toHaveBeenCalled()
-        resolveSpawn?.({ type: 'success', sessionId: 'fresh-hapi-session' })
-        await expect(first).resolves.toEqual({ type: 'success', sessionId: 'fresh-hapi-session' })
-        await expect(concurrentRetry).resolves.toEqual({ type: 'success', sessionId: 'fresh-hapi-session' })
     })
 
     it('shares an in-flight spawn and its successful result while the child is alive', async () => {
@@ -633,26 +580,5 @@ describe('releaseRecoveredSpawnDedupe', () => {
 
         expect(calls).toBe(1)
         expect(recovered.has(123)).toBe(false)
-    })
-
-    it('keeps the same-row cache until every recovered PID has exited', async () => {
-        let calls = 0
-        const dedupe = createSpawnDeduplicator(async () => {
-            calls += 1
-            return { type: 'success' as const, sessionId: 'fresh-hapi-session' }
-        })
-        dedupe.recoverChild('fresh-hapi-session', { type: 'success', sessionId: 'fresh-hapi-session' })
-        const recovered = new Map([
-            [123, 'fresh-hapi-session'],
-            [456, 'fresh-hapi-session']
-        ])
-
-        releaseRecoveredSpawnDedupe(123, recovered, dedupe)
-        await dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })
-        expect(calls).toBe(0)
-
-        releaseRecoveredSpawnDedupe(456, recovered, dedupe)
-        await dedupe({ directory: '/tmp', existingSessionId: 'fresh-hapi-session' })
-        expect(calls).toBe(1)
     })
 })

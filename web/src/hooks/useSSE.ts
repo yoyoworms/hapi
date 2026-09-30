@@ -21,6 +21,7 @@ import type {
     SyncEvent
 } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
+import { applyAgyCatalogAnnouncement } from '@/lib/agyCatalogAnnouncement'
 import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, markMessagesIndeterminate, markMessagesRequeued, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
 import { applySessionDetailPatch } from '@/lib/sessionPatch'
 
@@ -188,12 +189,7 @@ function getSessionPatch(value: unknown): SessionPatch | null {
     if (!parsed.success) {
         return null
     }
-    const patch = { ...parsed.data } as SessionPatch & { usage?: Session['usage'] }
-    // Fork extension: preserve `usage` field on patch even though the shared schema strips it.
-    if (isObject(value) && 'usage' in value && (value as Record<string, unknown>).usage !== undefined) {
-        patch.usage = (value as Record<string, unknown>).usage as Session['usage']
-    }
-    return Object.keys(patch).length > 0 ? patch : null
+    return Object.keys(parsed.data).length > 0 ? parsed.data : null
 }
 
 function isMachineRecord(value: unknown): value is Machine {
@@ -769,6 +765,10 @@ export function useSSE(options: {
                 }
             }
 
+            if (event.type === 'machine-agy-models-updated') {
+                void applyAgyCatalogAnnouncement(queryClient, event.machineId)
+            }
+
             if (event.type === 'machine-updated') {
                 if (isMachineRecord(event.data)) {
                     upsertMachine(event.data)
@@ -869,9 +869,10 @@ export function useSSE(options: {
             if (eventSourceRef.current !== eventSource) {
                 return
             }
-            // Check heartbeat even when hidden, but with a longer timeout
-            const staleMs = getVisibilityState() === 'hidden' ? HEARTBEAT_STALE_MS * 3 : HEARTBEAT_STALE_MS
-            if (Date.now() - lastActivityAtRef.current < staleMs) {
+            if (getVisibilityState() === 'hidden') {
+                return
+            }
+            if (Date.now() - lastActivityAtRef.current < HEARTBEAT_STALE_MS) {
                 return
             }
             requestReconnect('heartbeat-timeout')

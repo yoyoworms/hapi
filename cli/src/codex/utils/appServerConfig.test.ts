@@ -8,15 +8,9 @@ import {
     supportsReasoningSummary
 } from './appServerConfig';
 import { codexSystemPrompt } from './systemPrompt';
-import {
-    HAPI_CODEX_ASTRA_MODEL_ID,
-    HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
-    HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID
-} from '../hapiContextPolicy';
 
 describe('appServerConfig', () => {
     const mcpServers = { hapi: { command: 'node', args: ['mcp'] } };
-    const defaultContextConfig = {};
     const withCollaborationInstructions = (developerInstructions: string): string => {
         return `${developerInstructions}\n\n${codexCollaborationSpawnAgentInstructions}`;
     };
@@ -58,7 +52,6 @@ describe('appServerConfig', () => {
         expect(params.baseInstructions).toBeUndefined();
         expect(params.developerInstructions).toBe(codexSystemPrompt);
         expect(params.config).toEqual({
-            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -96,7 +89,6 @@ describe('appServerConfig', () => {
         });
 
         expect(params.config).toEqual({
-            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp'],
@@ -107,6 +99,40 @@ describe('appServerConfig', () => {
                 }
             },
             developer_instructions: codexSystemPrompt
+        });
+    });
+
+    it('preserves user MCP transport fields when building thread config', () => {
+        const params = buildThreadStartParams({
+            cwd: '/workspace/project',
+            mode: { permissionMode: 'default', collaborationMode: 'default' },
+            mcpServers: {
+                'package-manager': {
+                    command: 'uvx',
+                    args: ['example-mcp', 'serve'],
+                    env: { EXAMPLE_TOKEN: 'from-process-environment' }
+                },
+                remote: {
+                    url: 'https://example.test/mcp',
+                    bearer_token_env_var: 'REMOTE_MCP_TOKEN'
+                },
+                hapi: {
+                    command: 'node',
+                    args: ['mcp']
+                }
+            }
+        });
+
+        expect(params.config).toMatchObject({
+            'mcp_servers.package-manager': {
+                command: 'uvx',
+                args: ['example-mcp', 'serve'],
+                env: { EXAMPLE_TOKEN: 'from-process-environment' }
+            },
+            'mcp_servers.remote': {
+                url: 'https://example.test/mcp',
+                bearer_token_env_var: 'REMOTE_MCP_TOKEN'
+            }
         });
     });
 
@@ -171,7 +197,6 @@ describe('appServerConfig', () => {
         expect(params.baseInstructions).toBeUndefined();
         expect(params.developerInstructions).toBe(`${codexSystemPrompt}\n\nOnly respond in Chinese.`);
         expect(params.config).toEqual({
-            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -188,7 +213,6 @@ describe('appServerConfig', () => {
         });
 
         expect(params.config).toEqual({
-            ...defaultContextConfig,
             'mcp_servers.hapi': {
                 command: 'node',
                 args: ['mcp']
@@ -198,88 +222,21 @@ describe('appServerConfig', () => {
         });
     });
 
-    it('maps the selectable Sol 1M variant to upstream Sol with per-thread context config', () => {
-        const thread = buildThreadStartParams({
+    it('passes effective Codex context management settings via thread config', () => {
+        const params = buildThreadStartParams({
             cwd: '/workspace/project',
-            mode: {
-                permissionMode: 'default',
-                model: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
-                collaborationMode: 'default'
-            },
-            mcpServers
-        });
-        expect(thread.model).toBe('gpt-5.6-sol');
-        expect(thread.config).toMatchObject({
-            model_context_window: 1_000_000,
-            model_auto_compact_token_limit: 900_000,
-            model_auto_compact_token_limit_scope: 'total'
-        });
-
-        const turn = buildTurnStartParams({
-            threadId: 'thread-1',
-            message: 'hello',
-            cwd: '/workspace/project',
-            mode: {
-                permissionMode: 'default',
-                model: HAPI_CODEX_SOL_ONE_MILLION_MODEL_ID,
-                collaborationMode: 'default'
+            mode: { permissionMode: 'default', collaborationMode: 'default' },
+            mcpServers,
+            contextManagementConfig: {
+                modelContextWindow: 400_000,
+                modelAutoCompactTokenLimit: 300_000
             }
         });
-        expect(turn.collaborationMode?.settings.model).toBe('gpt-5.6-sol');
-        // Codex app-server only accepts arbitrary config overrides on the
-        // thread lifecycle APIs. turn/start silently ignores unknown config,
-        // so a context-tier change must resume the thread on a fresh server.
-        expect(turn).not.toHaveProperty('config');
-    });
 
-    it('applies Astra official 1.05M raw context at thread start', () => {
-        const thread = buildThreadStartParams({
-            cwd: '/workspace/project',
-            mode: {
-                permissionMode: 'default',
-                model: HAPI_CODEX_ASTRA_ONE_MILLION_MODEL_ID,
-                collaborationMode: 'default'
-            },
-            mcpServers
+        expect(params.config).toMatchObject({
+            model_context_window: 400_000,
+            model_auto_compact_token_limit: 300_000
         });
-
-        expect(thread.model).toBe(HAPI_CODEX_ASTRA_MODEL_ID);
-        expect(thread.config).toMatchObject({
-            model_context_window: 1_050_000,
-            model_auto_compact_token_limit: 950_000,
-            model_auto_compact_token_limit_scope: 'total'
-        });
-    });
-
-    it('keeps normal Astra on Codex defaults', () => {
-        const thread = buildThreadStartParams({
-            cwd: '/workspace/project',
-            mode: {
-                permissionMode: 'default',
-                model: HAPI_CODEX_ASTRA_MODEL_ID,
-                collaborationMode: 'default'
-            },
-            mcpServers
-        });
-
-        expect(thread.model).toBe(HAPI_CODEX_ASTRA_MODEL_ID);
-        expect(thread.config).toMatchObject(defaultContextConfig);
-    });
-
-    it('does not apply Sol context settings to another upstream model', () => {
-        const thread = buildThreadStartParams({
-            cwd: '/workspace/project',
-            mode: {
-                permissionMode: 'default',
-                model: 'gpt-5.3-codex-spark',
-                collaborationMode: 'default'
-            },
-            mcpServers
-        });
-
-        expect(thread.model).toBe('gpt-5.3-codex-spark');
-        expect(thread.config).not.toHaveProperty('model_context_window');
-        expect(thread.config).not.toHaveProperty('model_auto_compact_token_limit');
     });
 
     it('translates Fast to the advertised app-server tier (priority) in thread params', () => {

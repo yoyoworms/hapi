@@ -13,46 +13,6 @@ function makeMessage(content: unknown): DecryptedMessage {
 }
 
 describe('normalizeDecryptedMessage', () => {
-    it('renders persisted agent message events', () => {
-        const message = makeMessage({
-            role: 'agent',
-            content: {
-                id: 'failure-1',
-                type: 'event',
-                data: {
-                    type: 'message',
-                    message: 'Task failed: upstream returned 413 Payload Too Large'
-                }
-            }
-        })
-
-        expect(normalizeDecryptedMessage(message)).toMatchObject({
-            id: 'msg-1',
-            role: 'event',
-            isSidechain: false,
-            content: {
-                type: 'message',
-                message: 'Task failed: upstream returned 413 Payload Too Large'
-            }
-        })
-    })
-
-    it('preserves persisted ready events for completion-state reduction', () => {
-        const message = makeMessage({
-            role: 'agent',
-            content: {
-                id: 'ready-1',
-                type: 'event',
-                data: { type: 'ready' }
-            }
-        })
-
-        expect(normalizeDecryptedMessage(message)).toMatchObject({
-            role: 'event',
-            content: { type: 'ready' }
-        })
-    })
-
     it('drops unsupported Claude system output records', () => {
         const message = makeMessage({
             role: 'agent',
@@ -1127,74 +1087,6 @@ describe('normalizeDecryptedMessage', () => {
         })
     })
 
-    it('unwraps Codex response-step envelopes into Markdown while preserving phase', () => {
-        const raw = JSON.stringify({
-            steps: [
-                { kind: 'output', value: '化妆整理师最近30天直玩数据如下。' },
-                { kind: 'tool_calls', value: [] },
-                { kind: 'output', value: '**统计周期：2026-07-20 至 2026-08-18**\n\n| 基础数据 | 数值 |\n|---|---:|\n| 总消耗 | ¥173.79 |' },
-                { kind: 'execute_report', value: '采用本轮最新腾讯广告报表数据。' }
-            ]
-        })
-        const message = makeMessage({
-            role: 'agent',
-            content: {
-                type: 'codex',
-                data: {
-                    type: 'message',
-                    message: raw,
-                    phase: 'final_answer'
-                }
-            }
-        })
-
-        const normalized = normalizeDecryptedMessage(message)
-        expect(normalized).toMatchObject({
-            role: 'agent',
-            content: [{
-                type: 'text',
-                text: '化妆整理师最近30天直玩数据如下。\n\n**统计周期：2026-07-20 至 2026-08-18**\n\n| 基础数据 | 数值 |\n|---|---:|\n| 总消耗 | ¥173.79 |',
-                phase: 'final_answer'
-            }]
-        })
-        if (!normalized || normalized.role !== 'agent') throw new Error('Expected agent')
-        const text = normalized.content[0]
-        if (text.type !== 'text') throw new Error('Expected text')
-        expect(text.text).not.toContain('{"steps"')
-        expect(text.text).not.toContain('execute_report')
-    })
-
-    it('keeps lookalike Codex step JSON with an unknown kind as text', () => {
-        const raw = JSON.stringify({
-            steps: [
-                { kind: 'output', value: 'visible' },
-                { kind: 'custom_data', value: 'must stay JSON' }
-            ]
-        })
-        const normalized = normalizeDecryptedMessage(makeMessage({
-            role: 'agent',
-            content: { type: 'codex', data: { type: 'message', message: raw } }
-        }))
-
-        expect(normalized).toMatchObject({
-            role: 'agent',
-            content: [{ type: 'text', text: raw }]
-        })
-    })
-
-    it('recovers meaningful progress from a truncated Codex tool envelope', () => {
-        const raw = '{"steps":[{"kind":"output","value":"正在核对广告报表。"},{"kind":"tool_calls","value":[{"functions.exec":{"source":"truncated"}}]},{"kind":"execute_report","value":"truncated'
-        const normalized = normalizeDecryptedMessage(makeMessage({
-            role: 'agent',
-            content: { type: 'codex', data: { type: 'message', message: raw } }
-        }))
-
-        expect(normalized).toMatchObject({
-            role: 'agent',
-            content: [{ type: 'text', text: '正在核对广告报表。' }]
-        })
-    })
-
     it('keeps malformed Codex review-looking messages as text', () => {
         const message = makeMessage({
             role: 'agent',
@@ -1273,7 +1165,6 @@ describe('normalizeDecryptedMessage', () => {
                 type: 'codex',
                 data: {
                     type: 'plan_update',
-                    explanation: 'Surface the current task while commands stay folded.',
                     plan: [
                         { step: 'Inspect event stream', status: 'completed' },
                         { step: 'Render plan card', status: 'in_progress' }
@@ -1293,7 +1184,6 @@ describe('normalizeDecryptedMessage', () => {
                     id: 'codex-plan-state',
                     name: 'update_plan',
                     input: {
-                        explanation: 'Surface the current task while commands stay folded.',
                         plan: [
                             { step: 'Inspect event stream', status: 'completed' },
                             { step: 'Render plan card', status: 'in_progress' }
@@ -1305,7 +1195,6 @@ describe('normalizeDecryptedMessage', () => {
                     type: 'tool-result',
                     tool_use_id: 'codex-plan-state',
                     content: {
-                        explanation: 'Surface the current task while commands stay folded.',
                         plan: [
                             { step: 'Inspect event stream', status: 'completed' },
                             { step: 'Render plan card', status: 'in_progress' }

@@ -15,7 +15,6 @@ import React from 'react'
 import { defaultComponents, classifyScheme, denyOnlyTransform, UriConfirmProvider } from '@/components/assistant-ui/markdown-text'
 import { HappyChatProvider, type HappyChatContextValue } from '@/components/AssistantChat/context'
 import { I18nProvider } from '@/lib/i18n-context'
-import { ToastProvider } from '@/lib/toast-context'
 import type { ApiClient } from '@/api/client'
 
 const navigate = vi.fn()
@@ -66,31 +65,8 @@ function chatContext(overrides: Partial<HappyChatContextValue> = {}): HappyChatC
     }
 }
 
-function renderFileA(props: React.ComponentPropsWithoutRef<'a'>, api: object) {
-    return render(
-        <I18nProvider>
-            <ToastProvider>
-                <HappyChatProvider value={{
-                    api,
-                    sessionId: 'session-1',
-                    metadata: null,
-                    terminalToolDisplayMode: 'compact',
-                    disabled: false,
-                    onRefresh: vi.fn(),
-                    hasMoreMessages: false,
-                    isLoadingMoreMessages: false,
-                    loadOlderMessagesPreservingScroll: vi.fn(async () => false)
-                } as never}>
-                    <UriConfirmProvider>
-                        <AnchorComponent {...props} />
-                    </UriConfirmProvider>
-                </HappyChatProvider>
-            </ToastProvider>
-        </I18nProvider>
-    )
-}
-
 const STORAGE_KEY = 'hapi-allowed-schemes'
+const OPEN_NEW_TAB_STORAGE_KEY = 'hapi-open-external-links-in-new-tab'
 
 beforeEach(() => {
     localStorage.clear()
@@ -272,41 +248,6 @@ describe('markdown <A> component — click handler', () => {
     })
 })
 
-describe('markdown <A> component — remote session file download', () => {
-    it('downloads an explicit local artifact through the authenticated API instead of navigating to the Hub path', async () => {
-        const filePath = '/Users/liuxin/project/outputs/周报.xlsx'
-        const getSessionFileBlob = vi.fn(async () => new Blob(['xlsx']))
-        const createObjectUrl = vi.fn(() => 'blob:hapi-download')
-        const revokeObjectUrl = vi.fn()
-        Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
-        Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
-        const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
-        const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
-
-        renderFileA({
-            href: `hapi-file-download:${encodeURIComponent(filePath)}`,
-            children: 'Download Excel'
-        }, { getSessionFileBlob })
-
-        const link = screen.getByRole('link', { name: 'Download Excel' })
-        expect(link.getAttribute('href')).toContain('/sessions/session-1/file?path=')
-        fireEvent.click(link)
-
-        await waitFor(() => {
-            expect(getSessionFileBlob).toHaveBeenCalledWith('session-1', filePath)
-        })
-        expect(createObjectUrl).toHaveBeenCalled()
-        expect(anchorClick).toHaveBeenCalled()
-        expect(revokeObjectUrl).not.toHaveBeenCalled()
-        expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 1000)
-
-        for (const result of setTimeoutSpy.mock.results) {
-            if (result.type === 'return') window.clearTimeout(result.value)
-        }
-        setTimeoutSpy.mockRestore()
-    })
-})
-
 // ── relative / no-scheme hrefs — fail-closed (#1452) ─────────────────────────
 //
 // Finding 2 (historical): denyOnlyTransform passes relative hrefs through, but
@@ -479,6 +420,51 @@ describe('markdown <A> component — fail-closed path-like hrefs (#1452)', () =>
         renderA({ href: '/settings', children: 'settings' }, chatContext())
         expect(document.querySelector('a')!.getAttribute('href')).toBe('/settings')
         expect(document.querySelector('.aui-md-a-inert')).toBeNull()
+    })
+})
+
+// ── "open external links in a new tab" setting (Settings > Display > Links) ──
+
+describe('markdown <A> component — open external links in new tab setting', () => {
+    it('defaults to no explicit target on an external http(s) link', () => {
+        renderA({ href: 'https://example.com', children: 'link' })
+        expect(document.querySelector('a')!.getAttribute('target')).toBeNull()
+    })
+
+    it('forces target="_blank" + rel="noopener noreferrer" when the setting is enabled', () => {
+        localStorage.setItem(OPEN_NEW_TAB_STORAGE_KEY, 'true')
+        renderA({ href: 'https://example.com', children: 'link' })
+        const link = document.querySelector('a')!
+        expect(link.getAttribute('target')).toBe('_blank')
+        expect(link.getAttribute('rel')).toBe('noopener noreferrer')
+    })
+
+    it('does not force target on a relative/SPA href even when the setting is enabled', () => {
+        localStorage.setItem(OPEN_NEW_TAB_STORAGE_KEY, 'true')
+        renderA({ href: '/settings', children: 'settings' }, chatContext())
+        expect(document.querySelector('a')!.getAttribute('target')).toBeNull()
+    })
+
+    it('does not force target on a non-http(s) IANA scheme (mailto) even when enabled', () => {
+        localStorage.setItem(OPEN_NEW_TAB_STORAGE_KEY, 'true')
+        renderA({ href: 'mailto:a@b.com', children: 'mail' })
+        expect(document.querySelector('a')!.getAttribute('target')).toBeNull()
+    })
+
+    it('updates an already-rendered link when the setting changes via storage event (settings page in another tab, or Settings > Display in this one after context refactor)', () => {
+        renderA({ href: 'https://example.com', children: 'link' })
+        expect(document.querySelector('a')!.getAttribute('target')).toBeNull()
+
+        act(() => {
+            localStorage.setItem(OPEN_NEW_TAB_STORAGE_KEY, 'true')
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: OPEN_NEW_TAB_STORAGE_KEY,
+                newValue: 'true',
+                storageArea: localStorage,
+            }))
+        })
+
+        expect(document.querySelector('a')!.getAttribute('target')).toBe('_blank')
     })
 })
 

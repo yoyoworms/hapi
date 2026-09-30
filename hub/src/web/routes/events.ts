@@ -47,8 +47,8 @@ export function createEventsRoutes(
         }
 
         const query = c.req.query()
-        let all = parseBoolean(query.all)
-        const requestedSessionId = parseOptionalId(query.sessionId)
+        const all = parseBoolean(query.all)
+        const sessionId = parseOptionalId(query.sessionId)
         const machineId = parseOptionalId(query.machineId)
         const subscriptionId = randomUUID()
         const visibility = parseVisibility(query.visibility)
@@ -59,28 +59,15 @@ export function createEventsRoutes(
         const resumeFrom = parseOptionalId(c.req.header('Last-Event-ID'))
             ?? parseOptionalId(query.lastEventId)
         const namespace = c.get('namespace')
-        const sessionScope = c.get('sessionScope')
-        let resolvedSessionId = requestedSessionId
+        let resolvedSessionId = sessionId
 
-        // Share-link JWTs are deliberately restricted to one session. The web
-        // app normally opens a namespace-wide `all=true` stream as well as a
-        // selected-session stream, so relying on the client to request the safe
-        // shape would leak every session event in the namespace to a recipient.
-        if (sessionScope) {
-            if (all || machineId || (requestedSessionId && requestedSessionId !== sessionScope)) {
-                return c.json({ error: 'Not permitted for a shared session' }, 403)
-            }
-            all = false
-            resolvedSessionId = sessionScope
-        }
-
-        if (resolvedSessionId || machineId) {
+        if (sessionId || machineId) {
             const engine = getSyncEngine()
             if (!engine) {
                 return c.json({ error: 'Not connected' }, 503)
             }
-            if (resolvedSessionId) {
-                const sessionResult = requireSession(c, engine, resolvedSessionId)
+            if (sessionId) {
+                const sessionResult = requireSession(c, engine, sessionId)
                 if (sessionResult instanceof Response) {
                     return sessionResult
                 }
@@ -169,12 +156,7 @@ export function createEventsRoutes(
         }
 
         const namespace = c.get('namespace')
-        const updated = tracker.setVisibility(
-            parsed.data.subscriptionId,
-            namespace,
-            parsed.data.visibility,
-            c.get('sessionScope')
-        )
+        const updated = tracker.setVisibility(parsed.data.subscriptionId, namespace, parsed.data.visibility)
         if (!updated) {
             return c.json({ error: 'Subscription not found' }, 404)
         }

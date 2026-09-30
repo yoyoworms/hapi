@@ -2,7 +2,7 @@ import type { ClientToServerEvents } from '@hapi/protocol'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import type { CopilotAgentMode } from '@hapi/protocol'
-import type { AgentAccountStatus, AgentState, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
+import type { AgentState, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
 import { getReasoningStreamId, isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
 import type { Store, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
@@ -28,19 +28,6 @@ type SessionAlivePayload = {
     copilotAgentMode?: CopilotAgentMode
 }
 
-type SessionRuntimeSource = {
-    runtimeId?: string
-    runtimeGeneration?: number
-    /** Hub time minus the CLI wall clock, captured during the socket handshake. */
-    clockOffset?: number
-}
-
-type AuthoritativeSessionRuntimeSource = {
-    runtimeId: string
-    runtimeGeneration: number
-    clockOffset?: number
-}
-
 type SessionEndPayload = {
     sid: string
     time: number
@@ -52,13 +39,9 @@ type SessionReadyPayload = {
     time: number
 }
 
-type ResolveSessionAccess = (sessionId: string) => AccessResult<StoredSession>
+type ResolveSessionAccess = (sessionId: string, opts?: { fresh?: boolean }) => AccessResult<StoredSession>
 
 type EmitAccessError = (scope: 'session' | 'machine', id: string, reason: AccessErrorReason) => void
-
-// Hub-lifetime dedupe for completion edges. Kept outside the socket handler so
-// Socket.IO reconnects cannot replay the same `ready` event as new activity.
-const readyActivityDeliveredBySession = new Set<string>()
 
 type UpdateMetadataHandler = ClientToServerEvents['update-metadata']
 type UpdateStateHandler = ClientToServerEvents['update-state']
@@ -85,165 +68,6 @@ const updateStateSchema = z.object({
     agentState: z.unknown().nullable()
 })
 
-function getAgentEventType(content: unknown): string | null {
-    if (!content || typeof content !== 'object') {
-        return null
-    }
-
-    const record = content as {
-        type?: unknown
-        role?: unknown
-        content?: {
-            type?: unknown
-            data?: {
-                type?: unknown
-            }
-        }
-        data?: {
-            type?: unknown
-        }
-    }
-
-    if (record.type === 'event' && record.data && typeof record.data.type === 'string') {
-        return record.data.type
-    }
-
-    if (
-        record.role === 'agent'
-        && record.content?.type === 'event'
-        && record.content.data
-        && typeof record.content.data.type === 'string'
-    ) {
-        return record.content.data.type
-    }
-
-    return null
-}
-
-function getAuthoritativeRuntimeSource(socket: CliSocketWithData): AuthoritativeSessionRuntimeSource | null {
-    const runtimeData = socket.data
-    if (
-        !runtimeData
-        || typeof runtimeData.runtimeId !== 'string'
-        || !Number.isSafeInteger(runtimeData.runtimeGeneration)
-    ) {
-        return null
-    }
-    return {
-        runtimeId: runtimeData.runtimeId,
-        runtimeGeneration: runtimeData.runtimeGeneration as number,
-        ...(typeof runtimeData.clockOffset === 'number' && Number.isFinite(runtimeData.clockOffset)
-            ? { clockOffset: runtimeData.clockOffset }
-            : {})
-    }
-}
-
-function getDurableRuntimeId(session: Pick<StoredSession, 'metadata'>): string | null {
-    if (!session.metadata || typeof session.metadata !== 'object' || Array.isArray(session.metadata)) {
-        return null
-    }
-    const runtimeId = (session.metadata as Record<string, unknown>).runtimeId
-    return typeof runtimeId === 'string' && runtimeId.length > 0 ? runtimeId : null
-}
-
-function hasLifecycleState(metadata: unknown, lifecycleState: 'running' | 'archived'): boolean {
-    return Boolean(
-        metadata
-        && typeof metadata === 'object'
-        && !Array.isArray(metadata)
-        && (metadata as Record<string, unknown>).lifecycleState === lifecycleState
-    )
-}
-
-function isCurrentRuntimeSocket(socket: CliSocketWithData, session: Pick<StoredSession, 'metadata'>): boolean {
-    const durableRuntimeId = getDurableRuntimeId(session)
-    if (durableRuntimeId === null) {
-        return true
-    }
-    if (socket.data?.runtimeId !== durableRuntimeId) {
-        return false
-    }
-    const lifecycleState = session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
-        ? (session.metadata as Record<string, unknown>).lifecycleState
-        : null
-    return lifecycleState !== 'archived'
-}
-
-function isLegacyReopenMetadata(current: StoredSession, metadata: unknown): boolean {
-    if (
-        !current.metadata
-        || typeof current.metadata !== 'object'
-        || Array.isArray(current.metadata)
-        || !metadata
-        || typeof metadata !== 'object'
-        || Array.isArray(metadata)
-    ) {
-        return false
-    }
-    if (current.active) {
-        return false
-    }
-    const currentLifecycle = (current.metadata as Record<string, unknown>).lifecycleState
-    const currentLifecycleSince = (current.metadata as Record<string, unknown>).lifecycleStateSince
-    const nextLifecycle = (metadata as Record<string, unknown>).lifecycleState
-    const nextLifecycleSince = (metadata as Record<string, unknown>).lifecycleStateSince
-    return currentLifecycle === 'archived'
-        && nextLifecycle === 'running'
-        && typeof currentLifecycleSince === 'number'
-        && Number.isFinite(currentLifecycleSince)
-        && typeof nextLifecycleSince === 'number'
-        && Number.isFinite(nextLifecycleSince)
-        && nextLifecycleSince > currentLifecycleSince
-}
-
-function isLegacyPendingRuntimeClaim(current: StoredSession, metadata: unknown): boolean {
-    if (getDurableRuntimeId(current)) {
-        return isLegacyReopenMetadata(current, metadata)
-    }
-    if (
-        current.active
-        || !metadata
-        || typeof metadata !== 'object'
-        || Array.isArray(metadata)
-    ) {
-        return false
-    }
-    const next = metadata as Record<string, unknown>
-    if (
-        next.lifecycleState !== 'running'
-        || typeof next.lifecycleStateSince !== 'number'
-        || !Number.isFinite(next.lifecycleStateSince)
-    ) {
-        return false
-    }
-    const currentSince = current.metadata && typeof current.metadata === 'object' && !Array.isArray(current.metadata)
-        ? (current.metadata as Record<string, unknown>).lifecycleStateSince
-        : undefined
-    return typeof currentSince !== 'number'
-        || !Number.isFinite(currentSince)
-        || next.lifecycleStateSince > currentSince
-}
-
-function attachRuntimeOwnershipMetadata(
-    metadata: unknown,
-    runtimeSource: AuthoritativeSessionRuntimeSource | null
-): unknown {
-    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-        return metadata
-    }
-    const record = metadata as Record<string, unknown>
-    if (runtimeSource) {
-        return { ...record, runtimeId: runtimeSource.runtimeId }
-    }
-    if (record.lifecycleState === 'running') {
-        // A legacy CLI cannot prove ownership after Hub restart. Explicitly
-        // clear a carried-forward id when it reopens so future events stay on
-        // the legacy timestamp/lifecycle ordering path.
-        return { ...record, runtimeId: null }
-    }
-    return metadata
-}
-
 const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation'] as const
 
 function preserveHubOwnedMetadata(incoming: unknown, current: unknown): unknown {
@@ -263,39 +87,14 @@ export type SessionHandlersDeps = {
     store: Store
     resolveSessionAccess: ResolveSessionAccess
     emitAccessError: EmitAccessError
-    /** False after Socket.IO has closed this transport. Guards already queued
-     * callbacks from an evicted overlapping connection. */
-    isSessionTransportActive?: () => boolean
-    /** True after this transport has proved durable/timestamp ownership. Unlike
-     * the publish gate, this remains true through its own archive→end flow. */
-    isSessionRuntimeOwned?: (sessionId: string) => boolean
-    /** Socket-local ownership gate. Pending/superseded session sockets may
-     * stay connected so a valid newer lifecycle can claim the row, but they
-     * must not publish output or consume queued prompts before activation. */
-    isSessionRuntimeActive?: (sessionId: string) => boolean
-    onSessionAlive?: (payload: SessionAlivePayload & SessionRuntimeSource) => boolean | void
+    onSessionAlive?: (payload: SessionAlivePayload) => void
     onSessionReady?: (payload: SessionReadyPayload) => void
-    onSessionEnd?: (payload: SessionEndPayload & SessionRuntimeSource) => boolean
-    onSessionUsage?: (payload: { sid: string; totalCostUsd: number; totalInputTokens: number; totalOutputTokens: number }) => void
-    onSessionAccountStatus?: (payload: { sid: string; accountStatus: AgentAccountStatus }) => void
-    onSessionMetadataUpdated?: (payload: {
-        sid: string
-        namespace: string
-        metadata: unknown
-        runtimeId?: string
-        runtimeGeneration?: number
-        clockOffset?: number
-    }) => void
-    onSessionMetadataUpdateAllowed?: (payload: {
-        sid: string
-        metadata: unknown
-        runtimeId: string
-        runtimeGeneration: number
-        clockOffset?: number
-    }) => boolean
+    onSessionEnd?: (payload: SessionEndPayload) => void
     onWebappEvent?: (event: SyncEvent) => void
     onBackgroundTaskDelta?: (sessionId: string, delta: { started: number; completed: number }) => void
     onSessionActivity?: (sessionId: string, updatedAt: number) => void
+    /** tiann/hapi#1820: any message is agent progress, either direction. */
+    onAgentProgress?: (sessionId: string, at: number) => void
     /** Delegates session-end immediate-queue sweep to the MessageService layer. */
     onSweepImmediateQueued?: (sessionId: string, now: number) => void
     /** Drops the queued-thinking grace so synchronous CLI handlers (e.g. slash
@@ -304,19 +103,35 @@ export type SessionHandlersDeps = {
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, isSessionTransportActive, isSessionRuntimeOwned, isSessionRuntimeActive, onSessionAlive, onSessionReady, onSessionEnd, onSessionUsage, onSessionAccountStatus, onSessionMetadataUpdated, onSessionMetadataUpdateAllowed, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed } = deps
 
-    const canPublishSessionRuntime = (sessionId: string, session: StoredSession): boolean => {
-        return (isSessionRuntimeActive?.(sessionId) ?? true)
-            && isCurrentRuntimeSocket(socket, session)
-    }
+    socket.on('native-queue-message', data => {
+        const parsed = z.object({ sid: z.string(), localId: z.string().min(1), text: z.string().nullable() }).safeParse(data)
+        if (!parsed.success) return
+        const { sid, localId, text } = parsed.data
+        // Fresh resolve: the capabilities gate below decides whether the
+        // queue ledger is written, and capabilities can change via metadata
+        // writes (e.g. a merge copying capabilities onto this session) — a
+        // memo snapshot could silently drop or wrongly accept the entry.
+        // Queued input is human-paced, not a stream hot path.
+        const access = resolveSessionAccess(sid, { fresh: true })
+        if (!access.ok) { emitAccessError('session', sid, access.reason); return }
+        const metadata = access.value.metadata as Metadata | null
+        if (!metadata?.capabilities?.concurrentClients) return
+        if (text === null) {
+            const prior = store.messages.lookupQueuedMessage(sid, localId)
+            if ('resolvedId' in prior && store.messages.deleteQueuedMessageById(sid, localId)) {
+                onWebappEvent?.({ type: 'message-cancelled', sessionId: sid, messageId: prior.resolvedId, localId })
+            }
+        } else {
+            const message = store.messages.syncNativeQueuedMessage(sid, localId, text)
+            onWebappEvent?.({ type: 'message-received', sessionId: sid, message })
+        }
+    })
 
-    // Track recently seen content uuids to deduplicate messages from Socket.IO reconnect buffer
-    const recentContentUuids = new Set<string>()
-    socket.on('message', (data: unknown, ack?: () => void) => {
+    socket.on('message', (data: unknown) => {
         const parsed = messageSchema.safeParse(data)
         if (!parsed.success) {
-            ack?.()
             return
         }
 
@@ -340,109 +155,10 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
         const session = sessionAccess.value
 
-        // A session room may briefly contain a superseded socket while a new
-        // runtime claim is being reconciled. Never accept output from that
-        // socket: otherwise two runners can persist duplicate replies and a
-        // legacy orphan can emit a second `ready` edge for the same prompt.
-        if (!canPublishSessionRuntime(sid, session)) {
-            ack?.()
-            return
-        }
-
-        // Extract usage data from event messages before dropping them
-        const _c = content as any
-        if (_c?.role === 'agent' && _c?.content?.type === 'event' && _c?.content?.data?.type === 'usage') {
-            const usage = _c.content.data
-            onSessionUsage?.({
-                sid,
-                totalCostUsd: usage.totalCostUsd,
-                totalInputTokens: usage.totalInputTokens,
-                totalOutputTokens: usage.totalOutputTokens
-            })
-            ack?.()
-            return
-        }
-        if (_c?.role === 'agent' && _c?.content?.type === 'event' && _c?.content?.data?.type === 'account-status') {
-            const accountStatus = _c.content.data.accountStatus
-            if (accountStatus && typeof accountStatus === 'object') {
-                onSessionAccountStatus?.({ sid, accountStatus })
-            }
-            ack?.()
-            return
-        }
-        // Internal event messages are not user-visible — but 'ready' marks a
-        // completed turn and must be reported as session activity (upstream #524).
-        // We emit the webapp event + record activity, then short-circuit so the
-        // event is NOT persisted to the store (fork optimization).
-        const agentEventType = getAgentEventType(_c)
-        if (agentEventType === 'ready') {
-            if (readyActivityDeliveredBySession.has(sid)) {
-                // Duplicate ready from Socket.IO replay/reconnect: it is not new
-                // user-visible information and must not create another unread.
-                ack?.()
-                return
-            }
-            readyActivityDeliveredBySession.add(sid)
-            const now = Date.now()
-            onWebappEvent?.({
-                type: 'message-received',
-                sessionId: sid,
-                message: {
-                    id: randomUUID(),
-                    seq: null,
-                    localId: null,
-                    content,
-                    createdAt: now
-                }
-            })
-            // Completion is the attention edge for inactive viewers. `ready`
-            // is deliberately not persisted as a chat row, so this explicit
-            // activity touch is what advances Session.updatedAt and produces
-            // the sidebar unread marker once thinking becomes false.
-            onSessionActivity?.(sid, now)
-            ack?.()
-            return
-        }
-        // `message` events carry user-visible launcher failures (for example,
-        // exhausted Codex retries). Persist them like normal chat messages.
-        if (
-            agentEventType !== 'message'
-            && (_c?.type === 'event' || (_c?.role === 'agent' && _c?.content?.type === 'event'))
-        ) {
-            ack?.()
-            return
-        }
-        const INTERNAL_TYPES = ['usage', 'ready', 'rate_limit_event', 'rate_limit_info']
-        if (typeof _c?.type === 'string' && INTERNAL_TYPES.includes(_c.type)) {
-            ack?.()
-            return
-        }
-        if (_c?.role === 'agent' && typeof _c?.content?.type === 'string' && INTERNAL_TYPES.includes(_c.content.type)) {
-            ack?.()
-            return
-        }
-
-        // Upstream addition: drop redundant goal-status events.
         if (isRedundantGoalStatusEventContent(content)) {
-            ack?.()
             return
         }
 
-        // Deduplicate by content uuid (prevents duplicates from Socket.IO reconnect buffer)
-        const _uuid = _c?.content?.data?.uuid
-        if (typeof _uuid === 'string') {
-            const dedupKey = `${sid}:${_uuid}`
-            if (recentContentUuids.has(dedupKey)) {
-                ack?.()
-                return
-            }
-            recentContentUuids.add(dedupKey)
-            // Cap set size to prevent memory leak
-            if (recentContentUuids.size > 5000) {
-                const first = recentContentUuids.values().next().value
-                if (first) recentContentUuids.delete(first)
-            }
-        }
         const msg = store.messages.addMessage(sid, content, localId, undefined, createdAt)
 
         // A reasoning stream arrives as a series of growing snapshots under one
@@ -456,6 +172,11 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (reasoningStreamId) {
             store.messages.deleteLiveReasoningSnapshots(sid, reasoningStreamId, msg.id)
         }
+
+        // tiann/hapi#1820: every stored message proves the agent is doing
+        // something, so it refreshes the keepalive-idle clock. Only human
+        // turns additionally bump `updatedAt` (list ordering).
+        onAgentProgress?.(sid, msg.createdAt)
 
         if (shouldRecordSessionActivity(content)) {
             onSessionActivity?.(sid, msg.createdAt)
@@ -540,8 +261,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 invokedAt: msg.invokedAt
             }
         })
-
-        ack?.()
     })
 
     const handleUpdateMetadata: UpdateMetadataHandler = (data, cb) => {
@@ -552,77 +271,19 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         const { sid, metadata, expectedVersion } = parsed.data
-        const sessionAccess = resolveSessionAccess(sid)
+        // Fresh resolve: preserveHubOwnedMetadata below merges against
+        // sessionAccess.value.metadata, so the base must be the live row.
+        // A memo-stale base would drop a concurrently-set hub-owned key or
+        // resurrect a concurrently-cleared one in this very write.
+        const sessionAccess = resolveSessionAccess(sid, { fresh: true })
         if (!sessionAccess.ok) {
             cb({ result: 'error', reason: sessionAccess.reason })
-            return
-        }
-        if (!(isSessionTransportActive?.() ?? true)) {
-            cb({ result: 'error' })
-            return
-        }
-
-        const runtimeSource = getAuthoritativeRuntimeSource(socket)
-        const current = store.sessions.getSessionByNamespace(sid, sessionAccess.value.namespace)
-        const socketOwnsRuntime = isSessionRuntimeOwned?.(sid)
-            ?? (isSessionRuntimeActive?.(sid) ?? true)
-        if (
-            current
-            && !socketOwnsRuntime
-            && (runtimeSource
-                ? !hasLifecycleState(metadata, 'running')
-                : !isLegacyPendingRuntimeClaim(current, metadata))
-        ) {
-            // Pending sockets may only prove ownership with a `running`
-            // transition. In particular, a buffered end/archive from a runner
-            // that never won the room must not terminate the current owner.
-            cb({
-                result: 'success',
-                version: current.metadataVersion,
-                metadata: current.metadata
-            })
-            return
-        }
-        if (
-            current
-            && getDurableRuntimeId(current)
-            && !runtimeSource
-            && !isLegacyReopenMetadata(current, metadata)
-        ) {
-            // Legacy clients cannot mutate metadata owned by a live modern
-            // runtime. Acknowledge with the durable snapshot so an old client
-            // converges instead of retrying and clearing runtimeId.
-            cb({
-                result: 'success',
-                version: current.metadataVersion,
-                metadata: current.metadata
-            })
-            return
-        }
-        const metadataWithRuntime = attachRuntimeOwnershipMetadata(metadata, runtimeSource)
-        if (runtimeSource && onSessionMetadataUpdateAllowed && !onSessionMetadataUpdateAllowed({
-            sid,
-            metadata: metadataWithRuntime,
-            ...runtimeSource
-        })) {
-            const current = store.sessions.getSessionByNamespace(sid, sessionAccess.value.namespace)
-            if (!current) {
-                cb({ result: 'error' })
-                return
-            }
-            // Acknowledge with the durable value so the ended/stale client
-            // converges without retrying a write that can no longer be valid.
-            cb({
-                result: 'success',
-                version: current.metadataVersion,
-                metadata: current.metadata
-            })
             return
         }
 
         const result = store.sessions.updateSessionMetadata(
             sid,
-            preserveHubOwnedMetadata(metadataWithRuntime, current?.metadata ?? sessionAccess.value.metadata),
+            preserveHubOwnedMetadata(metadata, sessionAccess.value.metadata),
             expectedVersion,
             sessionAccess.value.namespace
         )
@@ -635,12 +296,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         if (result.result === 'success') {
-            onSessionMetadataUpdated?.({
-                sid,
-                namespace: sessionAccess.value.namespace,
-                metadata: result.value,
-                ...(runtimeSource ?? {})
-            })
             const stored = store.sessions.getSession(sid)
             const update = {
                 id: randomUUID(),
@@ -692,15 +347,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
 
-        if (!canPublishSessionRuntime(sid, sessionAccess.value)) {
-            cb({
-                result: 'success',
-                version: sessionAccess.value.agentStateVersion,
-                agentState: sessionAccess.value.agentState
-            })
-            return
-        }
-
         const result = store.sessions.updateSessionAgentState(
             sid,
             agentState,
@@ -746,16 +392,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number') {
             return
         }
-        if (data.thinking === true) {
-            readyActivityDeliveredBySession.delete(data.sid)
-        }
         const sessionAccess = resolveSessionAccess(data.sid)
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
             return
         }
-        const runtimeSource = getAuthoritativeRuntimeSource(socket)
-        onSessionAlive?.({ ...data, ...(runtimeSource ?? {}) })
+        onSessionAlive?.(data)
     })
 
     socket.on('session-ready', (data: SessionReadyPayload) => {
@@ -765,9 +407,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         const sessionAccess = resolveSessionAccess(data.sid)
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
-            return
-        }
-        if (!canPublishSessionRuntime(data.sid, sessionAccess.value)) {
             return
         }
         onSessionReady?.(data)
@@ -786,21 +425,15 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             emitAccessError('session', data.sid, sessionAccess.reason)
             return
         }
-        if (!canPublishSessionRuntime(data.sid, sessionAccess.value)) {
-            return
-        }
         const invokedAt = Date.now()
         let sessionUpdatedAt: number
-        let todosCleared: boolean
         try {
-            const recorded = store.recordMessagesConsumed(
+            sessionUpdatedAt = store.recordMessagesConsumed(
                 data.sid,
                 localIds,
                 invokedAt,
                 sessionAccess.value.namespace
             )
-            sessionUpdatedAt = recorded.updatedAt
-            todosCleared = recorded.todosCleared
         } catch (err) {
             console.error('recordMessagesConsumed failed', err)
             return
@@ -819,9 +452,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         // shift and `backend.prompt` start.
         if (data.clearQueuedThinkingGrace === true) {
             onMessagesConsumed?.(data.sid)
-        }
-        if (todosCleared) {
-            onWebappEvent?.({ type: 'session-updated', sessionId: data.sid })
         }
         // Emit only after the DB transaction succeeds. This is an ACK-level
         // batch contract, so preserve its original timestamp even when IDs are
@@ -892,22 +522,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number') {
             return
         }
-        readyActivityDeliveredBySession.delete(data.sid)
-        const sessionAccess = resolveSessionAccess(data.sid)
+        // Fresh resolve: the shared-Codex capability gate below decides
+        // whether the queue ledger is swept, and capabilities can change via
+        // metadata writes. Session end fires once per session — not a hot
+        // path — so read the live row rather than a memo snapshot.
+        const sessionAccess = resolveSessionAccess(data.sid, { fresh: true })
         if (!sessionAccess.ok) {
             emitAccessError('session', data.sid, sessionAccess.reason)
-            return
-        }
-
-        let accepted = true
-        try {
-            const runtimeSource = getAuthoritativeRuntimeSource(socket)
-            accepted = onSessionEnd?.({ ...data, ...(runtimeSource ?? {}) }) ?? true
-        } catch (err) {
-            console.error('session-end reconciliation failed', err)
-            accepted = false
-        }
-        if (!accepted) {
             return
         }
 
@@ -923,12 +544,18 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         // rows after the CLI exits — there is no longer an ack path, so they would
         // stay queued forever.  The 5-second tick in syncEngine.expireInactive
         // emits scheduled rows when they mature, regardless of session end.
-        if (data.reason !== 'cleared') {
+        // Shared Codex execution exit is suspension, not consumption. Its native
+        // queue ledger proves which messages can be replayed on ordinary resume.
+        // Never stamp pending/uncertain input as executed, including on archive.
+        const sharedCodex = (sessionAccess.value.metadata as Metadata | null)?.capabilities?.concurrentClients
+        if (data.reason !== 'cleared' && !sharedCodex) {
             try {
                 onSweepImmediateQueued?.(data.sid, Date.now())
             } catch (err) {
                 console.error('session-end sweep failed', err)
             }
         }
+
+        onSessionEnd?.(data)
     })
 }

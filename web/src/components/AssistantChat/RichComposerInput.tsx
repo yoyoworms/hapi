@@ -66,7 +66,6 @@ type ResolveSessionMentionTooltip = (
 type Props = {
     value: string
     disabled?: boolean
-    readOnly?: boolean
     placeholder?: string
     className?: string
     autoFocus?: boolean
@@ -673,7 +672,6 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
     {
         value,
         disabled = false,
-        readOnly = false,
         placeholder,
         className,
         autoFocus = false,
@@ -779,9 +777,6 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
         flushSerializedText: () => {
             const root = rootRef.current
             if (!root) return value
-            // Explicit send/park is a composition boundary even when an IME
-            // omitted compositionend before the toolbar activation.
-            composingRef.current = false
             const segments = segmentsFromEditor(root)
             const serialized = serializeComposerSegments(segments)
             lastEmittedRef.current = serialized
@@ -904,38 +899,16 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
         clearMentionTooltip()
     }, [clearMentionTooltip])
 
-    const handleInput = useCallback((e: ReactFormEvent<HTMLDivElement>) => {
+    const handleInput = useCallback((_e: ReactFormEvent<HTMLDivElement>) => {
         clearMentionTooltip()
-        if (readOnly) {
-            composingRef.current = false
-            syncFromValue(value)
-            return
-        }
-        const nativeIsComposing = (e.nativeEvent as InputEvent).isComposing === true
-        // Some mobile/third-party IMEs drop compositionend. Trust the next
-        // native non-composing input to release our guard, matching
-        // assistant-ui's textarea behavior, or the editor stays stuck forever.
-        if (composingRef.current && !nativeIsComposing) {
-            composingRef.current = false
-        }
-        if (nativeIsComposing || composingRef.current) {
+        if (composingRef.current) {
             const root = rootRef.current
             if (root) setDomIsEmpty(editorDomIsEmpty(root))
             return
         }
         onEdit?.()
         emitFromDom()
-    }, [clearMentionTooltip, emitFromDom, onEdit, readOnly, syncFromValue, value])
-
-    const flushPendingComposition = useCallback(() => {
-        if (!composingRef.current) return
-        // Blur/refocus is another reliable composition boundary for IMEs that
-        // omit compositionend. Commit the live contenteditable DOM before any
-        // controlled value can repaint it with the pre-composition draft.
-        composingRef.current = false
-        onEdit?.()
-        emitFromDom()
-    }, [emitFromDom, onEdit])
+    }, [clearMentionTooltip, emitFromDom, onEdit])
 
     const insertPlainClipboardText = useCallback((text: string) => {
         const root = rootRef.current
@@ -992,22 +965,17 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
     ])
 
     const handlePaste = useCallback((e: ReactClipboardEvent<HTMLDivElement>) => {
-        if (readOnly) {
-            e.preventDefault()
+        const files = Array.from(e.clipboardData?.files ?? [])
+        const hasImage = files.some((file) => file.type.startsWith('image/'))
+        if (hasImage) {
+            onPaste?.(e)
             return
         }
-        // Give the parent attachment handler first refusal. In particular,
-        // contenteditable/Safari can expose a pasted image only through
-        // clipboardData.items rather than clipboardData.files. The parent
-        // prevents default synchronously when it consumes an attachment.
-        onPaste?.(e)
-        if (e.defaultPrevented) return
-
         // Contenteditable default paste inserts HTML; nested blocks collapse in
         // segmentsFromEditor without depth-aware breaks. Force plain text.
         e.preventDefault()
         insertPlainClipboardText(e.clipboardData?.getData('text/plain') ?? '')
-    }, [insertPlainClipboardText, onPaste, readOnly])
+    }, [insertPlainClipboardText, onPaste])
 
     const applyBackwardDelete = useCallback((
         root: HTMLElement,
@@ -1032,10 +1000,6 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
         const root = rootRef.current
         if (!root) return
         const handleBeforeInput = (event: InputEvent) => {
-            if (readOnly) {
-                if (event.cancelable) event.preventDefault()
-                return
-            }
             if (
                 event.inputType !== 'deleteContentBackward'
                 || event.isComposing
@@ -1053,7 +1017,7 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
         }
         root.addEventListener('beforeinput', handleBeforeInput)
         return () => root.removeEventListener('beforeinput', handleBeforeInput)
-    }, [applyBackwardDelete, readOnly])
+    }, [applyBackwardDelete])
 
     // No onDrop: intercepting without caretRangeFromPoint appends at EOF / no-ops
     // in-editor moves. Native CE drop + plaintext-only / paste path is enough for #1215.
@@ -1101,16 +1065,7 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
     }, [domIsEmpty, placeholder])
 
     const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
-        if (readOnly) {
-            return
-        }
-        if (
-            e.nativeEvent.isComposing
-            // WebKit and some third-party IMEs report the confirmation key as
-            // keyCode 229 even when isComposing is already false.
-            || e.nativeEvent.keyCode === 229
-            || composingRef.current
-        ) {
+        if (e.nativeEvent.isComposing || composingRef.current) {
             return
         }
         if (e.key === 'Backspace' && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -1151,7 +1106,6 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
         emitFromDom,
         onEdit,
         onKeyDown,
-        readOnly,
     ])
 
     return (
@@ -1172,7 +1126,6 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
                 aria-multiline="true"
                 aria-label={placeholder}
                 aria-disabled={disabled || undefined}
-                aria-readonly={readOnly || undefined}
                 // Prefer plaintext-only when the engine accepts it (Chrome/Safari/FF136+);
                 // handlePaste still forces text/plain for engines that keep HTML paste.
                 contentEditable={contentEditableValue(disabled)}
@@ -1180,36 +1133,17 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, Props>(func
                 data-testid="rich-composer-input"
                 className={`${className ?? ''}${disabled ? ' cursor-not-allowed opacity-50' : ''}`}
                 onInput={handleInput}
-                onFocus={(e) => {
-                    flushPendingComposition()
-                    onFocus?.(e)
-                }}
-                onBlur={flushPendingComposition}
+                onFocus={onFocus}
                 onKeyDown={handleKeyDown}
                 onPointerOver={handlePointerOver}
                 onPointerLeave={handlePointerLeave}
                 onCopy={(e) => handleCopyOrCut(e, false)}
-                onCut={(e) => {
-                    if (readOnly) {
-                        e.preventDefault()
-                        return
-                    }
-                    handleCopyOrCut(e, true)
-                }}
+                onCut={(e) => handleCopyOrCut(e, true)}
                 onPaste={handlePaste}
-                onDrop={(e) => {
-                    if (readOnly) e.preventDefault()
-                }}
                 onCompositionStart={() => {
-                    if (readOnly) return
                     composingRef.current = true
                 }}
                 onCompositionEnd={() => {
-                    if (readOnly) {
-                        composingRef.current = false
-                        syncFromValue(value)
-                        return
-                    }
                     composingRef.current = false
                     onEdit?.()
                     emitFromDom()

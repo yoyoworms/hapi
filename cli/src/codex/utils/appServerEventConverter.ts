@@ -1,5 +1,4 @@
 import { INCLUSIVE_INPUT_TOKEN_USAGE_MARKER } from '@hapi/protocol/usage';
-import { normalizeAgentMessagePhase, unwrapCodexResponseStepEnvelope } from '@hapi/protocol/messages';
 import { logger } from '@/ui/logger';
 
 type ConvertedEvent = {
@@ -24,198 +23,6 @@ function asBoolean(value: unknown): boolean | null {
 
 function asNumber(value: unknown): number | null {
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function asNumberLike(value: unknown): number | null {
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value === 'string' && value.trim().length > 0) {
-        const parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : null;
-    }
-    return null;
-}
-
-function extractAccountLabel(params: Record<string, unknown>): string | null {
-    const account = asRecord(params.account) ?? asRecord(params.user) ?? asRecord(params.profile);
-    return asString(params.email ?? params.accountEmail ?? params.account_email ?? params.login ?? params.username)
-        ?? (account
-            ? asString(account.email ?? account.accountEmail ?? account.account_email ?? account.login ?? account.username ?? account.name)
-            : null);
-}
-
-function normalizeResetAt(value: unknown): number | null {
-    if (typeof value === 'string') {
-        const parsed = Date.parse(value);
-        return Number.isFinite(parsed) ? parsed : null;
-    }
-    const numeric = asNumberLike(value);
-    if (numeric === null) return null;
-    return numeric > 10_000_000_000 ? numeric : numeric * 1000;
-}
-
-function extractRemainingPercent(limit: Record<string, unknown>): number | null {
-    const direct = asNumberLike(
-        limit.remainingPercent
-        ?? limit.remaining_percent
-        ?? limit.percentRemaining
-        ?? limit.percent_remaining
-        ?? limit.remainingPct
-        ?? limit.remaining_pct
-    );
-    if (direct !== null) return Math.max(0, Math.min(100, direct > 1 ? direct : direct * 100));
-
-    const utilization = asNumberLike(limit.utilization ?? limit.usedPercent ?? limit.used_percent);
-    if (utilization !== null) {
-        const used = utilization > 1 ? utilization : utilization * 100;
-        return Math.max(0, Math.min(100, 100 - used));
-    }
-
-    const remaining = asNumberLike(limit.remaining ?? limit.remainingTokens ?? limit.remaining_tokens);
-    const total = asNumberLike(limit.limit ?? limit.total ?? limit.max ?? limit.quota);
-    if (remaining !== null && total !== null && total > 0) {
-        return Math.max(0, Math.min(100, (remaining / total) * 100));
-    }
-
-    return null;
-}
-
-function extractLimit(value: unknown): Record<string, unknown> | null {
-    const limit = asRecord(value);
-    if (!limit) return null;
-
-    const resetAt = normalizeResetAt(limit.resetAt ?? limit.reset_at ?? limit.resetsAt ?? limit.resets_at);
-    const remainingPercent = extractRemainingPercent(limit);
-    const remainingMs = resetAt ? Math.max(0, resetAt - Date.now()) : null;
-    if (resetAt === null && remainingPercent === null) return null;
-
-    return {
-        remainingMs,
-        remainingPercent,
-        resetAt
-    };
-}
-
-type NormalizedRateLimit = {
-    key: string;
-    limit: Record<string, unknown>;
-    windowMinutes: number | null;
-};
-
-const SHORT_RATE_LIMIT_MAX_MINUTES = 36 * 60;
-
-function extractWindowMinutes(value: unknown): number | null {
-    const limit = asRecord(value);
-    if (!limit) return null;
-    return asNumberLike(
-        limit.windowMinutes
-        ?? limit.window_minutes
-        ?? limit.windowDurationMinutes
-        ?? limit.window_duration_minutes
-        ?? limit.windowDurationMins
-        ?? limit.window_duration_mins
-    );
-}
-
-function classifyRateLimit(
-    entry: NormalizedRateLimit,
-    now: number
-): 'window' | 'weekly' | null {
-    if (entry.windowMinutes !== null && entry.windowMinutes > 0) {
-        return entry.windowMinutes <= SHORT_RATE_LIMIT_MAX_MINUTES ? 'window' : 'weekly';
-    }
-
-    if (['five', '5h', 'hour', 'short'].some((pattern) => entry.key.includes(pattern))) {
-        return 'window';
-    }
-    if (['week', 'seven', '7d', 'long'].some((pattern) => entry.key.includes(pattern))) {
-        return 'weekly';
-    }
-    if (entry.key.includes('secondary')) {
-        return 'weekly';
-    }
-
-    const resetAt = asNumber(entry.limit.resetAt);
-    if (resetAt !== null) {
-        return resetAt - now <= SHORT_RATE_LIMIT_MAX_MINUTES * 60_000
-            ? 'window'
-            : 'weekly';
-    }
-
-    return entry.key.includes('primary') ? 'window' : null;
-}
-
-function extractAccountStatus(params: Record<string, unknown>): Record<string, unknown> | null {
-    const limitsRoot = asRecord(params.rateLimits)
-        ?? asRecord(params.rate_limits)
-        ?? asRecord(params.limits)
-        ?? params;
-    const candidates: Array<{ key: string; value: unknown }> = [];
-
-    if (Array.isArray(limitsRoot)) {
-        limitsRoot.forEach((value, index) => candidates.push({ key: String(index), value }));
-    } else if (limitsRoot && typeof limitsRoot === 'object') {
-        for (const [key, value] of Object.entries(limitsRoot as Record<string, unknown>)) {
-            if (value && typeof value === 'object') {
-                candidates.push({ key, value });
-            }
-        }
-    }
-
-    const normalized = candidates.flatMap(({ key, value }): NormalizedRateLimit[] => {
-        const limit = extractLimit(value);
-        return limit ? [{
-            key: key.toLowerCase(),
-            limit,
-            windowMinutes: extractWindowMinutes(value)
-        }] : [];
-    });
-
-    const now = Date.now();
-    const classified = normalized.map((entry) => ({
-        entry,
-        kind: classifyRateLimit(entry, now)
-    }));
-    const windowEntry = classified.find(({ kind }) => kind === 'window')?.entry ?? null;
-    const weeklyEntry = classified.find(({ entry, kind }) => (
-        kind === 'weekly' && entry !== windowEntry
-    ))?.entry ?? null;
-
-    const unclassified = classified
-        .filter(({ entry, kind }) => (
-            kind === null && entry !== windowEntry && entry !== weeklyEntry
-        ))
-        .map(({ entry }) => entry);
-    const fallbackWindow = !windowEntry
-        ? unclassified.find((entry) => entry.key.includes('primary')) ?? unclassified[0] ?? null
-        : null;
-    const usedWindowEntry = windowEntry ?? fallbackWindow;
-    const fallbackWeekly = !weeklyEntry
-        ? unclassified.find((entry) => (
-            entry !== usedWindowEntry && entry.key.includes('secondary')
-        )) ?? unclassified.find((entry) => entry !== usedWindowEntry) ?? null
-        : null;
-
-    const window = usedWindowEntry?.limit ?? null;
-    const weekly = (weeklyEntry ?? fallbackWeekly)?.limit ?? null;
-
-    const accountLabel = extractAccountLabel(params);
-    if (!accountLabel && !window && !weekly) return null;
-
-    return {
-        provider: 'codex',
-        accountLabel,
-        window,
-        weekly,
-        updatedAt: Date.now()
-    };
-}
-
-function extractErrorMessage(params: Record<string, unknown>): string | null {
-    const errorRecord = asRecord(params.error);
-    return asString(params.message)
-        ?? asString(params.error)
-        ?? (errorRecord ? asString(errorRecord.message) : null)
-        ?? asString(params.reason);
 }
 
 function extractItemId(params: Record<string, unknown>): string | null {
@@ -319,18 +126,18 @@ function extractTextFromContent(value: unknown): string | null {
 }
 
 function extractItemText(item: Record<string, unknown>): string | null {
-    const text = asString(item.text ?? item.message) ?? extractTextFromContent(item.content);
-    return text ? (unwrapCodexResponseStepEnvelope(text) ?? text) : null;
+    return asString(item.text ?? item.message) ?? extractTextFromContent(item.content);
 }
 
-function extractReasoningSummary(item: Record<string, unknown>): string | null {
-    // App-server v2 deliberately separates the user-readable summary from raw
-    // reasoning content. Never fall back to item.content/item.text here: raw
-    // reasoning is hidden by default in the official Codex clients.
-    for (const value of [item.summary, item.summary_text, item.summaryText]) {
-        if (!Array.isArray(value)) continue;
+function extractReasoningText(item: Record<string, unknown>): string | null {
+    const direct = extractItemText(item);
+    if (direct) {
+        return direct;
+    }
 
-        const chunks = value.filter((part): part is string => typeof part === 'string' && part.length > 0);
+    const summary = item.summary_text ?? item.summaryText;
+    if (Array.isArray(summary)) {
+        const chunks = summary.filter((part): part is string => typeof part === 'string' && part.length > 0);
         if (chunks.length > 0) {
             return chunks.join('\n');
         }
@@ -377,16 +184,10 @@ function extractPlanEntries(value: unknown): Array<{ step: string; status: 'pend
 }
 
 function extractPlanUpdate(params: Record<string, unknown>): ConvertedEvent[] {
-    const update = asRecord(params.update);
     const plan = extractPlanEntries(
         params.plan ?? params.update ?? params.items ?? params.steps ?? params
     );
-    const explanation = asString(params.explanation ?? update?.explanation);
-    return plan.length > 0 ? [{
-        type: 'plan_update',
-        plan,
-        ...(explanation ? { explanation } : {})
-    }] : [];
+    return plan.length > 0 ? [{ type: 'plan_update', plan }] : [];
 }
 
 function extractEventScope(params: Record<string, unknown>): Record<string, unknown> {
@@ -689,7 +490,7 @@ function buildCollabAgentOutput(item: Record<string, unknown>, toolName: string)
 
 export class AppServerEventConverter {
     private readonly agentMessageBuffers = new Map<string, string>();
-    private readonly reasoningSummaryBuffers = new Map<string, string>();
+    private readonly reasoningBuffers = new Map<string, string>();
     private readonly commandOutputBuffers = new Map<string, string>();
     private readonly commandMeta = new Map<string, Record<string, unknown>>();
     private readonly fileChangeMeta = new Map<string, Record<string, unknown>>();
@@ -697,7 +498,7 @@ export class AppServerEventConverter {
     private readonly completedReasoningItems = new Set<string>();
     private readonly reasoningSectionBreakKeys = new Set<string>();
     private readonly lastAgentMessageDeltaByItemId = new Map<string, string>();
-    private readonly lastReasoningSummaryDeltaByItemId = new Map<string, string>();
+    private readonly lastReasoningDeltaByItemId = new Map<string, string>();
     private readonly lastCommandOutputDeltaByItemId = new Map<string, string>();
     private readonly rawAgentToolCallIds = new Set<string>();
     private readonly rawAgentToolNames = new Map<string, string>();
@@ -763,19 +564,14 @@ export class AppServerEventConverter {
             const itemId = asString(msg.item_id ?? msg.itemId ?? msg.id) ?? 'agent-message';
             const delta = asString(msg.delta ?? msg.text ?? msg.message);
             if (!delta) return [];
-            return this.handleNotification('item/agentMessage/delta', {
-                itemId,
-                delta,
-                phase: msg.phase,
-                ...msgScope
-            });
+            return this.handleNotification('item/agentMessage/delta', { itemId, delta, ...msgScope });
         }
 
         if (msgType === 'reasoning_content_delta') {
             const itemId = asString(msg.item_id ?? msg.itemId ?? msg.id) ?? 'reasoning';
             const delta = asString(msg.delta ?? msg.text ?? msg.message);
             if (!delta) return [];
-            return this.handleNotification('item/reasoning/textDelta', { itemId, delta, ...msgScope });
+            return this.handleNotification('item/reasoning/summaryTextDelta', { itemId, delta, ...msgScope });
         }
 
         if (msgType === 'agent_reasoning_section_break') {
@@ -806,7 +602,7 @@ export class AppServerEventConverter {
             if (willRetry) {
                 return [];
             }
-            const error = extractErrorMessage(msg);
+            const error = asString(msg.message ?? msg.reason ?? errorRecord?.message);
             const codexErrorInfo = extractCodexErrorInfo(msg, errorRecord);
             return error ? addEventScope([{
                 type: 'task_failed',
@@ -840,16 +636,12 @@ export class AppServerEventConverter {
             msgType === 'mcp_startup_update' ||
             msgType === 'mcp_startup_complete' ||
             msgType === 'skills_update_available' ||
+            msgType === 'stream_error' ||
             msgType === 'warning' ||
             msgType === 'terminal_interaction' ||
             msgType === 'user_message'
         ) {
             return [];
-        }
-
-        if (msgType === 'stream_error') {
-            const error = extractErrorMessage(msg);
-            return error ? addEventScope([{ type: 'task_failed', error }], msgScope) : [];
         }
 
         return addEventScope([msg as ConvertedEvent], msgScope);
@@ -873,8 +665,7 @@ export class AppServerEventConverter {
         }
 
         if (method === 'account/rateLimits/updated') {
-            const accountStatus = extractAccountStatus(paramsRecord);
-            return accountStatus ? [{ type: 'account_status', accountStatus }] : events;
+            return events;
         }
 
         if (method === 'thread/compacted') {
@@ -934,13 +725,6 @@ export class AppServerEventConverter {
             const threadId = asString(thread.threadId ?? thread.thread_id ?? thread.id);
             const status = asRecord(paramsRecord.status ?? thread.status);
             const statusType = asString(status?.type ?? paramsRecord.statusType ?? paramsRecord.status_type);
-            if (statusType?.toLowerCase() === 'idle') {
-                events.push({
-                    type: 'thread_idle',
-                    ...(threadId ? { thread_id: threadId } : {})
-                });
-                return events;
-            }
             if (statusType === 'systemError') {
                 const error = asString(status?.message ?? status?.error ?? paramsRecord.message ?? paramsRecord.error)
                     ?? 'Codex thread entered systemError';
@@ -1055,7 +839,7 @@ export class AppServerEventConverter {
             );
             const willRetry = retryable ?? false;
             if (willRetry) return events;
-            const message = extractErrorMessage(paramsRecord);
+            const message = asString(paramsRecord.message) ?? asString(errorRecord?.message);
             if (message) {
                 const codexErrorInfo = extractCodexErrorInfo(paramsRecord, errorRecord);
                 events.push(scoped({
@@ -1065,16 +849,6 @@ export class AppServerEventConverter {
                     ...(codexErrorInfo ? { codex_error_info: codexErrorInfo } : {}),
                     error: message
                 }));
-            }
-            return events;
-        }
-
-        if (method === 'stream/error' || method === 'turn/error') {
-            const willRetry = asBoolean(paramsRecord.will_retry ?? paramsRecord.willRetry) ?? false;
-            if (willRetry) return events;
-            const message = extractErrorMessage(paramsRecord);
-            if (message) {
-                events.push(scoped({ type: 'task_failed', error: message }));
             }
             return events;
         }
@@ -1139,24 +913,17 @@ export class AppServerEventConverter {
             return events;
         }
 
-        if (method === 'item/reasoning/textDelta') {
-            // This is the raw reasoning channel, not the user-readable summary.
-            // Match the official client default: ignore it and, importantly, do
-            // not let it contaminate the summary buffer used at completion.
-            return events;
-        }
-
-        if (method === 'item/reasoning/summaryTextDelta') {
+        if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
             const itemId = extractItemId(paramsRecord) ?? 'reasoning';
             const delta = asString(paramsRecord.delta ?? paramsRecord.text ?? paramsRecord.message);
             if (delta) {
-                const lastDelta = this.lastReasoningSummaryDeltaByItemId.get(itemId);
+                const lastDelta = this.lastReasoningDeltaByItemId.get(itemId);
                 if (lastDelta === delta) {
                     return events;
                 }
-                this.lastReasoningSummaryDeltaByItemId.set(itemId, delta);
-                const prev = this.reasoningSummaryBuffers.get(itemId) ?? '';
-                this.reasoningSummaryBuffers.set(itemId, prev + delta);
+                this.lastReasoningDeltaByItemId.set(itemId, delta);
+                const prev = this.reasoningBuffers.get(itemId) ?? '';
+                this.reasoningBuffers.set(itemId, prev + delta);
                 events.push(scoped({ type: 'agent_reasoning_delta', delta }));
             }
             return events;
@@ -1172,12 +939,6 @@ export class AppServerEventConverter {
                 }
                 this.reasoningSectionBreakKeys.add(key);
             }
-            const bufferedSummary = this.reasoningSummaryBuffers.get(itemId);
-            if (bufferedSummary && !bufferedSummary.endsWith('\n')) {
-                this.reasoningSummaryBuffers.set(itemId, `${bufferedSummary}\n`);
-            }
-            // Identical text in adjacent summary parts is not a duplicate delta.
-            this.lastReasoningSummaryDeltaByItemId.delete(itemId);
             events.push(scoped({ type: 'agent_reasoning_section_break' }));
             return events;
         }
@@ -1230,20 +991,22 @@ export class AppServerEventConverter {
                     if (this.completedAgentMessageItems.has(itemId)) {
                         return events;
                     }
-                    const bufferedText = this.agentMessageBuffers.get(itemId);
-                    const text = extractItemText(item)
-                        ?? (bufferedText ? (unwrapCodexResponseStepEnvelope(bufferedText) ?? bufferedText) : null);
+                    const text = extractItemText(item) ?? this.agentMessageBuffers.get(itemId);
                     if (text) {
-                        const phase = normalizeAgentMessagePhase(item.phase ?? paramsRecord.phase);
-                        events.push(scoped({
-                            type: 'agent_message',
-                            message: text,
-                            ...(phase ? { phase } : {})
-                        }));
+                        events.push(scoped({ type: 'agent_message', message: text }));
                         this.completedAgentMessageItems.add(itemId);
                         this.agentMessageBuffers.delete(itemId);
                     }
                     this.lastAgentMessageDeltaByItemId.delete(itemId);
+                }
+                return events;
+            }
+
+            if (itemType === 'plan') {
+                // Plan deltas are provisional; Codex's completed item is authoritative.
+                const plan = asString(item.text);
+                if (method === 'item/completed' && plan?.trim()) {
+                    events.push(scoped({ type: 'proposed_plan', plan }));
                 }
                 return events;
             }
@@ -1253,13 +1016,13 @@ export class AppServerEventConverter {
                     if (this.completedReasoningItems.has(itemId)) {
                         return events;
                     }
-                    const text = extractReasoningSummary(item) ?? this.reasoningSummaryBuffers.get(itemId);
+                    const text = extractReasoningText(item) ?? this.reasoningBuffers.get(itemId);
                     if (text) {
                         events.push(scoped({ type: 'agent_reasoning', text }));
                         this.completedReasoningItems.add(itemId);
-                        this.reasoningSummaryBuffers.delete(itemId);
+                        this.reasoningBuffers.delete(itemId);
                     }
-                    this.lastReasoningSummaryDeltaByItemId.delete(itemId);
+                    this.lastReasoningDeltaByItemId.delete(itemId);
                 }
                 return events;
             }
@@ -1443,7 +1206,7 @@ export class AppServerEventConverter {
 
     reset(): void {
         this.agentMessageBuffers.clear();
-        this.reasoningSummaryBuffers.clear();
+        this.reasoningBuffers.clear();
         this.commandOutputBuffers.clear();
         this.commandMeta.clear();
         this.fileChangeMeta.clear();
@@ -1451,7 +1214,7 @@ export class AppServerEventConverter {
         this.completedReasoningItems.clear();
         this.reasoningSectionBreakKeys.clear();
         this.lastAgentMessageDeltaByItemId.clear();
-        this.lastReasoningSummaryDeltaByItemId.clear();
+        this.lastReasoningDeltaByItemId.clear();
         this.lastCommandOutputDeltaByItemId.clear();
         this.rawAgentToolCallIds.clear();
         this.rawAgentToolNames.clear();

@@ -10,7 +10,7 @@ export type PushPayload = {
         type: string
         sessionId: string
         url: string
-        /** First pending permission request id (permission-request pushes only). */
+        /** First pending request id; input-request uses it for correlation, never approval. */
         requestId?: string
     }
 }
@@ -30,26 +30,12 @@ type PushSubscription = {
 }
 
 export class PushService {
-    private readonly requestOptions: {
-        timeout: number
-        proxy?: string
-    }
-
     constructor(
         private readonly vapidKeys: VapidKeys,
         private readonly subject: string,
         private readonly store: Store
     ) {
         webPush.setVapidDetails(this.subject, this.vapidKeys.publicKey, this.vapidKeys.privateKey)
-        const timeout = Number(process.env.HAPI_PUSH_TIMEOUT_MS ?? 10_000)
-        const proxy = process.env.HAPI_PUSH_PROXY
-            ?? process.env.HTTPS_PROXY
-            ?? process.env.HTTP_PROXY
-            ?? undefined
-        this.requestOptions = {
-            timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : 10_000,
-            ...(proxy ? { proxy } : {})
-        }
     }
 
     async sendToNamespace(namespace: string, payload: PushPayload): Promise<void> {
@@ -78,13 +64,13 @@ export class PushService {
         }
 
         try {
-            await webPush.sendNotification(pushSubscription, body, this.requestOptions)
+            await webPush.sendNotification(pushSubscription, body)
         } catch (error) {
             const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
                 ? (error as { statusCode: number }).statusCode
                 : null
 
-            if (statusCode === 404 || statusCode === 410) {
+            if (statusCode === 410) {
                 this.store.push.removePushSubscription(namespace, subscription.endpoint)
                 return
             }

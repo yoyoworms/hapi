@@ -7,9 +7,10 @@ const harness = vi.hoisted(() => ({
     dispatchNotification: null as ((method: string, params: unknown) => void) | null,
     registerRequestCalls: [] as string[],
     requestHandlers: new Map<string, (params: unknown) => Promise<unknown> | unknown>(),
-    connectCalls: 0,
-    disconnectCalls: 0,
     initializeCalls: [] as unknown[],
+    configReadCalls: [] as unknown[],
+    configReadResponse: { config: {} } as { config: Record<string, unknown> },
+    failConfigRead: false,
     setFeatureEnablementCalls: [] as unknown[],
     failSetFeatureEnablement: false,
     listCollaborationModeCalls: 0,
@@ -33,20 +34,11 @@ const harness = vi.hoisted(() => ({
     startThreadParams: [] as Array<Record<string, unknown>>,
     resumeThreadIds: [] as string[],
     resumeThreadParams: [] as Array<Record<string, unknown>>,
-    archivedResumeThreadIds: new Set<string>(),
-    unarchiveThreadIds: [] as string[],
-    deferResumeThread: false,
-    readThreadCalls: [] as Array<{ threadId: string; includeTurns?: boolean }>,
-    threadStatusById: new Map<string, 'notLoaded' | 'idle' | 'systemError' | 'active'>(),
     startTurnThreadIds: [] as string[],
     startTurnParams: [] as Array<Record<string, unknown>>,
     startTurnErrors: [] as Error[],
-    deferStartTurn: false,
-    releaseDeferredStartTurn: null as (() => void) | null,
-    steerTurnParams: [] as Array<Record<string, unknown>>,
-    steerTurnErrors: [] as Error[],
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
-    interruptErrors: [] as Array<Error | null>,
+    interruptErrors: [] as Error[],
     rollbackCalls: [] as Array<{ threadId: string; numTurns: number }>,
     rollbackErrors: [] as Error[],
     compactThreadIds: [] as string[],
@@ -57,7 +49,6 @@ const harness = vi.hoisted(() => ({
     suppressGoalNotifications: false,
     suppressTurnCompletion: false,
     remainingThreadSystemErrors: 0,
-    remainingNonRetryableContextErrors: 0,
     emitFailedCompletionAfterThreadSystemError: false,
     emitCyberPolicyAfterThreadSystemError: false,
     emitSafetyBuffering: false,
@@ -65,11 +56,11 @@ const harness = vi.hoisted(() => ({
     emitModelSafetyNotices: false,
     startTurnMessages: [] as string[],
     failResumeThreadIds: [] as string[],
-    resumeErrorMessage: 'resume failed',
     nextThreadSystemErrorMessage: null as string | null,
     failNextCompact: false,
     deferCompactCompletion: false,
     deferThreadStatusNotifications: false,
+    steerTurnParams: [] as Array<Record<string, unknown>>,
     steerDispatchError: null as Error | null,
     steerCompletionError: null as Error | null,
     readThreadParams: [] as Array<Record<string, unknown>>,
@@ -104,64 +95,8 @@ const harness = vi.hoisted(() => ({
     emitRunningChildTurnBeforeSuppressedParent: false,
     emitCompletedChildTurnBeforeSuppressedParent: false,
     emitTurnAbortedOnInterrupt: false,
-    deferParentInterruptAck: false,
-    releaseDeferredParentInterruptAck: null as (() => void) | null,
-    deferChildTurnAbortOnInterrupt: false,
-    emitLateChildStartOnParentInterrupt: false,
-    deferGeneratedImageRead: false,
-    releaseGeneratedImageRead: null as (() => void) | null,
     bridgeOptions: [] as unknown[]
 }));
-
-vi.mock('node:fs/promises', async (importOriginal) => {
-    const actual = await importOriginal<typeof import('node:fs/promises')>();
-    const deferredImagePath = '/tmp/hapi-deferred-generated-image.png';
-    return {
-        ...actual,
-        open: async (...args: Parameters<typeof actual.open>) => {
-            if (args[0] === deferredImagePath) {
-                const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-                return {
-                    stat: async () => ({
-                        isFile: () => true,
-                        size: png.length
-                    }),
-                    read: async (buffer: Buffer, offset: number) => {
-                        if (harness.deferGeneratedImageRead) {
-                            await new Promise<void>((resolve) => {
-                                harness.releaseGeneratedImageRead = resolve;
-                            });
-                            harness.releaseGeneratedImageRead = null;
-                        }
-                        png.copy(buffer, offset);
-                        return { bytesRead: png.length, buffer };
-                    },
-                    close: async () => {}
-                } as unknown as Awaited<ReturnType<typeof actual.open>>;
-            }
-            return actual.open(...args);
-        },
-        lstat: async (...args: Parameters<typeof actual.lstat>) => {
-            if (args[0] === deferredImagePath) {
-                return {
-                    isFile: () => true,
-                    size: 8
-                } as Awaited<ReturnType<typeof actual.lstat>>;
-            }
-            return actual.lstat(...args);
-        },
-        readFile: async (...args: Parameters<typeof actual.readFile>) => {
-            if (args[0] === deferredImagePath && harness.deferGeneratedImageRead) {
-                await new Promise<void>((resolve) => {
-                    harness.releaseGeneratedImageRead = resolve;
-                });
-                harness.releaseGeneratedImageRead = null;
-                return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-            }
-            return actual.readFile(...args);
-        }
-    };
-});
 
 vi.mock('./codexAppServerClient', () => {
     const INDETERMINATE_SYMBOL = Symbol('codex-app-server-indeterminate');
@@ -169,9 +104,7 @@ vi.mock('./codexAppServerClient', () => {
         private notificationHandler: ((method: string, params: unknown) => void) | null = null;
         private stderrHandler: ((text: string) => void) | null = null;
 
-        async connect(): Promise<void> {
-            harness.connectCalls += 1;
-        }
+        async connect(): Promise<void> {}
 
         isConnected(): boolean {
             return true;
@@ -184,6 +117,14 @@ vi.mock('./codexAppServerClient', () => {
         async initialize(params: unknown): Promise<{ protocolVersion: number }> {
             harness.initializeCalls.push(params);
             return { protocolVersion: 1 };
+        }
+
+        async readConfig(params: unknown): Promise<{ config: Record<string, unknown> }> {
+            harness.configReadCalls.push(params);
+            if (harness.failConfigRead) {
+                throw new Error('config/read unsupported');
+            }
+            return harness.configReadResponse;
         }
 
         setNotificationHandler(handler: ((method: string, params: unknown) => void) | null): void {
@@ -227,71 +168,17 @@ vi.mock('./codexAppServerClient', () => {
             const id = `thread-${harness.startThreadIds.length + 1}`;
             harness.startThreadIds.push(id);
             harness.startThreadParams.push(params ?? {});
-            return {
-                thread: { id },
-                model: typeof params?.model === 'string' ? params.model : 'gpt-5.4'
-            };
+            return { thread: { id }, model: 'gpt-5.4' };
         }
 
-        async resumeThread(
-            params?: Record<string, unknown>,
-            options?: { signal?: AbortSignal }
-        ): Promise<{ thread: { id: string }; model: string }> {
+        async resumeThread(params?: Record<string, unknown>): Promise<{ thread: { id: string }; model: string }> {
             const id = typeof params?.threadId === 'string' ? params.threadId : 'thread-resumed';
             harness.resumeThreadIds.push(id);
             harness.resumeThreadParams.push(params ?? {});
-            if (harness.deferResumeThread) {
-                await new Promise<void>((resolve, reject) => {
-                    const signal = options?.signal;
-                    const onAbort = () => {
-                        signal?.removeEventListener('abort', onAbort);
-                        reject(new DOMException('Aborted', 'AbortError'));
-                    };
-                    if (signal?.aborted) {
-                        onAbort();
-                        return;
-                    }
-                    signal?.addEventListener('abort', onAbort, { once: true });
-                    // The test releases the artificial delay by flipping the
-                    // flag and aborting the request through the real handler.
-                    void resolve;
-                });
-            }
             if (harness.failResumeThreadIds.includes(id)) {
-                throw new Error(harness.resumeErrorMessage);
+                throw new Error('resume failed');
             }
-            if (harness.archivedResumeThreadIds.has(id) && !harness.unarchiveThreadIds.includes(id)) {
-                throw new Error(`session ${id} is archived. Run \`codex unarchive ${id}\` to unarchive it first.`);
-            }
-            return {
-                thread: { id },
-                model: typeof params?.model === 'string' ? params.model : 'gpt-5.4'
-            };
-        }
-
-        async unarchiveThread(params: { threadId: string }): Promise<{ thread: { id: string } }> {
-            harness.unarchiveThreadIds.push(params.threadId);
-            return { thread: { id: params.threadId } };
-        }
-
-        async readThread(params: { threadId: string; includeTurns?: boolean }): Promise<unknown> {
-            harness.readThreadCalls.push(params);
-            if (params.includeTurns !== false) {
-                harness.readThreadParams.push(params as Record<string, unknown>);
-                if (harness.readThreadError) {
-                    throw harness.readThreadError;
-                }
-                return harness.readThreadResponse;
-            }
-            const type = harness.threadStatusById.get(params.threadId) ?? 'idle';
-            return {
-                thread: {
-                    id: params.threadId,
-                    status: type === 'active'
-                        ? { type, activeFlags: [] }
-                        : { type }
-                }
-            };
+            return { thread: { id }, model: 'gpt-5.4' };
         }
 
         async compactThread(params?: { threadId?: string }): Promise<Record<string, never>> {
@@ -349,13 +236,18 @@ vi.mock('./codexAppServerClient', () => {
             }
             return {
                 dispatched: Promise.resolve(),
-                completed: (() => {
-                    const completionError = harness.steerTurnErrors.shift() ?? harness.steerCompletionError;
-                    return completionError
-                        ? Promise.reject(completionError)
-                        : Promise.resolve({ turnId: params?.expectedTurnId ?? 'steered-turn' });
-                })()
+                completed: harness.steerCompletionError
+                    ? Promise.reject(harness.steerCompletionError)
+                    : Promise.resolve({ turnId: 'steered-turn' })
             };
+        }
+
+        async readThread(params?: { threadId?: string; includeTurns?: boolean }): Promise<unknown> {
+            harness.readThreadParams.push((params ?? {}) as Record<string, unknown>);
+            if (harness.readThreadError) {
+                throw harness.readThreadError;
+            }
+            return harness.readThreadResponse;
         }
 
         async clearThreadGoal(params?: { threadId?: string }): Promise<{ cleared: boolean }> {
@@ -381,12 +273,6 @@ vi.mock('./codexAppServerClient', () => {
             const threadId = params?.threadId ?? 'thread-unknown';
             harness.startTurnThreadIds.push(threadId);
             harness.startTurnMessages.push(params?.input?.[0]?.text ?? params?.message ?? params?.userMessage ?? '');
-            if (harness.deferStartTurn) {
-                await new Promise<void>((resolve) => {
-                    harness.releaseDeferredStartTurn = resolve;
-                });
-                harness.releaseDeferredStartTurn = null;
-            }
             const turnId = `turn-${harness.startTurnThreadIds.length}`;
             const started = { turn: { id: turnId } };
             harness.notifications.push({ method: 'turn/started', params: started });
@@ -434,21 +320,6 @@ vi.mock('./codexAppServerClient', () => {
                     harness.notifications.push({ method: 'turn/completed', params: completed });
                     this.notificationHandler?.('turn/completed', completed);
                 }
-                return { turn: { id: turnId } };
-            }
-
-            if (harness.remainingNonRetryableContextErrors > 0) {
-                harness.remainingNonRetryableContextErrors -= 1;
-                const contextError = {
-                    threadId,
-                    turnId,
-                    error: {
-                        message: "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
-                    },
-                    willRetry: false
-                };
-                harness.notifications.push({ method: 'error', params: contextError });
-                this.notificationHandler?.('error', contextError);
                 return { turn: { id: turnId } };
             }
 
@@ -792,7 +663,6 @@ vi.mock('./codexAppServerClient', () => {
                     item: {
                         id: 'child-msg-1',
                         type: 'agentMessage',
-                        phase: harness.emitSecondChildMessage ? 'commentary' : 'final_answer',
                         content: [{ type: 'text', text: childMessage }]
                     },
                     threadId: childThreadId,
@@ -806,7 +676,6 @@ vi.mock('./codexAppServerClient', () => {
                         item: {
                             id: 'child-msg-2',
                             type: 'agentMessage',
-                            phase: 'final_answer',
                             content: [{ type: 'text', text: secondChildMessage }]
                         },
                         threadId: childThreadId,
@@ -1102,7 +971,6 @@ vi.mock('./codexAppServerClient', () => {
                     item: {
                         id: 'stale-retry-message',
                         type: 'agentMessage',
-                        phase: 'final_answer',
                         content: [{ type: 'text', text: 'done after retry' }]
                     },
                     threadId,
@@ -1189,20 +1057,7 @@ vi.mock('./codexAppServerClient', () => {
             if (error) {
                 throw error;
             }
-            if (harness.emitLateChildStartOnParentInterrupt && threadId === 'thread-1') {
-                harness.emitLateChildStartOnParentInterrupt = false;
-                const childStarted = {
-                    threadId: 'late-child-thread',
-                    turnId: 'late-child-turn',
-                    turn: { id: 'late-child-turn' }
-                };
-                harness.notifications.push({ method: 'turn/started', params: childStarted });
-                this.notificationHandler?.('turn/started', childStarted);
-            }
-            if (
-                harness.emitTurnAbortedOnInterrupt
-                && !(harness.deferChildTurnAbortOnInterrupt && threadId === 'child-thread')
-            ) {
+            if (harness.emitTurnAbortedOnInterrupt) {
                 const interrupted = {
                     threadId,
                     turnId,
@@ -1211,12 +1066,6 @@ vi.mock('./codexAppServerClient', () => {
                 };
                 harness.notifications.push({ method: 'turn/completed', params: interrupted });
                 this.notificationHandler?.('turn/completed', interrupted);
-            }
-            if (harness.deferParentInterruptAck && threadId === 'thread-1') {
-                await new Promise<void>((resolve) => {
-                    harness.releaseDeferredParentInterruptAck = resolve;
-                });
-                harness.releaseDeferredParentInterruptAck = null;
             }
             return {};
         }
@@ -1231,9 +1080,7 @@ vi.mock('./codexAppServerClient', () => {
             return { thread: { id: threadId } };
         }
 
-        async disconnect(): Promise<void> {
-            harness.disconnectCalls += 1;
-        }
+        async disconnect(): Promise<void> {}
     }
 
     return {
@@ -1241,9 +1088,6 @@ vi.mock('./codexAppServerClient', () => {
         INDETERMINATE_SYMBOL,
         isIndeterminateError: (error: unknown) => Boolean(
             error && (error as Record<symbol, unknown>)[INDETERMINATE_SYMBOL] === true
-        ),
-        isCodexArchivedThreadError: (error: unknown) => /\bis archived\b.*\bunarchive\b/i.test(
-            error instanceof Error ? error.message : String(error)
         )
     };
 });
@@ -1300,6 +1144,7 @@ function createSessionStub(
     const sessionEvents: Array<{ type: string; [key: string]: unknown }> = [];
     const codexMessages: unknown[] = [];
     const summaryMessages: unknown[] = [];
+    const metadataUpdates: Array<Record<string, unknown>> = [];
     const thinkingChanges: boolean[] = [];
     const foundSessionIds: string[] = [];
     const resetThreadCalls: string[] = [];
@@ -1312,6 +1157,11 @@ function createSessionStub(
         requests: {},
         completedRequests: {}
     };
+    let metadata: Record<string, unknown> = {
+        path: '/tmp/hapi-update',
+        host: 'localhost',
+        name: 'issue-triage-#54'
+    };
 
     const rpcHandlers = new Map<string, (params: unknown) => unknown>();
     const client = {
@@ -1320,7 +1170,10 @@ function createSessionStub(
                 rpcHandlers.set(method, handler);
             }
         },
-        updateMetadata(_handler: (metadata: Record<string, unknown>) => Record<string, unknown>) {},
+        updateMetadata(handler: (current: Record<string, unknown>) => Record<string, unknown>) {
+            metadata = handler(metadata);
+            metadataUpdates.push({ ...metadata });
+        },
         updateAgentState(handler: (state: FakeAgentState) => FakeAgentState) {
             agentState = handler(agentState);
         },
@@ -1395,6 +1248,8 @@ function createSessionStub(
         sessionEvents,
         codexMessages,
         summaryMessages,
+        metadataUpdates,
+        getMetadata: () => metadata,
         thinkingChanges,
         foundSessionIds,
         resetThreadCalls,
@@ -1555,14 +1410,14 @@ describe('codexRemoteLauncher', () => {
         session.queue.close();
     });
     afterEach(() => {
-        delete process.env.HAPI_CODEX_RESUME_PATH;
         harness.notifications = [];
         harness.dispatchNotification = null;
         harness.registerRequestCalls = [];
         harness.requestHandlers = new Map();
-        harness.connectCalls = 0;
-        harness.disconnectCalls = 0;
         harness.initializeCalls = [];
+        harness.configReadCalls = [];
+        harness.configReadResponse = { config: {} };
+        harness.failConfigRead = false;
         harness.setFeatureEnablementCalls = [];
         harness.failSetFeatureEnablement = false;
         harness.listCollaborationModeCalls = 0;
@@ -1586,18 +1441,9 @@ describe('codexRemoteLauncher', () => {
         harness.startThreadParams = [];
         harness.resumeThreadIds = [];
         harness.resumeThreadParams = [];
-        harness.archivedResumeThreadIds = new Set();
-        harness.unarchiveThreadIds = [];
-        harness.deferResumeThread = false;
-        harness.readThreadCalls = [];
-        harness.threadStatusById = new Map();
         harness.startTurnThreadIds = [];
         harness.startTurnParams = [];
         harness.startTurnErrors = [];
-        harness.deferStartTurn = false;
-        harness.releaseDeferredStartTurn = null;
-        harness.steerTurnParams = [];
-        harness.steerTurnErrors = [];
         harness.interruptedTurns = [];
         harness.interruptErrors = [];
         harness.rollbackCalls = [];
@@ -1617,7 +1463,6 @@ describe('codexRemoteLauncher', () => {
         harness.startTurnMessages = [];
         harness.failResumeThreadIds = [];
         harness.remainingThreadSystemErrors = 0;
-        harness.remainingNonRetryableContextErrors = 0;
         harness.nextThreadSystemErrorMessage = null;
         harness.failNextCompact = false;
         harness.deferCompactCompletion = false;
@@ -1657,13 +1502,6 @@ describe('codexRemoteLauncher', () => {
         harness.emitRunningChildTurnBeforeSuppressedParent = false;
         harness.emitCompletedChildTurnBeforeSuppressedParent = false;
         harness.emitTurnAbortedOnInterrupt = false;
-        harness.deferParentInterruptAck = false;
-        harness.releaseDeferredParentInterruptAck = null;
-        harness.deferChildTurnAbortOnInterrupt = false;
-        harness.emitLateChildStartOnParentInterrupt = false;
-        harness.deferGeneratedImageRead = false;
-        harness.releaseGeneratedImageRead?.();
-        harness.releaseGeneratedImageRead = null;
         harness.bridgeOptions = [];
     });
 
@@ -1692,6 +1530,10 @@ describe('codexRemoteLauncher', () => {
                 experimentalApi: true
             }
         }]);
+        expect(harness.configReadCalls).toEqual([{
+            cwd: '/tmp/hapi-update',
+            includeLayers: false
+        }]);
         expect(harness.setFeatureEnablementCalls).toEqual([{ enablement: { goals: true } }]);
         expect(harness.notifications.map((entry) => entry.method)).toEqual([
             'turn/started',
@@ -1704,50 +1546,109 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
-    it('restarts and resumes the same thread when switching context profiles', async () => {
-        const baseMode = createMode();
-        const oneMillionMode: EnhancedMode = {
-            ...baseMode,
-            model: 'gpt-5.6-sol[1m]'
-        };
-        const { session } = createSessionStub(['base turn'], baseMode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1']));
-
-        session.setModel(oneMillionMode.model!);
-        session.queue.push('large-context turn', oneMillionMode);
-
-        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1']));
-        session.setModel(baseMode.model!);
-        session.queue.push('base-context turn', baseMode);
-
-        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1', 'thread-1']));
-        session.queue.close();
-        await running;
-
-        expect(harness.connectCalls).toBe(3);
-        expect(harness.initializeCalls).toHaveLength(3);
-        expect(harness.resumeThreadIds).toEqual(['thread-1', 'thread-1']);
-        expect(harness.resumeThreadParams[0]).toMatchObject({
-            threadId: 'thread-1',
-            model: 'gpt-5.6-sol',
+    it('forwards effective Codex context settings for fresh and resumed threads', async () => {
+        harness.configReadResponse = {
             config: {
-                model_context_window: 1_000_000,
-                model_auto_compact_token_limit: 900_000,
-                model_auto_compact_token_limit_scope: 'total'
+                model_context_window: 400_000,
+                model_auto_compact_token_limit: 300_000
+            }
+        };
+
+        const fresh = createSessionStub();
+        await codexRemoteLauncher(fresh.session as never);
+        expect(harness.startThreadParams[0]?.config).toMatchObject({
+            model_context_window: 400_000,
+            model_auto_compact_token_limit: 300_000
+        });
+
+        harness.startThreadParams = [];
+        const resumed = createSessionStub();
+        resumed.session.sessionId = 'thread-existing';
+        await codexRemoteLauncher(resumed.session as never);
+        expect(harness.resumeThreadParams[0]?.config).toMatchObject({
+            model_context_window: 400_000,
+            model_auto_compact_token_limit: 300_000
+        });
+    });
+
+    it('forwards user-configured MCP servers into fresh and resumed threads', async () => {
+        harness.configReadResponse = {
+            config: {
+                mcp_servers: {
+                    'package-manager': {
+                        command: 'uvx',
+                        args: ['example-mcp', 'serve'],
+                        environment_id: 'local',
+                        enabled: true,
+                        tool_timeout_sec: 60
+                    },
+                    remote: {
+                        url: 'https://example.test/mcp',
+                        bearer_token_env_var: 'REMOTE_MCP_TOKEN'
+                    }
+                }
+            }
+        };
+
+        const fresh = createSessionStub();
+        await codexRemoteLauncher(fresh.session as never);
+        const freshConfig = harness.startThreadParams[0]?.config as Record<string, unknown> | undefined;
+        const freshPackageManager = freshConfig?.['mcp_servers.package-manager'] as {
+            command?: string;
+            args?: string[];
+        } | undefined;
+        expect(harness.startThreadParams[0]?.config).toMatchObject({
+            'mcp_servers.remote': {
+                url: 'https://example.test/mcp',
+                bearer_token_env_var: 'REMOTE_MCP_TOKEN'
             }
         });
-        expect(harness.resumeThreadParams[1]).toMatchObject({
-            threadId: 'thread-1',
-            model: 'gpt-5.4'
+        expect(freshPackageManager).toEqual(expect.objectContaining({
+            environment_id: 'local',
+            enabled: true,
+            tool_timeout_sec: 60
+        }));
+        if (process.platform === 'win32') {
+            expect(freshPackageManager?.args).toContain('mcp-proxy');
+        } else {
+            expect(freshPackageManager).toMatchObject({
+                command: 'uvx',
+                args: ['example-mcp', 'serve']
+            });
+        }
+
+        harness.startThreadParams = [];
+        const resumed = createSessionStub();
+        resumed.session.sessionId = 'thread-existing';
+        await codexRemoteLauncher(resumed.session as never);
+        const resumedConfig = harness.resumeThreadParams[0]?.config as Record<string, unknown> | undefined;
+        const resumedPackageManager = resumedConfig?.['mcp_servers.package-manager'] as {
+            command?: string;
+            args?: string[];
+        } | undefined;
+        expect(harness.resumeThreadParams[0]?.config).toMatchObject({
+            'mcp_servers.remote': {
+                url: 'https://example.test/mcp'
+            }
         });
-        expect(harness.resumeThreadParams[1]?.config).not.toHaveProperty('model_context_window');
-        expect(harness.resumeThreadParams[1]?.config).not.toHaveProperty('model_auto_compact_token_limit');
-        expect(harness.startThreadIds).toEqual(['thread-1']);
-        expect(harness.startTurnParams[1]).not.toHaveProperty('config');
-        expect(harness.startTurnParams[2]).not.toHaveProperty('config');
-        expect(harness.disconnectCalls).toBe(3);
+        expect(resumedPackageManager).toBeDefined();
+        if (process.platform === 'win32') {
+            expect(resumedPackageManager?.args).toContain('mcp-proxy');
+        } else {
+            expect(resumedPackageManager).toMatchObject({
+                command: 'uvx',
+                args: ['example-mcp', 'serve']
+            });
+        }
+    });
+
+    it('keeps remote sessions working when config/read is unavailable', async () => {
+        harness.failConfigRead = true;
+        const { session } = createSessionStub();
+
+        await expect(codexRemoteLauncher(session as never)).resolves.toBe('exit');
+        expect(harness.startThreadParams[0]?.config).not.toHaveProperty('model_context_window');
+        expect(harness.startThreadParams[0]?.config).not.toHaveProperty('model_auto_compact_token_limit');
     });
 
     it('uses the native skill catalog for completion and structured turn input', async () => {
@@ -2166,35 +2067,6 @@ describe('codexRemoteLauncher', () => {
         });
     });
 
-    it('steers a follow-up into the active turn without replacing its terminal turn id', async () => {
-        harness.suppressTurnCompletion = true;
-        const { session, thinkingChanges } = createSessionStub([
-            'first message',
-            'follow-up while running'
-        ]);
-
-        const running = codexRemoteLauncher(session as never);
-
-        await vi.waitFor(() => {
-            expect(harness.steerTurnParams).toEqual([{
-                threadId: 'thread-1',
-                expectedTurnId: 'turn-1',
-                input: [{ type: 'text', text: 'follow-up while running' }]
-            }]);
-        });
-        expect(harness.startTurnMessages).toEqual(['first message']);
-
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'thread-1',
-            turnId: 'turn-1',
-            turn: { id: 'turn-1', status: 'completed' }
-        });
-
-        await expect(running).resolves.toBe('exit');
-        expect(session.thinking).toBe(false);
-        expect(thinkingChanges).toEqual(expect.arrayContaining([true, false]));
-    });
-
     it('switches collaboration mode to default after approving exit_plan_mode', async () => {
         const { session, rpcHandlers, collaborationModes, getCollaborationMode } = createSessionStub(['plan this'], {
             permissionMode: 'default',
@@ -2290,8 +2162,7 @@ describe('codexRemoteLauncher', () => {
         expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'message',
-            message: 'done after retry',
-            phase: 'final_answer'
+            message: 'done after retry'
         }));
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(session.thinking).toBe(false);
@@ -2368,62 +2239,6 @@ describe('codexRemoteLauncher', () => {
         expect(failureMessages[0]?.message).toContain('https://help.openai.com/en/articles/20001326');
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(session.thinking).toBe(false);
-    });
-
-    it('keeps deferred thread-status failure ordered behind queued authoritative errors', async () => {
-        harness.suppressTurnCompletion = true;
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-        const running = codexRemoteLauncher(session as never);
-
-        try {
-            await vi.waitFor(() => {
-                expect(harness.startTurnMessages).toEqual(['first message']);
-                expect(session.thinking).toBe(true);
-            });
-
-            harness.dispatchNotification?.('thread/status/changed', {
-                threadId: 'thread-1',
-                status: { type: 'systemError' }
-            });
-            await new Promise((resolve) => setTimeout(resolve, 25));
-
-            harness.deferGeneratedImageRead = true;
-            harness.dispatchNotification?.('codex/event/generated_image', {
-                msg: {
-                    type: 'generated_image',
-                    thread_id: 'thread-1',
-                    turn_id: 'turn-1',
-                    saved_path: '/tmp/hapi-deferred-generated-image.png'
-                }
-            });
-            await vi.waitFor(() => expect(harness.releaseGeneratedImageRead).not.toBeNull());
-
-            harness.dispatchNotification?.('error', {
-                threadId: 'thread-1',
-                turnId: 'turn-1',
-                error: {
-                    message: 'This content was flagged for possible cybersecurity risk.',
-                    codexErrorInfo: 'cyberPolicy'
-                },
-                willRetry: false
-            });
-
-            // Let the generic systemError grace period expire while the earlier
-            // image event owns the serialized queue. The authoritative policy
-            // error must still win once the queue resumes.
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            harness.releaseGeneratedImageRead?.();
-            await vi.waitFor(() => expect(session.thinking).toBe(false));
-            await new Promise((resolve) => setTimeout(resolve, 50));
-
-            expect(harness.startTurnMessages).toEqual(['first message']);
-        } finally {
-            harness.releaseGeneratedImageRead?.();
-            harness.deferGeneratedImageRead = false;
-            harness.emitTurnAbortedOnInterrupt = true;
-            await rpcHandlers.get('switch')?.({});
-            await running;
-        }
     });
 
     it('does not retry an explicitly non-retryable error even when its text is retryable', async () => {
@@ -2725,7 +2540,7 @@ describe('codexRemoteLauncher', () => {
         await vi.waitFor(() => {
             expect(sessionEvents).toContainEqual({
                 type: 'message',
-                message: 'Failed to retry with a faster model: Codex rejected the turn interrupt request'
+                message: 'Failed to retry with a faster model: turn/interrupt failed'
             });
         });
 
@@ -2778,23 +2593,6 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
-    it('compacts direct context-window errors even when Codex will not retry them', async () => {
-        harness.remainingNonRetryableContextErrors = 1;
-        const { session, sessionEvents } = createSessionStub(['first message']);
-
-        const exitReason = await codexRemoteLauncher(session as never);
-
-        expect(exitReason).toBe('exit');
-        expect(harness.compactThreadIds).toEqual(['thread-1']);
-        expect(harness.startTurnThreadIds).toEqual(['thread-1', 'thread-1']);
-        expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
-        expect(sessionEvents).not.toContainEqual({
-            type: 'message',
-            message: "Task failed: Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
-        });
-        expect(session.thinking).toBe(false);
-    });
-
     it('retries asynchronous thread-level systemError notifications on the same thread', async () => {
         harness.remainingThreadSystemErrors = 1;
         harness.deferThreadStatusNotifications = true;
@@ -2832,47 +2630,6 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents).not.toContainEqual({
             type: 'message',
             message: "Task failed: Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
-        });
-        expect(session.thinking).toBe(false);
-    });
-
-    it('acknowledges /compact while automatic compaction is still running', async () => {
-        harness.remainingThreadSystemErrors = 1;
-        harness.nextThreadSystemErrorMessage = "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.";
-        harness.deferCompactCompletion = true;
-        const mode = createMode();
-        const { session, sessionEvents } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.compactThreadIds).toEqual(['thread-1']);
-        });
-
-        session.queue.pushIsolateAndClear('/compact', mode);
-        await vi.waitFor(() => {
-            expect(sessionEvents).toContainEqual({
-                type: 'message',
-                message: 'Compaction already in progress; the failed request will retry automatically when it finishes'
-            });
-        });
-        expect(harness.compactThreadIds).toEqual(['thread-1']);
-
-        harness.dispatchNotification?.('item/completed', {
-            threadId: 'thread-1',
-            turnId: 'compact-1',
-            item: { id: 'compact-item-1', type: 'contextCompaction' }
-        });
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message', 'first message']);
-        });
-
-        session.queue.close();
-        const exitReason = await running;
-
-        expect(exitReason).toBe('exit');
-        expect(sessionEvents).toContainEqual({
-            type: 'message',
-            message: 'Context compacted; retrying same conversation'
         });
         expect(session.thinking).toBe(false);
     });
@@ -2931,55 +2688,6 @@ describe('codexRemoteLauncher', () => {
             message: 'Task failed: Codex conversation thread-old could not be resumed; no new conversation was created. Reason: resume failed'
         });
         expect(session.thinking).toBe(false);
-    });
-
-    it('starts a fresh thread when the runtime cannot list turns for an old conversation', async () => {
-        harness.failResumeThreadIds = ['thread-old'];
-        harness.resumeErrorMessage = 'list_turns is not supported yet';
-        const { session, sessionEvents } = createSessionStub(['first message']);
-        session.sessionId = 'thread-old';
-
-        const exitReason = await codexRemoteLauncher(session as never);
-
-        expect(exitReason).toBe('exit');
-        expect(harness.resumeThreadIds).toEqual(['thread-old']);
-        expect(harness.startThreadIds).toEqual(['thread-1']);
-        expect(harness.startTurnThreadIds).toEqual(['thread-1']);
-        expect(session.sessionId).toBe('thread-1');
-        expect(sessionEvents).toContainEqual({
-            type: 'message',
-            message: '旧 Codex 会话 thread-old 不支持当前运行时的历史恢复，已自动创建新的 Codex 会话继续。'
-        });
-        expect(session.thinking).toBe(false);
-    });
-
-    it('unarchives a transferred native fork before resuming it', async () => {
-        harness.archivedResumeThreadIds.add('thread-forked');
-        const { session } = createSessionStub(['continue the fork']);
-        session.sessionId = 'thread-forked';
-
-        const exitReason = await codexRemoteLauncher(session as never);
-
-        expect(exitReason).toBe('exit');
-        expect(harness.resumeThreadIds).toEqual(['thread-forked', 'thread-forked']);
-        expect(harness.unarchiveThreadIds).toEqual(['thread-forked']);
-        expect(harness.startThreadIds).toEqual([]);
-        expect(harness.startTurnThreadIds).toEqual(['thread-forked']);
-        expect(session.sessionId).toBe('thread-forked');
-    });
-
-    it('resumes a migrated conversation by its explicit rollout path', async () => {
-        process.env.HAPI_CODEX_RESUME_PATH = '/tmp/migrated-thread.jsonl';
-        const { session } = createSessionStub(['continue']);
-        session.sessionId = 'thread-old';
-
-        const exitReason = await codexRemoteLauncher(session as never);
-
-        expect(exitReason).toBe('exit');
-        expect(harness.resumeThreadParams).toHaveLength(1);
-        expect(harness.resumeThreadParams[0]?.path).toBe('/tmp/migrated-thread.jsonl');
-        expect(harness.startThreadIds).toEqual([]);
-        expect(harness.startTurnThreadIds).toEqual(['thread-old']);
     });
 
     it('does not start a fresh thread for the next queued message after thread-level systemError', async () => {
@@ -3049,8 +2757,7 @@ describe('codexRemoteLauncher', () => {
             agentId: 'child-thread',
             message: expect.objectContaining({
                 type: 'message',
-                message: 'child output should stay hidden',
-                phase: 'final_answer'
+                message: 'child output should stay hidden'
             })
         }));
         expect(codexMessages).toContainEqual(expect.objectContaining({
@@ -3064,7 +2771,7 @@ describe('codexRemoteLauncher', () => {
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'agent-run-update',
             agentId: 'child-thread',
-            activity: 'Running command',
+            activity: 'Running command: echo child',
             activityKind: 'running-command'
         }));
         expect(codexMessages).toContainEqual(expect.objectContaining({
@@ -3127,24 +2834,6 @@ describe('codexRemoteLauncher', () => {
         expect(lastCompleted).toEqual(expect.objectContaining({
             result: 'final child output should win',
             activity: 'Completed: final child output should win'
-        }));
-        expect(codexMessages).toContainEqual(expect.objectContaining({
-            type: 'agent-run-trace',
-            agentId: 'child-thread',
-            message: expect.objectContaining({
-                type: 'message',
-                message: 'child output should stay hidden',
-                phase: 'commentary'
-            })
-        }));
-        expect(codexMessages).toContainEqual(expect.objectContaining({
-            type: 'agent-run-trace',
-            agentId: 'child-thread',
-            message: expect.objectContaining({
-                type: 'message',
-                message: 'final child output should win',
-                phase: 'final_answer'
-            })
         }));
     });
 
@@ -3407,6 +3096,7 @@ describe('codexRemoteLauncher', () => {
 
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'token_count',
+            flavor: 'codex',
             thread_id: 'thread-1',
             usageSchema: 'hapi.usage.v1',
             inputTokenSemantics: 'includes-cache',
@@ -3630,15 +3320,13 @@ describe('codexRemoteLauncher', () => {
 
     it('applies parent-thread hapi change_title after disabling MCP-side title writes', async () => {
         harness.emitParentTitleChange = true;
-        const { session, codexMessages, summaryMessages } = createSessionStub();
+        const { session, codexMessages, summaryMessages, getMetadata } = createSessionStub();
 
         await codexRemoteLauncher(session as never);
 
         expect(harness.bridgeOptions).toEqual([{ emitTitleSummary: false }]);
-        expect(summaryMessages).toContainEqual(expect.objectContaining({
-            type: 'summary',
-            summary: 'Parent Title'
-        }));
+        expect(summaryMessages).toEqual([]);
+        expect(getMetadata().name).toBe('Parent Title');
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'tool-call',
             name: 'mcp__hapi__change_title',
@@ -3670,7 +3358,6 @@ describe('codexRemoteLauncher', () => {
 
     it('interrupts an in-flight turn before clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
         const { session, sessionEvents, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
         const exitReason = await codexRemoteLauncher(session as never);
@@ -3687,36 +3374,8 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
-    it('does not clear the conversation when the active turn rejects the interrupt', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.interruptErrors.push(new Error('turn is not interruptible'));
-        const { session, sessionEvents, resetThreadCalls } = createSessionStub(['first message', '/clear']);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.interruptedTurns).toEqual([{ threadId: 'thread-1', turnId: 'turn-1' }]);
-        });
-
-        expect(resetThreadCalls).toEqual([]);
-        expect(session.thinking).toBe(true);
-        expect(sessionEvents).toContainEqual({
-            type: 'message',
-            message: 'Command not applied because the active Codex turn could not be stopped'
-        });
-
-        harness.dispatchNotification?.('turn/completed', {
-            status: 'Completed',
-            turn: { id: 'turn-1' }
-        });
-        await running;
-
-        expect(resetThreadCalls).toEqual([]);
-        expect(session.thinking).toBe(false);
-    });
-
     it('interrupts active child agent turns before clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
         harness.emitRunningChildTurnBeforeSuppressedParent = true;
         const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
@@ -3754,517 +3413,8 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
-    it('does not start a new parent turn until every interrupted child is terminal', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitRunningChildTurnBeforeSuppressedParent = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        harness.deferChildTurnAbortOnInterrupt = true;
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(session.thinking).toBe(true));
-
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
-        await vi.waitFor(() => {
-            expect(harness.interruptedTurns).toEqual([
-                { threadId: 'thread-1', turnId: 'turn-1' },
-                { threadId: 'child-thread', turnId: 'child-turn' }
-            ]);
-            expect(session.thinking).toBe(false);
-        });
-
-        session.queue.push('after parent and child stop', mode);
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        expect(harness.startTurnMessages).toEqual(['first message']);
-
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'child-thread',
-            turnId: 'child-turn',
-            status: 'Interrupted',
-            turn: { id: 'child-turn' }
-        });
-        await aborting;
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual([
-                'first message',
-                'after parent and child stop'
-            ]);
-        });
-
-        harness.deferChildTurnAbortOnInterrupt = false;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('interrupts a child-only task after the parent turn has already completed', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitRunningChildTurnBeforeSuppressedParent = true;
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(session.thinking).toBe(true));
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'thread-1',
-            status: 'Completed',
-            turn: { id: 'turn-1' }
-        });
-        await vi.waitFor(() => expect(session.thinking).toBe(false));
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('abort')?.({});
-        expect(harness.interruptedTurns).toEqual([
-            { threadId: 'child-thread', turnId: 'child-turn' }
-        ]);
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('tracks and interrupts a child that starts while abort is being requested', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        harness.emitLateChildStartOnParentInterrupt = true;
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(session.thinking).toBe(true));
-
-        await rpcHandlers.get('abort')?.({});
-        expect(harness.interruptedTurns).toEqual(expect.arrayContaining([
-            { threadId: 'thread-1', turnId: 'turn-1' },
-            { threadId: 'late-child-thread', turnId: 'late-child-turn' }
-        ]));
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('keeps abort confirmation open for a child that starts before the initial interrupt RPC settles', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        harness.deferParentInterruptAck = true;
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(session.thinking).toBe(true));
-
-        let abortSettled = false;
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({})).finally(() => {
-            abortSettled = true;
-        });
-        await vi.waitFor(() => {
-            expect(harness.releaseDeferredParentInterruptAck).not.toBeNull();
-            expect(harness.interruptedTurns).toContainEqual({
-                threadId: 'thread-1',
-                turnId: 'turn-1'
-            });
-        });
-        await new Promise((resolve) => setTimeout(resolve, 75));
-        expect(abortSettled).toBe(false);
-
-        harness.dispatchNotification?.('turn/started', {
-            threadId: 'late-child-thread',
-            turnId: 'late-child-turn',
-            turn: { id: 'late-child-turn' }
-        });
-        await vi.waitFor(() => {
-            expect(harness.interruptedTurns).toContainEqual({
-                threadId: 'late-child-thread',
-                turnId: 'late-child-turn'
-            });
-        });
-        expect(abortSettled).toBe(false);
-
-        harness.releaseDeferredParentInterruptAck?.();
-        await aborting;
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('keeps abort confirmation open past the discovery interval while a spawn is pending', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        const { session, rpcHandlers, codexMessages } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => expect(session.thinking).toBe(true));
-
-        // The suppressed mock turn returns before its usual synthetic item
-        // stream. Inject the unresolved spawn explicitly so this test covers
-        // the real race: parent interruption completes while a child id has
-        // not been reported yet.
-        harness.dispatchNotification?.('item/started', {
-            item: {
-                id: 'delayed-spawn',
-                type: 'collabAgentToolCall',
-                tool: 'spawnAgent',
-                prompt: 'do delayed side work',
-                senderThreadId: 'thread-1',
-                receiverThreadIds: []
-            },
-            threadId: 'thread-1',
-            turnId: 'turn-1'
-        });
-        await vi.waitFor(() => {
-            expect(codexMessages).toContainEqual(expect.objectContaining({
-                type: 'agent-run-start',
-                cardId: 'delayed-spawn',
-                status: 'starting'
-            }));
-        });
-
-        let abortSettled = false;
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({})).finally(() => {
-            abortSettled = true;
-        });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(abortSettled).toBe(false);
-
-        harness.dispatchNotification?.('turn/started', {
-            threadId: 'delayed-child-thread',
-            turnId: 'delayed-child-turn',
-            turn: { id: 'delayed-child-turn' }
-        });
-        await vi.waitFor(() => {
-            expect(harness.interruptedTurns).toContainEqual({
-                threadId: 'delayed-child-thread',
-                turnId: 'delayed-child-turn'
-            });
-        });
-        await aborting;
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('keeps running after a rejected abort, then accepts a new turn after the real terminal event', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.interruptErrors.push(new Error('turn id is no longer active'));
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-            expect(rpcHandlers.has('abort')).toBe(true);
-        });
-
-        await expect(Promise.resolve(rpcHandlers.get('abort')?.({}))).rejects.toThrow(
-            'task is still running'
-        );
-
-        // A rejected interrupt is not an authoritative completion. Do not
-        // report a false idle state or start a second overlapping turn.
-        expect(session.thinking).toBe(true);
-        expect(harness.startTurnMessages).toEqual(['first message']);
-
-        harness.dispatchNotification?.('turn/completed', {
-            status: 'Completed',
-            turn: { id: 'turn-1' }
-        });
-        await vi.waitFor(() => expect(session.thinking).toBe(false));
-
-        session.queue.push('message after failed interrupt', mode);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual([
-                'first message',
-                'message after failed interrupt'
-            ]);
-        });
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-
-        expect(session.thinking).toBe(false);
-    });
-
-    it('keeps the turn running after an interrupt acknowledgement until its terminal event arrives', async () => {
-        harness.suppressTurnCompletion = true;
-        const mode = createMode();
-        const { session, rpcHandlers, thinkingChanges } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
-        await vi.waitFor(() => {
-            expect(harness.interruptedTurns).toEqual([{ threadId: 'thread-1', turnId: 'turn-1' }]);
-        });
-        await Promise.resolve();
-        await Promise.resolve();
-
-        session.queue.push('next turn after confirmed abort', mode);
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        expect(session.thinking).toBe(true);
-        expect(harness.startTurnMessages).toEqual(['first message']);
-
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'thread-1',
-            status: 'Interrupted',
-            turn: { id: 'turn-1' }
-        });
-        await aborting;
-        expect(thinkingChanges).toContain(false);
-
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual([
-                'first message',
-                'next turn after confirmed abort'
-            ]);
-        });
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-        expect(session.thinking).toBe(false);
-    });
-
-    it('does not automatically retry a failure that confirms an explicit abort', async () => {
-        harness.suppressTurnCompletion = true;
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
-        await vi.waitFor(() => expect(harness.interruptedTurns).toHaveLength(1));
-        harness.dispatchNotification?.('error', {
-            threadId: 'thread-1',
-            turnId: 'turn-1',
-            error: { message: 'Selected model is at capacity' }
-        });
-        await aborting;
-
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        expect(harness.startTurnMessages).toEqual(['first message']);
-        expect(session.thinking).toBe(false);
-
-        session.queue.push('new prompt after stopped failure', mode);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual([
-                'first message',
-                'new prompt after stopped failure'
-            ]);
-        });
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('recovers a naturally completed turn when thread idle arrives without turn/completed', async () => {
-        harness.suppressTurnCompletion = true;
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        harness.dispatchNotification?.('thread/status/changed', {
-            thread: { id: 'thread-1' },
-            status: { type: 'idle' }
-        });
-        await vi.waitFor(() => expect(session.thinking).toBe(false));
-        expect(harness.readThreadCalls).toContainEqual({
-            threadId: 'thread-1',
-            includeTurns: false
-        });
-
-        session.queue.push('next turn after recovered idle', mode);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual([
-                'first message',
-                'next turn after recovered idle'
-            ]);
-        });
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('does not let a delayed idle notification from the prior turn finish the current turn', async () => {
-        harness.suppressTurnCompletion = true;
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'thread-1',
-            turnId: 'turn-1',
-            turn: { id: 'turn-1', status: 'completed' }
-        });
-        session.queue.push('second message', mode);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message', 'second message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        harness.threadStatusById.set('thread-1', 'active');
-        harness.dispatchNotification?.('thread/status/changed', {
-            thread: { id: 'thread-1' },
-            status: { type: 'idle' }
-        });
-        await new Promise((resolve) => setTimeout(resolve, 350));
-
-        // Capability/history probes can complete after the status probe; only
-        // assert that the authoritative no-turns status read occurred.
-        expect(harness.readThreadCalls).toContainEqual({
-            threadId: 'thread-1',
-            includeTurns: false
-        });
-        expect(session.thinking).toBe(true);
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('rejects abort when acknowledgement is not followed by terminal or idle confirmation', async () => {
-        harness.suppressTurnCompletion = true;
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-        });
-
-        vi.useFakeTimers();
-        try {
-            const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
-            const rejected = expect(aborting).rejects.toThrow('task is still running');
-            await Promise.resolve();
-            await Promise.resolve();
-            await vi.advanceTimersByTimeAsync(8_001);
-
-            await rejected;
-            expect(session.thinking).toBe(true);
-        } finally {
-            vi.useRealTimers();
-        }
-
-        harness.dispatchNotification?.('turn/completed', {
-            threadId: 'thread-1',
-            status: 'Completed',
-            turn: { id: 'turn-1' }
-        });
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('cancels a turn that is still preparing its thread before dispatch', async () => {
-        harness.deferResumeThread = true;
-        const mode = createMode();
-        const { session, rpcHandlers } = createSessionStub(['first message'], mode, false, false);
-        session.sessionId = 'thread-existing';
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.resumeThreadIds).toEqual(['thread-existing']);
-            expect(harness.startTurnMessages).toEqual([]);
-        });
-
-        await rpcHandlers.get('abort')?.({});
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        expect(harness.startTurnMessages).toEqual([]);
-
-        harness.deferResumeThread = false;
-        session.queue.push('new prompt after preparation abort', mode);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['new prompt after preparation abort']);
-        });
-
-        harness.emitTurnAbortedOnInterrupt = true;
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('waits for a delayed turn/start id, then interrupts it without reporting ready', async () => {
-        harness.deferStartTurn = true;
-        harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        const mode = createMode();
-        const { session, sessionEvents, rpcHandlers } = createSessionStub(
-            ['first message'],
-            mode,
-            false,
-            false
-        );
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(harness.startTurnMessages).toEqual(['first message']);
-            expect(session.thinking).toBe(true);
-            expect(harness.releaseDeferredStartTurn).not.toBeNull();
-        });
-
-        const readyCountBeforeAbort = sessionEvents.filter((event) => event.type === 'ready').length;
-        const aborting = Promise.resolve(rpcHandlers.get('abort')?.({}));
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        expect(harness.interruptedTurns).toEqual([]);
-        expect(sessionEvents.filter((event) => event.type === 'ready')).toHaveLength(readyCountBeforeAbort);
-
-        harness.releaseDeferredStartTurn?.();
-        await aborting;
-        expect(harness.interruptedTurns).toContainEqual({
-            threadId: 'thread-1',
-            turnId: 'turn-1'
-        });
-        expect(session.thinking).toBe(false);
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
-    it('does not report abort success when a child turn rejects interruption', async () => {
-        harness.suppressTurnCompletion = true;
-        harness.emitRunningChildTurnBeforeSuppressedParent = true;
-        harness.emitTurnAbortedOnInterrupt = true;
-        harness.interruptErrors.push(null, new Error('child is not interruptible'));
-        const { session, rpcHandlers } = createSessionStub(['first message'], createMode(), false, false);
-
-        const running = codexRemoteLauncher(session as never);
-        await vi.waitFor(() => {
-            expect(session.thinking).toBe(true);
-            expect(harness.startTurnMessages).toEqual(['first message']);
-        });
-
-        await expect(Promise.resolve(rpcHandlers.get('abort')?.({}))).rejects.toThrow(
-            'task is still running'
-        );
-        expect(harness.interruptedTurns.slice(0, 2)).toEqual([
-            { threadId: 'thread-1', turnId: 'turn-1' },
-            { threadId: 'child-thread', turnId: 'child-turn' }
-        ]);
-
-        await rpcHandlers.get('switch')?.({});
-        await running;
-    });
-
     it('does not interrupt completed child agent turns when clearing codex thread state', async () => {
         harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
         harness.emitCompletedChildTurnBeforeSuppressedParent = true;
         const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
 
@@ -4338,7 +3488,6 @@ describe('codexRemoteLauncher', () => {
 
     it('interrupts an in-flight turn before compacting the current thread', async () => {
         harness.suppressTurnCompletion = true;
-        harness.emitTurnAbortedOnInterrupt = true;
         const { session, sessionEvents } = createSessionStub(['first message', '/compact']);
 
         const exitReason = await codexRemoteLauncher(session as never);

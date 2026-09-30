@@ -210,6 +210,74 @@ describe('codexLocalLauncher', () => {
         }
     });
 
+    it('notifies once for a live completion after forwarding the final answer, without replay alerts', async () => {
+        const transcriptPath = await writeTranscriptMeta('ready.jsonl', 'ready-session');
+        const event = (payload: Record<string, unknown>) => JSON.stringify({ type: 'event_msg', payload }) + '\n';
+        await appendFile(transcriptPath, event({ type: 'task_complete', turn_id: 'old' }));
+        const { session, sessionEvents, agentMessages } = createSessionStub('default', undefined, tempDir, null, true);
+        const sendReady = vi.spyOn(session, 'sendSessionEvent');
+        let release!: () => void;
+        harness.runBarrier = new Promise<void>((resolve) => { release = resolve; });
+        const running = codexLocalLauncher(session as never);
+        try {
+            await vi.waitFor(() => expect(harness.sessionHookHandlers).toHaveLength(1));
+            harness.sessionHookHandlers[0]('ready-session', { transcript_path: transcriptPath });
+            await wait(300);
+            expect(sessionEvents).not.toContainEqual({ type: 'ready' });
+            sendReady.mockImplementation((message) => {
+                if (message.type === 'ready') {
+                    expect(agentMessages).toContainEqual(expect.objectContaining({ message: 'finished answer' }));
+                }
+                sessionEvents.push(message);
+            });
+            await appendFile(transcriptPath,
+                event({ type: 'task_started', turn_id: 'live' })
+                + event({ type: 'agent_message', message: 'finished answer', phase: 'final_answer' })
+                + event({ type: 'task_complete', turn_id: 'live' }));
+            await vi.waitFor(() => expect(sessionEvents.filter(e => e.type === 'ready')).toHaveLength(1), { timeout: 3000 });
+            await appendFile(transcriptPath, event({ type: 'task_complete', turn_id: 'live' }) + event({ type: 'task_complete', turn_id: 'old' }));
+            await wait(300);
+            expect(sessionEvents.filter(e => e.type === 'ready')).toHaveLength(1);
+        } finally {
+            release();
+            await running;
+        }
+    });
+
+    it.each(['next-turn', 'queued', 'aborted', 'failed', 'shutdown'] as const)(
+        'does not notify while %s prevents an idle completion', async (scenario) => {
+            const transcriptPath = await writeTranscriptMeta('suppressed.jsonl', 'ready-session');
+            const event = (payload: Record<string, unknown>) => JSON.stringify({ type: 'event_msg', payload }) + '\n';
+            const { session, sessionEvents } = createSessionStub('default', undefined, tempDir);
+            if (scenario === 'queued') vi.spyOn(session.queue, 'size').mockReturnValue(1);
+            let release!: () => void;
+            harness.runBarrier = new Promise<void>((resolve) => { release = resolve; });
+            const running = codexLocalLauncher(session as never);
+            try {
+                await vi.waitFor(() => expect(harness.sessionHookHandlers).toHaveLength(1));
+                harness.sessionHookHandlers[0]('ready-session', { transcript_path: transcriptPath });
+                await wait(300);
+                const completion = scenario === 'aborted' ? 'turn_aborted' : scenario === 'failed' ? 'task_failed' : 'task_complete';
+                await appendFile(transcriptPath,
+                    event({ type: completion, turn_id: 'first' })
+                    + (scenario === 'next-turn' ? event({ type: 'task_started', turn_id: 'second' }) : ''));
+                if (scenario === 'shutdown') {
+                    release();
+                    await running;
+                }
+                await wait(300);
+                expect(sessionEvents).not.toContainEqual({ type: 'ready' });
+                if (scenario === 'next-turn') {
+                    await appendFile(transcriptPath, event({ type: 'task_complete', turn_id: 'second' }));
+                    await vi.waitFor(() => expect(sessionEvents).toContainEqual({ type: 'ready' }), { timeout: 3000 });
+                }
+            } finally {
+                release();
+                await running;
+            }
+        }
+    );
+
     it('rebuilds approval and sandbox args from yolo mode', async () => {
         const { session } = createSessionStub('yolo', [
             '--sandbox',
@@ -424,6 +492,7 @@ describe('codexLocalLauncher', () => {
         expect(getModelReasoningEffort()).toBeNull();
         expect(agentMessages).toContainEqual(expect.objectContaining({
             type: 'token_count',
+            flavor: 'codex',
             model: 'gpt-5.4',
             usageSchema: 'hapi.usage.v1',
             inputTokenSemantics: 'includes-cache'
@@ -580,8 +649,6 @@ describe('codexLocalLauncher', () => {
             const launcherPromise = codexLocalLauncher(session as never);
             await vi.waitFor(() => expect(harness.launches).toHaveLength(1));
             expect(session.sessionId).toBeNull();
-            const sessionMatchToken = harness.launches[0]?.sessionMatchToken;
-            expect(sessionMatchToken).toEqual(expect.any(String));
 
             await Promise.all([
                 writeFile(transcriptPath, [
@@ -590,10 +657,7 @@ describe('codexLocalLauncher', () => {
                         payload: {
                             id: 'review-primary',
                             cwd: '/tmp/effective-codex-cwd',
-                            source: 'cli',
-                            base_instructions: {
-                                text: `HAPI session match token: ${sessionMatchToken}`
-                            }
+                            source: 'cli'
                         }
                     }),
                     JSON.stringify({
@@ -613,10 +677,7 @@ describe('codexLocalLauncher', () => {
                         payload: {
                             id: 'review-subagent',
                             cwd: '/tmp/effective-codex-cwd',
-                            source: { subagent: 'review' },
-                            base_instructions: {
-                                text: `HAPI session match token: ${sessionMatchToken}`
-                            }
+                            source: { subagent: 'review' }
                         }
                     }),
                     JSON.stringify({
@@ -763,8 +824,10 @@ describe('codexLocalLauncher', () => {
             usageSchema: 'hapi.usage.v1',
             inputTokenSemantics: 'includes-cache'
         });
+        expect(tokenMessages[0]).not.toHaveProperty('flavor');
         expect(tokenMessages[0]).not.toHaveProperty('thread_id');
         expect(tokenMessages[1]).toMatchObject({
+            flavor: 'codex',
             threadId: 'codex-thread-import',
             thread_id: 'codex-thread-import',
             hapiUsageScope: 'managed',
@@ -1129,7 +1192,6 @@ describe('codexLocalLauncher', () => {
             message: {
                 type: 'message',
                 message: 'visible final A',
-                phase: 'final_answer',
                 id: 'final-a'
             }
         }, {
@@ -1140,7 +1202,6 @@ describe('codexLocalLauncher', () => {
             message: {
                 type: 'message',
                 message: 'visible final B',
-                phase: 'final_answer',
                 id: 'final-b'
             }
         }]);
@@ -1238,12 +1299,10 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible 0.147 commentary',
-            phase: 'commentary',
             id: 'commentary-147'
         }, {
             type: 'message',
             message: 'visible 0.147 final answer',
-            phase: 'final_answer',
             id: 'final-147'
         }]);
     });
@@ -1291,7 +1350,6 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible answer at EOF',
-            phase: 'final_answer',
             id: 'final-at-eof'
         }]);
 
@@ -1301,7 +1359,6 @@ describe('codexLocalLauncher', () => {
         expect(agentMessages).toEqual([{
             type: 'message',
             message: 'visible answer at EOF',
-            phase: 'final_answer',
             id: 'final-at-eof'
         }]);
     });
@@ -1578,114 +1635,5 @@ describe('codexLocalLauncher', () => {
 
         expect(session.sessionId).toBeNull();
         expect(session.transcriptPath).toBeNull();
-    });
-
-    it('forwards capacity/overload errors via sessionEvent', async () => {
-        const transcriptPath = join(tempDir, 'capacity-error-transcript.jsonl');
-        const { session, sessionEvents } = createSessionStub('default');
-        let releaseRunBarrier: (() => void) | undefined;
-        harness.runBarrier = new Promise((resolve) => {
-            releaseRunBarrier = resolve;
-        });
-
-        await writeFile(
-            transcriptPath,
-            JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-capacity' } }) + '\n'
-        );
-
-        const launcherPromise = codexLocalLauncher(session as never);
-        await wait(50);
-
-        harness.sessionHookHandlers[0]?.('codex-thread-capacity', {
-            transcript_path: transcriptPath
-        });
-        await wait(100);
-
-        await appendFile(
-            transcriptPath,
-            JSON.stringify({
-                type: 'event_msg',
-                payload: {
-                    type: 'task_failed',
-                    error: 'The selected model is at capacity. Please try again later.'
-                }
-            }) + '\n'
-        );
-        await wait(2300);
-
-        if (releaseRunBarrier) {
-            releaseRunBarrier();
-        }
-        await launcherPromise;
-
-        const capacityEvent = sessionEvents.find((event) =>
-            event.type === 'message' && typeof event.message === 'string' && event.message.includes('capacity')
-        );
-        expect(capacityEvent).toBeDefined();
-    });
-
-    it('emits empty-completion notice when task ends without assistant message', async () => {
-        const transcriptPath = join(tempDir, 'empty-completion-transcript.jsonl');
-        const { session, agentMessages } = createSessionStub('default');
-        let releaseRunBarrier: (() => void) | undefined;
-        harness.runBarrier = new Promise((resolve) => {
-            releaseRunBarrier = resolve;
-        });
-
-        await writeFile(
-            transcriptPath,
-            JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-empty' } }) + '\n'
-        );
-
-        const launcherPromise = codexLocalLauncher(session as never);
-        await wait(50);
-
-        harness.sessionHookHandlers[0]?.('codex-thread-empty', {
-            transcript_path: transcriptPath
-        });
-        await wait(100);
-
-        await appendFile(
-            transcriptPath,
-            JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }) + '\n'
-                + JSON.stringify({
-                    type: 'event_msg',
-                    payload: {
-                        type: 'exec_command_begin',
-                        call_id: 'call-abc',
-                        command: ['ls']
-                    }
-                }) + '\n'
-                + JSON.stringify({
-                    type: 'event_msg',
-                    payload: {
-                        type: 'exec_command_end',
-                        call_id: 'call-abc',
-                        exit_code: 0
-                    }
-                }) + '\n'
-                + JSON.stringify({
-                    type: 'event_msg',
-                    payload: {
-                        type: 'task_complete',
-                        last_agent_message: null
-                    }
-                }) + '\n'
-        );
-        await wait(2300);
-
-        if (releaseRunBarrier) {
-            releaseRunBarrier();
-        }
-        await launcherPromise;
-
-        const notice = agentMessages.find((message) =>
-            typeof message === 'object'
-            && message !== null
-            && (message as Record<string, unknown>).type === 'message'
-            && typeof (message as Record<string, unknown>).message === 'string'
-            && ((message as Record<string, unknown>).message as string).includes('继续')
-        );
-        expect(notice).toBeDefined();
     });
 });

@@ -5,12 +5,6 @@ type AppContextValue = {
     api: ApiClient
     token: string
     baseUrl: string
-    signOut?: () => void
-    /** True when authenticated via a session share link — the UI shows only
-     *  the one shared session and hides all navigation/session-list chrome. */
-    sharedMode?: boolean
-    /** The single session id a shared viewer is scoped to. */
-    sharedSessionId?: string
     titleSuggestionAvailable?: boolean
 }
 
@@ -33,8 +27,4 @@ export function useAppContext(): AppContextValue {
         throw new Error('AppContext is not available')
     }
     return context
-}
-
-export function useOptionalAppContext(): AppContextValue | null {
-    return useContext(AppContext)
 }

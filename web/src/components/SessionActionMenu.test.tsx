@@ -227,23 +227,6 @@ describe('SessionActionMenu - Reopen action', () => {
         // Archive should not show up for inactive sessions (it is the active-session destructive).
         expect(screen.queryByRole('menuitem', { name: /Archive/ })).toBeNull()
     })
-
-    it('uses a viewport-bounded scroll container on low-height screens', () => {
-        renderMenu({
-            onSetPinMode: vi.fn(),
-            onExport: vi.fn(),
-            onShare: vi.fn(),
-            onSyncCodex: vi.fn(),
-            onSyncPi: vi.fn(),
-            onSwitchCodexAccount: vi.fn(),
-        })
-
-        const menuContainer = screen.getByRole('menu').parentElement
-        expect(menuContainer).not.toBeNull()
-        expect(menuContainer?.className).toContain('max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-16px)]')
-        expect(menuContainer?.className).toContain('overflow-y-auto')
-        expect(menuContainer?.className).toContain('overscroll-contain')
-    })
 })
 
 describe('SessionActionMenu - Codex sync action', () => {

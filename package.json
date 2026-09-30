@@ -42,9 +42,7 @@
         "seed:mermaid-lightbox:session": "bun run scripts/dev/mermaid-lightbox-seed-session-db.ts",
         "gen:fixtures": "cd web && bun scripts/generate-fixtures.ts",
         "clean-session": "bun run hub/scripts/cleanup-sessions.ts",
-        "release-all": "cd cli && bun run release-all",
-        "deploy:liuxin": "scripts/deploy-liuxinhapi.sh",
-        "deploy:liuxin:fast": "scripts/deploy-liuxinhapi.sh --skip-tests"
+        "release-all": "cd cli && bun run release-all"
     },
     "devDependencies": {
         "@playwright/test": "^1.61.0",

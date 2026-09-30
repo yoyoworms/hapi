@@ -31,58 +31,8 @@ export interface InitializeResponse {
     [key: string]: unknown;
 }
 
-export type LoginAccountParams =
-    | {
-        type: 'chatgpt';
-        codexStreamlinedLogin?: boolean;
-        useHostedLoginSuccessPage?: boolean;
-        appBrand?: 'codex' | 'chatgpt' | null;
-    }
-    | {
-        type: 'chatgptDeviceCode';
-    };
-
-export type LoginAccountResponse =
-    | {
-        type: 'chatgpt';
-        loginId: string;
-        authUrl: string;
-    }
-    | {
-        type: 'chatgptDeviceCode';
-        loginId: string;
-        verificationUrl: string;
-        userCode: string;
-    };
-
-export interface GetAccountResponse {
-    account: {
-        type: 'chatgpt';
-        email: string | null;
-        planType: string;
-    } | {
-        type: string;
-        [key: string]: unknown;
-    } | null;
-    requiresOpenaiAuth: boolean;
-}
-
-export interface AccountRateLimitWindow {
-    usedPercent?: number | null;
-    resetsAt?: number | null;
-    [key: string]: unknown;
-}
-
-export interface GetAccountRateLimitsResponse {
-    rateLimits?: {
-        primary?: AccountRateLimitWindow | null;
-        secondary?: AccountRateLimitWindow | null;
-        [key: string]: unknown;
-    };
-    [key: string]: unknown;
-}
-
 export interface ModelListParams {
+    cursor?: string;
     includeHidden?: boolean;
 }
 
@@ -181,6 +131,20 @@ export interface ThreadStartResponse {
     [key: string]: unknown;
 }
 
+export interface ConfigReadParams {
+    cwd?: string | null;
+    includeLayers?: boolean;
+}
+
+export interface ConfigReadResponse {
+    config: {
+        model_context_window?: number | null;
+        model_auto_compact_token_limit?: number | null;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
 export type ResponseItem = Record<string, unknown>;
 
 export interface ThreadResumeParams {
@@ -207,12 +171,6 @@ export interface ThreadResumeResponse {
     [key: string]: unknown;
 }
 
-export type ThreadStatus =
-    | { type: 'notLoaded' }
-    | { type: 'idle' }
-    | { type: 'systemError' }
-    | { type: 'active'; activeFlags: string[] };
-
 export interface ThreadReadParams {
     threadId: string;
     includeTurns?: boolean;
@@ -221,13 +179,11 @@ export interface ThreadReadParams {
 export interface ThreadReadResponse {
     thread: {
         id: string;
-        status?: ThreadStatus;
         turns?: Array<{
             id?: string;
             status?: string;
             items?: ResponseItem[];
         }>;
-        [key: string]: unknown;
     };
     [key: string]: unknown;
 }
@@ -245,22 +201,6 @@ export interface ThreadForkResponse {
         turns?: Array<{ items?: ResponseItem[] }>;
     };
     model?: string;
-    [key: string]: unknown;
-}
-
-export interface ThreadArchiveParams {
-    threadId: string;
-}
-
-export interface ThreadUnarchiveParams {
-    threadId: string;
-}
-
-export interface ThreadUnarchiveResponse {
-    thread: {
-        id: string;
-        [key: string]: unknown;
-    };
     [key: string]: unknown;
 }
 
@@ -347,23 +287,6 @@ export interface TurnStartResponse {
     [key: string]: unknown;
 }
 
-export interface TurnSteerParams {
-    threadId: string;
-    input: UserInput[];
-    /**
-     * The currently active turn. App-server rejects the steer if the turn
-     * completed or changed before the request arrived.
-     */
-    expectedTurnId: string;
-    /** Optional client identity echoed back as userMessage.clientId. */
-    clientUserMessageId?: string | null;
-}
-
-export interface TurnSteerResponse {
-    turnId: string;
-    [key: string]: unknown;
-}
-
 export interface TurnInterruptParams {
     threadId: string;
     turnId: string;
@@ -384,6 +307,18 @@ export interface ThreadRollbackResponse {
         id: string;
         [key: string]: unknown;
     };
+    [key: string]: unknown;
+}
+
+export interface TurnSteerParams {
+    threadId: string;
+    input: UserInput[];
+    expectedTurnId: string;
+    clientUserMessageId?: string | null;
+}
+
+export interface TurnSteerResponse {
+    turnId: string;
     [key: string]: unknown;
 }
 

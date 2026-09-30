@@ -42,16 +42,9 @@ function isWeakToken(token: string): boolean {
 
 function validateCliApiToken(rawToken: string, source: 'env' | 'file'): string {
     if (rawToken.includes(':')) {
-        if (source === 'env') {
-            throw new Error(
-                `CLI_API_TOKEN env var must be the base token only; namespace suffixes are not accepted.`
-            )
-        }
-        const baseToken = rawToken.split(':', 1)[0]
-        console.warn(
-            `[WARN] cliApiToken in settings.json contains a namespace suffix; using base token only. Re-save settings to clean up.`
+        throw new Error(
+            `CLI API token from ${source} must be the base token only; namespace suffixes are not accepted.`
         )
-        return baseToken
     }
     return rawToken
 }

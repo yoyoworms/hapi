@@ -3,112 +3,6 @@ import { logger } from '@/ui/logger';
 import { AppServerEventConverter } from './appServerEventConverter';
 
 describe('AppServerEventConverter', () => {
-    it('classifies a single 10080-minute primary rate limit as weekly only', () => {
-        const converter = new AppServerEventConverter();
-        const resetsAt = Math.floor((Date.now() + 5 * 24 * 60 * 60_000) / 1000);
-        const events = converter.handleNotification('account/rateLimits/updated', {
-            rate_limits: {
-                primary: {
-                    used_percent: 17,
-                    window_minutes: 10_080,
-                    resets_at: resetsAt
-                },
-                secondary: null
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'account_status',
-            accountStatus: expect.objectContaining({
-                window: null,
-                weekly: expect.objectContaining({
-                    remainingPercent: 83,
-                    resetAt: resetsAt * 1000
-                })
-            })
-        }]);
-    });
-
-    it('classifies a single 5-hour primary rate limit as window only', () => {
-        const converter = new AppServerEventConverter();
-        const resetsAt = Math.floor((Date.now() + 4 * 60 * 60_000) / 1000);
-        const events = converter.handleNotification('account/rateLimits/updated', {
-            rateLimits: {
-                primary: {
-                    usedPercent: 17,
-                    windowMinutes: 300,
-                    resetsAt
-                }
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'account_status',
-            accountStatus: expect.objectContaining({
-                window: expect.objectContaining({
-                    remainingPercent: 83,
-                    resetAt: resetsAt * 1000
-                }),
-                weekly: null
-            })
-        }]);
-    });
-
-    it('uses the reset horizon when an ambiguous primary limit has no window duration', () => {
-        const converter = new AppServerEventConverter();
-        const resetsAt = Math.floor((Date.now() + 5 * 24 * 60 * 60_000) / 1000);
-        const events = converter.handleNotification('account/rateLimits/updated', {
-            rate_limits: {
-                primary: {
-                    used_percent: 17,
-                    resets_at: resetsAt
-                }
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'account_status',
-            accountStatus: expect.objectContaining({
-                window: null,
-                weekly: expect.objectContaining({ remainingPercent: 83 })
-            })
-        }]);
-    });
-
-    it('maps primary and secondary limits to distinct window and weekly buckets', () => {
-        const converter = new AppServerEventConverter();
-        const windowResetsAt = Math.floor((Date.now() + 4 * 60 * 60_000) / 1000);
-        const weeklyResetsAt = Math.floor((Date.now() + 6 * 24 * 60 * 60_000) / 1000);
-        const events = converter.handleNotification('account/rateLimits/updated', {
-            rateLimits: {
-                primary: {
-                    usedPercent: 17,
-                    windowMinutes: 300,
-                    resetsAt: windowResetsAt
-                },
-                secondary: {
-                    usedPercent: 60,
-                    windowMinutes: 10_080,
-                    resetsAt: weeklyResetsAt
-                }
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'account_status',
-            accountStatus: expect.objectContaining({
-                window: expect.objectContaining({
-                    remainingPercent: 83,
-                    resetAt: windowResetsAt * 1000
-                }),
-                weekly: expect.objectContaining({
-                    remainingPercent: 40,
-                    resetAt: weeklyResetsAt * 1000
-                })
-            })
-        }]);
-    });
-
     it('maps thread/started', () => {
         const converter = new AppServerEventConverter();
         const events = converter.handleNotification('thread/started', { thread: { id: 'thread-1' } });
@@ -165,18 +59,6 @@ describe('AppServerEventConverter', () => {
         }]);
     });
 
-    it('maps an idle thread status to an authoritative idle event', () => {
-        const converter = new AppServerEventConverter();
-
-        expect(converter.handleNotification('thread/status/changed', {
-            thread: { id: 'thread-1' },
-            status: { type: 'idle' }
-        })).toEqual([{
-            type: 'thread_idle',
-            thread_id: 'thread-1'
-        }]);
-    });
-
     it('maps turn/started and completed statuses', () => {
         const converter = new AppServerEventConverter();
 
@@ -208,52 +90,6 @@ describe('AppServerEventConverter', () => {
         });
 
         expect(completed).toEqual([{ type: 'agent_message', message: 'Hello world' }]);
-    });
-
-    it('preserves the completed agent message phase', () => {
-        const converter = new AppServerEventConverter();
-
-        const completed = converter.handleNotification('item/completed', {
-            item: {
-                id: 'msg-commentary',
-                type: 'agentMessage',
-                phase: 'commentary',
-                content: [{ type: 'text', text: 'Checking the implementation.' }]
-            }
-        });
-
-        expect(completed).toEqual([{
-            type: 'agent_message',
-            message: 'Checking the implementation.',
-            phase: 'commentary'
-        }]);
-    });
-
-    it('unwraps response-step envelopes from completed agent messages', () => {
-        const converter = new AppServerEventConverter();
-        const raw = JSON.stringify({
-            steps: [
-                { kind: 'output', value: 'Intro' },
-                { kind: 'tool_calls', value: [] },
-                { kind: 'output', value: '| A | B |\n|---|---|\n| 1 | 2 |' },
-                { kind: 'execute_report', value: 'internal' }
-            ]
-        });
-
-        const completed = converter.handleNotification('item/completed', {
-            item: {
-                id: 'msg-steps',
-                type: 'agentMessage',
-                phase: 'final_answer',
-                content: [{ type: 'text', text: raw }]
-            }
-        });
-
-        expect(completed).toEqual([{
-            type: 'agent_message',
-            message: 'Intro\n\n| A | B |\n|---|---|\n| 1 | 2 |',
-            phase: 'final_answer'
-        }]);
     });
 
     it('preserves thread and turn scope on item events', () => {
@@ -684,21 +520,21 @@ describe('AppServerEventConverter', () => {
         })]);
     });
 
-    it('ignores raw reasoning deltas', () => {
+    it('maps reasoning deltas', () => {
         const converter = new AppServerEventConverter();
 
         const events = converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'step' });
-        expect(events).toEqual([]);
+        expect(events).toEqual([{ type: 'agent_reasoning_delta', delta: 'step' }]);
     });
 
-    it('dedupes duplicate reasoning summary deltas', () => {
+    it('dedupes duplicate reasoning deltas', () => {
         const converter = new AppServerEventConverter();
 
-        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Hello ' }))
+        expect(converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'Hello ' }))
             .toEqual([{ type: 'agent_reasoning_delta', delta: 'Hello ' }]);
-        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Hello ' }))
+        expect(converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'Hello ' }))
             .toEqual([]);
-        converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'world' });
+        converter.handleNotification('item/reasoning/textDelta', { itemId: 'r1', delta: 'world' });
 
         const completed = converter.handleNotification('item/completed', {
             item: { id: 'r1', type: 'reasoning' }
@@ -712,72 +548,6 @@ describe('AppServerEventConverter', () => {
 
         const events = converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'step' });
         expect(events).toEqual([{ type: 'agent_reasoning_delta', delta: 'step' }]);
-    });
-
-    it('keeps summary part boundaries in the completion fallback', () => {
-        const converter = new AppServerEventConverter();
-
-        converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Same' });
-        converter.handleNotification('item/reasoning/summaryPartAdded', { itemId: 'r1', summaryIndex: 1 });
-        expect(converter.handleNotification('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: 'Same' }))
-            .toEqual([{ type: 'agent_reasoning_delta', delta: 'Same' }]);
-
-        expect(converter.handleNotification('item/completed', {
-            item: { id: 'r1', type: 'reasoning' }
-        })).toEqual([{ type: 'agent_reasoning', text: 'Same\nSame' }]);
-    });
-
-    it('keeps raw reasoning out of the readable summary buffer', () => {
-        const converter = new AppServerEventConverter();
-
-        expect(converter.handleNotification('item/reasoning/textDelta', {
-            itemId: 'r1',
-            delta: 'Readable summary'
-        })).toEqual([]);
-        expect(converter.handleNotification('item/reasoning/summaryTextDelta', {
-            itemId: 'r1',
-            delta: 'Readable summary'
-        })).toEqual([{ type: 'agent_reasoning_delta', delta: 'Readable summary' }]);
-
-        expect(converter.handleNotification('item/completed', {
-            item: { id: 'r1', type: 'reasoning' }
-        })).toEqual([{ type: 'agent_reasoning', text: 'Readable summary' }]);
-    });
-
-    it('prefers the official v2 reasoning summary and never exposes raw item content', () => {
-        const converter = new AppServerEventConverter();
-
-        expect(converter.handleNotification('item/completed', {
-            item: {
-                id: 'r1',
-                type: 'reasoning',
-                summary: ['Inspecting files', 'Checking tests'],
-                summary_text: ['Legacy summary'],
-                summaryText: ['Legacy camel summary'],
-                text: 'private raw text',
-                content: ['private raw content']
-            }
-        })).toEqual([{
-            type: 'agent_reasoning',
-            text: 'Inspecting files\nChecking tests'
-        }]);
-
-        expect(converter.handleNotification('item/completed', {
-            item: {
-                id: 'r2',
-                type: 'reasoning',
-                text: 'private raw text',
-                content: ['private raw content']
-            }
-        })).toEqual([]);
-    });
-
-    it('supports the legacy camel-case reasoning summary field', () => {
-        const converter = new AppServerEventConverter();
-
-        expect(converter.handleNotification('item/completed', {
-            item: { id: 'r1', type: 'reasoning', summaryText: ['Legacy summary'] }
-        })).toEqual([{ type: 'agent_reasoning', text: 'Legacy summary' }]);
     });
 
     it('deduplicates repeated reasoning completions for the same item', () => {
@@ -796,11 +566,19 @@ describe('AppServerEventConverter', () => {
 
 
 
+    it('uses completed proposal text instead of provisional plan deltas', () => {
+        const converter = new AppServerEventConverter();
+        expect(converter.handleNotification('item/started', { item: { id: 'plan', type: 'plan', text: '' } })).toEqual([]);
+        expect(converter.handleNotification('item/plan/delta', { itemId: 'plan', delta: 'provisional' })).toEqual([]);
+        expect(converter.handleNotification('item/completed', { item: { id: 'plan', type: 'plan', text: '# Final plan' } }))
+            .toEqual([{ type: 'proposed_plan', plan: '# Final plan' }]);
+        expect(converter.handleNotification('item/completed', { item: { id: 'empty', type: 'plan', text: ' \n' } })).toEqual([]);
+    });
+
     it('maps turn plan updates into update_plan events', () => {
         const converter = new AppServerEventConverter();
 
         const events = converter.handleNotification('turn/plan/updated', {
-            explanation: 'Keep the live task state visible.',
             plan: [
                 { step: 'Inspect Codex events', status: 'completed' },
                 { content: 'Render plan state', status: 'in_progress' },
@@ -810,7 +588,6 @@ describe('AppServerEventConverter', () => {
 
         expect(events).toEqual([{
             type: 'plan_update',
-            explanation: 'Keep the live task state visible.',
             plan: [
                 { step: 'Inspect Codex events', status: 'completed' },
                 { step: 'Render plan state', status: 'in_progress' },
@@ -826,7 +603,6 @@ describe('AppServerEventConverter', () => {
             msg: {
                 type: 'plan_update',
                 update: {
-                    explanation: 'Wrapped progress note.',
                     items: [
                         { text: 'Plan from wrapped event', status: 'completed' }
                     ]
@@ -836,7 +612,6 @@ describe('AppServerEventConverter', () => {
 
         expect(events).toEqual([{
             type: 'plan_update',
-            explanation: 'Wrapped progress note.',
             plan: [
                 { step: 'Plan from wrapped event', status: 'completed' }
             ]
@@ -1018,7 +793,7 @@ describe('AppServerEventConverter', () => {
     it('unwraps codex/event reasoning completion from summary text', () => {
         const converter = new AppServerEventConverter();
 
-        const rawDelta = converter.handleNotification('codex/event/reasoning_content_delta', {
+        converter.handleNotification('codex/event/reasoning_content_delta', {
             msg: { type: 'reasoning_content_delta', item_id: 'r1', delta: 'Plan' }
         });
         const completed = converter.handleNotification('codex/event/item_completed', {
@@ -1029,7 +804,6 @@ describe('AppServerEventConverter', () => {
             }
         });
 
-        expect(rawDelta).toEqual([]);
         expect(completed).toEqual([{ type: 'agent_reasoning', text: 'Plan done' }]);
     });
 
@@ -1094,37 +868,6 @@ describe('AppServerEventConverter', () => {
         });
 
         expect(events).toEqual([{ type: 'task_failed', error: 'fatal' }]);
-    });
-
-    it('maps wrapped stream errors to task_failed', () => {
-        const converter = new AppServerEventConverter();
-
-        const events = converter.handleNotification('codex/event/stream_error', {
-            msg: {
-                type: 'stream_error',
-                message: 'Selected model is at capacity. Please try a different model.'
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'task_failed',
-            error: 'Selected model is at capacity. Please try a different model.'
-        }]);
-    });
-
-    it('maps direct turn errors to task_failed', () => {
-        const converter = new AppServerEventConverter();
-
-        const events = converter.handleNotification('turn/error', {
-            error: {
-                message: 'Selected model is at capacity. Please try a different model.'
-            }
-        });
-
-        expect(events).toEqual([{
-            type: 'task_failed',
-            error: 'Selected model is at capacity. Please try a different model.'
-        }]);
     });
 
     it('preserves typed non-retryable cyber-policy errors', () => {

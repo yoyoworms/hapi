@@ -518,16 +518,6 @@ export class MessageQueue2<T> {
     }
 
     /**
-     * Drop messages that have not been collected yet without changing queue
-     * lifecycle or detaching an existing waiter. Abort must not call reset(),
-     * because reset() owns waiter/closed state and can orphan the run loop.
-     */
-    clearPending(): void {
-        logger.debug(`[MessageQueue2] clearPending() called. Clearing ${this.queue.length} messages`);
-        this.queue = [];
-    }
-
-    /**
      * Close the queue - no more messages can be pushed
      */
     close(): void {
@@ -555,10 +545,6 @@ export class MessageQueue2<T> {
      */
     size(): number {
         return this.queue.length;
-    }
-
-    peekMessage(): string | null {
-        return this.queue[0]?.message ?? null;
     }
 
     /**

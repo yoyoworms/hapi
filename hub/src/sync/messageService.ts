@@ -5,7 +5,7 @@ import {
     type HapiSessionExport,
     type HapiSessionExportResult
 } from '@hapi/protocol/sessionExport'
-import type { AttachmentMetadata, DecryptedMessage, Session } from '@hapi/protocol/types'
+import type { AttachmentMetadata, DecryptedMessage, Metadata, Session } from '@hapi/protocol/types'
 import {
     isClaudeChatVisibleMessage,
     isRedundantGoalStatusEventContent,
@@ -20,73 +20,6 @@ import { EventPublisher } from './eventPublisher'
 
 type StoredMessageForDelivery = ReturnType<Store['messages']['getMessages']>[number]
 type MessagePosition = { at: number; seq: number }
-
-/** Persisted chat previews are display-only. Keep them small enough that one
- * multi-image prompt cannot turn every history read into a tens-of-megabytes
- * response. The Web client targets <= 256 KiB decoded thumbnails; 384 KiB of
- * data-URL text leaves room for the MIME header and base64 rounding. */
-export const USER_ATTACHMENT_PREVIEW_MAX_CHARS = 384 * 1024
-export const USER_ATTACHMENT_PREVIEW_TOTAL_MAX_CHARS = 2 * 1024 * 1024
-
-type UserAttachmentPreviewLimits = {
-    maxPreviewChars: number
-    maxTotalPreviewChars: number
-}
-
-const DEFAULT_USER_ATTACHMENT_PREVIEW_LIMITS: UserAttachmentPreviewLimits = {
-    maxPreviewChars: USER_ATTACHMENT_PREVIEW_MAX_CHARS,
-    maxTotalPreviewChars: USER_ATTACHMENT_PREVIEW_TOTAL_MAX_CHARS,
-}
-
-/**
- * Remove only oversized display previews from user attachment metadata.
- *
- * Attachment paths are the CLI delivery contract and must remain intact. The
- * transformation is also applied when reading legacy rows, so an old full-size
- * data URL cannot keep poisoning history responses after this guard ships.
- * Agent messages and inputs that need no changes retain their original object.
- */
-export function sanitizeUserAttachmentPreviews<T>(
-    value: T,
-    limits: UserAttachmentPreviewLimits = DEFAULT_USER_ATTACHMENT_PREVIEW_LIMITS,
-): T {
-    if (!isObject(value) || Array.isArray(value) || value.role !== 'user') return value
-    if (!isObject(value.content) || Array.isArray(value.content)) return value
-
-    const attachments = value.content.attachments
-    if (!Array.isArray(attachments)) return value
-
-    let retainedPreviewChars = 0
-    let sanitizedAttachments: unknown[] | null = null
-
-    for (let index = 0; index < attachments.length; index++) {
-        const attachment = attachments[index]
-        if (!isObject(attachment) || Array.isArray(attachment)) continue
-
-        const previewUrl = attachment.previewUrl
-        if (typeof previewUrl !== 'string') continue
-
-        const exceedsSingleLimit = previewUrl.length > limits.maxPreviewChars
-        const exceedsTotalLimit = previewUrl.length > limits.maxTotalPreviewChars - retainedPreviewChars
-        if (!exceedsSingleLimit && !exceedsTotalLimit) {
-            retainedPreviewChars += previewUrl.length
-            continue
-        }
-
-        sanitizedAttachments ??= attachments.slice()
-        const { previewUrl: _previewUrl, ...metadata } = attachment
-        sanitizedAttachments[index] = metadata
-    }
-
-    if (!sanitizedAttachments) return value
-    return {
-        ...value,
-        content: {
-            ...value.content,
-            attachments: sanitizedAttachments,
-        },
-    } as T
-}
 
 function messagePosition(message: StoredMessageForDelivery): MessagePosition {
     return {
@@ -108,7 +41,7 @@ function toDecryptedMessage(message: StoredMessageForDelivery): DecryptedMessage
         id: message.id,
         seq: message.seq,
         localId: message.localId,
-        content: sanitizeUserAttachmentPreviews(message.content),
+        content: message.content,
         createdAt: message.createdAt,
         invokedAt: message.invokedAt,
         scheduledAt: message.scheduledAt,
@@ -209,15 +142,14 @@ export type RetryIndeterminateMessageResult =
     | { status: 'not-found' }
 
 function contentForDeferredDelivery(content: unknown): unknown {
-    const sanitized = sanitizeUserAttachmentPreviews(content)
-    if (!isObject(sanitized) || sanitized.role !== 'user' || !isObject(sanitized.meta)) {
-        return sanitized
+    if (!isObject(content) || content.role !== 'user' || !isObject(content.meta)) {
+        return content
     }
-    if (sanitized.meta.deliveryMode !== 'steer') return sanitized
+    if (content.meta.deliveryMode !== 'steer') return content
     return {
-        ...sanitized,
+        ...content,
         meta: {
-            ...sanitized.meta,
+            ...content.meta,
             deliveryMode: 'queue' as const
         }
     }
@@ -564,6 +496,17 @@ export class MessageService {
         // Phase 2: row is still queued. Ask the CLI whether it already shifted the item
         // (race window between collectBatch() shift and messages-consumed ack).
         const { localId, resolvedId, scheduledAt } = lookup
+        const shared = (this.store.sessions.getSession(sessionId)?.metadata as Metadata | null)?.capabilities?.concurrentClients === true
+        const connected = (this.io.of('/cli').adapter.rooms.get(`session:${sessionId}`)?.size ?? 0) > 0
+        if (shared && localId && !connected && (scheduledAt === null || scheduledAt <= Date.now())) {
+            // A shared worker keeps running through hub outages. Offline does
+            // not mean its native queue is empty; never claim cancellation.
+            if (localId) {
+                this.store.messages.setMessagesDeliveryState(sessionId, [localId], 'indeterminate')
+                this.publisher.emit({ type: 'messages-indeterminate', sessionId, localIds: [localId] })
+            }
+            return { status: 'busy', localId }
+        }
         const isDispatching = lookup.status === 'dispatching'
         const isIndeterminate = lookup.status === 'indeterminate'
 
@@ -607,7 +550,8 @@ export class MessageService {
             if (ackResult === 'consumed') {
                 return this.recordConsumedAcknowledgement(sessionId, localId)
             }
-            if (ackResult === 'in-flight' || ackResult === 'indeterminate' || (ackResult === 'timeout' && cliCount > 0)) {
+            if (ackResult === 'in-flight' || ackResult === 'indeterminate' || (ackResult === 'timeout' && cliCount > 0)
+                || (shared && ackResult !== 'removed')) {
                 return { status: 'busy', localId }
             }
             this.store.messages.deleteQueuedMessageById(sessionId, resolvedId)
@@ -625,10 +569,10 @@ export class MessageService {
         }
 
         // Phase 2b: future-scheduled messages were never emitted to the CLI, so they
-        // are not in the CLI's in-memory queue.  Asking the CLI whether it can remove
-        // the item would always return 'not-found', which the normal ack path
-        // misinterprets as "CLI already consumed it" and stamps invoked_at.
-        // Short-circuit: delete the row directly without a CLI ack round-trip.
+        // are not in the CLI's in-memory queue. Asking the CLI whether it can remove
+        // the item would always return 'not-found', forcing an unnecessary
+        // indeterminate state. Short-circuit: delete the row directly without a CLI
+        // ack round-trip.
         //
         // Single event loop turn: the scheduledAt > now check and the
         // deleteQueuedMessageById call execute atomically with no await between
@@ -692,7 +636,7 @@ export class MessageService {
         if (ackResult === 'consumed') {
             return this.recordConsumedAcknowledgement(sessionId, localId)
         }
-        if (ackResult === 'in-flight') {
+        if (ackResult === 'in-flight' || ackResult === 'indeterminate') {
             // The row is inside an async steer (mid-turn delivery): it can
             // neither be removed nor stamped invoked — the steer's eventual
             // accept/reject decides. Report busy so the caller keeps the row.
@@ -700,40 +644,19 @@ export class MessageService {
         }
 
         if (ackResult === 'not-found' || ackResult === 'timeout') {
-            // CLI could not remove the item — it was already shift()-ed or CLI is
-            // offline.  Stamp invoked_at immediately so the message lands in the thread
-            // as 'sent' instead of disappearing.  The agent's later assistant message
-            // (if it produced one) joins the same thread normally.
-            const invokedAt = Date.now()
-            try {
-                this.store.messages.markMessagesInvoked(sessionId, [localId], invokedAt)
-            } catch (err) {
-                console.error('cancelQueuedMessage: markMessagesInvoked failed', err)
-                // DB write failed — let the HTTP 500 surface to the caller.
-                throw err
+            // Neither outcome proves the model consumed the message. The CLI may have
+            // reserved it, disconnected, or simply missed the request. Hold the durable
+            // row out of automatic replay until a positive consumed ACK arrives or the
+            // user explicitly retries/discards it.
+            const changed = this.store.messages.setMessagesDeliveryState(sessionId, [localId], 'indeterminate')
+            if (changed === 0) {
+                const settled = this.store.messages.lookupQueuedMessage(sessionId, resolvedId)
+                if (settled.status === 'invoked') return settled
+                if (settled.status === 'absent') return { status: 'cancelled', localId }
+            } else {
+                this.publisher.emit({ type: 'messages-indeterminate', sessionId, localIds: [localId] })
             }
-            this.forgetScheduledMatureNotified([localId])
-            // Notify all SSE subscribers (other open tabs) that this queued row is now
-            // invoked so they remove it from the floating bar.  Without this emit, only
-            // the tab that sent the DELETE request learns about the status change via the
-            // HTTP response; every other subscriber keeps the row in the queued bar until
-            // a refresh or a later event.  Mirrors the identical publish in the normal
-            // CLI-driven path (sessionHandlers.ts messages-consumed handler).
-            this.publisher.emit({
-                type: 'messages-consumed',
-                sessionId,
-                localIds: [localId],
-                invokedAt,
-            })
-            // Re-fetch the single row via lookupQueuedMessage to avoid the 200-row
-            // pagination cap of getMessages.  After markMessagesInvoked the row will
-            // have invoked_at set, so lookupQueuedMessage returns status='invoked'.
-            const recheck = this.store.messages.lookupQueuedMessage(sessionId, localId)
-            if (recheck.status === 'invoked') {
-                return recheck
-            }
-            // Row absent from DB after markMessagesInvoked — edge case, treat as cancelled
-            return { status: 'cancelled', localId }
+            return { status: 'busy', localId }
         }
 
         // Phase 3: CLI confirmed removal.  Now DELETE the DB row and broadcast SSE.
@@ -785,6 +708,10 @@ export class MessageService {
                 : { status: 'not-found' }
         }
         if (cancelResult === 'in-flight' || cancelResult === 'timeout') {
+            return { status: 'retry-unavailable', localId: lookup.localId }
+        }
+        if ((this.store.sessions.getSession(sessionId)?.metadata as Metadata | null)?.capabilities?.concurrentClients
+            && cancelResult !== 'removed') {
             return { status: 'retry-unavailable', localId: lookup.localId }
         }
         const refreshed = this.store.messages.lookupQueuedMessage(sessionId, messageId)
@@ -921,7 +848,7 @@ export class MessageService {
             scheduledAt?: number | null
             deliveryMode?: MessageDeliveryMode
         }
-    ): Promise<{ actualSessionId: string; createdAt: number; deliveredImmediately: boolean }> {
+    ): Promise<{ actualSessionId: string; createdAt: number }> {
         // Defence-in-depth invariant for non-REST callers (Telegram bot, MCP,
         // internal callers).  Attachment paths live under the CLI session's
         // upload directory which `cleanupUploadDir` purges on session end; a
@@ -941,7 +868,7 @@ export class MessageService {
             payload.scheduledAt
         )
 
-        const content = sanitizeUserAttachmentPreviews({
+        const content = {
             role: 'user',
             content: {
                 type: 'text',
@@ -952,7 +879,7 @@ export class MessageService {
                 sentFrom,
                 deliveryMode
             }
-        })
+        }
 
         const inserted = this.store.addMessageForCurrentSession(
             sessionId,
@@ -1007,20 +934,14 @@ export class MessageService {
                 id: msg.id,
                 seq: msg.seq,
                 localId: msg.localId,
-                // A duplicate-localId retry can return a legacy row created
-                // before the write guard. Keep that SSE path bounded too.
-                content: sanitizeUserAttachmentPreviews(msg.content),
+                content: msg.content,
                 createdAt: msg.createdAt,
                 invokedAt: msg.invokedAt,
                 scheduledAt: msg.scheduledAt,
                 ...(msg.deliveryState ? { deliveryState: msg.deliveryState } : {})
             }
         })
-        return {
-            actualSessionId,
-            createdAt: msg.createdAt,
-            deliveredImmediately: !isFutureScheduled
-        }
+        return { actualSessionId, createdAt: msg.createdAt }
     }
 
     /**
@@ -1116,12 +1037,10 @@ export class MessageService {
      * restart scenarios (pitfall #2 guard).
      *
      * Race window with cancel: this tick widens the cancel race to 5 s for
-     * scheduled messages (vs near-zero for immediate-queued ones).  If the CLI
-     * has already shift()-ed the row when cancel arrives, cancelQueuedMessage
-     * gets 'not-found' from the CLI ack and stamps invoked_at (PR #568 contract
-     * preserved).  Web client surfaces this as 'sent' in the thread.
-     * See messageService.test.ts "cancel × mature race" for the documented
-     * expected behaviour. */
+     * scheduled messages (vs near-zero for immediate-queued ones). If the CLI
+     * has already shift()-ed the row when cancel arrives, a non-positive cancel
+     * ACK leaves the row indeterminate; only an explicit consumed ACK stamps it
+     * invoked. See messageService.test.ts "cancel × mature race". */
     releaseMatureScheduledMessages(now: number, skipSessionIds?: ReadonlySet<string>): void {
         const mature = this.store.messages.getMatureScheduledMessages(now)
         const maturedSessionIds = new Set<string>()

@@ -1,4 +1,4 @@
-import { AttachmentPrimitive, useThreadComposerAttachment } from '@assistant-ui/react'
+import { AttachmentPrimitive, useAuiState } from '@assistant-ui/react'
 import type { PendingAttachment } from '@assistant-ui/react'
 import type { KeyboardEventHandler, MouseEventHandler, PointerEventHandler, PointerEvent as ReactPointerEvent } from 'react'
 import { ImagePreview } from '@/components/ImagePreview'
@@ -95,7 +95,7 @@ function DragHandle(props: AttachmentDragHandleProps & { isFile?: boolean }) {
 }
 
 export function AttachmentItem(props: { dragHandleProps?: AttachmentDragHandleProps } = {}) {
-    const { name, status, previewUrl } = useThreadComposerAttachment() as ComposerAttachmentWithPreview
+    const { name, status, previewUrl } = useAuiState((s) => s.attachment) as ComposerAttachmentWithPreview
     const isParking = useComposerParking()
     const isUploading = status.type === 'running'
     const isError = status.type === 'incomplete'
@@ -157,19 +157,19 @@ export function AttachmentItem(props: { dragHandleProps?: AttachmentDragHandlePr
 
     return (
         <AttachmentPrimitive.Root
-            className="relative flex min-w-0 max-w-full items-center gap-1.5 rounded-lg bg-[var(--app-subtle-bg)] px-2 py-2 text-base text-[var(--app-fg)]"
+            className="relative flex items-center gap-1.5 rounded-lg bg-[var(--app-subtle-bg)] px-2 py-2 text-base text-[var(--app-fg)]"
             onPointerDown={surfacePointerDown}
             onContextMenu={props.dragHandleProps?.onSurfaceContextMenu}
         >
             {props.dragHandleProps ? <DragHandle {...props.dragHandleProps} isFile /> : null}
             {isUploading ? <Spinner size="sm" label={null} className="text-[var(--app-hint)]" /> : null}
             {isError ? (
-                <span className="shrink-0 text-red-500" aria-label="Upload failed" title="Upload failed">
+                <span className="text-red-500">
                     <ErrorIcon />
                 </span>
             ) : null}
-            <span className={`min-w-0 max-w-[150px] flex-1 truncate ${isError ? 'text-red-500 line-through' : ''}`}>{name}</span>
-            {isError ? <span aria-hidden="true" className="hidden shrink-0 whitespace-nowrap text-xs text-red-500 sm:inline">Upload failed</span> : null}
+            <span className={`max-w-[150px] truncate ${isError ? 'text-red-500 line-through' : ''}`}>{name}</span>
+            {isError ? <span className="text-xs text-red-500 whitespace-nowrap">Upload failed</span> : null}
             {!isParking ? (
                 <AttachmentPrimitive.Remove
                     className="hapi-composer-attachment-control hapi-composer-attachment-file-control -mx-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-transparent text-[var(--app-hint)] transition-colors hover:text-[var(--app-fg)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--app-link)]"

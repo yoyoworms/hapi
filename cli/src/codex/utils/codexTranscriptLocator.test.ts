@@ -131,42 +131,6 @@ describe('codexTranscriptLocator', () => {
         expect(located).toEqual([transcriptPath]);
     });
 
-    it('uses the injected session token to disambiguate concurrent launches in one cwd', async () => {
-        const located: string[] = [];
-        locator = createCodexTranscriptLocator({
-            cwd: '/tmp/project',
-            startupTimestampMs: Date.now(),
-            sessionMatchToken: '22222222-2222-4222-8222-222222222222',
-            intervalMs: 25,
-            settlementMs: 25,
-            onLocated: (result) => located.push(result.transcriptPath)
-        });
-        await locator.ready;
-        const other = await createTranscript('thread-other-token', '/tmp/project');
-        const target = await createTranscript('thread-target-token', '/tmp/project');
-
-        const developerEvent = (token: string) => `${JSON.stringify({
-            type: 'response_item',
-            payload: {
-                type: 'message',
-                role: 'developer',
-                content: [{ type: 'input_text', text: `HAPI session match token: ${token}` }]
-            }
-        })}\n`;
-        const userEvent = `${JSON.stringify({
-            timestamp: new Date().toISOString(),
-            type: 'event_msg',
-            payload: { type: 'user_message', message: 'hello' }
-        })}\n`;
-        await Promise.all([
-            appendFile(other, developerEvent('11111111-1111-4111-8111-111111111111') + userEvent),
-            appendFile(target, developerEvent('22222222-2222-4222-8222-222222222222') + userEvent)
-        ]);
-        await wait(150);
-
-        expect(located).toEqual([target]);
-    });
-
     it('refuses fallback when fresh activity is ambiguous', async () => {
         const located: string[] = [];
         const ambiguous: string[][] = [];

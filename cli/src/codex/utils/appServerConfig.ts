@@ -1,6 +1,6 @@
 import type { EnhancedMode } from '../loop';
 import type { CodexCliOverrides } from './codexCliOverrides';
-import type { McpServersConfig } from './buildHapiMcpBridge';
+import type { CodexMcpServersConfig } from './codexMcpServers';
 import { getCodexSystemPrompt } from './systemPrompt';
 import type {
     ApprovalPolicy,
@@ -12,10 +12,11 @@ import type {
     UserInput
 } from '../appServerTypes';
 import { resolveCodexPermissionModeConfig } from './permissionModeConfig';
-import {
-    buildHapiCodexModelContextConfig,
-    resolveHapiCodexModel
-} from '../hapiContextPolicy';
+
+export type CodexContextManagementConfig = {
+    modelContextWindow?: number;
+    modelAutoCompactTokenLimit?: number;
+};
 
 export const codexCollaborationSpawnAgentInstructions = [
     'Codex sub-agent spawning rules:',
@@ -101,15 +102,11 @@ export function supportsReasoningSummary(model: string | undefined): boolean {
     return !MODELS_WITHOUT_REASONING_SUMMARY.has(modelName);
 }
 
-function buildMcpServerConfig(mcpServers: McpServersConfig): Record<string, unknown> {
+function buildMcpServerConfig(mcpServers: CodexMcpServersConfig): Record<string, unknown> {
     const config: Record<string, unknown> = {};
 
     for (const [name, server] of Object.entries(mcpServers)) {
-        config[`mcp_servers.${name}`] = {
-            command: server.command,
-            args: server.args,
-            ...(server.tools ? { tools: server.tools } : {})
-        };
+        config[`mcp_servers.${name}`] = { ...server };
     }
 
     return config;
@@ -196,10 +193,11 @@ export function buildUserInputFromMessage(
 export function buildThreadStartParams(args: {
     cwd: string;
     mode: EnhancedMode;
-    mcpServers: McpServersConfig;
+    mcpServers: CodexMcpServersConfig;
     cliOverrides?: CodexCliOverrides;
     baseInstructions?: string;
     developerInstructions?: string;
+    contextManagementConfig?: CodexContextManagementConfig;
 }): ThreadStartParams {
     const approvalPolicy = resolveApprovalPolicy(args.mode);
     const sandbox = resolveSandbox(args.mode);
@@ -213,12 +211,16 @@ export function buildThreadStartParams(args: {
         baseInstructions,
         developerInstructions: resolvedDeveloperInstructions
     } = resolveInstructions(args);
-    const modelSpec = resolveHapiCodexModel(args.mode.model);
     const configWithInstructions = {
         ...config,
         developer_instructions: resolvedDeveloperInstructions,
         ...(args.mode.modelReasoningEffort ? { model_reasoning_effort: args.mode.modelReasoningEffort } : {}),
-        ...buildHapiCodexModelContextConfig(args.mode.model)
+        ...(args.contextManagementConfig?.modelContextWindow !== undefined
+            ? { model_context_window: args.contextManagementConfig.modelContextWindow }
+            : {}),
+        ...(args.contextManagementConfig?.modelAutoCompactTokenLimit !== undefined
+            ? { model_auto_compact_token_limit: args.contextManagementConfig.modelAutoCompactTokenLimit }
+            : {})
     };
 
     const params: ThreadStartParams = {
@@ -230,8 +232,8 @@ export function buildThreadStartParams(args: {
         ...(Object.keys(configWithInstructions).length > 0 ? { config: configWithInstructions } : {})
     };
 
-    if (modelSpec?.model) {
-        params.model = modelSpec.model;
+    if (args.mode.model) {
+        params.model = args.mode.model;
     }
     if (args.mode.personality) {
         params.personality = args.mode.personality;
@@ -291,8 +293,7 @@ export function buildTurnStartParams(args: {
     const collaborationMode = args.overrides?.suppressCollaborationMode
         ? undefined
         : args.mode?.collaborationMode;
-    const requestedModel = args.overrides?.model ?? args.mode?.model;
-    const model = resolveHapiCodexModel(requestedModel)?.model;
+    const model = args.overrides?.model ?? args.mode?.model;
     const modelReasoningEffort = args.mode?.modelReasoningEffort;
 
     if (modelReasoningEffort) {

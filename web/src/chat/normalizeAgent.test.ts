@@ -45,25 +45,6 @@ describe('normalizeAgentRecord — agentTimestamp exposure', () => {
         })
     })
 
-    it('normalizes the Codex agent message phase', () => {
-        const normalized = normalizeAgentRecord('message-row-phase', null, 1, {
-            type: 'codex',
-            data: {
-                type: 'message',
-                message: 'I am checking the tests.',
-                phase: 'Commentary'
-            }
-        })
-
-        expect(normalized).toMatchObject({
-            content: [{
-                type: 'text',
-                text: 'I am checking the tests.',
-                phase: 'commentary'
-            }]
-        })
-    })
-
     it('keeps legacy wire text messages without a stream id', () => {
         const normalized = normalizeAgentRecord('message-row-1', null, 1, {
             type: 'codex',
@@ -270,5 +251,32 @@ describe('normalizeAgentRecord — imported pi compact-summary (codex envelope)'
             }
         })
         expect((normalized as { content: { tokensBefore?: number } }).content.tokensBefore).toBeUndefined()
+    })
+})
+
+describe('normalizeAgentRecord — Codex usage provenance', () => {
+    it('preserves the Codex marker and model on token-count events', () => {
+        const normalized = normalizeAgentRecord('codex-token-count', null, 1, {
+            type: 'codex',
+            data: {
+                type: 'token_count',
+                flavor: 'codex',
+                model: 'gpt-5.4',
+                info: {
+                    last_token_usage: { input_tokens: 321, output_tokens: 12 },
+                    model_context_window: 200_000
+                }
+            }
+        })
+
+        expect(normalized).toMatchObject({
+            role: 'event',
+            content: {
+                type: 'token-count',
+                provider: 'codex',
+                model: 'gpt-5.4'
+            },
+            usage: { input_tokens: 321, output_tokens: 12 }
+        })
     })
 })

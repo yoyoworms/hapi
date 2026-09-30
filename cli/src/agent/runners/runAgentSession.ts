@@ -7,7 +7,7 @@ import { convertAgentMessage } from '@/agent/messageConverter';
 import { PermissionAdapter } from '@/agent/permissionAdapter';
 import type { AgentBackend, PromptContent } from '@/agent/types';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
-import { getHappyCliCommand, getSpawnedWorkingDirectory } from '@/utils/spawnHappyCLI';
+import { getHappyCliCommand } from '@/utils/spawnHappyCLI';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { bootstrapSession } from '@/agent/sessionFactory';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
@@ -62,7 +62,7 @@ export async function runAgentSession(opts: {
         return removed;
     });
 
-    let currentPermissionMode: SessionPermissionMode = opts.permissionMode ?? sessionInfo.permissionMode ?? 'bypassPermissions';
+    let currentPermissionMode: SessionPermissionMode = opts.permissionMode ?? sessionInfo.permissionMode ?? 'default';
 
     const backend: AgentBackend = AgentRegistry.create(opts.agentType);
     await backend.initialize();
@@ -161,7 +161,7 @@ export async function runAgentSession(opts: {
         }
     };
 
-    registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+    registerKillSessionHandler(session.rpcHandlerManager, handleKillSession, session);
 
     let sessionEndReason: SessionEndReason = 'completed';
     try {

@@ -34,8 +34,10 @@ fun isNewerVersionedPatch(patchVersion: Long, currentVersion: Long): Boolean {
  * present field is compared explicitly. A present versioned wrapper is always
  * relevant in TS (object identity), replicated with the `!= null` checks. A
  * present `scratchlistUpdatedAt` is always relevant ([Session] carries no such
- * field). [OptionalField] preserves the absent-vs-explicit-null distinction
- * for `activeTurnStartedAt` so turn boundaries can be set and cleared.
+ * field). Kotlin cannot distinguish an absent `activeTurnStartedAt` on the
+ * cached session from an explicit `null` the way TS `undefined !== null` does;
+ * the divergence is unobservable through [applySessionDetailPatch] because
+ * that field is never assigned anyway.
  */
 fun isRenderIrrelevantSessionPatch(session: Session, patch: SessionPatch): Boolean {
     patch.active?.let { if (session.active != it) return false }
@@ -74,7 +76,7 @@ fun isRenderIrrelevantSessionPatch(session: Session, patch: SessionPatch): Boole
  * value}` wrappers.
  *
  * Replicated exactly from the TS reference:
- * - flat fields (`active`, `thinking`, `activeTurnStartedAt`, `activeAt`, `model`,
+ * - flat fields (`active`, `thinking`, `activeAt`, `model`,
  *   `modelReasoningEffort`, `effort`, `serviceTier`, `permissionMode`,
  *   `collaborationMode`, `copilotAgentMode`, `backgroundTaskCount`) are
  *   last-write-wins when present; a present-`null` `model` /
@@ -82,8 +84,11 @@ fun isRenderIrrelevantSessionPatch(session: Session, patch: SessionPatch): Boole
  * - `updatedAt` is max-monotonic (a rejected stale replay must not rewind it);
  * - versioned sub-patches apply only when strictly newer than the cached
  *   watermark (`todosUpdatedAt` / `teamStateUpdatedAt` treat absent as 0);
- * - `scratchlistUpdatedAt` is deliberately NOT applied because it is a bare
- *   refetch trigger.
+ * - **`activeTurnStartedAt` and `scratchlistUpdatedAt` are deliberately NOT
+ *   applied** — the TS reference never assigns them (`scratchlistUpdatedAt`
+ *   is a bare refetch trigger; `activeTurnStartedAt` only arrives with full
+ *   session payloads). They still participate in the render-irrelevance
+ *   check, matching `Object.entries` semantics.
  */
 fun applySessionDetailPatch(session: Session, patch: SessionPatch): Session? {
     if (isRenderIrrelevantSessionPatch(session, patch)) {
@@ -99,12 +104,6 @@ fun applySessionDetailPatch(session: Session, patch: SessionPatch): Session? {
 
     patch.active?.let { if (next.active != it) set(next.copy(active = it)) }
     patch.thinking?.let { if (next.thinking != it) set(next.copy(thinking = it)) }
-    val activeTurnStartedAt = patch.activeTurnStartedAt
-    if (activeTurnStartedAt is OptionalField.Present
-        && next.activeTurnStartedAt != activeTurnStartedAt.value
-    ) {
-        set(next.copy(activeTurnStartedAt = activeTurnStartedAt.value))
-    }
     patch.activeAt?.let { if (next.activeAt != it) set(next.copy(activeAt = it)) }
     // Monotonic with hub applySessionPatch: a rejected stale
     // metadata/agentState replay must not rewind updatedAt.

@@ -6,7 +6,6 @@ import {
     createRootRoute,
     createRoute,
     createRouter,
-    retainSearchParams,
     useLocation,
     useMatchRoute,
     useNavigate,
@@ -52,7 +51,8 @@ import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer
 import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
 import { refreshSessionDetailPreservingActive } from '@/lib/session-detail-optimistic'
 import { inactiveSessionCanResume, resolveCursorReopenGate } from '@/lib/sessionResume'
-import { initializeSessionLastSeen, markSessionSeen } from '@/lib/sessionLastSeen'
+import { initializeSessionLastSeen } from '@/lib/sessionLastSeen'
+import { useSelectedSessionSeen } from '@/hooks/useSelectedSessionSeen'
 import { useSessionBrowserTitle } from '@/hooks/useSessionBrowserTitle'
 import { clearCodexImportedSession } from '@/lib/codexImportedSessions'
 import { getSupersedingSessionId, prepareFollowSupersedingSession, shouldFollowSupersedingSession } from '@/routes/sessions/followSupersedingSession'
@@ -155,20 +155,7 @@ function SettingsIcon(props: { className?: string }) {
     )
 }
 
-function SharedSessionsLayout() {
-    return (
-        <div className="flex h-full min-h-0 flex-col bg-[var(--app-bg)]">
-            <Outlet />
-        </div>
-    )
-}
-
 function SessionsPage() {
-    const { sharedMode } = useAppContext()
-    return sharedMode ? <SharedSessionsLayout /> : <OwnerSessionsPage />
-}
-
-function OwnerSessionsPage() {
     const { api, baseUrl, titleSuggestionAvailable = false } = useAppContext()
     const navigate = useNavigate()
     const pathname = useLocation({ select: location => location.pathname })
@@ -220,12 +207,7 @@ function OwnerSessionsPage() {
         initializeSessionLastSeen(baseUrl, sessions)
         setInitializedHub(baseUrl)
     }, [baseUrl, error, isLoading, sessions])
-    useEffect(() => {
-        if (!selectedSessionId || !selectedSession) {
-            return
-        }
-        markSessionSeen(selectedSessionId, selectedSession.updatedAt)
-    }, [selectedSessionId, selectedSession?.updatedAt])
+    useSelectedSessionSeen(selectedSessionId, selectedSession?.updatedAt)
     const isSessionsIndex = pathname === '/sessions' || pathname === '/sessions/'
     const sidebar = useSidebarResize()
     const handleNewSessionInDirectory = useCallback((args: { machineId: string | null; directory: string }) => {
@@ -352,11 +334,7 @@ function classifySendError(
 }
 
 function SessionPage() {
-    const { api, sharedMode, titleSuggestionAvailable = false } = useAppContext()
-    // A share token can read and interact with its scoped session, but it
-    // cannot use owner-wide discovery/RPC endpoints. Keep those hooks mounted
-    // with a null client so shared viewers never issue forbidden requests.
-    const ownerApi = sharedMode ? null : api
+    const { api, titleSuggestionAvailable = false } = useAppContext()
     const { t } = useTranslation()
     const goBack = useAppGoBack()
     const navigate = useNavigate()
@@ -369,17 +347,12 @@ function SessionPage() {
         error: sessionError,
         refetch: refetchSession,
     } = useSession(api, sessionId)
-    const cursorChatStore = useCursorChatStoreStatus({
-        api: ownerApi,
-        session,
-        enabled: !sharedMode,
-    })
-    // Disabled TanStack queries can still expose owner-cached data. Never use
-    // that data while rendering a share-scoped session.
-    const cursorChatStoreStatus = sharedMode ? undefined : cursorChatStore.status
-    const cursorChatStoreApplicable = !sharedMode && cursorChatStore.isApplicable
-    const cursorChatStoreError = sharedMode ? null : cursorChatStore.error
-    const cursorChatStoreLoading = !sharedMode && cursorChatStore.isLoading
+    const {
+        status: cursorChatStoreStatus,
+        isApplicable: cursorChatStoreApplicable,
+        error: cursorChatStoreError,
+        isLoading: cursorChatStoreLoading,
+    } = useCursorChatStoreStatus({ api, session })
     const {
         messages,
         warning: messagesWarning,
@@ -510,7 +483,7 @@ function SessionPage() {
     const cursorReopenUnverifiedHint = cursorReopenGate.probeUnverified
         ? t('session.action.reopenCursorUnverified')
         : undefined
-    const canOfferInactiveReopen = !sharedMode && session
+    const canOfferInactiveReopen = session
         ? inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)
         : false
     const rawSendError = sendErrors[sessionId] ?? null
@@ -542,13 +515,6 @@ function SessionPage() {
     const resolveSessionId = useCallback(async (currentSessionId: string) => {
         if (!api || !session || session.active) {
             return { sessionId: currentSessionId, resumed: false }
-        }
-        if (sharedMode) {
-            throw new ApiError(
-                t('chat.sendError.sessionInactive'),
-                409,
-                'session_inactive',
-            )
         }
         const cached = resolvedSessionRef.current
         if (cached?.source === currentSessionId) {
@@ -582,7 +548,7 @@ function SessionPage() {
                 'session_inactive',
             )
         }
-    }, [api, session, messages.length, cursorChatStoreStatus?.onDisk, sharedMode, t, addToast])
+    }, [api, session, messages.length, cursorChatStoreStatus?.onDisk, t, addToast])
 
     const handleSessionResolved = useCallback((resolvedSessionId: string) => {
         if (session) {
@@ -689,15 +655,13 @@ function SessionPage() {
     const {
         commands: slashCommands,
         getSuggestions: getSlashSuggestions,
-    } = useSlashCommands(ownerApi, sessionId, agentType)
+    } = useSlashCommands(api, sessionId, agentType)
     const {
         getSuggestions: getSkillSuggestions,
-    } = useSkills(ownerApi, sessionId)
-    // Shared viewers cannot query owner-wide session/machine inventories.
-    const { sessions: ownerSessions } = useSessions(ownerApi)
-    const { machines: ownerMachines } = useMachines(ownerApi, !sharedMode)
-    const allSessions = sharedMode ? [] : ownerSessions
-    const mentionMachines = sharedMode ? [] : ownerMachines
+    } = useSkills(api, sessionId)
+    // Mention pool is stricter than sidebar (#1506): titled sessions only; match via sessionMatchesQuery.
+    const { sessions: allSessions } = useSessions(api)
+    const { machines: mentionMachines } = useMachines(api, true)
     const mentionMachineLabelsById = useMachineLabels(mentionMachines)
     // Same fallbacks as share picker / SessionList search.
     const resolveMentionMachineLabel = useCallback((machineId: string | null) => {
@@ -716,27 +680,25 @@ function SessionPage() {
             // v1: plain-text expansion (same grammar as Copy reference) — #1213.
             // v2: segmented rich composer with inline session tokens — #1215.
             // Match via sessionMatchesQuery (share/sidebar); label/insert via getSessionTitle.
-            const sessionHits = sharedMode
-                ? []
-                : matchSessionsForMention(allSessions, search, {
-                    excludeId: sessionId,
-                    limit: 20,
-                    resolveMachineLabel: resolveMentionMachineLabel,
-                }).map((s) => {
-                    const title = getSessionTitle(s)
-                    const mentionText = buildSessionReferenceText(title, s.id)
-                    const idPrefix = s.id.slice(0, 8)
-                    return {
-                        key: `session:${s.id}`,
-                        text: mentionText,
-                        label: `@${title || idPrefix}`,
-                        description: s.active
-                            ? `Session · ${idPrefix} · active`
-                            : `Session · ${idPrefix}`,
-                        // Rich composer atom; textarea path still inserts `text` prose.
-                        sessionMention: { id: s.id, title: title || idPrefix },
-                    }
-                })
+            const sessionHits = matchSessionsForMention(allSessions, search, {
+                excludeId: sessionId,
+                limit: 20,
+                resolveMachineLabel: resolveMentionMachineLabel,
+            }).map((s) => {
+                const title = getSessionTitle(s)
+                const mentionText = buildSessionReferenceText(title, s.id)
+                const idPrefix = s.id.slice(0, 8)
+                return {
+                    key: `session:${s.id}`,
+                    text: mentionText,
+                    label: `@${title || idPrefix}`,
+                    description: s.active
+                        ? `Session · ${idPrefix} · active`
+                        : `Session · ${idPrefix}`,
+                    // Rich composer atom; textarea path still inserts `text` prose.
+                    sessionMention: { id: s.id, title: title || idPrefix },
+                }
+            })
 
             const fileHits: Suggestion[] = []
             if ((agentType === 'codex' || agentType === 'copilot') && api && sessionId) {
@@ -760,15 +722,12 @@ function SessionPage() {
             return [...sessionHits, ...fileHits]
         }
         if (query.startsWith('$')) {
-            if (sharedMode) return []
             return await getSkillSuggestions(query)
         }
-        if (sharedMode) return []
         return await getSlashSuggestions(query)
     }, [
         agentType,
         api,
-        sharedMode,
         sessionId,
         allSessions,
         resolveMentionMachineLabel,
@@ -776,9 +735,11 @@ function SessionPage() {
         getSlashSuggestions,
     ])
 
-    const refreshSelectedSession = useCallback(() => {
-        void refetchSession()
-        void refetchMessages()
+    const refreshSelectedSession = useCallback(async () => {
+        await Promise.all([
+            refetchSession(),
+            refetchMessages(),
+        ])
     }, [refetchMessages, refetchSession])
 
     const handleInitialOutlineConsumed = useCallback(() => {
@@ -825,7 +786,7 @@ function SessionPage() {
     return (
         <SessionChat
             api={api}
-            titleSuggestionAvailable={!sharedMode && titleSuggestionAvailable}
+            titleSuggestionAvailable={titleSuggestionAvailable}
             session={session}
             cursorChatOnDisk={cursorChatStoreStatus?.onDisk}
             reopenDisabledReason={cursorReopenDisabledReason}
@@ -851,7 +812,7 @@ function SessionPage() {
             onViewModeChange={setViewMode}
             onRetryMessage={retryMessage}
             autocompleteSuggestions={getAutocompleteSuggestions}
-            availableSlashCommands={sharedMode ? [] : slashCommands}
+            availableSlashCommands={slashCommands}
             sendError={sendError}
             onClearSendError={clearSendError}
             onSuppressSendErrorRestore={suppressSendErrorRestore}
@@ -878,7 +839,7 @@ function SessionPage() {
 }
 
 function SessionDetailRoute() {
-    const { api, sharedMode } = useAppContext()
+    const { api } = useAppContext()
     const pathname = useLocation({ select: location => location.pathname })
     const { sessionId } = useParams({ from: '/sessions/$sessionId' })
     const navigate = useNavigate()
@@ -913,7 +874,7 @@ function SessionDetailRoute() {
     }, [navigate, session, sessionId, supersedingSessionId])
 
     useEffect(() => {
-        if (!sessionNotFound || sharedMode) {
+        if (!sessionNotFound) {
             return
         }
         navigate({
@@ -921,17 +882,12 @@ function SessionDetailRoute() {
             replace: true,
             ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
-    }, [navigate, sessionNotFound, sessionId, sharedMode])
+    }, [navigate, sessionNotFound, sessionId])
 
     if (sessionNotFound) {
         return (
-            <div className="flex-1 flex items-center justify-center p-4 text-center">
-                <LoadingState
-                    label={sharedMode
-                        ? 'This shared session is no longer available.'
-                        : 'Session not found. Returning to sessions…'}
-                    className="text-sm"
-                />
+            <div className="flex-1 flex items-center justify-center p-4">
+                <LoadingState label="Session not found. Returning to sessions…" className="text-sm" />
             </div>
         )
     }
@@ -1080,43 +1036,6 @@ const rootRoute = createRootRoute({
     component: App,
 })
 
-function ShareViewerPage() {
-    const { sharedSessionId } = useAppContext()
-    const { token } = useParams({ from: '/s/$token' })
-    if (sharedSessionId) {
-        return <Navigate {...buildSharedSessionNavigation(sharedSessionId, token)} />
-    }
-    return (
-        <div className="flex h-full items-center justify-center p-4">
-            <LoadingState label="Opening shared session…" className="text-sm" />
-        </div>
-    )
-}
-
-/**
- * Render a shared session through the normal session route while preserving the
- * capability-bearing share URL in the browser. This makes refreshes and copied
- * address-bar links redeemable in a fresh tab without exposing owner routes.
- */
-export function buildSharedSessionNavigation(sessionId: string, token: string) {
-    return {
-        to: '/sessions/$sessionId' as const,
-        params: { sessionId },
-        search: { share: token },
-        mask: {
-            to: '/s/$token' as const,
-            params: { token },
-        },
-        replace: true,
-    }
-}
-
-const shareViewerRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: '/s/$token',
-    component: ShareViewerPage,
-})
-
 const indexRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/',
@@ -1138,21 +1057,9 @@ const sessionsIndexRoute = createRoute({
 const sessionDetailRoute = createRoute({
     getParentRoute: () => sessionsRoute,
     path: '$sessionId',
-    validateSearch: (search: Record<string, unknown>): { outline?: boolean; share?: string } => {
+    validateSearch: (search: Record<string, unknown>): { outline?: boolean } => {
         const outline = search.outline === true || search.outline === 'true'
-        const share = typeof search.share === 'string' && search.share.length > 0
-            ? search.share
-            : undefined
-        return {
-            ...(outline ? { outline: true } : {}),
-            ...(share ? { share } : {}),
-        }
-    },
-    search: {
-        // A share token is the capability that makes session URLs portable.
-        // Keep it through chat/files/file navigation instead of relying on
-        // sessionStorage from the tab that first opened the link.
-        middlewares: [retainSearchParams(['share'])],
+        return outline ? { outline: true } : {}
     },
     component: SessionDetailRoute,
 })
@@ -1384,7 +1291,6 @@ export const routeTree = rootRoute.addChildren([
         settingsAboutRoute,
     ]),
     shareRoute,
-    shareViewerRoute,
 ])
 
 type RouterHistory = Parameters<typeof createRouter>[0]['history']

@@ -1,17 +1,10 @@
-import {
-    useCallback,
-    useEffect,
-    useId,
-    useLayoutEffect,
-    useRef,
-    useState,
-    type CSSProperties
-} from 'react'
+import { useId } from 'react'
 import { useTranslation } from '@/lib/use-translation'
 import { HoverTooltip } from '@/components/HoverTooltip'
 import { safeCopyToClipboard } from '@/lib/clipboard'
 import { buildSessionReferenceText } from '@/lib/sessionReference'
 import { usePlatform } from '@/hooks/usePlatform'
+import { useAnchoredMenu } from '@/hooks/useAnchoredMenu'
 import { CopyIcon } from '@/components/icons'
 
 type SessionActionMenuProps = {
@@ -24,13 +17,10 @@ type SessionActionMenuProps = {
     sessionPinned?: boolean
     sessionGlobalPinned?: boolean
     onSetPinMode?: (mode: 'none' | 'project' | 'global') => void
-    onRestart?: () => void
     onExport?: () => void
-    onShare?: () => void
     onMarkUnread?: () => void
     onSyncCodex?: () => void
     onSyncPi?: () => void
-    onSwitchCodexAccount?: () => void
     onArchive: () => void
     onReopen?: () => void
     reopenDisabledReason?: string
@@ -39,40 +29,6 @@ type SessionActionMenuProps = {
     onDelete: () => void
     anchorPoint: { x: number; y: number }
     menuId?: string
-}
-
-function ShareLinkIcon(props: { className?: string }) {
-    return (
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
-            <circle cx="18" cy="5" r="3" />
-            <circle cx="6" cy="12" r="3" />
-            <circle cx="18" cy="19" r="3" />
-            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
-            <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
-        </svg>
-    )
-}
-
-function RestartIcon(props: { className?: string }) {
-    return (
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-            <path d="M16 16h5v5" />
-        </svg>
-    )
-}
-
-function AccountSwitchIcon(props: { className?: string }) {
-    return (
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={props.className}>
-            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-            <circle cx="9" cy="7" r="4" />
-            <path d="m17 8 4-4" />
-            <path d="m17 4 4 4" />
-        </svg>
-    )
 }
 
 function EditIcon(props: { className?: string }) {
@@ -229,12 +185,6 @@ function TrashIcon(props: { className?: string }) {
     )
 }
 
-type MenuPosition = {
-    top: number
-    left: number
-    transformOrigin: string
-}
-
 export function SessionActionMenu(props: SessionActionMenuProps) {
     const { t } = useTranslation()
     const { haptic } = usePlatform()
@@ -248,13 +198,10 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         sessionPinned = false,
         sessionGlobalPinned = false,
         onSetPinMode,
-        onRestart,
         onExport,
-        onShare,
         onMarkUnread,
         onSyncCodex,
         onSyncPi,
-        onSwitchCodexAccount,
         onArchive,
         onReopen,
         reopenDisabledReason,
@@ -263,8 +210,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         anchorPoint,
         menuId
     } = props
-    const menuRef = useRef<HTMLDivElement | null>(null)
-    const [menuPosition, setMenuPosition] = useState<MenuPosition | null>(null)
+    const { menuRef, menuStyle } = useAnchoredMenu({ isOpen, onClose, anchorPoint })
     const internalId = useId()
     const resolvedMenuId = menuId ?? `session-action-menu-${internalId}`
     const headingId = `${resolvedMenuId}-heading`
@@ -289,11 +235,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         onSetPinMode?.(mode)
     }
 
-    const handleRestart = () => {
-        onClose()
-        onRestart?.()
-    }
-
     const handleArchive = () => {
         onClose()
         onArchive()
@@ -307,11 +248,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleExport = () => {
         onClose()
         onExport?.()
-    }
-
-    const handleShare = () => {
-        onClose()
-        onShare?.()
     }
 
     const handleMarkUnread = () => {
@@ -329,101 +265,12 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
         onSyncPi?.()
     }
 
-    const handleSwitchCodexAccount = () => {
-        onClose()
-        onSwitchCodexAccount?.()
-    }
-
     const handleDelete = () => {
         onClose()
         onDelete()
     }
 
-    const updatePosition = useCallback(() => {
-        const menuEl = menuRef.current
-        if (!menuEl) return
-
-        const menuRect = menuEl.getBoundingClientRect()
-        const viewportWidth = window.innerWidth
-        const viewportHeight = window.innerHeight
-        const padding = 8
-        const gap = 8
-
-        const spaceBelow = viewportHeight - anchorPoint.y
-        const spaceAbove = anchorPoint.y
-        const openAbove = spaceBelow < menuRect.height + gap && spaceAbove > spaceBelow
-
-        let top = openAbove ? anchorPoint.y - menuRect.height - gap : anchorPoint.y + gap
-        // Keep the menu centered on the trigger, then clamp it only when it would leave the viewport.
-        let left = anchorPoint.x - menuRect.width / 2
-        const transformOrigin = openAbove ? 'bottom center' : 'top center'
-
-        top = Math.min(Math.max(top, padding), viewportHeight - menuRect.height - padding)
-        left = Math.min(Math.max(left, padding), viewportWidth - menuRect.width - padding)
-
-        setMenuPosition({ top, left, transformOrigin })
-    }, [anchorPoint])
-
-    useLayoutEffect(() => {
-        if (!isOpen) return
-        updatePosition()
-    }, [isOpen, updatePosition])
-
-    useEffect(() => {
-        if (!isOpen) {
-            setMenuPosition(null)
-            return
-        }
-
-        const handlePointerDown = (event: PointerEvent) => {
-            const target = event.target as Node
-            if (menuRef.current?.contains(target)) return
-            onClose()
-        }
-
-        const handleKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') {
-                onClose()
-            }
-        }
-
-        const handleReflow = () => {
-            updatePosition()
-        }
-
-        document.addEventListener('pointerdown', handlePointerDown)
-        document.addEventListener('keydown', handleKeyDown)
-        window.addEventListener('resize', handleReflow)
-        window.addEventListener('scroll', handleReflow, true)
-
-        return () => {
-            document.removeEventListener('pointerdown', handlePointerDown)
-            document.removeEventListener('keydown', handleKeyDown)
-            window.removeEventListener('resize', handleReflow)
-            window.removeEventListener('scroll', handleReflow, true)
-        }
-    }, [isOpen, onClose, updatePosition])
-
-    useEffect(() => {
-        if (!isOpen) return
-
-        const frame = window.requestAnimationFrame(() => {
-            const firstItem = menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')
-            firstItem?.focus()
-        })
-
-        return () => window.cancelAnimationFrame(frame)
-    }, [isOpen])
-
     if (!isOpen) return null
-
-    const menuStyle: CSSProperties | undefined = menuPosition
-        ? {
-            top: `max(${menuPosition.top}px, calc(env(safe-area-inset-top) + 8px))`,
-            left: menuPosition.left,
-            transformOrigin: menuPosition.transformOrigin
-        }
-        : undefined
 
     // The left text inset includes the icon and gap; mirror it on the right so
     // the text-to-border distance is symmetric without counting the icon twice.
@@ -433,7 +280,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     return (
         <div
             ref={menuRef}
-            className="fixed z-50 box-border max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-16px)] w-max max-w-[calc(100vw-16px)] overflow-y-auto overscroll-contain rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
+            className="fixed z-50 box-border w-max max-w-[calc(100vw-16px)] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-1 shadow-lg animate-menu-pop"
             style={menuStyle}
         >
             <div
@@ -503,18 +350,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     </>
                 ) : null}
 
-                {sessionActive && onRestart ? (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} text-[var(--app-link)] hover:bg-[var(--app-link)]/10`}
-                        onClick={handleRestart}
-                    >
-                        <RestartIcon className="text-[var(--app-link)]" />
-                        {t('session.action.restart')}
-                    </button>
-                ) : null}
-
                 {onExport ? (
                     <button
                         type="button"
@@ -524,18 +359,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <DownloadIcon className="text-[var(--app-hint)]" />
                         {t('session.action.export')}
-                    </button>
-                ) : null}
-
-                {onShare ? (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
-                        onClick={handleShare}
-                    >
-                        <ShareLinkIcon className="text-[var(--app-hint)]" />
-                        {t('session.action.share')}
                     </button>
                 ) : null}
 
@@ -560,18 +383,6 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <SyncIcon className="text-[var(--app-hint)]" />
                         {t('session.action.syncPi')}
-                    </button>
-                ) : null}
-
-                {onSwitchCodexAccount ? (
-                    <button
-                        type="button"
-                        role="menuitem"
-                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
-                        onClick={handleSwitchCodexAccount}
-                    >
-                        <AccountSwitchIcon className="text-[var(--app-hint)]" />
-                        {t('session.action.switchCodexAccount')}
                     </button>
                 ) : null}
 

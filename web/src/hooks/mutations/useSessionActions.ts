@@ -19,7 +19,6 @@ export function useSessionActions(
     archiveSession: () => Promise<void>
     reopenSession: () => Promise<ReopenSessionResponse>
     switchSession: () => Promise<void>
-    resumeSession: (resumeWithSessionId?: string) => Promise<string>
     setPermissionMode: (mode: PermissionMode) => Promise<void>
     setCollaborationMode: (mode: CodexCollaborationMode) => Promise<void>
     setCopilotAgentMode: (mode: CopilotAgentMode) => Promise<void>
@@ -126,16 +125,6 @@ export function useSessionActions(
                 throw new Error('Session unavailable')
             }
             await api.switchSession(sessionId)
-        },
-        onSuccess: () => void invalidateSession(),
-    })
-
-    const resumeMutation = useMutation({
-        mutationFn: async (resumeWithSessionId?: string) => {
-            if (!api || !sessionId) {
-                throw new Error('Session unavailable')
-            }
-            return api.resumeSession(sessionId, resumeWithSessionId ? { resumeWithSessionId } : undefined)
         },
         onSuccess: () => void invalidateSession(),
     })
@@ -296,7 +285,6 @@ export function useSessionActions(
         archiveSession: archiveMutation.mutateAsync,
         reopenSession: reopenMutation.mutateAsync,
         switchSession: switchMutation.mutateAsync,
-        resumeSession: resumeMutation.mutateAsync,
         setPermissionMode: permissionMutation.mutateAsync,
         setCollaborationMode: collaborationMutation.mutateAsync,
         setCopilotAgentMode: copilotAgentModeMutation.mutateAsync,
@@ -313,7 +301,6 @@ export function useSessionActions(
             || archiveMutation.isPending
             || reopenMutation.isPending
             || switchMutation.isPending
-            || resumeMutation.isPending
             || permissionMutation.isPending
             || collaborationMutation.isPending
             || copilotAgentModeMutation.isPending

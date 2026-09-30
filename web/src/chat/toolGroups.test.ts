@@ -217,7 +217,7 @@ describe('buildVisibleChatBlocks', () => {
         expect(isToolGroupBlock(visible[0]) && visible[0].defaultOpen).toBe(true)
     })
 
-    it('keeps structured general Codex commands in collapsed activity groups between exploration groups', () => {
+    it('keeps structured general Codex commands separate from exploration groups', () => {
         const read = makeToolBlock('codex-read', 'CodexBash', {
             command: 'cat package.json',
             command_actions: [{
@@ -241,27 +241,65 @@ describe('buildVisibleChatBlocks', () => {
             }]
         })
 
-        const visible = buildVisibleChatBlocks([read, test, nextRead], { hasMoreMessages: false })
+        const patch = makeToolBlock('codex-patch', 'CodexPatch', { changes: {} })
+        const visible = buildVisibleChatBlocks([read, test, patch, nextRead], { hasMoreMessages: false })
 
         expect(visible).toHaveLength(3)
         expect(isToolGroupBlock(visible[0]) && visible[0].presentationMode).toBe('codex-exploration')
-        expect(isToolGroupBlock(visible[1]) && visible[1].tools).toEqual([test])
         expect(isToolGroupBlock(visible[1]) && visible[1].presentationMode).toBe('default')
+        expect(isToolGroupBlock(visible[1]) && visible[1].tools).toEqual([test, patch])
         expect(isToolGroupBlock(visible[2]) && visible[2].presentationMode).toBe('codex-exploration')
     })
 
-    it('collapses a single ordinary Codex command instead of rendering a raw Terminal card', () => {
-        const command = makeToolBlock('codex-test', 'CodexBash', {
-            command: '/bin/zsh -lc "bun test --filter chat"',
-            command_actions: [{ type: 'unknown', command: 'bun test --filter chat' }]
-        })
+    it.each(['command_actions', 'commandActions'])('groups shared Codex commands and patches with legacy tools (%s)', (actionsKey) => {
+        const tools = [
+            makeToolBlock('shared-command', 'CodexBash', {
+                command: 'git diff --stat',
+                command_source: 'unifiedExecStartup',
+                [actionsKey]: [{ type: 'unknown', command: 'git diff --stat' }]
+            }),
+            makeToolBlock('patch', 'CodexPatch', { changes: {} }),
+            makeToolBlock('mixed-command', 'CodexBash', {
+                command: 'cat package.json && bun test',
+                [actionsKey]: [
+                    { type: 'read', command: 'cat package.json', name: 'package.json', path: '/repo/package.json' },
+                    { type: 'unknown', command: 'bun test' }
+                ]
+            }),
+            makeToolBlock('legacy-command', 'CodexBash', { command: 'git status', source: 'codex-hook' })
+        ]
+        const visible = buildVisibleChatBlocks(tools, { hasMoreMessages: false })
 
-        const visible = buildVisibleChatBlocks([command], { hasMoreMessages: false })
-
+        expect(tools.every(isEligibleForToolGrouping)).toBe(true)
         expect(visible).toHaveLength(1)
-        expect(isToolGroupBlock(visible[0])).toBe(true)
-        expect(isToolGroupBlock(visible[0]) && visible[0].tools).toEqual([command])
-        expect(isToolGroupBlock(visible[0]) && visible[0].defaultOpen).toBe(false)
+        if (!isToolGroupBlock(visible[0])) throw new Error('expected ordinary tool group')
+        expect(visible[0].presentationMode).toBe('default')
+        expect(visible[0].defaultOpen).toBe(false)
+        expect(visible[0].tools).toEqual(tools)
+    })
+
+    it.each([
+        ['command_source', 'command_actions'],
+        ['commandSource', 'commandActions']
+    ])('keeps user shell commands standalone regardless of classification (%s)', (sourceKey, actionsKey) => {
+        for (const actions of [
+            undefined,
+            [{ type: 'unknown', command: 'bun test' }],
+            [{ type: 'read', command: 'cat package.json', name: 'package.json', path: '/repo/package.json' }]
+        ]) {
+            const userShell = makeToolBlock('user-shell', 'CodexBash', {
+                command: 'bun test', [sourceKey]: 'userShell', [actionsKey]: actions
+            })
+            const before = [makeToolBlock('a', 'Read'), makeToolBlock('b', 'Read')]
+            const after = [makeToolBlock('c', 'Read'), makeToolBlock('d', 'Read')]
+            const visible = buildVisibleChatBlocks([...before, userShell, ...after], { hasMoreMessages: false })
+
+            expect(isEligibleForToolGrouping(userShell)).toBe(false)
+            expect(visible).toHaveLength(3)
+            expect(isToolGroupBlock(visible[0]) && visible[0].tools).toEqual(before)
+            expect(visible[1]).toBe(userShell)
+            expect(isToolGroupBlock(visible[2]) && visible[2].tools).toEqual(after)
+        }
     })
 
     it('groups contiguous eligible root tool cards', () => {
@@ -464,29 +502,5 @@ describe('buildVisibleChatBlocks', () => {
         })
 
         expect(isToolGroupBlock(previous[0]) && isToolGroupBlock(next[0]) && previous[0].id === next[0].id).toBe(true)
-    })
-
-    it('does not assign one previous stable id to two newly split groups', () => {
-        const previous = buildVisibleChatBlocks([
-            makeToolBlock('read-1', 'Read'),
-            makeToolBlock('bash-1', 'Bash'),
-            makeToolBlock('grep-1', 'Grep'),
-            makeToolBlock('edit-1', 'Edit'),
-        ], { hasMoreMessages: false }).filter(isToolGroupBlock)
-
-        const next = buildVisibleChatBlocks([
-            makeToolBlock('read-1', 'Read'),
-            makeToolBlock('bash-1', 'Bash'),
-            makeTextBlock('boundary'),
-            makeToolBlock('grep-1', 'Grep'),
-            makeToolBlock('edit-1', 'Edit'),
-        ], {
-            hasMoreMessages: false,
-            previousGroups: previous,
-        }).filter(isToolGroupBlock)
-
-        expect(next).toHaveLength(2)
-        expect(new Set(next.map((group) => group.id)).size).toBe(2)
-        expect(next.filter((group) => group.id === previous[0]?.id)).toHaveLength(1)
     })
 })

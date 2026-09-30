@@ -33,15 +33,6 @@ function getInitialPath(): string {
     return sessionId ? `/sessions/${sessionId}` : '/sessions'
 }
 
-function isStandaloneDisplay(): boolean {
-    return window.matchMedia('(display-mode: standalone)').matches
-        || (window.navigator as Navigator & { standalone?: boolean }).standalone === true
-}
-
-function isMobileDevice(): boolean {
-    return /Android|iPad|iPhone|iPod/i.test(window.navigator.userAgent)
-}
-
 async function bootstrap() {
     installScrollRestorationGuard()
     initializeFontScale()
@@ -49,9 +40,6 @@ async function bootstrap() {
     // Only load Telegram SDK in Telegram environment (with 3s timeout)
     const isTelegram = isTelegramEnvironment()
     document.documentElement.dataset.telegramApp = isTelegram ? 'true' : 'false'
-    document.documentElement.dataset.mobileStandaloneApp = !isTelegram && isStandaloneDisplay() && isMobileDevice()
-        ? 'true'
-        : 'false'
     if (isTelegram) {
         await loadTelegramSdk()
     }

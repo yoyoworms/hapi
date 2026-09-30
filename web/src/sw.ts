@@ -29,26 +29,6 @@ type PushPayload = {
     }
 }
 
-async function hasVisibleWindowClient(): Promise<boolean> {
-    const windowClients = await self.clients.matchAll({
-        type: 'window',
-        includeUncontrolled: true
-    })
-
-    return windowClients.some((client) => {
-        const maybeWindow = client as WindowClient
-        return maybeWindow.visibilityState === 'visible'
-    })
-}
-
-self.addEventListener('install', () => {
-    self.skipWaiting()
-})
-
-self.addEventListener('activate', (event) => {
-    event.waitUntil(self.clients.claim())
-})
-
 precacheAndRoute(self.__WB_MANIFEST)
 
 registerRoute(
@@ -142,19 +122,15 @@ self.addEventListener('push', (event) => {
     const data = payload.data
     const tag = payload.tag
 
-    event.waitUntil((async () => {
-        if (await hasVisibleWindowClient()) {
-            return
-        }
-
-        await self.registration.showNotification(title, {
+    event.waitUntil(
+        self.registration.showNotification(title, {
             body,
             icon,
             badge,
             data,
             tag
         })
-    })())
+    )
 })
 
 self.addEventListener('notificationclick', (event) => {

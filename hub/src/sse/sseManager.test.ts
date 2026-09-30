@@ -118,41 +118,6 @@ describe('SSEManager namespace filtering', () => {
         expect(received).toHaveLength(1)
         expect(received[0]?.id).toBe('visible')
     })
-
-    it('does not leak toasts across session-scoped connections', async () => {
-        const manager = new SSEManager(0, new VisibilityTracker())
-        const received: string[] = []
-
-        for (const [id, sessionId] of [
-            ['matching', 'session-1'],
-            ['other', 'session-2'],
-            ['global', null],
-        ] as const) {
-            manager.subscribe({
-                id,
-                namespace: 'alpha',
-                sessionId,
-                visibility: 'visible',
-                send: () => {
-                    received.push(id)
-                },
-                sendHeartbeat: () => {}
-            })
-        }
-
-        const delivered = await manager.sendToast('alpha', {
-            type: 'toast',
-            data: {
-                title: 'Private title',
-                body: 'Private body',
-                sessionId: 'session-1',
-                url: '/sessions/session-1'
-            }
-        })
-
-        expect(delivered).toBe(2)
-        expect(received.sort()).toEqual(['global', 'matching'])
-    })
 })
 
 describe('SSEManager reconnect replay', () => {
@@ -367,5 +332,44 @@ describe('SSEManager reconnect replay', () => {
         expect(fresh.resume).toBe('ok')
         expect(fresh.replay).toHaveLength(1)
         expect(fresh.replay[0]?.event).toMatchObject({ sessionId: 'big-3' })
+    })
+})
+
+describe('SSEManager agy catalog announcements', () => {
+    it('reaches the global connection the app always keeps open, and no other namespace', () => {
+        // The app runs one `all` connection plus a session-scoped one
+        // (web/src/lib/appSseSubscriptions.ts), so this is what decides whether
+        // an open in-session picker hears about a new catalog.
+        const manager = new SSEManager(0, new VisibilityTracker())
+        const globalAlpha: SyncEvent[] = []
+        const sessionAlpha: SyncEvent[] = []
+        const machineAlpha: SyncEvent[] = []
+        const globalBeta: SyncEvent[] = []
+
+        manager.subscribe({
+            id: 'alpha-global', namespace: 'alpha', all: true,
+            send: (event) => { globalAlpha.push(event) }, sendHeartbeat: () => {}
+        })
+        manager.subscribe({
+            id: 'alpha-session', namespace: 'alpha', all: false, sessionId: 's1',
+            send: (event) => { sessionAlpha.push(event) }, sendHeartbeat: () => {}
+        })
+        manager.subscribe({
+            id: 'alpha-machine', namespace: 'alpha', all: false, machineId: 'm1',
+            send: (event) => { machineAlpha.push(event) }, sendHeartbeat: () => {}
+        })
+        manager.subscribe({
+            id: 'beta-global', namespace: 'beta', all: true,
+            send: (event) => { globalBeta.push(event) }, sendHeartbeat: () => {}
+        })
+
+        manager.broadcast({ type: 'machine-agy-models-updated', machineId: 'm1', namespace: 'alpha' })
+
+        expect(globalAlpha).toHaveLength(1)
+        expect(machineAlpha).toHaveLength(1)
+        // A session-scoped connection carries no machineId, so it is not the
+        // route: the global connection is.
+        expect(sessionAlpha).toHaveLength(0)
+        expect(globalBeta).toHaveLength(0)
     })
 })

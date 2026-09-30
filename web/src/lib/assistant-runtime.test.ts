@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
     type BlockWithThreadMessageId,
     aggregateResponseGroups,
@@ -6,7 +6,7 @@ import {
     assignThreadMessageIdsWithStableWrappers,
     findLatestCompletedBoundaryId,
     getBlockPresentationTimestamp,
-    getResponseGroupTimestamps,
+    getResponseGroupTimestamps
 } from './assistant-runtime'
 import type { AgentEventBlock, AgentTextBlock, CliOutputBlock, ToolCallBlock, UserTextBlock } from '@/chat/types'
 import { buildVisibleChatBlocks, type ToolGroupBlock, type VisibleChatBlock } from '@/chat/toolGroups'
@@ -822,6 +822,25 @@ describe('aggregateResponseGroups', () => {
 
         expect(aggregateResponseGroups([userText('u1'), singleTurn]).get('single')?.roundSummary).toEqual(summary)
         expect(aggregateResponseGroups([userText('u2'), groupedTurn, tool]).get('grouped')?.roundSummary).toEqual(summary)
+    })
+
+    it('derives Codex Round duration from invocation to response completion', () => {
+        const summary = {
+            provider: 'codex' as const,
+            modelUsage: {
+                'gpt-5.4': { inputTokens: 100, outputTokens: 10 }
+            },
+            numTurns: 1
+        }
+        const blocks: VisibleChatBlock[] = [
+            userText('u1', { invokedAt: 1_000 }),
+            Object.assign(agentText('codex-answer', { createdAt: 2_800 }), { roundSummary: summary })
+        ]
+
+        expect(aggregateResponseGroups(blocks).get('codex-answer')?.roundSummary).toEqual({
+            ...summary,
+            durationMs: 1_800
+        })
     })
 
     it('preserves a tool-only result summary through tool-call to tool-group conversion', () => {

@@ -2,8 +2,8 @@
  * MessageService.cancelQueuedMessage race scenario tests
  *
  * Race-A: CLI ack returns { removed: true }  → DB DELETE + status='cancelled'
- * Race-B: CLI ack returns { removed: false } (already shift()-ed) → markMessagesInvoked + status='invoked'
- * Race-C: CLI ack times out (500 ms)         → markMessagesInvoked + status='invoked'
+ * Race-B: CLI ack returns { removed: false } → indeterminate + status='busy'
+ * Race-C: CLI ack times out (500 ms)         → indeterminate + status='busy'
  * Race-D (CLI offline): no CLI socket in room → immediate DELETE, message-cancelled emit, no ack call
  * Race-E (partial ack): broadcast ack receives err + [{ removed: true }] → DELETE + status='cancelled'
  */
@@ -11,11 +11,8 @@ import { describe, expect, it } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-    MessageService,
-    USER_ATTACHMENT_PREVIEW_MAX_CHARS,
-    sanitizeUserAttachmentPreviews,
-} from './messageService'
+import { MessageService } from './messageService'
+import type { EventPublisher } from './eventPublisher'
 import { Store } from '../store'
 import type { Server } from 'socket.io'
 import { SESSION_EXPORT_MESSAGE_LIMIT } from '@hapi/protocol/sessionExport'
@@ -60,7 +57,15 @@ function toProtocolSession(session: ReturnType<typeof makeSession>): Session {
     }
 }
 
-type AckCallback = (err: Error | null, responses: Array<{ removed: boolean }>) => void
+type AckCallback = (
+    err: Error | null,
+    responses: Array<{
+        removed: boolean
+        inFlight?: boolean
+        indeterminate?: boolean
+        consumed?: boolean
+    }>
+) => void
 
 function makeIo(onEmit: (ack: AckCallback) => void, socketCount = 1): Server {
     const broadcastRoom = {
@@ -97,186 +102,25 @@ function makePublisher() {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('sanitizeUserAttachmentPreviews', () => {
-    it('keeps bounded previews and strips only entries that exceed single or aggregate limits', () => {
-        const content = {
-            role: 'user',
-            content: {
-                type: 'text',
-                text: 'keep the prompt',
-                attachments: [
-                    { id: 'kept-1', path: '/tmp/kept-1.png', marker: 1, previewUrl: '12345' },
-                    { id: 'too-large', path: '/tmp/too-large.png', marker: 2, previewUrl: '123456' },
-                    { id: 'kept-2', path: '/tmp/kept-2.png', marker: 3, previewUrl: '123' },
-                    { id: 'over-total', path: '/tmp/over-total.png', marker: 4, previewUrl: 'x' },
-                    { id: 'no-preview', path: '/tmp/no-preview.png', marker: 5 },
-                ]
-            },
-            meta: { sentFrom: 'webapp' }
-        }
-
-        const sanitized = sanitizeUserAttachmentPreviews(content, {
-            maxPreviewChars: 5,
-            maxTotalPreviewChars: 8,
-        })
-
-        expect(sanitized).not.toBe(content)
-        expect(sanitized).toEqual({
-            role: 'user',
-            content: {
-                type: 'text',
-                text: 'keep the prompt',
-                attachments: [
-                    { id: 'kept-1', path: '/tmp/kept-1.png', marker: 1, previewUrl: '12345' },
-                    { id: 'too-large', path: '/tmp/too-large.png', marker: 2 },
-                    { id: 'kept-2', path: '/tmp/kept-2.png', marker: 3, previewUrl: '123' },
-                    { id: 'over-total', path: '/tmp/over-total.png', marker: 4 },
-                    { id: 'no-preview', path: '/tmp/no-preview.png', marker: 5 },
-                ]
-            },
-            meta: { sentFrom: 'webapp' }
-        })
-        // Read-path sanitization must not rewrite the persisted object in place.
-        expect(content.content.attachments[1]?.previewUrl).toBe('123456')
-        expect(content.content.attachments[3]?.previewUrl).toBe('x')
-    })
-
-    it('does not touch agent messages or clone already-bounded user messages', () => {
-        const agent = {
-            role: 'agent',
-            content: {
-                attachments: [{ path: '/tmp/agent.png', previewUrl: 'oversized-agent-preview' }]
-            }
-        }
-        const user = {
-            role: 'user',
-            content: {
-                text: 'bounded',
-                attachments: [{ path: '/tmp/user.png', previewUrl: 'ok' }]
-            }
-        }
-
-        expect(sanitizeUserAttachmentPreviews(agent, {
-            maxPreviewChars: 1,
-            maxTotalPreviewChars: 1,
-        })).toBe(agent)
-        expect(sanitizeUserAttachmentPreviews(user, {
-            maxPreviewChars: 2,
-            maxTotalPreviewChars: 2,
-        })).toBe(user)
-    })
-})
-
-describe('MessageService attachment preview bounds', () => {
-    const makeAttachment = (id: string, previewUrl?: string) => ({
-        id,
-        filename: `${id}.png`,
-        mimeType: 'image/png',
-        size: 42,
-        path: `/tmp/${id}.png`,
-        ...(previewUrl === undefined ? {} : { previewUrl })
-    })
-
-    function readAttachments(content: unknown): Array<Record<string, unknown>> {
-        if (!content || typeof content !== 'object') throw new Error('Expected message envelope')
-        const inner = (content as { content?: unknown }).content
-        if (!inner || typeof inner !== 'object') throw new Error('Expected message content')
-        const attachments = (inner as { attachments?: unknown }).attachments
-        if (!Array.isArray(attachments)) throw new Error('Expected attachments')
-        return attachments as Array<Record<string, unknown>>
-    }
-
-    it('sanitizes oversized previews when reading and exporting legacy rows without mutating storage', () => {
-        const store = makeStore()
-        const session = makeSession(store, 'legacy-attachment-preview')
-        const oversizedPreview = 'p'.repeat(USER_ATTACHMENT_PREVIEW_MAX_CHARS + 1)
-        const stored = store.messages.addMessage(session.id, {
-            role: 'user',
-            content: {
-                type: 'text',
-                text: 'legacy prompt stays intact',
-                attachments: [makeAttachment('legacy', oversizedPreview)]
-            }
-        })
-        const service = new MessageService(store, makeIo(() => {}), makePublisher() as any)
-
-        const page = service.getMessagesPage(session.id, { limit: 10, before: null })
-        expect(page.messages).toHaveLength(1)
-        expect(page.messages[0]?.content).toMatchObject({
-            role: 'user',
-            content: { text: 'legacy prompt stays intact' }
-        })
-        expect(readAttachments(page.messages[0]?.content)[0]).toEqual(makeAttachment('legacy'))
-
-        const exported = service.getSessionExport(session.id, toProtocolSession(session))
-        expect(exported.type).toBe('success')
-        if (exported.type !== 'success') throw new Error('Expected successful export')
-        expect(readAttachments(exported.payload.messages[0]?.content)[0]).toEqual(makeAttachment('legacy'))
-
-        // Legacy cleanup is a response view; no production DB rewrite is required.
-        const raw = store.messages.getMessages(session.id, 10).find(message => message.id === stored.id)
-        expect(readAttachments(raw?.content)[0]?.previewUrl).toBe(oversizedPreview)
-    })
-
-    it('strips oversized previews before DB, CLI, and Web SSE while retaining attachment paths', async () => {
-        const store = makeStore()
-        const session = makeSession(store, 'new-attachment-preview')
-        const publisher = makePublisher()
-        const cliUpdates: unknown[] = []
-        const io = {
-            of: (namespace: string) => ({
-                to: (_room: string) => ({
-                    emit: (_event: string, data: unknown) => {
-                        if (namespace === '/cli') cliUpdates.push(data)
-                    },
-                    timeout: (_ms: number) => ({ emit: () => {} })
-                }),
-                adapter: { rooms: { get: () => undefined } }
-            })
-        } as unknown as Server
-        const service = new MessageService(store, io, publisher as any)
-        const smallPreview = 'data:image/png;base64,b2s='
-        const oversizedPreview = 'p'.repeat(USER_ATTACHMENT_PREVIEW_MAX_CHARS + 1)
-
-        await service.sendMessage(session.id, {
-            text: 'new prompt stays intact',
-            localId: 'local-with-previews',
-            attachments: [
-                makeAttachment('small', smallPreview),
-                makeAttachment('oversized', oversizedPreview),
-            ]
-        })
-
-        const storedContent = store.messages.getMessages(session.id, 10)[0]?.content
-        expect(storedContent).toMatchObject({
-            role: 'user',
-            content: { text: 'new prompt stays intact' }
-        })
-        expect(readAttachments(storedContent)).toEqual([
-            makeAttachment('small', smallPreview),
-            makeAttachment('oversized'),
-        ])
-
-        expect(cliUpdates).toHaveLength(1)
-        const cliContent = (cliUpdates[0] as {
-            body: { message: { content: unknown } }
-        }).body.message.content
-        expect(readAttachments(cliContent)).toEqual([
-            makeAttachment('small', smallPreview),
-            makeAttachment('oversized'),
-        ])
-
-        const received = publisher.events.find(event => event.type === 'message-received')
-        expect(received?.type).toBe('message-received')
-        if (!received || received.type !== 'message-received') throw new Error('Expected message-received')
-        expect(readAttachments(received.message.content)).toEqual([
-            makeAttachment('small', smallPreview),
-            makeAttachment('oversized'),
-        ])
-    })
-})
-
 describe('MessageService goal status filtering', () => {
+    it('does not discard or replay an uncertain shared input on a not-found cancellation ACK', async () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession('shared-unknown', { capabilities: { concurrentClients: true } }, null, 'default')
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'possibly executing' } }, 'shared-q')
+        store.messages.setMessagesDeliveryState(session.id, ['shared-q'], 'indeterminate')
+        const service = new MessageService(store, makeIo(ack => ack(null, [{ removed: false }])), makePublisher() as unknown as EventPublisher)
+        expect(await service.cancelQueuedMessage(session.id, 'shared-q')).toEqual({ status: 'busy', localId: 'shared-q' })
+        expect(await service.retryIndeterminateMessage(session.id, 'shared-q')).toEqual({ status: 'retry-unavailable', localId: 'shared-q' })
+        expect(store.messages.lookupQueuedMessage(session.id, 'shared-q').status).toBe('indeterminate')
+    })
+    it('does not discard a shared native queue when the worker is disconnected from the hub', async () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession('shared-offline', { capabilities: { concurrentClients: true } }, null, 'default')
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'may be executing' } }, 'shared-q')
+        const service = new MessageService(store, makeIo(() => { throw new Error('offline') }, 0), makePublisher() as unknown as EventPublisher)
+        expect(await service.cancelQueuedMessage(session.id, 'shared-q')).toEqual({ status: 'busy', localId: 'shared-q' })
+        expect(store.messages.lookupQueuedMessage(session.id, 'shared-q').status).toBe('indeterminate')
+    })
     function redundantGoalStatusContent(message: string): unknown {
         return {
             role: 'agent',
@@ -792,8 +636,8 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
         })
     })
 
-    describe('Race-B: CLI ack removed:false (already shift()-ed) → markMessagesInvoked + status=invoked', () => {
-        it('returns invoked with message row when CLI says item was already consumed', async () => {
+    describe('Race-B: CLI ack removed:false is ambiguous → indeterminate + status=busy', () => {
+        it('does not claim delivery when the CLI cannot find the item', async () => {
             const store = makeStore()
             const session = makeSession(store, 'race-b')
             const msg = store.messages.addMessage(
@@ -804,47 +648,35 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
 
             const publisher = makePublisher()
             const io = makeIo((callback) => {
-                // CLI already shifted the item before the cancel arrived
+                // Not found does not distinguish a reservation from consumption.
                 callback(null, [{ removed: false }])
             })
 
             const service = new MessageService(store, io, publisher as any)
             const result = await service.cancelQueuedMessage(session.id, msg.id)
 
-            expect(result.status).toBe('invoked')
-            if (result.status === 'invoked') {
-                expect(result.message.id).toBe(msg.id)
-                expect(result.message.localId).toBe('local-b')
-                expect(result.message.invokedAt).not.toBeNull()
-            }
+            expect(result).toEqual({ status: 'busy', localId: 'local-b' })
 
-            // Row must still exist but now have invoked_at set
+            // The durable row remains held and is never presented as sent.
             const rows = store.messages.getMessages(session.id)
             const row = rows.find(r => r.id === msg.id)
             expect(row).toBeDefined()
-            expect(row!.invokedAt).not.toBeNull()
+            expect(row!.invokedAt).toBeNull()
+            expect(row!.deliveryState).toBe('indeterminate')
 
             // No message-cancelled SSE should have been emitted
             const cancelled = publisher.events.find(e => e.type === 'message-cancelled')
             expect(cancelled).toBeUndefined()
 
-            // messages-consumed SSE must be broadcast so other web clients clear the queued row
-            const consumed = publisher.events.find(e => e.type === 'messages-consumed')
-            expect(consumed).toBeDefined()
-            if (consumed?.type === 'messages-consumed') {
-                expect(consumed.sessionId).toBe(session.id)
-                expect(consumed.localIds).toEqual(['local-b'])
-                expect(typeof consumed.invokedAt).toBe('number')
-            }
-
-            // messages-consumed must be emitted exactly once
             const consumedCount = publisher.events.filter(e => e.type === 'messages-consumed').length
-            expect(consumedCount).toBe(1)
+            expect(consumedCount).toBe(0)
+            const held = publisher.events.find(e => e.type === 'messages-indeterminate')
+            expect(held).toBeDefined()
         })
     })
 
-    describe('Race-C: CLI ack timeout → markMessagesInvoked + status=invoked', () => {
-        it('returns invoked with message row when CLI does not respond within timeout', async () => {
+    describe('Race-C: CLI ack timeout → indeterminate + status=busy', () => {
+        it('does not claim delivery when the CLI does not respond', async () => {
             const store = makeStore()
             const session = makeSession(store, 'race-c')
             const msg = store.messages.addMessage(
@@ -862,34 +694,49 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
             const service = new MessageService(store, io, publisher as any)
             const result = await service.cancelQueuedMessage(session.id, msg.id)
 
-            expect(result.status).toBe('invoked')
-            if (result.status === 'invoked') {
-                expect(result.message.id).toBe(msg.id)
-                expect(result.message.invokedAt).not.toBeNull()
-            }
+            expect(result).toEqual({ status: 'busy', localId: 'local-c' })
 
-            // Row must still exist with invoked_at stamped
+            // Row remains held without invoked_at.
             const rows = store.messages.getMessages(session.id)
             const row = rows.find(r => r.id === msg.id)
             expect(row).toBeDefined()
-            expect(row!.invokedAt).not.toBeNull()
+            expect(row!.invokedAt).toBeNull()
+            expect(row!.deliveryState).toBe('indeterminate')
 
             // No message-cancelled SSE
             const cancelled = publisher.events.find(e => e.type === 'message-cancelled')
             expect(cancelled).toBeUndefined()
 
-            // messages-consumed SSE must be broadcast so other web clients clear the queued row
-            const consumed = publisher.events.find(e => e.type === 'messages-consumed')
-            expect(consumed).toBeDefined()
-            if (consumed?.type === 'messages-consumed') {
-                expect(consumed.sessionId).toBe(session.id)
-                expect(consumed.localIds).toEqual(['local-c'])
-                expect(typeof consumed.invokedAt).toBe('number')
-            }
-
-            // messages-consumed must be emitted exactly once
             const consumedCount = publisher.events.filter(e => e.type === 'messages-consumed').length
-            expect(consumedCount).toBe(1)
+            expect(consumedCount).toBe(0)
+            const held = publisher.events.find(e => e.type === 'messages-indeterminate')
+            expect(held).toBeDefined()
+        })
+    })
+
+    describe('positive consumed ACK', () => {
+        it('returns invoked only when the CLI explicitly confirms consumption', async () => {
+            const store = makeStore()
+            const session = makeSession(store, 'race-consumed')
+            const msg = store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'hello' } },
+                'local-consumed'
+            )
+            const publisher = makePublisher()
+            const io = makeIo((callback) => {
+                callback(null, [{ removed: false, consumed: true }])
+            })
+
+            const service = new MessageService(store, io, publisher as any)
+            const result = await service.cancelQueuedMessage(session.id, msg.id)
+
+            expect(result.status).toBe('invoked')
+            if (result.status === 'invoked') {
+                expect(result.message.localId).toBe('local-consumed')
+                expect(result.message.invokedAt).not.toBeNull()
+            }
+            expect(publisher.events.filter(e => e.type === 'messages-consumed')).toHaveLength(1)
         })
     })
 
@@ -1018,12 +865,9 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
 
 describe('MessageService — cancel × mature race (scheduled messages)', () => {
     // The 5-second mature tick widens the cancel race window for scheduled
-    // messages compared to immediately-queued ones.  When mature fires first,
-    // the CLI shifts the row; a subsequent cancel call gets 'not-found' from
-    // the CLI ack, which stamps invoked_at (PR #568 contract preserved).
-    // The web client surfaces this as "sent".  This test documents that the
-    // behaviour is intentional — it is the expected outcome, not a bug.
-    it('cancel after mature-emit stamps invoked_at (race resolved as invoked — expected behavior)', async () => {
+    // messages compared to immediately-queued ones. When mature fires first,
+    // a later not-found cancel ACK is ambiguous and must not claim delivery.
+    it('holds a mature message as indeterminate after an ambiguous cancel ACK', async () => {
         const store = makeStore()
         const session = makeSession(store, 'race-sched-mature')
         const publisher = makePublisher()
@@ -1050,17 +894,12 @@ describe('MessageService — cancel × mature race (scheduled messages)', () => 
         // Then cancel arrives — CLI says not-found
         const result = await service.cancelQueuedMessage(session.id, msg.id)
 
-        // Expected behavior: invoked_at is stamped (PR #568 contract preserved)
-        // Web client will show the message as "sent"
-        expect(result.status).toBe('invoked')
-        if (result.status === 'invoked') {
-            expect(result.message.localId).toBe('local-sched-race')
-            expect(result.message.invokedAt).not.toBeNull()
-        }
+        expect(result).toEqual({ status: 'busy', localId: 'local-sched-race' })
 
-        // messages-consumed SSE ensures web clients remove it from the queued bar
-        const consumed = publisher.events.find(e => e.type === 'messages-consumed')
-        expect(consumed).toBeDefined()
+        const held = store.messages.lookupQueuedMessage(session.id, msg.id)
+        expect(held.status).toBe('indeterminate')
+        expect(publisher.events.some(e => e.type === 'messages-consumed')).toBe(false)
+        expect(publisher.events.some(e => e.type === 'messages-indeterminate')).toBe(true)
     })
 })
 
@@ -1193,12 +1032,11 @@ describe('MessageService.sendMessage with scheduledAt', () => {
         const futureMs = Date.now() + 60_000
 
         const service = new MessageService(store, io, publisher as any)
-        const result = await service.sendMessage(session.id, {
+        await service.sendMessage(session.id, {
             text: 'hello future',
             localId: 'local-sched',
             scheduledAt: futureMs
         })
-        expect(result.deliveredImmediately).toBe(false)
 
         // DB must have the message with scheduledAt set
         const msgs = store.messages.getUninvokedLocalMessages(session.id)
@@ -1232,8 +1070,7 @@ describe('MessageService.sendMessage with scheduledAt', () => {
         } as unknown as Server
 
         const service = new MessageService(store, io, publisher as any)
-        const result = await service.sendMessage(session.id, { text: 'immediate', localId: 'local-imm' })
-        expect(result.deliveredImmediately).toBe(true)
+        await service.sendMessage(session.id, { text: 'immediate', localId: 'local-imm' })
 
         // CLI must receive the message immediately
         expect(cliEmitted).toHaveLength(1)

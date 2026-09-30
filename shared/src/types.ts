@@ -1,7 +1,5 @@
 export type {
     AgentState,
-    AgentAccountLimit,
-    AgentAccountStatus,
     AgentStateCompletedRequest,
     AgentStateRequest,
     AttachmentMetadata,

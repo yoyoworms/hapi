@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useIsMutating, useQueryClient } from '@tanstack/react-query'
 import type { Session } from '@/types/api'
 import type { ApiClient } from '@/api/client'
@@ -6,7 +6,6 @@ import { isTelegramApp } from '@/hooks/useTelegram'
 import { sessionModelMutationKey, useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
 import { SessionExportDialog } from '@/components/SessionExportDialog'
-import { ShareSessionDialog } from '@/components/ShareSessionDialog'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { useScratchlistCount } from '@/lib/use-scratchlist-count'
@@ -28,9 +27,6 @@ import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
 import { formatSessionHeaderTimestamp } from '@/lib/sessionHeaderTimestamp'
 import { selectMobileSessionHeaderSecondary } from '@/lib/sessionHeaderMobileMetadata'
 import { useMinuteTick } from '@/hooks/useMinuteTick'
-import { useOptionalAppContext } from '@/lib/app-context'
-import { seedMessageWindowFromSession, syncTailMessages } from '@/lib/message-window-store'
-import { CodexAccountSwitchDialog } from '@/components/CodexAccountSwitchDialog'
 import { markSessionUnread } from '@/lib/sessionLastSeen'
 
 /** Same preference order as session-list chips: display label → host → short id. */
@@ -159,7 +155,6 @@ export function SessionHeader(props: {
     onSessionReopened?: (newSessionId: string) => void | Promise<void>
 }) {
     const { t, locale } = useTranslation()
-    const sharedMode = useOptionalAppContext()?.sharedMode ?? false
     const queryClient = useQueryClient()
     const { addToast } = useToast()
     const { session, api, onSessionDeleted, onSessionReopened } = props
@@ -188,16 +183,10 @@ export function SessionHeader(props: {
     const codexSessionId = session.metadata?.flavor === 'codex'
         ? session.metadata.codexSessionId?.trim() || null
         : null
-    const codexAccountLabel = session.metadata?.flavor === 'codex'
-        ? session.metadata.codexAccountLabel?.trim() || (
-            session.metadata.codexAccountId === 'system' ? 'System default' : null
-        )
-        : null
     const piSessionId = session.metadata?.flavor === 'pi'
         ? session.metadata.piSessionId?.trim() || null
         : null
-    const { machines: ownerMachines } = useMachines(api, Boolean(api) && !sharedMode)
-    const machines = sharedMode ? [] : ownerMachines
+    const { machines } = useMachines(api, Boolean(api))
     const machineLabelsById = useMachineLabels(machines)
     const machineLabel = useMemo(
         () => resolveSessionHeaderMachineLabel(session, machineLabelsById),
@@ -222,56 +211,25 @@ export function SessionHeader(props: {
         worktree: headerMetadata.worktree && Boolean(worktreeBranch),
         fastMode: headerMetadata.fastMode && showFastBadge,
     })
-    const showMobileMetadata = (headerMetadata.agent && agentLabel !== null)
-        || mobileSecondary !== null
-        || codexAccountLabel !== null
+    const showMobileMetadata = (headerMetadata.agent && agentLabel !== null) || mobileSecondary !== null
 
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
     const menuId = useId()
     const menuAnchorRef = useRef<HTMLButtonElement | null>(null)
     const [renameOpen, setRenameOpen] = useState(false)
-    const [restartOpen, setRestartOpen] = useState(false)
     const [exportOpen, setExportOpen] = useState(false)
-    const [shareOpen, setShareOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
     const [isSyncingCodex, setIsSyncingCodex] = useState(false)
     const [isSyncingPi, setIsSyncingPi] = useState(false)
-    const [codexAccountSwitchOpen, setCodexAccountSwitchOpen] = useState(false)
 
-    const {
-        archiveSession,
-        reopenSession,
-        renameSession,
-        suggestSessionTitle,
-        updateSessionSummary,
-        setPinMode,
-        deleteSession,
-        resumeSession,
-        isPending
-    } = useSessionActions(
+    const { archiveSession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, setPinMode, deleteSession, isPending } = useSessionActions(
         api,
         session.id,
         session.metadata?.flavor ?? null
     )
     const [reopenError, setReopenError] = useState<string | null>(null)
-
-    const handleResume = useCallback(async () => {
-        const resolvedId = await resumeSession()
-        if (resolvedId !== session.id) seedMessageWindowFromSession(session.id, resolvedId)
-        if (api) await syncTailMessages(api, resolvedId).catch(() => {})
-        await onSessionReopened?.(resolvedId)
-    }, [api, onSessionReopened, resumeSession, session.id])
-
-    const handleCodexAccountSwitched = useCallback(async (resolvedId: string) => {
-        if (resolvedId !== session.id) seedMessageWindowFromSession(session.id, resolvedId)
-        await Promise.all([
-            queryClient.invalidateQueries({ queryKey: queryKeys.session(resolvedId) }),
-            queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
-        ])
-        await onSessionReopened?.(resolvedId)
-    }, [onSessionReopened, queryClient, session.id])
 
     const handleSetPinMode = async (mode: 'none' | 'project' | 'global') => {
         try {
@@ -289,7 +247,7 @@ export function SessionHeader(props: {
     // delete-confirm copy so the operator knows what cascades when they
     // confirm. Read-only hook reuses the cache filled by SessionChat -
     // no extra network when both components are mounted.
-    const scratchlistCount = useScratchlistCount(session.id, sharedMode ? null : api)
+    const scratchlistCount = useScratchlistCount(session.id, api)
 
     const handleDelete = async () => {
         await deleteSession()
@@ -310,7 +268,7 @@ export function SessionHeader(props: {
     }
 
     const handleSyncCodex = async () => {
-        if (!api || !codexSessionId || isSyncingCodex) return
+        if (!api || !codexSessionId || isSyncingCodex || session.active) return
 
         setIsSyncingCodex(true)
         try {
@@ -318,8 +276,7 @@ export function SessionHeader(props: {
             const result = await api.syncCodexSession({
                 sessionIds: [codexSessionId],
                 cwd: typeof session.metadata?.path === 'string' ? session.metadata.path : undefined,
-                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined,
-                codexAccountId: typeof session.metadata?.codexAccountId === 'string' ? session.metadata.codexAccountId : undefined
+                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined
             })
             if (!result.success) {
                 throw new Error(result.error || t('codexSync.failed.body'))
@@ -456,7 +413,6 @@ export function SessionHeader(props: {
                                 {mobileSecondary === 'createdAt' && createdAtLabel ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
                                 {mobileSecondary === 'worktree' && worktreeBranch ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}{worktreeBranch}</span> : null}
                                 {mobileSecondary === 'fastMode' ? <span className="truncate text-[#34C759]">fast</span> : null}
-                                {codexAccountLabel ? <span className="truncate">{codexAccountLabel}</span> : null}
                             </div>
                         ) : null}
                         <div className="hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--app-hint)] sm:flex">
@@ -490,11 +446,6 @@ export function SessionHeader(props: {
                             {headerMetadata.fastMode && showFastBadge ? (
                                 <span data-testid="session-header-fast" className="text-[#34C759]">
                                     fast
-                                </span>
-                            ) : null}
-                            {codexAccountLabel ? (
-                                <span data-testid="session-header-codex-account" title={codexAccountLabel}>
-                                    {headerMetadata.showLabels ? `Account: ` : ''}{codexAccountLabel}
                                 </span>
                             ) : null}
                             {createdAtLabel ? <span>{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
@@ -544,25 +495,23 @@ export function SessionHeader(props: {
                         </button>
                     ) : null}
 
-                    {!sharedMode ? (
-                        <button
-                            type="button"
-                            onClick={handleMenuToggle}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            ref={menuAnchorRef}
-                            aria-haspopup="menu"
-                            aria-expanded={menuOpen}
-                            aria-controls={menuOpen ? menuId : undefined}
-                            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
-                            title={t('session.more')}
-                        >
-                            <MoreVerticalIcon />
-                        </button>
-                    ) : null}
+                    <button
+                        type="button"
+                        onClick={handleMenuToggle}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        ref={menuAnchorRef}
+                        aria-haspopup="menu"
+                        aria-expanded={menuOpen}
+                        aria-controls={menuOpen ? menuId : undefined}
+                        className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
+                        title={t('session.more')}
+                    >
+                        <MoreVerticalIcon />
+                    </button>
                 </div>
             </div>
 
-            {!sharedMode ? <SessionActionMenu
+            <SessionActionMenu
                 isOpen={menuOpen}
                 onClose={() => setMenuOpen(false)}
                 sessionId={session.id}
@@ -573,14 +522,9 @@ export function SessionHeader(props: {
                 onRename={() => setRenameOpen(true)}
                 onMarkUnread={() => markSessionUnread(session.id, session.updatedAt)}
                 onSetPinMode={api ? (mode) => void handleSetPinMode(mode) : undefined}
-                onRestart={api ? () => setRestartOpen(true) : undefined}
                 onExport={() => setExportOpen(true)}
-                onShare={api ? () => setShareOpen(true) : undefined}
-                onSyncCodex={api && codexSessionId ? handleSyncCodex : undefined}
+                onSyncCodex={api && codexSessionId && !session.active ? handleSyncCodex : undefined}
                 onSyncPi={api && piSessionId && !session.active ? handleSyncPi : undefined}
-                onSwitchCodexAccount={api && agentFlavor === 'codex'
-                    ? () => setCodexAccountSwitchOpen(true)
-                    : undefined}
                 onArchive={() => setArchiveOpen(true)}
                 onReopen={props.canReopen === false ? undefined : handleReopen}
                 reopenDisabledReason={props.reopenDisabledReason}
@@ -588,7 +532,7 @@ export function SessionHeader(props: {
                 onDelete={() => setDeleteOpen(true)}
                 anchorPoint={menuAnchorPoint}
                 menuId={menuId}
-            /> : null}
+            />
 
             {reopenError ? (
                 <ConfirmDialog
@@ -619,35 +563,6 @@ export function SessionHeader(props: {
                 onClose={() => setExportOpen(false)}
                 sessionId={session.id}
                 api={api}
-            />
-
-            <ShareSessionDialog
-                isOpen={shareOpen}
-                onClose={() => setShareOpen(false)}
-                sessionId={session.id}
-                api={api}
-            />
-
-            {!sharedMode && api && agentFlavor === 'codex' ? (
-                <CodexAccountSwitchDialog
-                    isOpen={codexAccountSwitchOpen}
-                    onClose={() => setCodexAccountSwitchOpen(false)}
-                    session={session}
-                    api={api}
-                    onSwitched={handleCodexAccountSwitched}
-                />
-            ) : null}
-
-            <ConfirmDialog
-                isOpen={restartOpen}
-                onClose={() => setRestartOpen(false)}
-                title={t('dialog.restart.title')}
-                description={t('dialog.restart.description', { name: title })}
-                confirmLabel={t('dialog.restart.confirm')}
-                confirmingLabel={t('dialog.restart.confirming')}
-                onConfirm={handleResume}
-                isPending={isPending}
-                centerTitle
             />
 
             <ConfirmDialog

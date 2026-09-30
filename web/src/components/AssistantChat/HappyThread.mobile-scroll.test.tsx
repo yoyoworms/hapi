@@ -4,10 +4,8 @@ import type { PropsWithChildren } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '@/lib/i18n-context'
 
-const useMachinesMock = vi.fn((_api: ApiClient | null, _enabled: boolean) => ({ machines: [] }))
-
 vi.mock('@/hooks/queries/useMachines', () => ({
-    useMachines: (api: ApiClient | null, enabled: boolean) => useMachinesMock(api, enabled)
+    useMachines: () => ({ machines: [] })
 }))
 
 vi.mock('@assistant-ui/react', async (importOriginal) => {
@@ -34,8 +32,21 @@ import type { ApiClient } from '@/api/client'
 import type { Session } from '@/types/api'
 
 const originalScrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTo')
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView')
+const originalResizeObserver = Object.getOwnPropertyDescriptor(globalThis, 'ResizeObserver')
+let resizeCallbacks: Array<() => void> = []
 
-function renderThread(onViewModeChange = vi.fn()) {
+class TestResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(() => callback([], this as unknown as ResizeObserver))
+    }
+
+    observe() {}
+
+    disconnect() {}
+}
+
+function renderThread(onViewModeChange = vi.fn(), unseenCount = 0) {
     const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } }
     })
@@ -56,7 +67,7 @@ function renderThread(onViewModeChange = vi.fn()) {
                     isLoadingMoreMessages={false}
                     onLoadMore={vi.fn().mockResolvedValue({ status: 'exhausted' })}
                     onCancelLoadMore={vi.fn()}
-                    unseenCount={0}
+                    unseenCount={unseenCount}
                     rawMessagesCount={1}
                     normalizedMessagesCount={1}
                     messagesVersion={1}
@@ -90,8 +101,12 @@ function renderThread(onViewModeChange = vi.fn()) {
 }
 
 beforeEach(() => {
-    useMachinesMock.mockClear()
     vi.useFakeTimers()
+    resizeCallbacks = []
+    Object.defineProperty(globalThis, 'ResizeObserver', {
+        configurable: true,
+        value: TestResizeObserver
+    })
     Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
         configurable: true,
         writable: true,
@@ -112,52 +127,61 @@ afterEach(() => {
     } else {
         Reflect.deleteProperty(HTMLElement.prototype, 'scrollTo')
     }
+    if (originalScrollIntoView) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', originalScrollIntoView)
+    } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'scrollIntoView')
+    }
+    if (originalResizeObserver) {
+        Object.defineProperty(globalThis, 'ResizeObserver', originalResizeObserver)
+    } else {
+        Reflect.deleteProperty(globalThis, 'ResizeObserver')
+    }
 })
 
 describe('mobile initial scroll settling', () => {
-    it('disables owner machine discovery when requested by a shared viewer', () => {
-        const queryClient = new QueryClient({
-            defaultOptions: { queries: { retry: false } }
+    it('checks the final keyboard position before clearing intent at scrollend', () => {
+        const { container, viewport } = renderThread()
+        const sentinel = container.querySelector('.chat-scroll-content > [aria-hidden="true"]')!
+        vi.spyOn(sentinel, 'getBoundingClientRect').mockImplementation(() => ({
+            top: -viewport.scrollTop,
+            bottom: 1 - viewport.scrollTop
+        } as DOMRect))
+        fireEvent.keyDown(viewport, { key: 'Home' })
+        fireEvent.keyUp(viewport, { key: 'Home' })
+        act(() => {
+            vi.advanceTimersByTime(1_000)
         })
-        const getHubSettings = vi.fn().mockResolvedValue({
-            sessionSummaryContract: false,
-            sessionSummaryInChat: false
+        viewport.scrollTop = 0
+        fireEvent(viewport, new Event('scrollend'))
+        act(() => {
+            vi.advanceTimersByTime(1_800)
         })
-        render(
-            <QueryClientProvider client={queryClient}>
-                <I18nProvider>
-                    <HappyThread
-                        api={{ getHubSettings } as unknown as ApiClient}
-                        session={{ metadata: {} } as Session}
-                        sessionId="shared-session"
-                        metadata={null}
-                        disabled={false}
-                        machineDiscoveryEnabled={false}
-                        hubSettingsEnabled={false}
-                        onRefresh={vi.fn()}
-                        onViewModeChange={vi.fn()}
-                        isSyncingTail={false}
-                        messagesWarning={null}
-                        hasMoreMessages={false}
-                        isLoadingMoreMessages={false}
-                        onLoadMore={vi.fn().mockResolvedValue({ status: 'exhausted' })}
-                        onCancelLoadMore={vi.fn()}
-                        unseenCount={0}
-                        rawMessagesCount={0}
-                        normalizedMessagesCount={0}
-                        messagesVersion={0}
-                        historyVersion={0}
-                        forceScrollToken={0}
-                        outlineOpen={false}
-                        outlineItems={[]}
-                        onOutlineOpenChange={vi.fn()}
-                    />
-                </I18nProvider>
-            </QueryClientProvider>,
-        )
+        expect(viewport.scrollTop).toBe(0)
+    })
 
-        expect(useMachinesMock).toHaveBeenCalledWith(expect.anything(), false)
-        expect(getHubSettings).not.toHaveBeenCalled()
+    it.each([false, true])('keeps delayed keyboard intent only until scrollend (ended=%s)', (ended) => {
+        const { container, viewport, onViewModeChange } = renderThread()
+        const sentinel = container.querySelector('.chat-scroll-content > [aria-hidden="true"]')!
+        vi.spyOn(sentinel, 'getBoundingClientRect').mockImplementation(() => ({
+            top: -viewport.scrollTop,
+            bottom: 1 - viewport.scrollTop
+        } as DOMRect))
+
+        fireEvent.keyDown(viewport, { key: 'Home' })
+        fireEvent.keyUp(viewport, { key: 'Home' })
+        act(() => {
+            vi.advanceTimersByTime(1_000)
+        })
+        if (ended) fireEvent(viewport, new Event('scrollend'))
+        viewport.scrollTop = 520
+        fireEvent.scroll(viewport)
+        act(() => {
+            vi.advanceTimersByTime(1_800)
+        })
+
+        expect(viewport.scrollTop).toBe(ended ? 702 : 520)
+        if (!ended) expect(onViewModeChange).toHaveBeenLastCalledWith('history')
     })
 
     it('does not snap back after pointer cancellation ends a touch swipe', () => {
@@ -254,6 +278,51 @@ describe('mobile initial scroll settling', () => {
 })
 
 describe('explicit tail scrolling', () => {
+    it('renders the unread count inside the compact bottom control', () => {
+        const { container } = renderThread(vi.fn(), 7)
+        const button = container.querySelector<HTMLButtonElement>('button[aria-label*="7"]')
+
+        expect(button).not.toBeNull()
+        expect(button).toHaveClass('rounded-full', 'h-6', 'w-6')
+        expect(button).toHaveClass('bg-[var(--app-button)]', 'text-[var(--app-button-text)]')
+        expect(button?.querySelector('span')).toHaveClass('translate-y-px')
+        expect(button?.textContent).toContain('7')
+    })
+
+    it('uses the same smooth end-alignment scroll as outline navigation', () => {
+        const scrollIntoView = vi.fn()
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+            configurable: true,
+            writable: true,
+            value: scrollIntoView
+        })
+        const { rerenderThread } = renderThread()
+
+        rerenderThread(1)
+
+        expect(scrollIntoView).toHaveBeenCalledWith({ block: 'end', behavior: 'smooth' })
+    })
+
+    it('retargets the smooth tail jump when content grows during the animation', () => {
+        const scrollIntoView = vi.fn()
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+            configurable: true,
+            writable: true,
+            value: scrollIntoView
+        })
+        const { rerenderThread } = renderThread()
+
+        rerenderThread(1)
+        expect(scrollIntoView).toHaveBeenCalledTimes(1)
+
+        act(() => {
+            resizeCallbacks.at(-1)?.()
+        })
+
+        expect(scrollIntoView).toHaveBeenCalledTimes(2)
+        expect(scrollIntoView).toHaveBeenLastCalledWith({ block: 'end', behavior: 'smooth' })
+    })
+
     it('stays in tail mode through smooth-scroll progress and content growth', () => {
         const { viewport, onViewModeChange, rerenderThread } = renderThread()
         act(() => {
