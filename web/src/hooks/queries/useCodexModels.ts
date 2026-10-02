@@ -8,23 +8,24 @@ export function useCodexModels(args: {
     api: ApiClient | null
     sessionId?: string | null
     machineId?: string | null
+    accountId?: string | null
     enabled?: boolean
 }): {
     models: CodexModelSummary[]
     isLoading: boolean
     error: string | null
 } {
-    const { api, sessionId, machineId } = args
+    const { api, sessionId, machineId, accountId } = args
     const enabled = Boolean(args.enabled && api && (sessionId || machineId))
 
     const machineQuery = useQuery({
-        queryKey: queryKeys.machineCodexModels(machineId ?? 'unknown'),
+        queryKey: queryKeys.machineCodexModels(machineId ?? 'unknown', accountId),
         queryFn: async () => {
             if (!api) {
                 throw new Error('API unavailable')
             }
             if (machineId) {
-                return await api.getMachineCodexModels(machineId)
+                return await api.getMachineCodexModels(machineId, accountId)
             }
             throw new Error('Codex models target unavailable')
         },

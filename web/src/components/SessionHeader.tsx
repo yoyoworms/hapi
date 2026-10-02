@@ -28,6 +28,7 @@ import { formatSessionHeaderTimestamp } from '@/lib/sessionHeaderTimestamp'
 import { selectMobileSessionHeaderSecondary } from '@/lib/sessionHeaderMobileMetadata'
 import { useMinuteTick } from '@/hooks/useMinuteTick'
 import { markSessionUnread } from '@/lib/sessionLastSeen'
+import { CodexAccountSwitchDialog } from '@/components/CodexAccountSwitchDialog'
 
 /** Same preference order as session-list chips: display label → host → short id. */
 export function resolveSessionHeaderMachineLabel(
@@ -183,6 +184,11 @@ export function SessionHeader(props: {
     const codexSessionId = session.metadata?.flavor === 'codex'
         ? session.metadata.codexSessionId?.trim() || null
         : null
+    const codexAccountLabel = session.metadata?.flavor === 'codex'
+        ? session.metadata.codexAccountLabel?.trim() || (
+            session.metadata.codexAccountId === 'system' ? 'System default' : null
+        )
+        : null
     const piSessionId = session.metadata?.flavor === 'pi'
         ? session.metadata.piSessionId?.trim() || null
         : null
@@ -223,6 +229,7 @@ export function SessionHeader(props: {
     const [deleteOpen, setDeleteOpen] = useState(false)
     const [isSyncingCodex, setIsSyncingCodex] = useState(false)
     const [isSyncingPi, setIsSyncingPi] = useState(false)
+    const [codexAccountSwitchOpen, setCodexAccountSwitchOpen] = useState(false)
 
     const { archiveSession, reopenSession, renameSession, suggestSessionTitle, updateSessionSummary, setPinMode, deleteSession, isPending } = useSessionActions(
         api,
@@ -276,7 +283,8 @@ export function SessionHeader(props: {
             const result = await api.syncCodexSession({
                 sessionIds: [codexSessionId],
                 cwd: typeof session.metadata?.path === 'string' ? session.metadata.path : undefined,
-                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined
+                machineId: typeof session.metadata?.machineId === 'string' ? session.metadata.machineId : undefined,
+                codexAccountId: typeof session.metadata?.codexAccountId === 'string' ? session.metadata.codexAccountId : undefined
             })
             if (!result.success) {
                 throw new Error(result.error || t('codexSync.failed.body'))
@@ -413,6 +421,7 @@ export function SessionHeader(props: {
                                 {mobileSecondary === 'createdAt' && createdAtLabel ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
                                 {mobileSecondary === 'worktree' && worktreeBranch ? <span className="truncate">{headerMetadata.showLabels ? `${t('session.item.worktree')}: ` : ''}{worktreeBranch}</span> : null}
                                 {mobileSecondary === 'fastMode' ? <span className="truncate text-[#34C759]">fast</span> : null}
+                                {codexAccountLabel ? <span className="truncate">{codexAccountLabel}</span> : null}
                             </div>
                         ) : null}
                         <div className="hidden flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--app-hint)] sm:flex">
@@ -446,6 +455,11 @@ export function SessionHeader(props: {
                             {headerMetadata.fastMode && showFastBadge ? (
                                 <span data-testid="session-header-fast" className="text-[#34C759]">
                                     fast
+                                </span>
+                            ) : null}
+                            {codexAccountLabel ? (
+                                <span data-testid="session-header-codex-account" title={codexAccountLabel}>
+                                    {headerMetadata.showLabels ? 'Account: ' : ''}{codexAccountLabel}
                                 </span>
                             ) : null}
                             {createdAtLabel ? <span>{headerMetadata.showLabels ? `${t('session.header.createdAt')}: ` : ''}{createdAtLabel}</span> : null}
@@ -525,6 +539,9 @@ export function SessionHeader(props: {
                 onExport={() => setExportOpen(true)}
                 onSyncCodex={api && codexSessionId && !session.active ? handleSyncCodex : undefined}
                 onSyncPi={api && piSessionId && !session.active ? handleSyncPi : undefined}
+                onSwitchCodexAccount={api && agentFlavor === 'codex'
+                    ? () => setCodexAccountSwitchOpen(true)
+                    : undefined}
                 onArchive={() => setArchiveOpen(true)}
                 onReopen={props.canReopen === false ? undefined : handleReopen}
                 reopenDisabledReason={props.reopenDisabledReason}
@@ -564,6 +581,22 @@ export function SessionHeader(props: {
                 sessionId={session.id}
                 api={api}
             />
+
+            {api && agentFlavor === 'codex' ? (
+                <CodexAccountSwitchDialog
+                    isOpen={codexAccountSwitchOpen}
+                    onClose={() => setCodexAccountSwitchOpen(false)}
+                    session={session}
+                    api={api}
+                    onSwitched={async (resolvedId) => {
+                        await Promise.all([
+                            queryClient.invalidateQueries({ queryKey: queryKeys.session(resolvedId) }),
+                            queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
+                        ])
+                        await onSessionReopened?.(resolvedId)
+                    }}
+                />
+            ) : null}
 
             <ConfirmDialog
                 isOpen={archiveOpen}

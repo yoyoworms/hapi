@@ -2,12 +2,16 @@ import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionM
 import { PERMISSION_REQUEST_NOT_FOUND_MESSAGE, RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import {
     ArchiveCodexSessionRpcResponseSchema,
+    CodexAccountLoginStatusResponseSchema,
+    CodexAccountLoginStartResponseSchema,
+    CodexAccountsResponseSchema,
     AgentAvailabilityResponseSchema,
     CursorChatStoreStatusSchema,
     ListCodexSessionsRpcResponseSchema,
     ListPiSessionsRpcResponseSchema
 } from '@hapi/protocol/apiTypes'
 import type {
+    AddCodexApiEndpointRequest,
     AgyModelsResponse,
     AgentAvailabilityResponse,
     CodexModelSummary,
@@ -29,6 +33,9 @@ import type {
     ListCodexSessionsRpcResponse,
     ListPiSessionsRpcResponse,
     ArchiveCodexSessionRpcResponse,
+    CodexAccountLoginStatusResponse,
+    CodexAccountLoginStartResponse,
+    CodexAccountsResponse,
     OpencodeModelsResponse,
     OpencodeModelSummary,
     OpencodeModelVariantsResponse,
@@ -236,7 +243,11 @@ export class RpcGateway {
         // latter is adopt-stub (create/getOrCreate with id), not reopen.
         forkSession?: boolean,
         /** Fresh machine-spawn stub — distinct from reopen existingSessionId. */
-        reservedSessionId?: string
+        reservedSessionId?: string,
+        sandbox?: boolean,
+        continueLatest?: boolean,
+        codexAccountId?: string,
+        codexSourceAccountId?: string
     ): Promise<
         | { type: 'success'; sessionId: string }
         | {
@@ -273,7 +284,11 @@ export class RpcGateway {
                     collaborationMode,
                     copilotAgentMode,
                     startingMode,
-                    forkSession: forkSession === true
+                    forkSession: forkSession === true,
+                    sandbox,
+                    continueLatest,
+                    codexAccountId,
+                    codexSourceAccountId
                 }
             )
             if (result && typeof result === 'object') {
@@ -324,6 +339,36 @@ export class RpcGateway {
             // Do not claim childStarted: false — hub keeps the stub.
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }
+    }
+
+    async listCodexAccountsForMachine(machineId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexAccounts, {}, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async startCodexAccountLogin(machineId: string): Promise<CodexAccountLoginStartResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.StartCodexAccountLogin, {}, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountLoginStartResponseSchema.parse(result)
+    }
+
+    async addCodexApiEndpoint(machineId: string, input: AddCodexApiEndpointRequest): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.AddCodexApiEndpoint, input, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async getCodexAccountLoginStatus(machineId: string, attemptId: string): Promise<CodexAccountLoginStatusResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.GetCodexAccountLoginStatus, { attemptId }, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountLoginStatusResponseSchema.parse(result)
+    }
+
+    async setDefaultCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.SetDefaultCodexAccount, { accountId }, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountsResponseSchema.parse(result)
+    }
+
+    async removeCodexAccount(machineId: string, accountId: string): Promise<CodexAccountsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.RemoveCodexAccount, { accountId }, MODEL_LIST_RPC_TIMEOUT_MS)
+        return CodexAccountsResponseSchema.parse(result)
     }
 
     async listMachineDirectory(machineId: string, path: string, includeHidden?: boolean): Promise<RpcListDirectoryResponse> {
@@ -437,8 +482,8 @@ export class RpcGateway {
         }
     }
 
-    async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {
-        return await this.machineRpc(machineId, RPC_METHODS.ListCodexModels, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListCodexModelsResponse
+    async listCodexModelsForMachine(machineId: string, accountId?: string): Promise<RpcListCodexModelsResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.ListCodexModels, accountId ? { accountId } : {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListCodexModelsResponse
     }
 
     async listOpencodeModelVariantsForMachine(machineId: string, cwd?: string | null): Promise<RpcListOpencodeModelVariantsResponse> {
@@ -454,8 +499,8 @@ export class RpcGateway {
         ) as RpcListCodexModelsResponse
     }
 
-    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListCodexSessionsResponse> {
-        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexSessions, { cwd: cwd ?? null, sessionIds }, MODEL_LIST_RPC_TIMEOUT_MS)
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[], codexAccountId?: string | null): Promise<RpcListCodexSessionsResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.ListCodexSessions, { cwd: cwd ?? null, sessionIds, codexAccountId: codexAccountId ?? null }, MODEL_LIST_RPC_TIMEOUT_MS)
         return ListCodexSessionsRpcResponseSchema.parse(result)
     }
 
@@ -464,8 +509,11 @@ export class RpcGateway {
         return ListPiSessionsRpcResponseSchema.parse(result)
     }
 
-    async archiveCodexSessionForMachine(machineId: string, sessionId: string): Promise<RpcArchiveCodexSessionResponse> {
-        const result = await this.machineRpc(machineId, RPC_METHODS.ArchiveCodexSession, { sessionId }, MODEL_LIST_RPC_TIMEOUT_MS)
+    async archiveCodexSessionForMachine(machineId: string, sessionId: string, codexAccountId?: string | null): Promise<RpcArchiveCodexSessionResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.ArchiveCodexSession, {
+            sessionId,
+            codexAccountId: codexAccountId ?? null
+        }, MODEL_LIST_RPC_TIMEOUT_MS)
         return ArchiveCodexSessionRpcResponseSchema.parse(result)
     }
 

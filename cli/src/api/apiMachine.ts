@@ -58,6 +58,7 @@ import type { SpawnSessionOptions, SpawnSessionResult } from '../modules/common/
 import { applyVersionedAck } from './versionedUpdate'
 import { archiveLocalCodexSession, listLocalCodexSessionSummaries, listLocalCodexSessionsWithMessagesByIds } from '../modules/common/codexSessions'
 import { listLocalPiSessionSummaries, listLocalPiSessionsWithMessagesByIds } from '../modules/common/piSessions'
+import { codexAccountManager } from '@/codex/codexAccountManager'
 import { buildSocketIoExtraHeaderOptions } from './hubExtraHeaders'
 import { collectMachineHealth } from '@/utils/machineHealth'
 import { inspectCursorChatStore } from '@/cursor/cursorChatStoreStatus'
@@ -128,7 +129,10 @@ export class ApiMachineClient {
             logger: (msg, data) => logger.debug(msg, data)
         })
 
-        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd())
+        registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd(), {
+            codexModelsMachineScoped: true,
+            codexAccountsMachineScoped: true
+        })
 
         // Only the machine daemon answers `<machineId>:listAgyModels`, so it is
         // the one process that can tell the hub its catalog moved.
@@ -344,9 +348,20 @@ export class ApiMachineClient {
                 const requestedIds = parsed.data.sessionIds
                     ? new Set(parsed.data.sessionIds)
                     : null
+                let codexHome: string | undefined
+                if (parsed.data.codexAccountId) {
+                    try {
+                        codexHome = (await codexAccountManager.resolveAccount(parsed.data.codexAccountId)).homeDir
+                    } catch (error) {
+                        return {
+                            success: false,
+                            error: error instanceof Error ? error.message : 'Codex account is unavailable'
+                        }
+                    }
+                }
                 const allSessions = requestedIds
-                    ? listLocalCodexSessionsWithMessagesByIds(requestedIds)
-                    : listLocalCodexSessionSummaries()
+                    ? listLocalCodexSessionsWithMessagesByIds(requestedIds, codexHome)
+                    : listLocalCodexSessionSummaries(undefined, codexHome)
                 const sessions = []
                 for (const session of allSessions) {
                     if (await this.isLocalSessionWithinWorkspaceRoots(session)) {
@@ -363,7 +378,19 @@ export class ApiMachineClient {
                 const parsed = ArchiveCodexSessionRpcRequestSchema.safeParse(params)
                 if (!parsed.success) return { success: false, error: 'Invalid Codex archive request' }
                 const sessionId = parsed.data.sessionId.trim()
+                let codexHome: string | undefined
+                if (parsed.data.codexAccountId) {
+                    try {
+                        codexHome = (await codexAccountManager.resolveAccount(parsed.data.codexAccountId)).homeDir
+                    } catch (error) {
+                        return {
+                            success: false,
+                            error: error instanceof Error ? error.message : 'Codex account is unavailable'
+                        }
+                    }
+                }
                 return await archiveLocalCodexSession(sessionId, {
+                    codexHome,
                     canArchive: (session) => this.isLocalSessionWithinWorkspaceRoots(session)
                 })
             }
@@ -404,7 +431,7 @@ export class ApiMachineClient {
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
         this.rpcHandlerManager.registerHandler(RPC_METHODS.SpawnHappySession, async (params: any) => {
-            const { directory, sessionId, existingSessionId, reservedSessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, collaborationMode, copilotAgentMode, token, sessionType, worktreeName, startingMode, forkSession } = params || {}
+            const { directory, sessionId, existingSessionId, reservedSessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, codexAccountId, codexSourceAccountId, collaborationMode, copilotAgentMode, token, sessionType, worktreeName, startingMode, forkSession, sandbox } = params || {}
 
             if (!directory) {
                 throw new Error('Directory is required')
@@ -436,6 +463,8 @@ export class ApiMachineClient {
                 yolo,
                 permissionMode,
                 serviceTier,
+                codexAccountId,
+                codexSourceAccountId,
                 collaborationMode,
                 copilotAgentMode,
                 token,
@@ -443,6 +472,7 @@ export class ApiMachineClient {
                 worktreeName,
                 startingMode,
                 forkSession: forkSession === true,
+                sandbox: sandbox === true,
                 validateDirectory: async (path) => await this.pathPolicy.allowsSpawn(path),
             })
 

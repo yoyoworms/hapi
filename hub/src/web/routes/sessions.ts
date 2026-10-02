@@ -222,19 +222,26 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ error: 'Invalid body' }, 400)
         }
 
-        const { permissionMode } = parsed.data
+        const { permissionMode, resumeWithSessionId, codexAccountId } = parsed.data
         if (permissionMode !== undefined) {
             const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
             if (!isPermissionModeAllowedForFlavor(permissionMode, flavor)) {
                 return c.json({ error: 'Invalid permission mode for session flavor' }, 400)
             }
         }
+        if (codexAccountId !== undefined && sessionResult.session.metadata?.flavor !== 'codex') {
+            return c.json({ error: 'Codex account switching is only available for Codex sessions' }, 400)
+        }
 
         const namespace = c.get('namespace')
         const result = await engine.resumeSession(
             sessionResult.sessionId,
             namespace,
-            permissionMode !== undefined ? { permissionMode } : undefined
+            {
+                ...(permissionMode !== undefined ? { permissionMode } : {}),
+                ...(resumeWithSessionId !== undefined ? { resumeWithSessionId } : {}),
+                ...(codexAccountId !== undefined ? { codexAccountId } : {})
+            }
         )
         if (result.type === 'error') {
             const status = result.code === 'no_machine_online' ? 503

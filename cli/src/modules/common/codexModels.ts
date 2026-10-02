@@ -1,10 +1,13 @@
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import { codexAccountManager } from '@/codex/codexAccountManager';
 import { getErrorMessage } from './rpcResponses';
 
 export interface ListCodexModelsRequest {
     includeHidden?: boolean;
+    accountId?: string;
 }
 
 export type ListCodexModelsResponse = CodexModelsResponse;
@@ -92,24 +95,33 @@ interface CacheEntry {
 // involved. Cache successful lists for 5 minutes (same shape as the opencode
 // model cache) and coalesce concurrent requests into a single spawn.
 const CACHE_TTL_MS = 5 * 60_000;
-const cache = new Map<boolean, CacheEntry>();
-const inflight = new Map<boolean, Promise<CodexModelSummary[]>>();
+const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<CodexModelSummary[]>>();
 
-export async function listCodexModels(includeHidden: boolean = false): Promise<CodexModelSummary[]> {
-    const cached = cache.get(includeHidden);
+function getCacheKey(includeHidden: boolean, environment?: Record<string, string>): string {
+    if (!environment) return `${includeHidden}:default`;
+    const fingerprint = createHash('sha256')
+        .update(JSON.stringify(Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))))
+        .digest('hex');
+    return `${includeHidden}:${fingerprint}`;
+}
+
+export async function listCodexModels(includeHidden: boolean = false, environment?: Record<string, string>): Promise<CodexModelSummary[]> {
+    const cacheKey = getCacheKey(includeHidden, environment);
+    const cached = cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
         return cached.models;
     }
 
-    const existing = inflight.get(includeHidden);
+    const existing = inflight.get(cacheKey);
     if (existing) {
         return existing;
     }
 
-    const promise = fetchCodexModelsFromAppServer(includeHidden)
+    const promise = fetchCodexModelsFromAppServer(includeHidden, environment)
         .then((models) => {
             if (models.length > 0) {
-                cache.set(includeHidden, {
+                cache.set(cacheKey, {
                     expiresAt: Date.now() + CACHE_TTL_MS,
                     models
                 });
@@ -117,17 +129,17 @@ export async function listCodexModels(includeHidden: boolean = false): Promise<C
             return models;
         })
         .finally(() => {
-            inflight.delete(includeHidden);
+            inflight.delete(cacheKey);
         });
 
-    inflight.set(includeHidden, promise);
+    inflight.set(cacheKey, promise);
     return promise;
 }
 
-async function fetchCodexModelsFromAppServer(includeHidden: boolean): Promise<CodexModelSummary[]> {
+async function fetchCodexModelsFromAppServer(includeHidden: boolean, environment?: Record<string, string>): Promise<CodexModelSummary[]> {
     // Model discovery is account-scoped. Never inherit a session/runner cwd:
     // project config or a deleted worktree must not alter or break the catalog.
-    const client = new CodexAppServerClient({ cwd: homedir() });
+    const client = new CodexAppServerClient({ cwd: homedir(), env: environment });
 
     try {
         await client.connect();

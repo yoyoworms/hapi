@@ -71,6 +71,7 @@ import {
     savePreferredYoloMode,
 } from './preferences'
 import { SessionTypeSelector } from './SessionTypeSelector'
+import { CodexAccountSelector } from './CodexAccountSelector'
 import { PermissionField } from './PermissionField'
 import { usesNativePermissionSelect, usesSharedPermissionModeState } from '@/lib/codexFamilyPermissionAgents'
 import { CodexSessionSyncDialog } from '@/components/CodexSessionSyncDialog'
@@ -124,6 +125,7 @@ export function NewSession(props: {
     const [copilotAgentMode, setCopilotAgentMode] = useState<CopilotAgentMode>('interactive')
     const [yoloMode, setYoloMode] = useState(loadPreferredYoloMode)
     const [nativePermissionMode, setNativePermissionMode] = useState<PermissionMode>('default')
+    const [codexAccountId, setCodexAccountId] = useState<string | null>(null)
     const [grokPermissionMode, setGrokPermissionMode] = useState<GrokPermissionMode>('default')
     const [sessionType, setSessionType] = useState<SessionType>('simple')
     const [worktreeName, setWorktreeName] = useState('')
@@ -195,6 +197,7 @@ export function NewSession(props: {
 
     useEffect(() => {
         if (agent !== 'codex') {
+            setCodexAccountId(null)
             setSelectedCodexImportSessionId(null)
             setCodexImportSessions([])
             setCodexImportMachineId(null)
@@ -310,6 +313,7 @@ export function NewSession(props: {
     const codexModelsState = useCodexModels({
         api: props.api,
         machineId,
+        accountId: codexAccountId,
         enabled: agent === 'codex' && Boolean(machineId)
     })
     const [agySelectedModel, setAgySelectedModel] = useState<string | null>(null)
@@ -1026,7 +1030,11 @@ export function NewSession(props: {
 
     const handleArchiveCodexImportSession = useCallback(async (session: CodexLocalSessionSummary) => {
         if (!props.api) return
-        const result = await props.api.archiveCodexSession(session.id, codexImportMachineId ?? machineId)
+        const result = await props.api.archiveCodexSession(
+            session.id,
+            codexImportMachineId ?? machineId,
+            codexAccountId
+        )
         if (!result.success) {
             throw new Error(result.error)
         }
@@ -1034,14 +1042,14 @@ export function NewSession(props: {
         if (selectedCodexImportSessionId === session.id) {
             setSelectedCodexImportSessionId(null)
         }
-    }, [codexImportMachineId, machineId, props.api, selectedCodexImportSessionId])
+    }, [codexAccountId, codexImportMachineId, machineId, props.api, selectedCodexImportSessionId])
 
     const loadCodexImportSessions = useCallback(async () => {
         if (agent !== 'codex' || !machineId) return
         setIsLoadingCodexImportSessions(true)
         setCodexImportError(null)
         try {
-            const result = await props.api.getCodexSessions(trimmedDirectory || null, machineId)
+            const result = await props.api.getCodexSessions(trimmedDirectory || null, machineId, codexAccountId)
             setCodexImportSessions(result.sessions)
             setCodexImportMachineId(result.machineId ?? machineId)
             setSelectedCodexImportSessionId((current) => current && result.sessions.some((session) => session.id === current) ? current : null)
@@ -1053,7 +1061,7 @@ export function NewSession(props: {
         } finally {
             setIsLoadingCodexImportSessions(false)
         }
-    }, [agent, machineId, props.api, trimmedDirectory, t])
+    }, [agent, codexAccountId, machineId, props.api, trimmedDirectory, t])
 
     useEffect(() => {
         piLoadGenerationRef.current += 1
@@ -1367,6 +1375,7 @@ export function NewSession(props: {
     const handleMachineChange = useCallback((newMachineId: string) => {
         preserveRestoredDraftRef.current = false
         setMachineId(newMachineId)
+        setCodexAccountId(null)
         setModel('auto')
         setCursorSelectedBase('auto')
         setSelectedCodexImportSessionId(null)
@@ -1603,6 +1612,7 @@ export function NewSession(props: {
                     sessionIds: [selectedCodexImportSession.id],
                     cwd: selectedCodexImportSession.cwd ?? trimmedDirectory,
                     machineId: codexImportMachineId ?? machineId,
+                    codexAccountId,
                     model: resolvedModel ?? null,
                     modelReasoningEffort: resolvedModelReasoningEffort ?? null,
                     serviceTier: resolvedServiceTier,
@@ -1618,8 +1628,11 @@ export function NewSession(props: {
                     // 这里立刻 resume，避免进入会话页时先看到离线，等首条消息才触发启动。
                     const resumedSessionId = await props.api.resumeSession(
                         importedSessionId,
-                        nativePermissionMode !== 'default'
-                            ? { permissionMode: nativePermissionMode }
+                        nativePermissionMode !== 'default' || codexAccountId
+                            ? {
+                                ...(nativePermissionMode !== 'default' ? { permissionMode: nativePermissionMode } : {}),
+                                ...(codexAccountId ? { codexAccountId } : {})
+                            }
                             : undefined
                     )
                     haptic.notification('success')
@@ -1680,6 +1693,7 @@ export function NewSession(props: {
                 serviceTier: resolvedServiceTier,
                 collaborationMode: resolvedCollaborationMode,
                 copilotAgentMode: agent === 'copilot' ? copilotAgentMode : undefined,
+                codexAccountId: agent === 'codex' ? codexAccountId ?? undefined : undefined,
             })
 
 
@@ -1828,17 +1842,26 @@ export function NewSession(props: {
                 </div>
             ) : null}
             {agent === 'codex' ? (
-                <CodexImportActions
-                    selectedSession={selectedCodexImportSession}
-                    isLoading={isLoadingCodexImportSessions}
-                    isDisabled={isFormDisabled}
-                    error={codexImportError}
-                    onChooseHistory={() => {
-                        setIsCodexImportDialogOpen(true)
-                        void loadCodexImportSessions()
-                    }}
-                    onClear={() => setSelectedCodexImportSessionId(null)}
-                />
+                <>
+                    <CodexAccountSelector
+                        api={props.api}
+                        machineId={machineId}
+                        value={codexAccountId}
+                        isDisabled={isFormDisabled}
+                        onChange={setCodexAccountId}
+                    />
+                    <CodexImportActions
+                        selectedSession={selectedCodexImportSession}
+                        isLoading={isLoadingCodexImportSessions}
+                        isDisabled={isFormDisabled}
+                        error={codexImportError}
+                        onChooseHistory={() => {
+                            setIsCodexImportDialogOpen(true)
+                            void loadCodexImportSessions()
+                        }}
+                        onClear={() => setSelectedCodexImportSessionId(null)}
+                    />
+                </>
             ) : null}
             {agent === 'pi' ? (
                 <PiImportActions

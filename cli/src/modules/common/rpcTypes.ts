@@ -11,6 +11,14 @@ export interface SpawnSessionOptions {
     // (adopt-stub create/getOrCreate) — must NOT take the reopen path.
     reservedSessionId?: string
     resumeSessionId?: string
+    /** Codex account identity selected on the target runner. */
+    codexAccountId?: string
+    /** Account that owns the source Codex rollout when switching identities. */
+    codexSourceAccountId?: string
+    /** Continue the latest Codex rollout when reopening through the hub. */
+    continueLatest?: boolean
+    /** Run the Codex process in the requested sandbox mode. */
+    sandbox?: boolean
     approvedNewDirectoryCreation?: boolean
     agent?: AgentFlavor
     model?: string

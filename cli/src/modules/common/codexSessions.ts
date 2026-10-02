@@ -41,6 +41,7 @@ export type LocalCodexSessionWithMessages = LocalCodexSessionSummary & {
 }
 
 export type ArchiveLocalCodexSessionOptions = {
+    codexHome?: string | null
     canArchive?: (session: LocalCodexSessionSummary) => boolean | Promise<boolean>
 }
 
@@ -97,23 +98,22 @@ function collectJsonlFiles(root: string, files: string[]): void {
     }
 }
 
-function getCodexHome(): string {
-    return process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+function getCodexHome(codexHome?: string | null): string {
+    return codexHome?.trim() || process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
 }
 
-function getCodexSessionRoots(): string[] {
-    const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
-    return [join(codexHome, 'sessions')]
+function getCodexSessionRoots(codexHome?: string | null): string[] {
+    return [join(getCodexHome(codexHome), 'sessions')]
 }
 
-function getCodexSessionIndexPath(): string {
-    return join(getCodexHome(), 'session_index.jsonl')
+function getCodexSessionIndexPath(codexHome?: string | null): string {
+    return join(getCodexHome(codexHome), 'session_index.jsonl')
 }
 
-function readCodexSessionIndexTitles(): Map<string, CodexSessionIndexTitle> {
+function readCodexSessionIndexTitles(codexHome?: string | null): Map<string, CodexSessionIndexTitle> {
     let content: string
     try {
-        content = readFileSync(getCodexSessionIndexPath(), 'utf-8')
+        content = readFileSync(getCodexSessionIndexPath(codexHome), 'utf-8')
     } catch {
         return new Map()
     }
@@ -376,12 +376,12 @@ function parseCodexLocalSession(
     return includeMessages ? { ...summary, messages: deduplicateAdjacentImportedMessages(messages) } : summary
 }
 
-function listLocalCodexSessions(includeMessages: false, limit?: number): LocalCodexSessionSummary[]
-function listLocalCodexSessions(includeMessages: true, limit?: number): LocalCodexSessionWithMessages[]
-function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): Array<LocalCodexSessionSummary | LocalCodexSessionWithMessages> {
+function listLocalCodexSessions(includeMessages: false, limit?: number, codexHome?: string | null): LocalCodexSessionSummary[]
+function listLocalCodexSessions(includeMessages: true, limit?: number, codexHome?: string | null): LocalCodexSessionWithMessages[]
+function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): Array<LocalCodexSessionSummary | LocalCodexSessionWithMessages> {
     const files: string[] = []
-    for (const root of getCodexSessionRoots()) collectJsonlFiles(root, files)
-    const sessionIndexTitles = readCodexSessionIndexTitles()
+    for (const root of getCodexSessionRoots(codexHome)) collectJsonlFiles(root, files)
+    const sessionIndexTitles = readCodexSessionIndexTitles(codexHome)
     const deduped = new Map<string, LocalCodexSessionSummary | LocalCodexSessionWithMessages>()
     for (const file of files) {
         const session = parseCodexLocalSession(file, includeMessages, sessionIndexTitles)
@@ -392,18 +392,18 @@ function listLocalCodexSessions(includeMessages: boolean, limit = DEFAULT_CODEX_
     return Array.from(deduped.values()).sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, limit)
 }
 
-export function listLocalCodexSessionSummaries(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): LocalCodexSessionSummary[] {
-    return listLocalCodexSessions(false, limit)
+export function listLocalCodexSessionSummaries(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): LocalCodexSessionSummary[] {
+    return listLocalCodexSessions(false, limit, codexHome)
 }
 
-export function listLocalCodexSessionsWithMessages(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT): LocalCodexSessionWithMessages[] {
-    return listLocalCodexSessions(true, limit)
+export function listLocalCodexSessionsWithMessages(limit = DEFAULT_CODEX_SESSION_SCAN_LIMIT, codexHome?: string | null): LocalCodexSessionWithMessages[] {
+    return listLocalCodexSessions(true, limit, codexHome)
 }
 
-export function listLocalCodexSessionsWithMessagesByIds(ids: Set<string>): LocalCodexSessionWithMessages[] {
+export function listLocalCodexSessionsWithMessagesByIds(ids: Set<string>, codexHome?: string | null): LocalCodexSessionWithMessages[] {
     if (ids.size === 0) return []
-    const sessionIndexTitles = readCodexSessionIndexTitles()
-    return listLocalCodexSessionSummaries(Number.MAX_SAFE_INTEGER)
+    const sessionIndexTitles = readCodexSessionIndexTitles(codexHome)
+    return listLocalCodexSessionSummaries(Number.MAX_SAFE_INTEGER, codexHome)
         .filter((session) => ids.has(session.id))
         .map((session) => parseCodexLocalSession(session.file, true, sessionIndexTitles))
         .filter((session): session is LocalCodexSessionWithMessages => Boolean(session))
@@ -414,9 +414,9 @@ export async function archiveLocalCodexSession(sessionId: string, options: Archi
     const normalizedId = sessionId.trim()
     if (!normalizedId) return { success: false, error: 'sessionId is required' }
 
-    const sessionsRoot = getCodexSessionRoots()[0]
-    const archivedRoot = join(getCodexHome(), 'archived_sessions')
-    const sessions = listLocalCodexSessionSummaries(DEFAULT_CODEX_SESSION_SCAN_LIMIT * 5)
+    const sessionsRoot = getCodexSessionRoots(options.codexHome)[0]
+    const archivedRoot = join(getCodexHome(options.codexHome), 'archived_sessions')
+    const sessions = listLocalCodexSessionSummaries(DEFAULT_CODEX_SESSION_SCAN_LIMIT * 5, options.codexHome)
     const target = sessions.find((session) => session.id === normalizedId)
     if (!target) return { success: false, error: 'Codex session not found' }
     if (options.canArchive && !(await options.canArchive(target))) {

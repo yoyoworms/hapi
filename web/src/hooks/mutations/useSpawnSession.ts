@@ -12,7 +12,9 @@ type SpawnInput = {
     effort?: string
     modelReasoningEffort?: string
     yolo?: boolean
+    sandbox?: boolean
     permissionMode?: PermissionMode
+    codexAccountId?: string
     sessionType?: 'simple' | 'worktree'
     worktreeName?: string
     serviceTier?: 'fast' | 'standard'
@@ -43,7 +45,9 @@ export function useSpawnSession(api: ApiClient | null): {
                 input.sessionType,
                 input.worktreeName,
                 input.effort,
+                input.sandbox,
                 input.permissionMode,
+                input.codexAccountId,
                 input.serviceTier,
                 input.collaborationMode,
                 input.copilotAgentMode,

@@ -39,7 +39,11 @@ import type {
     ThreadGoalClearParams,
     ThreadGoalClearResponse,
     ExperimentalFeatureEnablementSetParams,
-    ExperimentalFeatureEnablementSetResponse
+    ExperimentalFeatureEnablementSetResponse,
+    GetAccountRateLimitsResponse,
+    GetAccountResponse,
+    LoginAccountParams,
+    LoginAccountResponse
 } from './appServerTypes';
 
 type JsonRpcLiteRequest = {
@@ -82,6 +86,7 @@ export function isIndeterminateError(error: unknown): boolean {
 
 type CodexAppServerClientOptions = {
     cwd?: string;
+    env?: NodeJS.ProcessEnv;
     /** An independently owned shared server. Disconnect only detaches this client. */
     endpoint?: string;
     token?: string;
@@ -256,10 +261,11 @@ export class CodexAppServerClient extends JsonLineParser {
 
         const codexCommand = resolveCodexAppServerCommand();
         logger.debug(`[CodexAppServer] Starting ${codexCommand} app-server`);
+        const childEnv = { ...process.env, ...this.options.env };
         const child = spawn(codexCommand, ['app-server'], {
             cwd: this.options.cwd,
-            env: Object.keys(process.env).reduce((acc, key) => {
-                const value = process.env[key];
+            env: Object.keys(childEnv).reduce((acc, key) => {
+                const value = childEnv[key];
                 if (typeof value === 'string') acc[key] = value;
                 return acc;
             }, {} as Record<string, string>),
@@ -360,6 +366,24 @@ export class CodexAppServerClient extends JsonLineParser {
             timeoutMs: 30_000
         });
         return response as ModelListResponse;
+    }
+
+    async loginAccount(params: LoginAccountParams): Promise<LoginAccountResponse> {
+        return await this.sendRequest('account/login/start', params, { timeoutMs: 30_000 }) as LoginAccountResponse;
+    }
+
+    async cancelAccountLogin(loginId: string): Promise<void> {
+        await this.sendRequest('account/login/cancel', { loginId }, { timeoutMs: 30_000 });
+    }
+
+    async readAccount(options?: { refreshToken?: boolean }): Promise<GetAccountResponse> {
+        return await this.sendRequest('account/read', {
+            refreshToken: options?.refreshToken ?? false
+        }, { timeoutMs: 30_000 }) as GetAccountResponse;
+    }
+
+    async readAccountRateLimits(): Promise<GetAccountRateLimitsResponse> {
+        return await this.sendRequest('account/rateLimits/read', {}, { timeoutMs: 30_000 }) as GetAccountRateLimitsResponse;
     }
 
     async listSkills(params: SkillsListParams): Promise<SkillsListResponse> {

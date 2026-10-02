@@ -402,14 +402,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     // Webhook timeout tolerance. Opus 1M + --resume can legitimately take
     // longer than the default 15s to reach the "Session started" webhook
     // (observed real-world durations of 30s – 60min under rate-limit /
-    // heavy session restore). Allow advanced users to raise this ceiling
-    // so that slow starts no longer leave orphaned child processes which
-    // later report back as ghost sessions.
+    // heavy session restore). Keep a generous default so normal history
+    // replay is not mistaken for a dead child; advanced users can still
+    // raise/lower this ceiling with the environment variable.
     const envWebhookTimeout = Number(process.env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS);
     const webhookTimeoutMs =
       Number.isFinite(envWebhookTimeout) && envWebhookTimeout > 0
         ? envWebhookTimeout
-        : 15_000;
+        : 60_000;
 
     // Session spawning awaiter system
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
@@ -565,6 +565,17 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           logger.debug(
             `[RUNNER RUN] Adopted untracked runner-spawned session ${sessionId} (PID ${pid}) after restart or shared recovery`
           );
+          // A webhook can race the timeout callback just after it removes the
+          // in-memory tracking entry.  If this spawn still has an awaiter,
+          // completing it here prevents the original request from being
+          // reported as a timeout even though the child successfully started.
+          const awaiter = pidToAwaiter.get(pid);
+          if (awaiter) {
+            pidToAwaiter.delete(pid);
+            pidToErrorAwaiter.delete(pid);
+            awaiter(adopted);
+            logger.debug(`[RUNNER RUN] Resolved adopted session awaiter for PID ${pid}`);
+          }
           return;
         }
 
@@ -753,6 +764,31 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
         // Resolve authentication token if provided
         let extraEnv: Record<string, string> = {};
+        if (options.codexAccountId && agent !== 'codex') {
+          return {
+            type: 'error',
+            errorMessage: 'Codex account selection is only valid for Codex sessions',
+            childStarted: false
+          };
+        }
+        if (options.codexSourceAccountId && agent !== 'codex') {
+          return {
+            type: 'error',
+            errorMessage: 'Codex source account is only valid for Codex sessions',
+            childStarted: false
+          };
+        }
+        if (options.codexAccountId && options.token) {
+          return {
+            type: 'error',
+            errorMessage: 'Codex account selection cannot be combined with token injection',
+            childStarted: false
+          };
+        }
+        if (options.agent === 'codex') {
+          if (options.codexAccountId) extraEnv.HAPI_CODEX_ACCOUNT_ID = options.codexAccountId;
+          if (options.codexSourceAccountId) extraEnv.HAPI_CODEX_SOURCE_ACCOUNT_ID = options.codexSourceAccountId;
+        }
         if (options.token) {
           if (options.agent === 'codex') {
 
@@ -767,6 +803,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
             // Set the environment variable for Codex
             extraEnv = {
+              ...extraEnv,
               CODEX_HOME: codexHomeDir
             };
           } else if (options.agent === 'claude' || !options.agent) {
@@ -960,6 +997,16 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           // (e.g. opus[1m] --resume).
           const timeout = setTimeout(() => {
             void (async () => {
+              // The webhook and this timer are delivered by different event
+              // sources.  Give an already-started child a short event-loop
+              // grace period before treating the timeout as definitive.  This
+              // closes the race where the timer removes tracking immediately
+              // before the Session started webhook is processed.
+              await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+              // A webhook (or an early process error/exit) may have settled
+              // the spawn while the grace period elapsed.
+              if (!pidToAwaiter.has(pid)) return;
+
               pidToAwaiter.delete(pid);
               pidToErrorAwaiter.delete(pid);
 

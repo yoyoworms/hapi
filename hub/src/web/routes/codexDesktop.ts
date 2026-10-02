@@ -131,6 +131,7 @@ type SyncSessionRequestParseResult = {
     sessionIds: string[]
     cwd?: string | null
     machineId?: string | null
+    codexAccountId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
     serviceTier?: string | null
@@ -957,12 +958,13 @@ async function listCodexSessionsViaMachine(options: {
     cwd?: string | null
     machineId?: string | null
     sessionIds?: string[]
+    codexAccountId?: string | null
 }): Promise<{ sessions: RemoteCodexSession[]; machineId?: string; error?: string }> {
     const machineId = resolveCodexImportMachineId(options.cwd, options.namespace, options.engine, options.machineId)
     if (!machineId || !options.engine) {
         return { sessions: [], error: 'No online machine available for Codex history import' }
     }
-    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds)
+    const result = await options.engine.listCodexSessionsForMachine(machineId, options.cwd, options.sessionIds, options.codexAccountId)
     if (!result || typeof result !== 'object') {
         return { sessions: [], machineId, error: 'Unexpected Codex sessions RPC response' }
     }
@@ -976,7 +978,8 @@ function buildImportedSessionMetadata(
     data: CodexTranscriptImportData,
     existingMetadata?: Record<string, unknown> | null,
     resolvedMachineId?: string,
-    permissionMode?: string
+    permissionMode?: string,
+    codexAccountId?: string | null
 ): Record<string, unknown> {
     const now = Date.now()
     const path = data.cwd ?? (typeof existingMetadata?.path === 'string' ? existingMetadata.path : dirname(data.file))
@@ -1007,6 +1010,9 @@ function buildImportedSessionMetadata(
         codexSourceSessionId: typeof existingMetadata?.codexSourceSessionId === 'string'
             ? existingMetadata.codexSourceSessionId
             : data.id,
+        codexAccountId: typeof existingMetadata?.codexAccountId === 'string'
+            ? existingMetadata.codexAccountId
+            : codexAccountId?.trim() || 'system',
         ...(permissionMode ? { preferredPermissionMode: permissionMode } : {}),
         ...(machineId ? { machineId } : {}),
         lifecycleState: typeof existingMetadata?.lifecycleState === 'string'
@@ -1866,7 +1872,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         return { sessionIds: [] }
     }
 
-    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
+    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; codexAccountId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
     const rawSessionIds = bodyRecord.sessionIds
     if (!Array.isArray(rawSessionIds)) {
         return { sessionIds: [], error: 'Invalid sessionIds' }
@@ -1899,6 +1905,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         sessionIds: Array.from(new Set(sessionIds)),
         cwd: typeof bodyRecord.cwd === 'string' && bodyRecord.cwd.trim() ? bodyRecord.cwd.trim() : null,
         machineId: typeof bodyRecord.machineId === 'string' && bodyRecord.machineId.trim() ? bodyRecord.machineId.trim() : null,
+        codexAccountId: typeof bodyRecord.codexAccountId === 'string' && bodyRecord.codexAccountId.trim() ? bodyRecord.codexAccountId.trim() : null,
         model: hasModel ? (typeof bodyRecord.model === 'string' && bodyRecord.model.trim() ? bodyRecord.model.trim() : null) : undefined,
         modelReasoningEffort: hasModelReasoningEffort ? (typeof bodyRecord.modelReasoningEffort === 'string' && bodyRecord.modelReasoningEffort.trim() ? bodyRecord.modelReasoningEffort.trim() : null) : undefined,
         serviceTier: hasServiceTier ? bodyRecord.serviceTier as 'fast' | 'standard' | null : undefined,
@@ -1981,6 +1988,7 @@ function importSingleCodexSession(options: {
     modelReasoningEffort?: string | null
     yolo?: boolean
     machineId?: string | null
+    codexAccountId?: string | null
 }): ScriptLaunchResponse {
     const summary = options.localSessionsById.get(options.codexSessionId)
     if (!summary) {
@@ -2038,7 +2046,8 @@ function importSingleCodexSession(options: {
             transcript,
             asRecord(existingStored?.metadata),
             options.machineId ?? resolveImportMachineId(transcript.cwd, options.namespace, engine) ?? undefined,
-            options.yolo ? 'yolo' : undefined
+            options.yolo ? 'yolo' : undefined,
+            options.codexAccountId
         )
 
         let sessionId = existingStored?.id ?? null
@@ -2145,6 +2154,7 @@ export async function importSelectedCodexSessions(options: {
     collaborationMode?: CodexCollaborationMode
     yolo?: boolean
     machineId?: string | null
+    codexAccountId?: string | null
 }): Promise<ScriptLaunchResponse> {
     const codexSessionIds = options.codexSessionIds
     if (codexSessionIds.length === 0) {
@@ -2163,7 +2173,8 @@ export async function importSelectedCodexSessions(options: {
             model: options.model,
             modelReasoningEffort: options.modelReasoningEffort,
             yolo: options.yolo,
-            machineId: options.machineId
+            machineId: options.machineId,
+            codexAccountId: options.codexAccountId
         })
         results.push(result)
 
@@ -2225,11 +2236,13 @@ export function createCodexDesktopRoutes(options: {
     app.get('/codex/sessions', async (c) => {
         const cwd = c.req.query('cwd')?.trim() || null
         const machineId = c.req.query('machineId')?.trim() || null
+        const codexAccountId = c.req.query('codexAccountId')?.trim() || null
         const remote = await listCodexSessionsViaMachine({
             engine: options.getSyncEngine(),
             namespace: c.get('namespace'),
             cwd,
-            machineId
+            machineId,
+            codexAccountId
         })
         if (remote.error) {
             return c.json({
@@ -2252,6 +2265,7 @@ export function createCodexDesktopRoutes(options: {
         const record = asRecord(body)
         const sessionId = typeof record?.sessionId === 'string' ? record.sessionId.trim() : ''
         const requestedMachineId = typeof record?.machineId === 'string' ? record.machineId.trim() : null
+        const codexAccountId = typeof record?.codexAccountId === 'string' ? record.codexAccountId.trim() : null
         if (!sessionId) {
             return c.json({ success: false, error: 'sessionId is required' }, 400)
         }
@@ -2262,7 +2276,7 @@ export function createCodexDesktopRoutes(options: {
             return c.json({ success: false, error: 'No online machine available for Codex history archive' }, 503)
         }
 
-        const result = await engine.archiveCodexSessionForMachine(machineId, sessionId)
+        const result = await engine.archiveCodexSessionForMachine(machineId, sessionId, codexAccountId)
         if (!result || typeof result !== 'object') {
             return c.json({ success: false, error: 'Unexpected Codex archive RPC response', machineId }, 500)
         }
@@ -2297,7 +2311,8 @@ export function createCodexDesktopRoutes(options: {
             namespace: c.get('namespace'),
             cwd: parsed.cwd,
             machineId: parsed.machineId,
-            sessionIds: parsed.sessionIds
+            sessionIds: parsed.sessionIds,
+            codexAccountId: parsed.codexAccountId
         })
         if (remote.error) {
             const { workspace } = getDirectImportRouteContext()
@@ -2316,6 +2331,7 @@ export function createCodexDesktopRoutes(options: {
             getSyncEngine: options.getSyncEngine,
             localSessions: remote.sessions,
             machineId: remote.machineId ?? null,
+            codexAccountId: parsed.codexAccountId,
             model: parsed.model,
             modelReasoningEffort: parsed.modelReasoningEffort,
             serviceTier: parsed.serviceTier,

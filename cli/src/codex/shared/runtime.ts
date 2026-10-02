@@ -10,13 +10,48 @@ import { notifyRunnerSessionStarted } from '@/runner/controlClient';
 import { getProcessStartMarker, killProcessByChildProcess } from '@/utils/process';
 import { logger } from '@/ui/logger';
 import { CodexAppServerClient, isIndeterminateError } from '../codexAppServerClient';
-import { codexHome, saveRuntime, runtimeDirectory, runtimeAuthHash, findColdBinding, withThreadOwnership, type CodexRuntimeRecord } from './registry';
+import { saveRuntime, runtimeDirectory, runtimeAuthHash, findColdBinding, withThreadOwnership, type CodexRuntimeRecord } from './registry';
 import { startCodexGateway, record, string, type Envelope } from './gateway';
 import { resolveSharedCodex, sharedLaunchConfig, initializeSharedClient, checkSharedCapabilities, takeReservedSessionId, type SharedLaunchOptions } from './launch';
 import { SharedCodexRoot } from './root';
+import { codexAccountManager } from '../codexAccountManager';
+import type { ResponseItem } from '../appServerTypes';
 
 export type RuntimeReady = { sessionId: string; runtime: CodexRuntimeRecord };
 type Reservation = { root: SharedCodexRoot; resumeId?: string };
+
+/**
+ * Third-party OpenAI-compatible providers often validate reasoning item IDs
+ * more strictly than the native Codex provider.  A rollout created by another
+ * provider can therefore fail cold-resume with e.g. "reasoning IDs must begin
+ * with 'rs'".  Re-label only the incompatible reasoning IDs; the textual
+ * history and all other item IDs remain intact.
+ */
+function isInvalidReasoningIdError(error: unknown): boolean {
+    return error instanceof Error && /reasoning IDs must begin with ['"]rs['"]/iu.test(error.message);
+}
+
+function normalizedResumeHistory(raw: unknown): ResponseItem[] {
+    const thread = record(record(raw).thread);
+    const turns = Array.isArray(thread.turns) ? thread.turns : [];
+    const items: ResponseItem[] = [];
+    for (const turn of turns) {
+        const turnRecord = record(turn);
+        if (!Array.isArray(turnRecord.items)) continue;
+        for (const item of turnRecord.items) {
+            const responseItem = record(item);
+            if (responseItem.type === 'reasoning') {
+                const id = string(responseItem.id);
+                if (id && !id.startsWith('rs')) {
+                    items.push({ ...responseItem, id: `rs${randomUUID().replaceAll('-', '')}` });
+                    continue;
+                }
+            }
+            items.push(responseItem);
+        }
+    }
+    return items;
+}
 
 function gitInfo(cwd: string): { sha: string | null; branch: string | null; originUrl: string | null } {
     const git = (...args: string[]) => {
@@ -42,10 +77,39 @@ async function freePort(): Promise<number> {
 export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (ready: RuntimeReady) => void, abortSignal?: AbortSignal): Promise<void> {
     abortSignal?.throwIfAborted();
     const command = resolveSharedCodex();
+    const switchingCodexAccount = Boolean(
+        options.codexSourceAccountId
+        && options.codexAccountId
+        && options.codexSourceAccountId !== options.codexAccountId
+    );
+    let sourceAccountKind: 'system' | 'managed' | 'api' | undefined;
+    let migratedResumePath: string | null = null;
+    if (switchingCodexAccount) {
+        if (!options.resumeSessionId) {
+            throw new Error('Codex account switching requires an existing Codex session');
+        }
+        sourceAccountKind = (await codexAccountManager.resolveAccount(options.codexSourceAccountId!)).kind;
+        migratedResumePath = await codexAccountManager.prepareSessionSwitch(
+            options.codexSourceAccountId!,
+            options.codexAccountId!,
+            options.resumeSessionId
+        );
+    }
+    const account = options.resumeSessionId && !switchingCodexAccount
+        ? await codexAccountManager.resolveAccountForResume(options.codexAccountId, options.resumeSessionId)
+        : await codexAccountManager.resolveAccount(options.codexAccountId);
+    const requestedModel = options.model?.trim();
+    if (switchingCodexAccount && sourceAccountKind === 'api' && account.kind !== 'api') {
+        // A custom endpoint's model id is not meaningful after switching
+        // into a ChatGPT-managed identity; let that account's config win.
+        options.model = undefined;
+    } else if (account.model && (!requestedModel || requestedModel === 'auto' || switchingCodexAccount)) {
+        options.model = account.model;
+    }
     const launch = sharedLaunchConfig(options, options.workingDirectory ?? process.cwd());
     const id = randomUUID();
-    await mkdir(codexHome(), { recursive: true, mode: 0o700 });
-    const home = await realpath(codexHome());
+    await mkdir(account.homeDir, { recursive: true, mode: 0o700 });
+    const home = await realpath(account.homeDir);
     await mkdir(runtimeDirectory(), { recursive: true, mode: 0o700 });
     // Unix sockaddr_un has a small path limit; don't nest sockets under CODEX_HOME.
     const sockets = await mkdtemp(join(process.platform === 'win32' ? tmpdir() : '/tmp', 'hapi-cx-')); await chmod(sockets, 0o700);
@@ -55,6 +119,15 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: home };
     // Every thread injects its own identity. A launch from another agent must not inherit that root's identity.
     delete env.HAPI_SESSION_ID;
+    delete env.HAPI_CODEX_ACCOUNT_ID;
+    delete env.HAPI_CODEX_SOURCE_ACCOUNT_ID;
+    delete env.HAPI_CODEX_API_KEY;
+    delete env.HAPI_CODEX_RESUME_PATH;
+    Object.assign(env, account.env);
+    env.HAPI_CODEX_ACCOUNT_ID = account.id;
+    env.HAPI_CODEX_ACCOUNT_LABEL = account.label;
+    env.HAPI_CODEX_ACCOUNT_KIND = account.kind;
+    if (migratedResumePath) env.HAPI_CODEX_RESUME_PATH = migratedResumePath;
     let server: ChildProcess | undefined;
     let gateway: Awaited<ReturnType<typeof startCodexGateway>> | undefined;
     let stopping = false;
@@ -171,6 +244,9 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         assertRunning();
         const shared = { flavor: 'codex', startedBy: options.startedBy ?? 'terminal', workingDirectory: cwd,
             exportSessionEnv: false, reportStarted: false, metadataOverrides: { capabilities: { terminal: true, concurrentClients: true },
+                codexAccountId: account.id,
+                codexAccountLabel: account.label,
+                codexAccountKind: account.kind,
                 ...(parent ? { forkedFrom: parent.session.sessionId } : {}) } } as const;
         // reservedSessionId names one preallocated hub row — single-use. A second
         // create()/fork must mint a fresh row, not re-adopt (#1911 Opus Major).
@@ -368,13 +444,44 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             try {
                 response = record(await root.client.request('thread/resume', params));
             } catch (error) {
+                if (isInvalidReasoningIdError(error)) {
+                    // The native rollout can contain provider-specific
+                    // reasoning IDs.  Retry once with a normalized history so
+                    // switching back to an OpenAI-compatible account does
+                    // not make an otherwise recoverable session unusable.
+                    try {
+                        const read = await root.client.request('thread/read', { threadId, includeTurns: true });
+                        const history = normalizedResumeHistory(read);
+                        if (history.length > 0) {
+                            logger.warn(`[Codex shared] Retrying resume with normalized reasoning IDs for ${threadId}`);
+                            response = record(await root.client.request('thread/resume', { ...params, history }));
+                        } else {
+                            throw error;
+                        }
+                    } catch (normalizedError) {
+                        if (!isInvalidReasoningIdError(normalizedError)) throw normalizedError;
+                        // Some providers reject the rollout before honoring
+                        // the supplied history.  Start a fresh native thread
+                        // rather than leaving the HAPI session permanently
+                        // unreopenable.  HAPI's persisted transcript remains
+                        // intact; only the provider-native continuation
+                        // boundary changes.
+                        const { threadId: _ignoredThreadId, ...startParams } = params;
+                        logger.warn(`[Codex shared] Native history incompatible for ${threadId}; starting a fresh thread`);
+                        response = record(await root.client.request('thread/start', {
+                            ...startParams,
+                            threadSource: 'hapi-recovery'
+                        }));
+                    }
+                } else {
                 // Reopening a HAPI binding also restores its native archive.
                 // Only retry an explicit archived rejection, never a transport
                 // failure whose resume outcome may be unknown.
-                if (!options.existingSessionId || !(error instanceof Error)
-                    || !error.message.startsWith(`session ${threadId} is archived.`)) throw error;
-                await root.client.request('thread/unarchive', { threadId });
-                response = record(await root.client.request('thread/resume', params));
+                    if (!options.existingSessionId || !(error instanceof Error)
+                        || !error.message.startsWith(`session ${threadId} is archived.`)) throw error;
+                    await root.client.request('thread/unarchive', { threadId });
+                    response = record(await root.client.request('thread/resume', params));
+                }
             }
             await bind(root, response, false, options);
         } else root = await create('thread/start', { ...launch.threadParams, cwd: launch.cwd }, undefined, options);

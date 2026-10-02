@@ -1,11 +1,11 @@
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { z } from 'zod';
 import { configuration } from '@/configuration';
-import { getProcessStartMarker, isProcessAlive } from '@/utils/process';
+import { getProcessStartMarker, isProcessAlive, killProcessTreeByPid } from '@/utils/process';
 import { withSettingsFileLock } from '@hapi/protocol/settingsFileLock';
 
 const RuntimeSchema = z.object({
@@ -86,6 +86,17 @@ export async function withThreadOwnership<T>(home: string, threadId: string, own
             const match = Object.entries(owner.sessions).find(([, session]) => session.threadId === threadId && session.active);
             if (!match) continue;
             const orphanAlive = owner.serverPid && generationMayBeAlive(owner.serverPid, owner.serverMarker);
+            // A crashed wrapper can leave the detached app-server alive. It
+            // must not permanently reserve the thread; reap it before taking
+            // ownership for the recovery attempt.
+            if (orphanAlive && !runtimeAlive(owner)) {
+                await killProcessTreeByPid(owner.serverPid!, true).catch(() => false);
+                await Promise.all([
+                    unlink(join(directory, `${owner.id}.json`)).catch(() => {}),
+                    unlink(join(runtimeDirectory(), `${owner.id}.json`)).catch(() => {})
+                ]);
+                continue;
+            }
             if (generationMayBeAlive(owner.pid, owner.marker) || orphanAlive) {
                 throw new Error(`Thread belongs to another Codex runtime. Use hapi resume ${match[0]}.${orphanAlive && !runtimeAlive(owner) ? ' Its wrapper exited; stop the orphaned runtime before recovery.' : ''}`);
             }

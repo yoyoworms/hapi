@@ -17,11 +17,21 @@ import { registerRipgrepHandlers } from './handlers/ripgrep'
 import { registerSlashCommandHandlers } from './handlers/slashCommands'
 import { registerSkillsHandlers } from './handlers/skills'
 import { registerUploadHandlers } from './handlers/uploads'
+import { registerCodexAccountHandlers } from './handlers/codexAccounts'
 
-export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string): void {
+export interface RegisterCommonHandlerOptions {
+    codexModelsMachineScoped?: boolean
+    codexAccountsMachineScoped?: boolean
+}
+
+export function registerCommonHandlers(
+    rpcHandlerManager: RpcHandlerManager,
+    workingDirectory: string,
+    options?: RegisterCommonHandlerOptions
+): void {
     registerAgyModelHandlers(rpcHandlerManager)
     registerBashHandlers(rpcHandlerManager, workingDirectory)
-    registerCodexModelHandlers(rpcHandlerManager)
+    registerCodexModelHandlers(rpcHandlerManager, options?.codexModelsMachineScoped === true)
     registerCursorModelHandlers(rpcHandlerManager)
     registerOpencodeModelHandlers(rpcHandlerManager)
     registerOpencodeModelVariantsHandlers(rpcHandlerManager)
@@ -37,4 +47,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     registerSkillsHandlers(rpcHandlerManager, workingDirectory)
     registerGitHandlers(rpcHandlerManager, workingDirectory)
     registerUploadHandlers(rpcHandlerManager)
+    if (options?.codexAccountsMachineScoped === true) {
+        registerCodexAccountHandlers(rpcHandlerManager)
+    }
 }

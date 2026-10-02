@@ -999,6 +999,7 @@ function SessionChatInner(props: SessionChatProps) {
         api: props.api,
         sessionId: props.session.id,
         machineId: props.session.metadata?.machineId ?? null,
+        accountId: props.session.metadata?.codexAccountId ?? null,
         enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
     })
     const effectiveCodexServiceTier = agentFlavor === 'codex'

@@ -17,6 +17,8 @@ export const SharedLaunchSchema = z.object({
     reservedSessionId: z.string().optional(),
     model: z.string().optional(), modelReasoningEffort: z.string().optional(),
     serviceTier: z.string().optional(), collaborationMode: z.enum(['default', 'plan']).optional(),
+    codexAccountId: z.string().min(1).optional(),
+    codexSourceAccountId: z.string().min(1).optional(),
     workingDirectory: z.string().optional()
 });
 export type SharedLaunchOptions = z.infer<typeof SharedLaunchSchema>;

@@ -49,7 +49,16 @@ export async function attachSharedSession(runtime: CodexRuntimeRecord, sessionId
 }
 
 export async function runSharedCodex(raw: SharedLaunchOptions): Promise<void> {
-    const options = SharedLaunchSchema.parse({ ...raw, workingDirectory: raw.workingDirectory ?? getInvokedCwd() });
+    const options = SharedLaunchSchema.parse({
+        ...raw,
+        workingDirectory: raw.workingDirectory ?? getInvokedCwd(),
+        // Runner-spawned Codex processes receive account identity through a
+        // private environment marker. Keep the marker out of user-facing
+        // command arguments and let the shared runtime resolve the isolated
+        // CODEX_HOME itself.
+        codexAccountId: raw.codexAccountId ?? process.env.HAPI_CODEX_ACCOUNT_ID,
+        codexSourceAccountId: raw.codexSourceAccountId ?? process.env.HAPI_CODEX_SOURCE_ACCOUNT_ID
+    });
     // reservedSessionId is fresh adopt-stub — never treat as reopen (#1911 Codex Major).
     if (options.existingSessionId && !options.reservedSessionId) {
         const api = await ApiClient.create();
@@ -61,6 +70,7 @@ export async function runSharedCodex(raw: SharedLaunchOptions): Promise<void> {
         }
         if (session.active) throw new Error('Existing session is active in another or legacy runtime. Stop it explicitly before cold resume; no hot migration.');
         options.resumeSessionId ??= session.metadata?.codexSessionId;
+        options.codexAccountId ??= session.metadata?.codexAccountId;
         if (!options.resumeSessionId) throw new Error('Existing HAPI session has no Codex thread binding');
     }
     const runner = await readRunnerState();

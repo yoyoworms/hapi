@@ -12,7 +12,7 @@ import {
     cliBinaryUpdatedOnDisk,
     isMachineCapabilitySkewed,
 } from '@hapi/protocol/runnerCapabilities'
-import type { CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
 import type { SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
 import type { ImplementCodexPlanResult } from '@hapi/protocol/apiTypes'
 import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
@@ -2181,7 +2181,11 @@ export class SyncEngine {
         startingMode?: 'remote' | 'pty',
         // Required for fresh machine spawns so the runner stamps the HAPI id on
         // argv before the first webhook (#1911 Major: unreapable window).
-        namespace?: string
+        namespace?: string,
+        sandbox?: boolean,
+        continueLatest?: boolean,
+        codexAccountId?: string,
+        codexSourceAccountId?: string
     ): ReturnType<RpcGateway['spawnSession']> {
         // Fresh machine spawns historically omitted existingSessionId, so
         // buildCliArgs could not stamp --hapi-session-id / --existing-session-id.
@@ -2236,7 +2240,11 @@ export class SyncEngine {
                 copilotAgentMode,
                 startingMode,
                 undefined,
-                preallocated ? allocatedSessionId : undefined
+                preallocated ? allocatedSessionId : undefined,
+                sandbox,
+                continueLatest,
+                codexAccountId,
+                codexSourceAccountId
             )
         } catch (error) {
             // Ambiguous post-dispatch failure — keep the stub (child may exist).
@@ -3122,7 +3130,11 @@ export class SyncEngine {
         }
     }
 
-    async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode }): Promise<ResumeSessionResult> {
+    async resumeSession(sessionId: string, namespace: string, opts?: {
+        permissionMode?: PermissionMode
+        resumeWithSessionId?: string
+        codexAccountId?: string
+    }): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -3168,8 +3180,27 @@ export class SyncEngine {
             this.ptyResumeQuarantinedIds.delete(access.sessionId)
             initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
-        if (initialSession.active) {
+        const currentCodexAccountId = initialSession.metadata?.codexAccountId ?? 'system'
+        const codexAccountSwitchRequested = initialSession.metadata?.flavor === 'codex'
+            && opts?.codexAccountId !== undefined
+            && opts.codexAccountId !== currentCodexAccountId
+        if (initialSession.active && !codexAccountSwitchRequested) {
             return { type: 'success', sessionId: access.sessionId }
+        }
+        if (initialSession.active && codexAccountSwitchRequested) {
+            // Account switching reuses the resume endpoint. Stop the current
+            // shared runtime first so the source transcript is fully flushed
+            // before the target account receives its copied rollout.
+            try {
+                await this.archiveSession(access.sessionId)
+            } catch (error) {
+                return {
+                    type: 'error',
+                    message: error instanceof Error ? error.message : 'Failed to stop the active Codex session',
+                    code: 'resume_failed'
+                }
+            }
+            initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
 
         // tiann/hapi#824 — invisible, automatic, per-session ACP migration on
@@ -3275,6 +3306,15 @@ export class SyncEngine {
             : opts?.permissionMode
                 ?? session.permissionMode
                 ?? metadataPermissionMode
+        const sourceCodexAccountId = flavor === 'codex'
+            ? metadata.codexAccountId ?? 'system'
+            : undefined
+        const targetCodexAccountId = flavor === 'codex'
+            ? opts?.codexAccountId ?? sourceCodexAccountId
+            : undefined
+        const switchingCodexAccount = flavor === 'codex'
+            && opts?.codexAccountId !== undefined
+            && targetCodexAccountId !== sourceCodexAccountId
         const resumedStartingMode =
             (session.agentState as { startingMode?: 'local' | 'remote' | 'pty' } | null)?.startingMode === 'pty'
                 ? 'pty'
@@ -3340,7 +3380,13 @@ export class SyncEngine {
                 access.sessionId,
                 session.collaborationMode ?? undefined,
                 session.copilotAgentMode ?? undefined,
-                resumedStartingMode
+                resumedStartingMode,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                targetCodexAccountId,
+                switchingCodexAccount ? sourceCodexAccountId : undefined
             )
 
             if (spawnResult.type !== 'success') {
@@ -4303,8 +4349,8 @@ export class SyncEngine {
         return await this.rpcGateway.listPiModelsForMachine(machineId)
     }
 
-    async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {
-        return await this.rpcGateway.listCodexModelsForMachine(machineId)
+    async listCodexModelsForMachine(machineId: string, accountId?: string): Promise<RpcListCodexModelsResponse> {
+        return await this.rpcGateway.listCodexModelsForMachine(machineId, accountId)
     }
 
     async listOpencodeModelVariantsForMachine(machineId: string, cwd?: string | null): Promise<RpcListOpencodeModelVariantsResponse> {
@@ -4315,16 +4361,40 @@ export class SyncEngine {
         return await this.rpcGateway.listCodexModelsForSession(sessionId)
     }
 
-    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]) {
-        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds)
+    async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[], codexAccountId?: string | null) {
+        return await this.rpcGateway.listCodexSessionsForMachine(machineId, cwd, sessionIds, codexAccountId)
+    }
+
+    async listCodexAccountsForMachine(machineId: string) {
+        return await this.rpcGateway.listCodexAccountsForMachine(machineId)
+    }
+
+    async startCodexAccountLogin(machineId: string) {
+        return await this.rpcGateway.startCodexAccountLogin(machineId)
+    }
+
+    async addCodexApiEndpoint(machineId: string, input: AddCodexApiEndpointRequest) {
+        return await this.rpcGateway.addCodexApiEndpoint(machineId, input)
+    }
+
+    async getCodexAccountLoginStatus(machineId: string, attemptId: string) {
+        return await this.rpcGateway.getCodexAccountLoginStatus(machineId, attemptId)
+    }
+
+    async setDefaultCodexAccount(machineId: string, accountId: string) {
+        return await this.rpcGateway.setDefaultCodexAccount(machineId, accountId)
+    }
+
+    async removeCodexAccount(machineId: string, accountId: string) {
+        return await this.rpcGateway.removeCodexAccount(machineId, accountId)
     }
 
     async listPiSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListPiSessionsResponse> {
         return await this.rpcGateway.listPiSessionsForMachine(machineId, cwd, sessionIds)
     }
 
-    async archiveCodexSessionForMachine(machineId: string, sessionId: string): Promise<RpcArchiveCodexSessionResponse> {
-        return await this.rpcGateway.archiveCodexSessionForMachine(machineId, sessionId)
+    async archiveCodexSessionForMachine(machineId: string, sessionId: string, codexAccountId?: string | null): Promise<RpcArchiveCodexSessionResponse> {
+        return await this.rpcGateway.archiveCodexSessionForMachine(machineId, sessionId, codexAccountId)
     }
 
     async listCursorModelsForSession(sessionId: string): Promise<RpcListCursorModelsResponse> {
