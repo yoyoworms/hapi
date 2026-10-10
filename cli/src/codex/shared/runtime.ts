@@ -1,6 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdir, mkdtemp, chmod, rm, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, chmod, rm, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
@@ -14,11 +14,17 @@ import { saveRuntime, runtimeDirectory, runtimeAuthHash, findColdBinding, withTh
 import { startCodexGateway, record, string, type Envelope } from './gateway';
 import { resolveSharedCodex, sharedLaunchConfig, initializeSharedClient, checkSharedCapabilities, takeReservedSessionId, type SharedLaunchOptions } from './launch';
 import { SharedCodexRoot } from './root';
-import { codexAccountManager } from '../codexAccountManager';
+import { codexAccountManager, findTranscriptPath } from '../codexAccountManager';
 import type { ResponseItem } from '../appServerTypes';
+import { installLegacyRollout, isPaginatedRollout, prepareLegacyRollout } from './legacyRollout';
 
 export type RuntimeReady = { sessionId: string; runtime: CodexRuntimeRecord };
 type Reservation = { root: SharedCodexRoot; resumeId?: string };
+
+// Third-party Responses gateways commonly reject or stall on very large
+// historical rollouts. Replaying hundreds of MB is not a useful recovery
+// operation; HAPI already retains the transcript independently.
+const MAX_NATIVE_RESUME_ROLLOUT_BYTES = 250 * 1024 * 1024;
 
 /**
  * Third-party OpenAI-compatible providers often validate reasoning item IDs
@@ -29,6 +35,10 @@ type Reservation = { root: SharedCodexRoot; resumeId?: string };
  */
 function isInvalidReasoningIdError(error: unknown): boolean {
     return error instanceof Error && /reasoning IDs must begin with ['"]rs['"]/iu.test(error.message);
+}
+
+function isResumeTimeoutError(error: unknown): boolean {
+    return error instanceof Error && /thread\/resume.*timed out|timed out.*thread\/resume|no rollout found for thread/i.test(error.message);
 }
 
 function normalizedResumeHistory(raw: unknown): ResponseItem[] {
@@ -88,12 +98,13 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         if (!options.resumeSessionId) {
             throw new Error('Codex account switching requires an existing Codex session');
         }
-        sourceAccountKind = (await codexAccountManager.resolveAccount(options.codexSourceAccountId!)).kind;
-        migratedResumePath = await codexAccountManager.prepareSessionSwitch(
+        const preparedSwitch = await codexAccountManager.prepareSessionSwitch(
             options.codexSourceAccountId!,
             options.codexAccountId!,
             options.resumeSessionId
         );
+        sourceAccountKind = preparedSwitch.sourceAccount.kind;
+        migratedResumePath = preparedSwitch.resumePath;
     }
     const account = options.resumeSessionId && !switchingCodexAccount
         ? await codexAccountManager.resolveAccountForResume(options.codexAccountId, options.resumeSessionId)
@@ -273,12 +284,19 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         runtime.pendingCreations = runtime.pendingCreations?.filter(sid => sid !== root.session.sessionId); await persist();
     };
     const reserve = async (root: SharedCodexRoot, threadId: string) => withThreadOwnership(home, threadId, id, () => reserveRecord(root, threadId));
-    const bind = async (root: SharedCodexRoot, response: Record<string, unknown>, subscribe: boolean, initialOptions?: SharedLaunchOptions) => {
+    const bind = async (root: SharedCodexRoot, response: Record<string, unknown>, subscribe: boolean, initialOptions?: SharedLaunchOptions, allowRetarget = false) => {
         assertRunning();
         const threadId = string(record(response.thread).id);
         if (!threadId) throw new Error('Codex lifecycle response has no thread ID');
         const reserved = runtime.sessions[root.session.sessionId];
-        if (reserved && reserved.threadId !== threadId) throw new Error('Codex retargeted a reserved thread');
+        if (reserved && reserved.threadId !== threadId) {
+            if (!allowRetarget) throw new Error('Codex retargeted a reserved thread');
+            // Recovery from an oversized/stalled native rollout deliberately
+            // starts a new thread. Move the preallocated HAPI binding to that
+            // fresh native boundary instead of treating it as corruption.
+            reserved.threadId = threadId;
+            await withThreadOwnership(home, threadId, id, async () => {});
+        }
         if (!reserved) await reserve(root, threadId);
         // No fake user turn/name. Metadata write materializes an empty legacy rollout for native resume.
         await control.request('thread/metadata/update', { threadId, gitInfo: gitInfo(string(record(response.thread).cwd) ?? root.bootstrap.workingDirectory) });
@@ -288,7 +306,10 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         assertRunning();
         // Cold-resumed threads predate the control connection's automatic
         // new-thread subscription. Subscribe once without changing settings.
-        await control.request('thread/resume', { threadId });
+        // A recovery thread was just created locally and is already loaded;
+        // sending a second resume can make Codex reconstruct a nonexistent
+        // paginated source rollout.
+        if (!allowRetarget) await control.request('thread/resume', { threadId });
         await root.activate(initialOptions);
         await root.session.flush();
         await persist();
@@ -428,21 +449,66 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         }
         if (options.resumeSessionId) {
             const threadId = options.resumeSessionId;
-            const thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+            let thread: Record<string, unknown> = {};
+            try {
+                thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+            } catch (error) {
+                if (!isResumeTimeoutError(error)) throw error;
+                logger.warn(`[Codex shared] Native thread metadata unavailable for ${threadId}; using clean recovery`);
+            }
             if (string(thread.parentThreadId)) {
                 throw new Error('Cannot cold-resume a child agent independently. Resume its parent HAPI session instead.');
             }
             // Prove ownership before bootstrap can alter an existing HAPI
             // row's hostPid/metadata. Hold the lock until the reservation is durable.
             root = await withThreadOwnership(home, threadId, id, async () => {
+                const rolloutPath = string(thread.path) ?? migratedResumePath
+                    ?? await findTranscriptPath(join(home, 'sessions'), threadId);
+                if (thread.historyMode === 'paginated' || (rolloutPath && await isPaginatedRollout(rolloutPath, threadId))) {
+                    // The app-server cannot read unloaded paginated history,
+                    // so probing it would fail before resume. Convert it before
+                    // the native engine can load the thread and retain a backup.
+                    if (!rolloutPath) throw new Error(`Cannot recover paginated Codex rollout ${threadId}: path not found`);
+                    const convertedPath = await prepareLegacyRollout(rolloutPath, threadId);
+                    const backupPath = await installLegacyRollout(rolloutPath, convertedPath);
+                    logger.warn(`[Codex shared] Recovered paginated rollout as legacy history for ${threadId}; backup: ${backupPath}`);
+                }
                 const existing = options.existingSessionId ?? await findColdBinding(home, threadId);
                 const root = await prepare(launch.cwd, existing);
                 await reserveRecord(root, threadId); return root;
             });
             const params = root.config({ ...launch.threadParams, threadId });
             let response: Record<string, unknown>;
+            let startedRecoveryThread = false;
+            const startRecoveryTurn = async (startResponse: Record<string, unknown>): Promise<Record<string, unknown>> => {
+                const newThreadId = string(record(record(startResponse).thread).id);
+                if (!newThreadId) throw new Error('Recovery thread has no ID');
+                await root.client.request('turn/start', {
+                    threadId: newThreadId,
+                    input: [{
+                        type: 'text',
+                        text: 'This is a clean continuation of an existing HAPI conversation. The native history was too large to restore. Inspect the current workspace and continue the prior task; do not modify files until the user gives a new instruction.',
+                        text_elements: []
+                    }],
+                    model: launch.threadParams.model,
+                    clientUserMessageId: `hapi-recovery-${randomUUID()}`
+                });
+                return startResponse;
+            };
             try {
-                response = record(await root.client.request('thread/resume', params));
+                const rolloutPath = await findTranscriptPath(join(home, 'sessions'), threadId);
+                const rolloutSize = rolloutPath ? (await stat(rolloutPath).catch(() => null))?.size ?? 0 : 0;
+                if (rolloutSize > MAX_NATIVE_RESUME_ROLLOUT_BYTES) {
+                    const { threadId: _ignoredThreadId, ...startParams } = params;
+                    logger.warn(`[Codex shared] Native rollout for ${threadId} is ${rolloutSize} bytes; starting a fresh continuation thread`);
+                    response = await startRecoveryTurn(record(await root.client.request('thread/start', {
+                        ...startParams,
+                        threadSource: 'hapi-recovery'
+                    })));
+                    startedRecoveryThread = true;
+                } else {
+                    response = record(await root.client.request('thread/resume', params));
+                }
             } catch (error) {
                 if (isInvalidReasoningIdError(error)) {
                     // The native rollout can contain provider-specific
@@ -473,6 +539,18 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                             threadSource: 'hapi-recovery'
                         }));
                     }
+                } else if (isResumeTimeoutError(error)) {
+                    // A provider may stall even below the size threshold when
+                    // reconstructing a heavily compacted rollout. Do not make
+                    // reopen permanently fail; retain HAPI's transcript and
+                    // continue from a clean native boundary.
+                    const { threadId: _ignoredThreadId, ...startParams } = params;
+                    logger.warn(`[Codex shared] Native resume timed out for ${threadId}; starting a fresh continuation thread`);
+                    response = await startRecoveryTurn(record(await root.client.request('thread/start', {
+                        ...startParams,
+                        threadSource: 'hapi-recovery'
+                    })));
+                    startedRecoveryThread = true;
                 } else {
                 // Reopening a HAPI binding also restores its native archive.
                 // Only retry an explicit archived rejection, never a transport
@@ -483,7 +561,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                     response = record(await root.client.request('thread/resume', params));
                 }
             }
-            await bind(root, response, false, options);
+            await bind(root, response, false, options, startedRecoveryThread);
         } else root = await create('thread/start', { ...launch.threadParams, cwd: launch.cwd }, undefined, options);
         assertRunning();
         onReady?.({ sessionId: root.session.sessionId, runtime });

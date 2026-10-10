@@ -22,7 +22,13 @@ import {
 } from 'react'
 import { useNarrowViewport } from '@/hooks/useNarrowViewport'
 import { shouldInvokeComposerDictateShortcut } from '@/lib/composerDictateShortcut'
-import { isRichComposerMentionsEnabled, resolveComposerPlaceholderKey } from '@/lib/composerSegments'
+import {
+    mirrorComposerSegments,
+    parseComposerSegments,
+    isRichComposerMentionsEnabled,
+    resolveComposerPlaceholderKey,
+} from '@/lib/composerSegments'
+import { addComposerInputHistory, getComposerInputHistory } from '@/lib/composerInputHistory'
 import type { SessionMentionResolveResult } from '@/components/AssistantChat/RichComposerInput'
 import {
     RichComposerInput,
@@ -71,6 +77,10 @@ export interface TextInputState {
     text: string
     selection: { start: number; end: number }
 }
+
+// Keep the storage helpers available to the focused composer regression tests
+// and to callers that need to seed or inspect the per-session history.
+export { addComposerInputHistory, getComposerInputHistory }
 
 export function getComposerEscapeAction(input: {
     hasSuggestions: boolean
@@ -593,6 +603,8 @@ export function HappyComposer(props: {
 
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const richInputRef = useRef<RichComposerInputHandle>(null)
+    const historyIndexRef = useRef<number | null>(null)
+    const historyDraftRef = useRef('')
     const richComposerFueAnchorRef = useRef<HTMLDivElement>(null)
     const settingsButtonRef = useRef<HTMLButtonElement>(null)
     const modelValueButtonRef = useRef<HTMLButtonElement>(null)
@@ -621,6 +633,15 @@ export function HappyComposer(props: {
     } = useFue('rich-composer-mentions')
     const prevControlledByUser = useRef(controlledByUser)
 
+    const resetInputHistoryNavigation = useCallback(() => {
+        historyIndexRef.current = null
+        historyDraftRef.current = ''
+    }, [])
+
+    useEffect(() => {
+        resetInputHistoryNavigation()
+    }, [resetInputHistoryNavigation, sessionId])
+
     // Composer itself is the affordance: open the FUE callout once the rich
     // path is live. Relying on DOM focus alone is flaky (programmatic
     // autofocus / Playwright headless often skip the focus event).
@@ -631,7 +652,8 @@ export function HappyComposer(props: {
 
     const recordUserEdit = useCallback(() => {
         userEditGenerationRef.current += 1
-    }, [])
+        resetInputHistoryNavigation()
+    }, [resetInputHistoryNavigation])
 
     const handleUserEdit = useCallback(() => {
         recordUserEdit()
@@ -1153,9 +1175,11 @@ export function HappyComposer(props: {
         resetPendingSendIntent()
 
         // Rich chips must be serialized into composer.text before any send or
-        // scratchlist park snapshot (RichComposerInput contract).
+        // scratchlist park snapshot (RichComposerInput contract). Keep the
+        // serialized text so a successful send can be recalled with ↑ later.
+        let textToRecord = composerTextRef.current
         if (richMentionsEnabled && richInputRef.current) {
-            richInputRef.current.flushSerializedText()
+            textToRecord = richInputRef.current.flushSerializedText()
         }
 
         // Scratchlist parks must not go through assistant-ui's send(): it
@@ -1218,6 +1242,8 @@ export function HappyComposer(props: {
             // Must be adjacent to send(): useHappyRuntime consumes and resets
             // this ref synchronously from assistant-ui's onNew callback.
             if (pendingSendIntentRef) pendingSendIntentRef.current = effectiveIntent
+            addComposerInputHistory(sessionId, textToRecord)
+            resetInputHistoryNavigation()
             api.composer().send()
         } catch (error) {
             resetPendingSendIntent()
@@ -1250,6 +1276,8 @@ export function HappyComposer(props: {
         attachmentOrderRef,
         pendingSendIntentRef,
         resetPendingSendIntent,
+        resetInputHistoryNavigation,
+        sessionId,
     ])
 
     const flushAndSend = useCallback((intent: ComposerSendIntent = 'default') => {
@@ -1314,6 +1342,73 @@ export function HappyComposer(props: {
             }
         }
 
+        // Shell-style per-session history. Suggestions retain first refusal;
+        // IME composition retains ownership of arrow keys. Respect multiline
+        // caret boundaries so ↑/↓ still moves within a prompt naturally.
+        const inputHistory = getComposerInputHistory(sessionId)
+        if ((key === 'ArrowUp' || key === 'ArrowDown') && inputHistory.length > 0) {
+            const textarea = richMentionsEnabled ? null : textareaRef.current
+            const historyText = textarea?.value ?? inputState.text
+            const selection = textarea
+                ? { start: textarea.selectionStart, end: textarea.selectionEnd }
+                : inputState.selection
+            const selectionCollapsed = selection.start === selection.end
+            const caretOnFirstLine = !historyText.slice(0, selection.start).includes('\n')
+            const caretOnLastLine = !historyText.slice(selection.end).includes('\n')
+            const canNavigateUp = key === 'ArrowUp'
+                && selectionCollapsed
+                && caretOnFirstLine
+            const canNavigateDown = key === 'ArrowDown'
+                && selectionCollapsed
+                && historyIndexRef.current !== null
+                && caretOnLastLine
+
+            if (canNavigateUp || canNavigateDown) {
+                e.preventDefault()
+
+                if (key === 'ArrowUp') {
+                    if (historyIndexRef.current === null) {
+                        historyDraftRef.current = composerTextRef.current
+                        historyIndexRef.current = inputHistory.length - 1
+                    } else {
+                        historyIndexRef.current = Math.max(0, historyIndexRef.current - 1)
+                    }
+                } else if (historyIndexRef.current !== null) {
+                    if (historyIndexRef.current >= inputHistory.length - 1) {
+                        historyIndexRef.current = null
+                    } else {
+                        historyIndexRef.current += 1
+                    }
+                }
+
+                const nextText = historyIndexRef.current === null
+                    ? historyDraftRef.current
+                    : inputHistory[historyIndexRef.current] ?? ''
+                const mirrorText = richMentionsEnabled
+                    ? mirrorComposerSegments(parseComposerSegments(nextText))
+                    : nextText
+                const cursorPosition = mirrorText.length
+
+                flushTapSync(() => {
+                    api.composer().setText(nextText)
+                })
+                setInputState({
+                    text: mirrorText,
+                    selection: { start: cursorPosition, end: cursorPosition },
+                })
+                setTimeout(() => {
+                    if (richMentionsEnabled) {
+                        richInputRef.current?.focus()
+                        return
+                    }
+                    const input = textareaRef.current
+                    if (!input) return
+                    input.setSelectionRange(nextText.length, nextText.length)
+                }, 0)
+                return
+            }
+        }
+
         if (key === 'Escape') {
             // FUE callout also listens on window; dismiss it first so Escape
             // does not also abort a running thread or collapse the editor.
@@ -1358,9 +1453,11 @@ export function HappyComposer(props: {
         permissionMode,
         permissionModes,
         canSend,
-        handleSend,
         haptic,
         composerEnterBehavior,
+        api,
+        inputState,
+        sessionId,
         richMentionsEnabled,
         richComposerFueStatus,
         dismissRichComposerFue,

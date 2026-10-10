@@ -346,7 +346,17 @@ export class CodexAppServerClient extends JsonLineParser {
     }
 
     async request<T = unknown>(method: string, params?: unknown): Promise<T> {
-        return await this.sendRequest(method, params, { timeoutMs: 20_000 }) as T;
+        // Resuming a persisted Codex rollout can require materializing a large
+        // history before the app-server answers.  The old fixed 20s deadline
+        // killed otherwise healthy runtimes (especially third-party API
+        // accounts) while thread/resume was still working. Keep interactive
+        // RPCs bounded, but allow lifecycle/history requests enough time.
+        const timeoutMs = method === 'thread/resume' || method === 'thread/read'
+            ? 120_000
+            : method === 'thread/turns/list'
+                ? 60_000
+                : 20_000;
+        return await this.sendRequest(method, params, { timeoutMs }) as T;
     }
 
     async initialize(params: InitializeParams): Promise<InitializeResponse> {

@@ -362,7 +362,7 @@ async function normalizeManagedAccountConfig(
     await normalizeCodexAccountConfig(homeDir, kind);
 }
 
-async function findTranscriptPath(root: string, sessionId: string): Promise<string | null> {
+export async function findTranscriptPath(root: string, sessionId: string): Promise<string | null> {
     const candidates: Array<{ path: string; mtimeMs: number }> = [];
     const visit = async (directory: string): Promise<void> => {
         let entries: import('node:fs').Dirent[];
@@ -387,6 +387,20 @@ async function findTranscriptPath(root: string, sessionId: string): Promise<stri
     await visit(root);
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
     return candidates[0]?.path ?? null;
+}
+
+async function findAccountTranscriptPath(homeDir: string, sessionId: string): Promise<string | null> {
+    const candidates = await Promise.all(
+        ['sessions', 'archived_sessions'].map(async (directory) => {
+            const path = await findTranscriptPath(join(homeDir, directory), sessionId);
+            if (!path) return null;
+            const fileStat = await stat(path).catch(() => null);
+            return fileStat ? { path, mtimeMs: fileStat.mtimeMs } : null;
+        })
+    );
+    return candidates
+        .filter((candidate): candidate is { path: string; mtimeMs: number } => candidate !== null)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)[0]?.path ?? null;
 }
 
 export class CodexAccountManager {
@@ -714,10 +728,7 @@ export class CodexAccountManager {
                 throw error;
             }
         }
-        const requestedPath = await findTranscriptPath(
-            join(requested.homeDir, 'sessions'),
-            sessionId
-        );
+        const requestedPath = await findAccountTranscriptPath(requested.homeDir, sessionId);
         if (requestedPath) return requested;
 
         const registry = await this.readRegistry();
@@ -725,7 +736,7 @@ export class CodexAccountManager {
             SYSTEM_CODEX_ACCOUNT_ID,
             ...registry.accounts.map((account) => account.id)
         ].filter((candidateId) => candidateId !== requested.id);
-        const matches: ResolvedCodexAccount[] = [];
+        const matches: Array<{ account: ResolvedCodexAccount; transcriptPath: string; mtimeMs: number }> = [];
 
         for (const candidateId of candidateIds) {
             let candidate: ResolvedCodexAccount;
@@ -734,15 +745,15 @@ export class CodexAccountManager {
             } catch {
                 continue;
             }
-            const transcriptPath = await findTranscriptPath(
-                join(candidate.homeDir, 'sessions'),
-                sessionId
-            );
-            if (transcriptPath) matches.push(candidate);
+            const transcriptPath = await findAccountTranscriptPath(candidate.homeDir, sessionId);
+            if (transcriptPath) {
+                const transcriptStat = await stat(transcriptPath).catch(() => null);
+                matches.push({ account: candidate, transcriptPath, mtimeMs: transcriptStat?.mtimeMs ?? 0 });
+            }
         }
 
         if (matches.length === 1) {
-            const recovered = matches[0]!;
+            const recovered = matches[0]!.account;
             logger.debug('[CodexAccountManager] Recovered mismatched resume account metadata', {
                 sessionId,
                 recordedAccountId: requested.id,
@@ -751,9 +762,21 @@ export class CodexAccountManager {
             return recovered;
         }
         if (matches.length > 1) {
-            throw new Error(
-                `Codex conversation ${sessionId} exists in multiple local accounts; select the account explicitly`
-            );
+            // Older HAPI versions copied a rollout while migrating accounts,
+            // leaving the same thread in more than one local CODEX_HOME. A
+            // cold resume must remain usable: prefer the newest complete
+            // rollout (the one most recently written by the runner), rather
+            // than making the user choose an account that is no longer shown
+            // in the session metadata.
+            matches.sort((a, b) => b.mtimeMs - a.mtimeMs);
+            const recovered = matches[0]!.account;
+            logger.warn('[CodexAccountManager] Multiple local rollouts found; selected newest transcript', {
+                sessionId,
+                recordedAccountId: requested.id,
+                selectedAccountId: recovered.id,
+                candidateAccountIds: matches.map(match => match.account.id)
+            });
+            return recovered;
         }
         return requested;
     }
@@ -762,21 +785,21 @@ export class CodexAccountManager {
         sourceAccountId: string,
         targetAccountId: string,
         sessionId: string
-    ): Promise<string | null> {
-        if (sourceAccountId === targetAccountId) return null;
-        const [source, target] = await Promise.all([
-            this.resolveAccount(sourceAccountId),
-            this.resolveAccount(targetAccountId)
-        ]);
-        const sourcePath = await findTranscriptPath(join(source.homeDir, 'sessions'), sessionId);
+    ): Promise<{ resumePath: string | null; sourceAccount: ResolvedCodexAccount }> {
+        const source = await this.resolveAccountForResume(sourceAccountId, sessionId);
+        const target = await this.resolveAccount(targetAccountId);
+        if (source.id === target.id) {
+            return { resumePath: null, sourceAccount: source };
+        }
+
+        const sourcePath = await findAccountTranscriptPath(source.homeDir, sessionId);
         if (!sourcePath) {
             // Legacy metadata may name the wrong source even though the exact
             // conversation already belongs to the explicitly selected target.
-            const existingTargetPath = await findTranscriptPath(
-                join(target.homeDir, 'sessions'),
-                sessionId
-            );
-            if (existingTargetPath) return existingTargetPath;
+            const existingTargetPath = await findAccountTranscriptPath(target.homeDir, sessionId);
+            if (existingTargetPath) {
+                return { resumePath: existingTargetPath, sourceAccount: target };
+            }
             throw new Error(`Codex conversation ${sessionId} was not found in account ${source.label}`);
         }
 
@@ -787,7 +810,7 @@ export class CodexAccountManager {
         await copyFile(sourcePath, temporaryPath);
         await chmod(temporaryPath, 0o600).catch(() => {});
         await rename(temporaryPath, destinationPath);
-        return destinationPath;
+        return { resumePath: destinationPath, sourceAccount: source };
     }
 
     private async completeAttempt(attemptId: string): Promise<void> {

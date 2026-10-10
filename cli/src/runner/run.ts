@@ -409,7 +409,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     const webhookTimeoutMs =
       Number.isFinite(envWebhookTimeout) && envWebhookTimeout > 0
         ? envWebhookTimeout
-        : 60_000;
+        : 180_000;
 
     // Session spawning awaiter system
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
