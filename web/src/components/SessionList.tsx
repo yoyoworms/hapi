@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { SessionListScrollAnchor } from './SessionListScrollAnchor'
 import type { SessionSummary } from '@/types/api'
-import { SESSION_LIFECYCLE_IDLE } from '@hapi/protocol'
+import { compareSessionSummariesByRecency, SESSION_LIFECYCLE_IDLE } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
 import {
     buildSessionSearchScoreIndex,
@@ -99,7 +99,7 @@ export function emptyRunningBuckets(): Record<RunningBucketKey, SessionSummary[]
 export function bucketRunningSessions(
     sessions: SessionSummary[],
     pinInProgressSessions: boolean,
-    compare: (a: SessionSummary, b: SessionSummary) => number = (a, b) => b.updatedAt - a.updatedAt
+    compare: (a: SessionSummary, b: SessionSummary) => number = compareSessionSummariesByRecency
 ): Record<RunningBucketKey, SessionSummary[]> {
     const buckets = emptyRunningBuckets()
     if (!pinInProgressSessions) {
@@ -272,7 +272,7 @@ export function deduplicateSessionsByAgentId(sessions: SessionSummary[], selecte
             // Preserve an explicit pin when otherwise choosing by recency
             if (Boolean(a.globalPinned) !== Boolean(b.globalPinned)) return a.globalPinned ? -1 : 1
             if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
-            return b.updatedAt - a.updatedAt
+            return compareSessionSummariesByRecency(a, b)
         })
         result.push(group[0])
     }
@@ -355,7 +355,7 @@ function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
                 const rankA = a.active ? (a.pendingRequestsCount > 0 ? 0 : 1) : 2
                 const rankB = b.active ? (b.pendingRequestsCount > 0 ? 0 : 1) : 2
                 if (rankA !== rankB) return rankA - rankB
-                return b.updatedAt - a.updatedAt
+                return compareSessionSummariesByRecency(a, b)
             })
             const latestUpdatedAt = group.sessions.reduce(
                 (max, s) => (s.updatedAt > max ? s.updatedAt : max),
@@ -383,7 +383,9 @@ function groupSessionsByDirectory(sessions: SessionSummary[]): SessionGroup[] {
             if (a.hasActiveSession !== b.hasActiveSession) {
                 return a.hasActiveSession ? -1 : 1
             }
-            return b.latestUpdatedAt - a.latestUpdatedAt
+            const byUpdatedAt = b.latestUpdatedAt - a.latestUpdatedAt
+            if (byUpdatedAt !== 0) return byUpdatedAt
+            return a.key < b.key ? -1 : a.key > b.key ? 1 : 0
         })
 }
 
@@ -432,7 +434,11 @@ function groupByMachine(
     return [...map.values()].sort((a, b) => {
         if (a.hasPinnedSession !== b.hasPinnedSession) return a.hasPinnedSession ? -1 : 1
         if (a.hasActiveSession !== b.hasActiveSession) return a.hasActiveSession ? -1 : 1
-        return b.latestUpdatedAt - a.latestUpdatedAt
+        const byUpdatedAt = b.latestUpdatedAt - a.latestUpdatedAt
+        if (byUpdatedAt !== 0) return byUpdatedAt
+        const left = a.machineId ?? UNKNOWN_MACHINE_ID
+        const right = b.machineId ?? UNKNOWN_MACHINE_ID
+        return left < right ? -1 : left > right ? 1 : 0
     })
 }
 
@@ -1377,14 +1383,14 @@ export function SessionList(props: {
         if (searchScoreIndex && hasTextQuery) {
             return sortSessionsBySearchRelevance(pinned, searchScoreIndex)
         }
-        return [...pinned].sort((a, b) => b.updatedAt - a.updatedAt)
+        return [...pinned].sort(compareSessionSummariesByRecency)
     }, [machineFilteredSessions, searchScoreIndex, hasTextQuery])
     const runningSessions = useMemo(() => {
         const byRelevanceOrRecent = (a: SessionSummary, b: SessionSummary) => {
             if (searchScoreIndex && hasTextQuery) {
                 return compareSessionsBySearchRelevance(a, b, searchScoreIndex)
             }
-            return b.updatedAt - a.updatedAt
+            return compareSessionSummariesByRecency(a, b)
         }
         return bucketRunningSessions(machineFilteredSessions, pinInProgressSessions, byRelevanceOrRecent)
     }, [machineFilteredSessions, pinInProgressSessions, searchScoreIndex, hasTextQuery])

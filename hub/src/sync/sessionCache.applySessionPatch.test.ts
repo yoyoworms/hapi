@@ -1,4 +1,8 @@
 import { describe, expect, it } from 'bun:test'
+import { Database } from 'bun:sqlite'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { SyncEvent } from '@hapi/protocol/types'
 import { Store } from '../store'
 import type { EventPublisher } from './eventPublisher'
@@ -20,6 +24,60 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
 // cache-vs-DB divergence would manifest as ghost notifications, stale
 // pendingRequestsCount, or wrong todos progress in the session list.
 describe('SessionCache.applySessionPatch', () => {
+    it('backfills historical todos without advancing session activity', () => {
+        const directory = mkdtempSync(join(tmpdir(), 'hapi-todo-backfill-'))
+        const dbPath = join(directory, 'hapi.db')
+        let store: Store | null = null
+        try {
+            store = new Store(dbPath)
+            const cache = new SessionCache(store, createPublisher([]))
+            const created = cache.getOrCreateSession(
+                'todo-backfill-session',
+                { path: '/tmp', host: 'h' },
+                null,
+                'default'
+            )
+
+            const historicalActivity = created.updatedAt
+            const todoAt = historicalActivity + 1_000
+            const raw = new Database(dbPath)
+            raw.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(historicalActivity, created.id)
+            raw.close()
+            store.messages.addMessage(
+                created.id,
+                {
+                    role: 'agent',
+                    content: {
+                        type: 'codex',
+                        data: {
+                            type: 'tool-call',
+                            name: 'TodoWrite',
+                            input: {
+                                todos: [{ content: 'historic task', status: 'pending', priority: 'medium', id: 'todo-1' }]
+                            }
+                        }
+                    }
+                },
+                undefined,
+                undefined,
+                todoAt
+            )
+
+            const restarted = new SessionCache(store, createPublisher([]))
+            restarted.reloadAll()
+
+            const reloaded = store.sessions.getSession(created.id)
+            expect(reloaded?.todos).toEqual([
+                { content: 'historic task', status: 'pending', priority: 'medium', id: 'todo-1' }
+            ])
+            expect(reloaded?.updatedAt).toBe(historicalActivity)
+            expect(restarted.getSession(created.id)?.updatedAt).toBe(historicalActivity)
+        } finally {
+            store?.close()
+            rmSync(directory, { recursive: true, force: true })
+        }
+    })
+
     it('applies a todos patch in place when the session is cached', () => {
         const store = new Store(':memory:')
         const events: SyncEvent[] = []

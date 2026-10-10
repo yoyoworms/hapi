@@ -1,5 +1,5 @@
 import type { SessionSummary } from '@/types/api'
-import { isWildcardSearch, matchesSearchQuery } from '@hapi/protocol'
+import { compareSessionSummariesByRecency, isWildcardSearch, matchesSearchQuery } from '@hapi/protocol'
 import { getSessionTitle } from '@/lib/sessionTitle'
 import { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
 
@@ -216,7 +216,7 @@ export function compareSessionsBySearchRelevance(
     const scoreA = index.scores.get(a.id) ?? 0
     const scoreB = index.scores.get(b.id) ?? 0
     if (scoreB !== scoreA) return scoreB - scoreA
-    return b.updatedAt - a.updatedAt
+    return compareSessionSummariesByRecency(a, b)
 }
 
 export function sortSessionsBySearchRelevance<T extends SessionSummary>(
@@ -277,7 +277,11 @@ export function rankSessionGroupsBySearchRelevance<T extends {
         if (a.hasActiveSession !== b.hasActiveSession) {
             return a.hasActiveSession ? -1 : 1
         }
-        return b.latestUpdatedAt - a.latestUpdatedAt
+        const byUpdatedAt = b.latestUpdatedAt - a.latestUpdatedAt
+        if (byUpdatedAt !== 0) return byUpdatedAt
+        const left = a.sessions[0]?.id ?? ''
+        const right = b.sessions[0]?.id ?? ''
+        return left < right ? -1 : left > right ? 1 : 0
     })
 }
 

@@ -32,6 +32,59 @@ describe('getOrCreateSession: active_at', () => {
     })
 })
 
+describe('session ordering', () => {
+    it('uses the id as a deterministic tie-break for equal updated_at values', () => {
+        const store = makeStore()
+        const first = store.sessions.getOrCreateSession('ordering-first', {}, null, 'default', undefined, undefined, undefined, 'session-b')
+        const second = store.sessions.getOrCreateSession('ordering-second', {}, null, 'default', undefined, undefined, undefined, 'session-a')
+        const timestamp = Math.max(first.updatedAt, second.updatedAt) + 1_000
+
+        store.sessions.touchSessionUpdatedAt(first.id, timestamp, 'default')
+        store.sessions.touchSessionUpdatedAt(second.id, timestamp, 'default')
+
+        expect(store.sessions.getSessionsByNamespace('default').map((session) => session.id))
+            .toEqual(['session-a', 'session-b'])
+        store.close()
+    })
+})
+
+describe('agent state recency', () => {
+    it('does not touch updated_at by default', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession('agent-state-recency', {}, null, 'default')
+        const beforeUpdatedAt = session.updatedAt
+
+        const result = store.sessions.updateSessionAgentState(
+            session.id,
+            { thinking: true },
+            session.agentStateVersion,
+            'default'
+        )
+
+        expect(result.result).toBe('success')
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBe(beforeUpdatedAt)
+        store.close()
+    })
+
+    it('can touch updated_at when explicitly requested', async () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession('agent-state-touch', {}, null, 'default')
+        await new Promise((resolve) => setTimeout(resolve, 3))
+
+        const result = store.sessions.updateSessionAgentState(
+            session.id,
+            { thinking: true },
+            session.agentStateVersion,
+            'default',
+            { touchUpdatedAt: true }
+        )
+
+        expect(result.result).toBe('success')
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBeGreaterThan(session.updatedAt)
+        store.close()
+    })
+})
+
 describe('session pinning', () => {
     it('persists project and global pin modes without changing session recency', () => {
         const store = makeStore()
@@ -1215,7 +1268,32 @@ describe('updateSessionMetadata: protocol resume token preservation', () => {
     })
 })
 
-describe('replaceSessionTodos: watermark ratchet (PR #897 rewind race)', () => {
+describe('session todo recency and watermark', () => {
+    it('can backfill todos without changing session recency', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'todo-backfill-recency',
+            { path: '/tmp/project' },
+            null,
+            'default'
+        )
+        const originalUpdatedAt = session.updatedAt
+        const historicalTodoAt = originalUpdatedAt + 1
+
+        expect(store.sessions.setSessionTodos(
+            session.id,
+            [{ content: 'historic', status: 'pending' }],
+            historicalTodoAt,
+            'default',
+            { touchUpdatedAt: false }
+        )).toBe(true)
+
+        const after = store.sessions.getSession(session.id)
+        expect(after?.todosUpdatedAt).toBe(historicalTodoAt)
+        expect(after?.updatedAt).toBe(originalUpdatedAt)
+        store.close()
+    })
+
     it('advances todosUpdatedAt past the prior write even when rebuilding older content', () => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(

@@ -178,7 +178,16 @@ export class SessionCache {
                 const message = messages[i]
                 const todos = extractTodoWriteTodosFromMessageContent(message.content)
                 if (todos) {
-                    const updated = this.store.sessions.setSessionTodos(sessionId, todos, message.createdAt, stored.namespace)
+                    // This is a read-side migration of historical transcript data.
+                    // It must not make an old session look newly active: the TodoWrite
+                    // timestamp can be newer than the durable human-turn watermark.
+                    const updated = this.store.sessions.setSessionTodos(
+                        sessionId,
+                        todos,
+                        message.createdAt,
+                        stored.namespace,
+                        { touchUpdatedAt: false }
+                    )
                     if (updated) {
                         stored = this.store.sessions.getSession(sessionId) ?? stored
                     }
@@ -1429,7 +1438,8 @@ export class SessionCache {
                 newSessionId,
                 oldStored.todos,
                 oldStored.todosUpdatedAt,
-                namespace
+                namespace,
+                { touchUpdatedAt: false }
             )
         }
 
@@ -1447,7 +1457,8 @@ export class SessionCache {
                     newSessionId,
                     mergedAgentState,
                     latest.agentStateVersion,
-                    namespace
+                    namespace,
+                    { touchUpdatedAt: false }
                 )
                 if (result.result !== 'version-mismatch') break
                 // version-mismatch: retry with fresh snapshot

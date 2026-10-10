@@ -10,6 +10,7 @@ export function normalizeDecryptedMessage(message: DecryptedMessage): Normalized
     if (!record) {
         return {
             id: message.id,
+            seq: message.seq,
             localId: message.localId,
             createdAt: message.createdAt,
             role: 'agent',
@@ -23,9 +24,10 @@ export function normalizeDecryptedMessage(message: DecryptedMessage): Normalized
     if (record.role === 'user') {
         const normalized = normalizeUserRecord(message.id, message.localId, message.createdAt, record.content, record.meta)
         return normalized
-            ? { ...normalized, status: message.status, originalText: message.originalText, invokedAt: message.invokedAt, steered: message.steered }
+            ? { ...normalized, seq: message.seq, status: message.status, originalText: message.originalText, invokedAt: message.invokedAt, steered: message.steered }
             : {
                 id: message.id,
+                seq: message.seq,
                 localId: message.localId,
                 createdAt: message.createdAt,
                 role: 'user',
@@ -47,9 +49,10 @@ export function normalizeDecryptedMessage(message: DecryptedMessage): Normalized
             return null
         }
         return normalized
-            ? { ...normalized, status: message.status, originalText: message.originalText, invokedAt: message.invokedAt }
+            ? { ...normalized, seq: message.seq, status: message.status, originalText: message.originalText, invokedAt: message.invokedAt }
             : {
                 id: message.id,
+                seq: message.seq,
                 localId: message.localId,
                 createdAt: message.createdAt,
                 role: 'agent',
@@ -64,6 +67,7 @@ export function normalizeDecryptedMessage(message: DecryptedMessage): Normalized
 
     return {
         id: message.id,
+        seq: message.seq,
         localId: message.localId,
         createdAt: message.createdAt,
         role: 'agent',

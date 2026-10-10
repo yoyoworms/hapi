@@ -71,6 +71,7 @@ describe('normalizeDecryptedMessage', () => {
 
         expect(normalizeDecryptedMessage(message)).toMatchObject({
             id: 'msg-1',
+            seq: 1,
             role: 'event',
             isSidechain: true,
             parentToolUseId: 'toolu-agent-1',

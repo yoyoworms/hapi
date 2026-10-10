@@ -77,6 +77,27 @@ export type SessionSummary = {
     effort: string | null
 }
 
+/**
+ * Compare session summaries by the order shown in recency lists.
+ *
+ * Equal timestamps otherwise inherit whatever order a Map or REST query
+ * happened to return. A stable id tie-break prevents rows from swapping on
+ * every refresh while keeping `updatedAt` as the primary recency signal.
+ */
+export function compareSessionSummariesByRecency(
+    left: Pick<SessionSummary, 'id' | 'updatedAt'>,
+    right: Pick<SessionSummary, 'id' | 'updatedAt'>
+): number {
+    const byUpdatedAt = right.updatedAt - left.updatedAt
+    if (byUpdatedAt !== 0) {
+        return byUpdatedAt
+    }
+    if (left.id === right.id) {
+        return 0
+    }
+    return left.id < right.id ? -1 : 1
+}
+
 // Re-exported as a standalone derivation so SSE patch handlers can recompute
 // summary fields from a structured `agentState` patch without needing the
 // full Session in hand.

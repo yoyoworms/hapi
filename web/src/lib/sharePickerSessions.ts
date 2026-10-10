@@ -1,4 +1,5 @@
 import type { SessionSummary } from '@/types/api'
+import { compareSessionSummariesByRecency } from '@hapi/protocol'
 import { DEFAULT_SESSION_PREVIEW_LIMIT } from '@/hooks/useSessionPreviewLimit'
 import {
     normalizeSearch,
@@ -10,7 +11,7 @@ import {
 export type SharePickerMachineLabelResolver = (machineId: string | null) => string
 
 function sortByUpdatedAtDesc(sessions: SessionSummary[]): SessionSummary[] {
-    return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+    return [...sessions].sort(compareSessionSummariesByRecency)
 }
 
 /**

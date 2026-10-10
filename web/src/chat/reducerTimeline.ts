@@ -153,6 +153,18 @@ function getAgentRunDisplayPatch(event: Record<string, unknown>): Record<string,
     return patch
 }
 
+function compareStreamSnapshotOrder(left: TracedMessage, right: TracedMessage): number {
+    // Stream snapshots are appended to the hub in sequence order. Provider
+    // timestamps can move backwards when a resumed transcript or an async
+    // flush delivers an older snapshot late, so seq is authoritative whenever
+    // both rows carry it.
+    if (typeof left.seq === 'number' && typeof right.seq === 'number' && left.seq !== right.seq) {
+        return left.seq - right.seq
+    }
+    if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt
+    return left.id.localeCompare(right.id)
+}
+
 function getAgentRunFingerprint(event: Record<string, unknown>): string | null {
     const summary = getEventString(event, 'summary')
     if (summary) return summary
@@ -218,6 +230,7 @@ function normalizeTraceMessage(
     const createdAt = source.createdAt
     const base = {
         localId: null,
+        seq: source.seq,
         createdAt,
         isSidechain: false,
         meta: source.meta
@@ -327,6 +340,9 @@ export function reduceTimeline(
     const pendingAgentRunCardByFingerprint = new Map<string, string>()
     const textBlocksByStreamId = new Map<string, AgentTextBlock>()
     const reasoningBlocksByStreamId = new Map<string, AgentReasoningBlock>()
+    const textSnapshotByStreamId = new Map<string, TracedMessage>()
+    const reasoningSnapshotByStreamId = new Map<string, TracedMessage>()
+    const toolCallSeen = new Set<string>()
     let hasReadyEvent = false
 
     const ensureAgentRunBlock = (
@@ -455,8 +471,7 @@ export function reduceTimeline(
         const fromTrace = agentRunTraceMessagesByCardId.get(fromCardId) ?? []
         const toTrace = agentRunTraceMessagesByCardId.get(toCardId) ?? []
         if (fromTrace.length > 0 || toTrace.length > 0) {
-            const mergedTrace = [...toTrace, ...fromTrace]
-                .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+            const mergedTrace = [...toTrace, ...fromTrace].sort(compareStreamSnapshotOrder)
             agentRunTraceMessagesByCardId.set(toCardId, mergedTrace)
             agentRunTraceMessagesByCardId.delete(fromCardId)
             refreshAgentRunChildren(toCardId)
@@ -852,11 +867,16 @@ export function reduceTimeline(
                     if (streamId) {
                         const existing = textBlocksByStreamId.get(streamId)
                         if (existing) {
+                            const previous = textSnapshotByStreamId.get(streamId)
+                            if (previous && compareStreamSnapshotOrder(msg, previous) < 0) {
+                                continue
+                            }
                             existing.text = c.text
                             existing.usage = msg.usage
                             existing.model = msg.model
                             existing.meta = msg.meta
                             existing.invokedAt = msg.invokedAt
+                            textSnapshotByStreamId.set(streamId, msg)
                             continue
                         }
                     }
@@ -881,6 +901,7 @@ export function reduceTimeline(
                     blocks.push(block)
                     if (streamId) {
                         textBlocksByStreamId.set(streamId, block)
+                        textSnapshotByStreamId.set(streamId, msg)
                     }
                     continue
                 }
@@ -906,11 +927,16 @@ export function reduceTimeline(
                     if (streamId) {
                         const existing = reasoningBlocksByStreamId.get(streamId)
                         if (existing) {
+                            const previous = reasoningSnapshotByStreamId.get(streamId)
+                            if (previous && compareStreamSnapshotOrder(msg, previous) < 0) {
+                                continue
+                            }
                             existing.text = c.text
                             existing.usage = msg.usage
                             existing.model = msg.model
                             existing.meta = msg.meta
                             existing.invokedAt = msg.invokedAt
+                            reasoningSnapshotByStreamId.set(streamId, msg)
                             continue
                         }
                     }
@@ -933,6 +959,7 @@ export function reduceTimeline(
                     blocks.push(block)
                     if (streamId) {
                         reasoningBlocksByStreamId.set(streamId, block)
+                        reasoningSnapshotByStreamId.set(streamId, msg)
                     }
                     continue
                 }
@@ -1001,6 +1028,21 @@ export function reduceTimeline(
                         permission,
                         agentTimestamp: msg.agentTimestamp
                     })
+
+                    // A result can be reduced before its tool_use when a
+                    // provider flushes records out of order. The result-only
+                    // placeholder was appended at the flush point; once the
+                    // canonical tool_use arrives, move the existing card to
+                    // the tool_use position so the conversation reads call →
+                    // result regardless of arrival order.
+                    if (!toolCallSeen.has(c.id)) {
+                        toolCallSeen.add(c.id)
+                        const currentIndex = blocks.indexOf(block)
+                        if (currentIndex !== -1 && currentIndex !== blocks.length - 1) {
+                            blocks.splice(currentIndex, 1)
+                            blocks.push(block)
+                        }
+                    }
 
                     if (block.tool.state === 'pending') {
                         block.tool = { ...block.tool, state: 'running' }

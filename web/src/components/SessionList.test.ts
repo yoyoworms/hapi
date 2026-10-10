@@ -696,6 +696,14 @@ describe('bucketRunningSessions', () => {
         expect(bucketRunningSessions([{ ...idle, pendingRequestsCount: 1 }], true).pending).toHaveLength(1)
     })
 
+    it('keeps equal-timestamp running rows in a deterministic order', () => {
+        const first = { ...quiet, id: 'session-b', updatedAt: 20 }
+        const second = { ...quiet, id: 'session-a', updatedAt: 20 }
+
+        expect(bucketRunningSessions([first, second], true).active.map((s) => s.id))
+            .toEqual(['session-a', 'session-b'])
+    })
+
     it('ignores disconnected and pinned sessions', () => {
         const buckets = bucketRunningSessions([
             { ...idle, active: false },

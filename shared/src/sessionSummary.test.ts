@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import type { Session } from './schemas'
 import {
     PENDING_REQUEST_SUMMARY_CAP,
+    compareSessionSummariesByRecency,
     computePendingRequestKinds,
     computePendingRequestsCount,
     computeTodoProgress,
@@ -236,6 +237,23 @@ describe('toSessionSummary', () => {
     it('returns empty pendingRequests when agentState has no requests', () => {
         const summary = toSessionSummary(makeSession({ agentState: null }))
         expect(summary.pendingRequests).toEqual([])
+    })
+})
+
+describe('compareSessionSummariesByRecency', () => {
+    it('uses the session id as a deterministic tie-breaker', () => {
+        const olderId = { id: 'session-a', updatedAt: 100 }
+        const newerId = { id: 'session-b', updatedAt: 100 }
+
+        expect([newerId, olderId].sort(compareSessionSummariesByRecency).map((session) => session.id))
+            .toEqual(['session-a', 'session-b'])
+    })
+
+    it('still prioritizes a newer activity timestamp', () => {
+        expect(compareSessionSummariesByRecency(
+            { id: 'session-new', updatedAt: 200 },
+            { id: 'session-old', updatedAt: 100 }
+        )).toBe(-100)
     })
 })
 

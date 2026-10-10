@@ -351,7 +351,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             sid,
             agentState,
             expectedVersion,
-            sessionAccess.value.namespace
+            sessionAccess.value.namespace,
+            // Agent state contains runtime UI state (thinking/plan/control
+            // flags and permission requests). Those changes are delivered as
+            // structured patches, but are not conversation activity: moving
+            // updatedAt here makes unread badges and recent ordering flicker.
+            { touchUpdatedAt: false }
         )
         if (result.result === 'success') {
             cb({ result: 'success', version: result.version, agentState: result.value })

@@ -5,6 +5,7 @@ import {
     computePendingRequests,
     computePendingRequestsCount,
     computeTodoProgress,
+    compareSessionSummariesByRecency,
     isObject,
     toSessionSummary,
     toSessionSummaryMetadata
@@ -114,7 +115,7 @@ function sortSessionSummaries(left: SessionSummary, right: SessionSummary): numb
     if (left.active && left.pendingRequestsCount !== right.pendingRequestsCount) {
         return right.pendingRequestsCount - left.pendingRequestsCount
     }
-    return right.updatedAt - left.updatedAt
+    return compareSessionSummariesByRecency(left, right)
 }
 
 function isSessionRecord(value: unknown): value is Session {

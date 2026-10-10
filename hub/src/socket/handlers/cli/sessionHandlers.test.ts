@@ -303,6 +303,7 @@ describe('cli session handlers', () => {
             null,
             'default'
         )
+        const beforeUpdatedAt = session.updatedAt
         const socket = new FakeSocket()
         const webEvents: SyncEvent[] = []
 
@@ -337,8 +338,10 @@ describe('cli session handlers', () => {
         expect(data?.agentState?.version).toBe(session.agentStateVersion + 1)
         expect(data?.agentState?.value).toMatchObject({ controlledByUser: true })
         expect(typeof data?.updatedAt).toBe('number')
-        // Same-ms create+update is common in unit tests; store still touches updated_at.
-        expect(data?.updatedAt).toBeGreaterThanOrEqual(session.updatedAt)
+        // Runtime state patches must not create conversation activity or move
+        // the session in recent/unread lists.
+        expect(data?.updatedAt).toBe(beforeUpdatedAt)
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBe(beforeUpdatedAt)
     })
 
     it('update-metadata broadcasts the merged value, not the pre-merge payload', () => {

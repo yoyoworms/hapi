@@ -454,6 +454,83 @@ describe('reduceTimeline', () => {
         })
     })
 
+    it('does not let a late older stream snapshot overwrite the newest text', () => {
+        const newest = makeAgentMessage('newest text', {
+            id: 'text-newest',
+            seq: 2,
+            createdAt: 1_000,
+            content: [{
+                type: 'text',
+                text: 'newest text',
+                uuid: 'text-newest',
+                streamId: 'text-stream-late',
+                parentUUID: null
+            }]
+        })
+        const lateOlder = makeAgentMessage('older text', {
+            id: 'text-older',
+            seq: 1,
+            createdAt: 2_000,
+            content: [{
+                type: 'text',
+                text: 'older text',
+                uuid: 'text-older',
+                streamId: 'text-stream-late',
+                parentUUID: null
+            }]
+        })
+
+        const { blocks } = reduceTimeline([newest, lateOlder], makeContext())
+        const textBlocks = blocks.filter((block) => block.kind === 'agent-text')
+        expect(textBlocks).toHaveLength(1)
+        expect(textBlocks[0]).toMatchObject({ id: 'text-stream-late', text: 'newest text' })
+    })
+
+    it('anchors a tool card at tool_use position when tool_result arrives first', () => {
+        const resultFirst: TracedMessage = {
+            id: 'tool-result-first',
+            seq: 1,
+            localId: null,
+            createdAt: 1_000,
+            role: 'agent',
+            content: [{
+                type: 'tool-result',
+                tool_use_id: 'out-of-order-tool',
+                content: 'done',
+                is_error: false,
+                uuid: 'result-uuid',
+                parentUUID: null
+            }],
+            isSidechain: false
+        } as TracedMessage
+        const interveningText = makeAgentMessage('between result and call', {
+            id: 'intervening-text',
+            seq: 2,
+            createdAt: 1_100
+        })
+        const callLater: TracedMessage = {
+            id: 'tool-call-later',
+            seq: 3,
+            localId: null,
+            createdAt: 1_200,
+            role: 'agent',
+            content: [{
+                type: 'tool-call',
+                id: 'out-of-order-tool',
+                name: 'Bash',
+                input: { command: 'echo ok' },
+                description: null,
+                uuid: 'call-uuid',
+                parentUUID: null
+            }],
+            isSidechain: false
+        } as TracedMessage
+
+        const { blocks } = reduceTimeline([resultFirst, interveningText, callLater], makeContext())
+        expect(blocks.map((block) => block.id)).toEqual(['intervening-text:0', 'out-of-order-tool'])
+        expect(blocks[1]).toMatchObject({ kind: 'tool-call', tool: { name: 'Bash', result: 'done' } })
+    })
+
     it('updates one running tool card with progress snapshots before the final result', () => {
         const start: TracedMessage = {
             id: 'tool-start',

@@ -1749,4 +1749,31 @@ describe('sessions routes', () => {
         expect(body.sessions.map((s) => s.id)).toEqual(['new-inactive'])
     })
 
+    it('keeps equal-timestamp sessions in a deterministic order across refreshes', async () => {
+        const sessions = [
+            createSession({ id: 'session-b', active: true, updatedAt: 100 }),
+            createSession({ id: 'session-a', active: true, updatedAt: 100 })
+        ]
+        const engine = {
+            getSessionsByNamespace: () => sessions,
+            getFutureScheduledMessageCounts: (ids: string[]) => new Map(ids.map((id) => [id, 0])),
+            getNextScheduledAtBySessionIds: (_ids: string[]) => new Map<string, number>(),
+            resolveSessionAccess: () => ({ ok: false, reason: 'not-found' as const })
+        } as unknown as Partial<SyncEngine>
+
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createSessionsRoutes(() => engine as SyncEngine))
+
+        const first = await app.request('/api/sessions')
+        const second = await app.request('/api/sessions')
+        expect((await first.json() as { sessions: Array<{ id: string }> }).sessions.map((s) => s.id))
+            .toEqual(['session-a', 'session-b'])
+        expect((await second.json() as { sessions: Array<{ id: string }> }).sessions.map((s) => s.id))
+            .toEqual(['session-a', 'session-b'])
+    })
+
 })

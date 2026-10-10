@@ -42,6 +42,16 @@ describe('filterSharePickerSessions', () => {
         expect(result.map((s) => s.id)).toEqual(['new-active', 'old-active'])
     })
 
+    it('keeps equal timestamps in a deterministic order', () => {
+        const sessions = [
+            makeSession({ id: 'session-b', active: true, updatedAt: 100 }),
+            makeSession({ id: 'session-a', active: true, updatedAt: 100 }),
+        ]
+
+        expect(filterSharePickerSessions(sessions, '', machineLabel).map((s) => s.id))
+            .toEqual(['session-a', 'session-b'])
+    })
+
     it('caps active sessions when query is empty', () => {
         const previewLimit = DEFAULT_SESSION_PREVIEW_LIMIT
         const sessions = Array.from({ length: previewLimit + 3 }, (_, index) =>

@@ -508,10 +508,12 @@ export function updateSessionAgentState(
     id: string,
     agentState: unknown,
     expectedVersion: number,
-    namespace: string
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
 ): VersionedUpdateResult<unknown | null> {
     const now = Date.now()
     const normalized = agentState ?? null
+    const touchUpdatedAt = options?.touchUpdatedAt === true
 
     return updateVersionedField({
         db,
@@ -524,7 +526,10 @@ export function updateSessionAgentState(
         value: normalized,
         encode: (value) => (value === null ? null : JSON.stringify(value)),
         decode: safeJsonParse,
-        setClauses: ['updated_at = @updated_at', 'seq = seq + 1'],
+        setClauses: [
+            ...(touchUpdatedAt ? ['updated_at = @updated_at'] : []),
+            'seq = seq + 1'
+        ],
         params: { updated_at: now }
     })
 }
@@ -534,15 +539,23 @@ export function setSessionTodos(
     id: string,
     todos: unknown,
     todosUpdatedAt: number,
-    namespace: string
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
 ): boolean {
+    // Live TodoWrite messages retain the historical recency behavior by
+    // default. Read-side transcript backfills can opt out so loading an old
+    // session does not create new activity for the web unread indicator.
+    const touchUpdatedAt = options?.touchUpdatedAt !== false
     try {
         const json = todos === null || todos === undefined ? null : JSON.stringify(todos)
         const result = prepareCached(db, `
             UPDATE sessions
             SET todos = @todos,
                 todos_updated_at = @todos_updated_at,
-                updated_at = CASE WHEN updated_at > @updated_at THEN updated_at ELSE @updated_at END,
+                updated_at = CASE
+                    WHEN @touch_updated_at = 1 AND updated_at < @updated_at THEN @updated_at
+                    ELSE updated_at
+                END,
                 seq = seq + 1
             WHERE id = @id
               AND namespace = @namespace
@@ -552,6 +565,7 @@ export function setSessionTodos(
             todos: json,
             todos_updated_at: todosUpdatedAt,
             updated_at: todosUpdatedAt,
+            touch_updated_at: touchUpdatedAt ? 1 : 0,
             namespace
         })
 
@@ -861,13 +875,13 @@ export function getSessionByNamespace(db: Database, id: string, namespace: strin
 }
 
 export function getSessions(db: Database): StoredSession[] {
-    const rows = prepareCached(db, 'SELECT * FROM sessions ORDER BY updated_at DESC').all() as DbSessionRow[]
+    const rows = prepareCached(db, 'SELECT * FROM sessions ORDER BY updated_at DESC, id ASC').all() as DbSessionRow[]
     return rows.map(toStoredSession)
 }
 
 export function getSessionsByNamespace(db: Database, namespace: string): StoredSession[] {
     const rows = prepareCached(db, 
-        'SELECT * FROM sessions WHERE namespace = ? ORDER BY updated_at DESC'
+        'SELECT * FROM sessions WHERE namespace = ? ORDER BY updated_at DESC, id ASC'
     ).all(namespace) as DbSessionRow[]
     return rows.map(toStoredSession)
 }

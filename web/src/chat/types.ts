@@ -149,6 +149,8 @@ export type NormalizedMessage = ({
     content: AgentEvent
 }) & {
     id: string
+    /** Durable hub insertion order used to reject late stream snapshots. */
+    seq?: number | null
     localId: string | null
     createdAt: number
     isSidechain: boolean

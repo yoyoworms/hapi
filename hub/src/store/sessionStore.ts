@@ -74,13 +74,20 @@ export class SessionStore {
         id: string,
         agentState: unknown,
         expectedVersion: number,
-        namespace: string
+        namespace: string,
+        options?: { touchUpdatedAt?: boolean }
     ): VersionedUpdateResult<unknown | null> {
-        return updateSessionAgentState(this.db, id, agentState, expectedVersion, namespace)
+        return updateSessionAgentState(this.db, id, agentState, expectedVersion, namespace, options)
     }
 
-    setSessionTodos(id: string, todos: unknown, todosUpdatedAt: number, namespace: string): boolean {
-        return setSessionTodos(this.db, id, todos, todosUpdatedAt, namespace)
+    setSessionTodos(
+        id: string,
+        todos: unknown,
+        todosUpdatedAt: number,
+        namespace: string,
+        options?: { touchUpdatedAt?: boolean }
+    ): boolean {
+        return setSessionTodos(this.db, id, todos, todosUpdatedAt, namespace, options)
     }
 
     replaceSessionTodos(

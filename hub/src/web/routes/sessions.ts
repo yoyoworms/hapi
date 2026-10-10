@@ -23,6 +23,7 @@ import {
     UpdateSessionSummaryRequestSchema,
     supportsModelChange,
     supportsEffort,
+    compareSessionSummariesByRecency,
     toSessionSummary,
     UploadFileRequestSchema
 } from '@hapi/protocol'
@@ -92,7 +93,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             .sort((a, b) => {
                 // Peer discovery wants newest activity first before limit truncation.
                 if (order === 'updatedAt') {
-                    return b.updatedAt - a.updatedAt
+                    return compareSessionSummariesByRecency(a, b)
                 }
                 if (Boolean(a.globalPinned) !== Boolean(b.globalPinned)) {
                     return a.globalPinned ? -1 : 1
@@ -111,7 +112,7 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                     return bPending - aPending
                 }
                 // Then by updatedAt
-                return b.updatedAt - a.updatedAt
+                return compareSessionSummariesByRecency(a, b)
             })
         if (limit !== null) {
             sessionRecords = sessionRecords.slice(0, limit)
