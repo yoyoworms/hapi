@@ -430,16 +430,34 @@ export function useSSE(options: {
 
             const tasks: Array<Promise<unknown>> = []
             if (shouldInvalidateSessions) {
-                tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.sessions }))
+                // SSE can deliver several lifecycle/message events while a
+                // full list request is still in flight.  Keep that request
+                // and mark the cache stale instead of cancelling/restarting
+                // it for every event; repeated restarts were a major source
+                // of /api/sessions request bursts when several HAPI tabs were
+                // open at once.
+                tasks.push(queryClient.invalidateQueries(
+                    { queryKey: queryKeys.sessions },
+                    { cancelRefetch: false }
+                ))
             }
             for (const sessionId of sessionIds) {
-                tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.session(sessionId) }))
+                tasks.push(queryClient.invalidateQueries(
+                    { queryKey: queryKeys.session(sessionId) },
+                    { cancelRefetch: false }
+                ))
             }
             for (const sessionId of scratchlistSessionIds) {
-                tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.scratchlist(sessionId) }))
+                tasks.push(queryClient.invalidateQueries(
+                    { queryKey: queryKeys.scratchlist(sessionId) },
+                    { cancelRefetch: false }
+                ))
             }
             if (shouldInvalidateMachines) {
-                tasks.push(queryClient.invalidateQueries({ queryKey: queryKeys.machines }))
+                tasks.push(queryClient.invalidateQueries(
+                    { queryKey: queryKeys.machines },
+                    { cancelRefetch: false }
+                ))
             }
 
             if (tasks.length === 0) {
