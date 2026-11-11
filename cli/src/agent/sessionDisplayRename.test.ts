@@ -10,6 +10,13 @@ describe('sessionDisplayRename', () => {
         expect(normalizeSessionDisplayTitle(null)).toBeNull()
     })
 
+    it('keeps a locked title when a deferred callback runs after the user pins it', () => {
+        const metadata: Metadata = { path: '/repo', host: 'test', name: 'Pinned', titleLocked: true }
+        let updater!: (value: Metadata) => Metadata
+        applySessionDisplayRename({ updateMetadata: fn => { updater = fn } }, 'Agent title')
+        expect(updater(metadata)).toBe(metadata)
+    })
+
     it('sets metadata.name even when a spawn name already exists', () => {
         let metadata: Metadata = {
             path: '/tmp/project',
@@ -50,5 +57,16 @@ describe('sessionDisplayRename', () => {
         const client = { updateMetadata: vi.fn() }
         expect(applySessionDisplayRename(client, '   ')).toBe(false)
         expect(client.updateMetadata).not.toHaveBeenCalled()
+    })
+
+    it('rechecks user ownership when a queued agent rename is applied', () => {
+        let metadata: Metadata = { path: '/tmp/project', host: 'localhost', name: 'Agent title' }
+        let queued: ((current: Metadata) => Metadata) | undefined
+        const client = { updateMetadata: (handler: (current: Metadata) => Metadata) => { queued = handler } }
+
+        applySessionDisplayRename(client, 'New agent title')
+        metadata = { ...metadata, name: 'My title', nameSource: 'user' }
+        metadata = queued!(metadata)
+        expect(metadata).toMatchObject({ name: 'My title', nameSource: 'user' })
     })
 })

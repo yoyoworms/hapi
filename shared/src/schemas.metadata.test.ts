@@ -24,4 +24,21 @@ describe('MetadataSchema cursorSessionProtocol', () => {
         expect(result.success).toBe(true);
         expect(result.data?.conversationHistoryEntryIds).toEqual({ 'local-user-id': 'pi-entry-id' });
     });
+
+    it('accepts the Hub-owned automatic title attempt marker', () => {
+        const result = MetadataSchema.safeParse({
+            ...base,
+            titleSuggestionAutoAttemptedAt: 1234,
+            titleSuggestionTurn: { first: true, completed: false },
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.data?.titleSuggestionAutoAttemptedAt).toBe(1234);
+        expect(result.data?.titleSuggestionTurn).toEqual({ first: true, completed: false });
+    })
+
+    it('retains user title ownership in metadata received by the CLI', () => {
+        expect(MetadataSchema.parse({ ...base, name: 'My title', nameSource: 'user' }).nameSource).toBe('user');
+        expect(MetadataSchema.safeParse({ ...base, nameSource: 'unknown' }).success).toBe(false);
+    });
 });

@@ -1,6 +1,7 @@
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager'
 import { registerAgyModelHandlers } from './handlers/agyModels'
 import { registerBashHandlers } from './handlers/bash'
+import { registerClaudeModelHandlers } from './handlers/claudeModels'
 import { registerCodexModelHandlers } from './handlers/codexModels'
 import { registerCursorModelHandlers } from './handlers/cursorModels'
 import { registerOpencodeModelHandlers } from './handlers/opencodeModels'
@@ -31,6 +32,7 @@ export function registerCommonHandlers(
 ): void {
     registerAgyModelHandlers(rpcHandlerManager)
     registerBashHandlers(rpcHandlerManager, workingDirectory)
+    registerClaudeModelHandlers(rpcHandlerManager)
     registerCodexModelHandlers(rpcHandlerManager, options?.codexModelsMachineScoped === true)
     registerCursorModelHandlers(rpcHandlerManager)
     registerOpencodeModelHandlers(rpcHandlerManager)

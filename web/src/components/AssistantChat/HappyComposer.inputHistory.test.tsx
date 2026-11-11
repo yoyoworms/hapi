@@ -9,7 +9,8 @@ import { addComposerInputHistory, getComposerInputHistory, HappyComposer } from 
 import { segmentsFromEditor } from './RichComposerInput'
 import { serializeComposerSegments } from '@/lib/composerSegments'
 
-vi.mock('@/components/AssistantChat/ComposerButtons', () => ({
+vi.mock('@/components/AssistantChat/ComposerButtons', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./ComposerButtons')>(),
     ComposerButtons: (props: { canSend: boolean; onSend: () => void }) => (
         <button type="button" disabled={!props.canSend} onClick={props.onSend}>
             Send

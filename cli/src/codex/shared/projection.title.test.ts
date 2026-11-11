@@ -31,6 +31,26 @@ function params(item: unknown, turnId = 'turn') { return { threadId: 'thread', t
 function history(...items: unknown[]) { return { turns: [{ id: 'turn', status: 'completed', items }] }; }
 
 describe('shared Codex titles', () => {
+    it('keeps a user lock on live tool completions and historical title projection', async () => {
+        const f = fixture()
+        f.update(metadata => ({ ...metadata, titleLocked: true }))
+        await f.projection.notification('item/completed', params(titleItem('locked', 'Agent')))
+        await f.projection.history(history(titleItem('old-locked', 'Historical')))
+        expect(f.metadata()).toMatchObject({ name: 'Manual name', titleLocked: true })
+    })
+    it('preserves a user rename made after an agent title completion was queued', async () => {
+        const f = fixture(undefined, true);
+        await f.projection.notification('item/completed', params(titleItem('title', 'Planned title')));
+        // The hub rename arrives before the CLI metadata lock executes the write.
+        Object.assign(f.metadata(), { name: 'My title', nameSource: 'user' });
+        f.flush();
+        f.projection.reset();
+        await f.projection.history(history(titleItem('title', 'Planned title')));
+        await f.projection.notification('item/completed', params(titleItem('later', 'Another plan')));
+        f.flush();
+        expect(f.metadata()).toMatchObject({ name: 'My title', nameSource: 'user' });
+    });
+
     it('renames via metadata.name so a spawn name does not hide change_title', async () => {
         const f = fixture();
         const item = titleItem('title', ' Remote title ');

@@ -9,13 +9,14 @@ const harness = vi.hoisted(() => ({
 }))
 
 vi.mock('@/claude/utils/startHappyServer', () => ({
-    startHappyServer: vi.fn(async (_client: unknown, options: { skillLookup?: unknown }) => {
+    startHappyServer: vi.fn(async (_client: unknown, options: { skillLookup?: unknown; enablePeerCollaboration?: boolean }) => {
         harness.startOptions = options
+        const peerTools = options.enablePeerCollaboration ? ['list_peers', 'ping_peer', 'inspect_peer', 'spawn_peer'] : []
         return {
             url: 'http://127.0.0.1:43006/',
             toolNames: options.skillLookup
-                ? ['change_title', 'display_image', 'display_video', 'display_media', 'list_peers', 'ping_peer', 'inspect_peer', 'skill_lookup']
-                : ['change_title', 'display_image', 'display_video', 'display_media', 'list_peers', 'ping_peer', 'inspect_peer'],
+                ? ['change_title', 'display_image', 'display_video', 'display_media', ...peerTools, 'session_job', 'skill_lookup']
+                : ['change_title', 'display_image', 'display_video', 'display_media', ...peerTools, 'session_job'],
             stop: vi.fn()
         }
     })
@@ -60,10 +61,13 @@ describe('buildHapiMcpBridge skill lookup config', () => {
             flavor: 'opencode'
         }
 
-        const bridge = await buildHapiMcpBridge(createClient(), { skillLookup })
+        const bridge = await buildHapiMcpBridge(createClient(), { skillLookup, enablePeerCollaboration: true })
 
         expect(harness.startOptions).toEqual({
             emitTitleSummary: undefined,
+            enableChangeTitle: undefined,
+            workingDirectory: '/repo',
+            enablePeerCollaboration: true,
             skillLookup
         })
         expect(harness.cliArgs).toEqual([
@@ -71,16 +75,17 @@ describe('buildHapiMcpBridge skill lookup config', () => {
             '--url',
             'http://127.0.0.1:43006/',
             '--tools',
-            'change_title,display_image,display_video,display_media,list_peers,ping_peer,inspect_peer,skill_lookup',
+            'change_title,display_image,display_video,display_media,list_peers,ping_peer,inspect_peer,spawn_peer,session_job,skill_lookup',
             '--hapi-session-id',
             'hub-session-1',
         ])
         expect(bridge.mcpServers.hapi.tools).toEqual({
-            change_title: { approval_mode: 'approve' },
             display_image: { approval_mode: 'prompt' },
             display_video: { approval_mode: 'prompt' },
             display_media: { approval_mode: 'prompt' },
+            change_title: { approval_mode: 'approve' },
             list_peers: { approval_mode: 'approve' },
+            session_job: { approval_mode: 'approve' },
             skill_lookup: { approval_mode: 'approve' }
         })
     })
@@ -93,16 +98,16 @@ describe('buildHapiMcpBridge skill lookup config', () => {
             '--url',
             'http://127.0.0.1:43006/',
             '--tools',
-            'change_title,display_image,display_video,display_media,list_peers,ping_peer,inspect_peer',
+            'change_title,display_image,display_video,display_media,session_job',
             '--hapi-session-id',
             'hub-session-1',
         ])
         expect(bridge.mcpServers.hapi.tools).toEqual({
-            change_title: { approval_mode: 'approve' },
             display_image: { approval_mode: 'prompt' },
             display_video: { approval_mode: 'prompt' },
             display_media: { approval_mode: 'prompt' },
-            list_peers: { approval_mode: 'approve' }
+            change_title: { approval_mode: 'approve' },
+            session_job: { approval_mode: 'approve' }
         })
     })
 

@@ -4,9 +4,8 @@ import type { Metadata } from '@/api/types';
 type SessionDisplayRenameClient = Pick<ApiSessionClient, 'updateMetadata'>;
 
 /**
- * Explicit agent/operator rename: set metadata.name (same field as web
- * renameSession / PATCH /sessions/:id). Distinct from native/generated
- * summaries, which must not overwrite an intentional name.
+ * Agent rename: set metadata.name unless the user has chosen a title.
+ * Web/operator renames own the title and take priority over agent updates.
  */
 export function normalizeSessionDisplayTitle(title: unknown): string | null {
     if (typeof title !== 'string') {
@@ -26,12 +25,14 @@ export function applySessionDisplayRename(
     }
 
     client.updateMetadata((metadata: Metadata) => {
+        if (metadata.titleLocked || (metadata.titleLocked !== false && metadata.nameSource === 'user')) return metadata;
         if (metadata.name?.trim() === normalized) {
             return metadata;
         }
         return {
             ...metadata,
-            name: normalized
+            name: normalized,
+            nameSource: 'agent'
         };
     });
     return true;

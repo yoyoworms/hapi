@@ -9,7 +9,9 @@ import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { getHappyCliCommand } from '@/utils/spawnHappyCLI';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { exportHapiSessionEnv } from '@/agent/hapiSessionEnv';
+import { isPeerToolsDisabled } from '@/modules/common/peerTools';
 import type { CodexMcpServerConfig } from './codexMcpServers';
+import { isPeerCollaborationEnabled } from '@/modules/common/peerCollaboration';
 
 /**
  * MCP server entry configuration.
@@ -48,6 +50,10 @@ export interface HapiMcpBridgeOptions {
     exportSessionEnv?: boolean;
     emitTitleSummary?: boolean;
     enableChangeTitle?: boolean;
+    onChangeTitle?: (title: string) => void;
+    /** Session project cwd for relative spawn_peer directories (Codex --cd aware). */
+    workingDirectory?: string;
+    enablePeerCollaboration?: boolean;
     skillLookup?: {
         workingDirectory: string;
         flavor: string;
@@ -82,6 +88,9 @@ export async function buildHapiMcpBridge(
     const happyServer = await startHappyServer(client, {
         emitTitleSummary: options.emitTitleSummary,
         enableChangeTitle: options.enableChangeTitle,
+        onChangeTitle: options.onChangeTitle,
+        workingDirectory: options.workingDirectory ?? options.skillLookup?.workingDirectory,
+        enablePeerCollaboration: options.enablePeerCollaboration,
         skillLookup: options.skillLookup
     });
     // Stamp the hub row id so orphanReap can find MCP helpers after the agent
@@ -111,13 +120,19 @@ export async function buildHapiMcpBridge(
             approval_mode: 'approve'
         };
     }
-    // Discovery shortlist only - same trust as skill_lookup / change_title.
-    tools.list_peers = {
+    if (!isPeerToolsDisabled() && (options.enablePeerCollaboration ?? isPeerCollaborationEnabled())) {
+        // Discovery is only available in explicitly opted-in collaboration mode.
+        tools.list_peers = {
+            approval_mode: 'approve'
+        };
+    }
+    // Own-session progress meter (tiann/hapi#1404) — hub REST, not peer inject.
+    tools.session_job = {
         approval_mode: 'approve'
     };
-    // ping_peer / inspect_peer are registered on the HTTP MCP server / stdio
-    // bridge, but are not auto-approved: they target another session (resume +
-    // inject, or read peer histories).
+    // ping_peer / inspect_peer / spawn_peer are registered on the HTTP MCP
+    // server / stdio bridge, but are not auto-approved: they target another
+    // session (resume + inject, read peer histories, or create + inject).
     if (options.skillLookup) {
         tools.skill_lookup = {
             approval_mode: 'approve'

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -32,6 +32,39 @@ describe('paginated rollout recovery', () => {
         expect(converted.slice(converted.indexOf('\n') + 1)).toBe(history);
         expect(await readFile(source.path, 'utf8')).toBe(source.contents);
         if (process.platform !== 'win32') expect((await stat(path)).mode & 0o777).toBe(0o600);
+    });
+
+    it('materializes an external base history before converting to legacy', async () => {
+        directory = await mkdtemp(join(tmpdir(), 'hapi-legacy-rollout-'));
+        const sessions = join(directory, 'sessions');
+        await mkdir(sessions);
+        const parentHistory = `${JSON.stringify({ type: 'event_msg', ordinal: 1, payload: { text: 'parent' } })}\n`;
+        const parentHeader = `${JSON.stringify({ type: 'session_meta', payload: { id: 'parent', history_mode: 'legacy' } })}\n`;
+        const parentPath = join(sessions, 'rollout-parent.jsonl');
+        await writeFile(parentPath, parentHeader + parentHistory);
+        const endByteOffset = Buffer.byteLength(parentHeader + parentHistory);
+        const childHistory = `${JSON.stringify({ type: 'event_msg', ordinal: 2, payload: { text: 'child' } })}\n`;
+        const childPayload = {
+            id: 'thread',
+            history_mode: 'paginated',
+            history_base: { thread_id: 'parent', end_byte_offset: endByteOffset, end_ordinal_exclusive: 2 }
+        };
+        const child = {
+            path: join(directory, 'rollout-thread.jsonl'),
+            contents: `${JSON.stringify({ type: 'session_meta', payload: childPayload })}\n${childHistory}`
+        };
+        await writeFile(child.path, child.contents);
+
+        const converted = await prepareLegacyRollout(child.path, 'thread', { historyRoot: directory });
+        const contents = await readFile(converted, 'utf8');
+        const firstNewline = contents.indexOf('\n');
+        expect(JSON.parse(contents.slice(0, firstNewline)).payload).toEqual({
+            id: 'thread',
+            history_mode: 'legacy'
+        });
+        expect(contents.slice(firstNewline + 1)).toBe(parentHistory + childHistory);
+        expect(await readFile(parentPath, 'utf8')).toBe(parentHeader + parentHistory);
+        expect(await readFile(child.path, 'utf8')).toBe(child.contents);
     });
 
     it.each([

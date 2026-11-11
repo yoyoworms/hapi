@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, mock } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, it, mock } from 'bun:test'
 import { Hono } from 'hono'
 import type { SyncEngine } from '../../sync/syncEngine'
 import { createConfiguration } from '../../configuration'
@@ -17,10 +17,28 @@ function authHeaders() {
     }
 }
 
+const testCliApiToken = 'test-cli-token-0123456789abcdef'
+let previousCliApiToken: string | undefined
+
+function restoreCliApiTokenEnv(): void {
+    if (previousCliApiToken === undefined) delete process.env.CLI_API_TOKEN
+    else process.env.CLI_API_TOKEN = previousCliApiToken
+}
+
 beforeAll(async () => {
-    const config = await createConfiguration()
-    config._setCliApiToken('test-token', 'env', false)
+    previousCliApiToken = process.env.CLI_API_TOKEN
+    // Do not let a developer's real settings.json (including an old
+    // namespace-suffixed token) make this route test fail during setup.
+    process.env.CLI_API_TOKEN = testCliApiToken
+    try {
+        const config = await createConfiguration()
+        config._setCliApiToken('test-token', 'env', false)
+    } finally {
+        restoreCliApiTokenEnv()
+    }
 })
+
+afterAll(restoreCliApiTokenEnv)
 
 describe('cli resume routes', () => {
     it('returns local resumable sessions', async () => {

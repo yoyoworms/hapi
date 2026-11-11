@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import type { Database } from 'bun:sqlite'
 import { Store } from './index'
 import { randomUUID } from 'node:crypto'
 import { SessionIdentityConflictError } from './sessions'
@@ -44,6 +45,53 @@ describe('session ordering', () => {
 
         expect(store.sessions.getSessionsByNamespace('default').map((session) => session.id))
             .toEqual(['session-a', 'session-b'])
+        store.close()
+    })
+})
+
+describe('user title ownership', () => {
+    it('keeps a title on a preallocated session when the runner adopts it', () => {
+        const store = makeStore()
+        const id = randomUUID()
+        store.sessions.getOrCreateSession(`machine-spawn:${id}`, {
+            path: '/tmp/project', host: 'localhost', name: 'My title', nameSource: 'user'
+        }, null, 'default', undefined, undefined, undefined, id)
+        const adopted = store.sessions.adoptPreallocatedSession(id, randomUUID(), {
+            path: '/tmp/project', host: 'localhost', name: 'Agent title', nameSource: 'agent'
+        }, null, 'default')
+        expect(adopted.metadata).toMatchObject({ name: 'My title', nameSource: 'user' })
+        store.close()
+    })
+
+    it.each([
+        { name: 'Planned title', nameSource: 'agent' },
+        { name: 'Stale title', nameSource: 'user' },
+        { name: 'Native title' },
+        { name: null, nameSource: null },
+        { tools: ['read_file'] },
+        null
+    ])('preserves the user title for an automatic metadata replacement: %j', (incoming) => {
+        const store = makeStore()
+        const created = store.sessions.getOrCreateSession('user-title', {
+            path: '/tmp/project', host: 'localhost', name: 'My title', nameSource: 'user'
+        }, null, 'default')
+
+        const result = store.sessions.updateSessionMetadata(created.id, incoming, created.metadataVersion, 'default')
+        expect(result).toMatchObject({ result: 'success', value: { name: 'My title', nameSource: 'user' } })
+        expect(getMetadata(store, created.id)).toMatchObject({ name: 'My title', nameSource: 'user' })
+        store.close()
+    })
+
+    it('still rejects stale versions without applying any part of the incoming update', () => {
+        const store = makeStore()
+        const created = store.sessions.getOrCreateSession('user-title-stale', {
+            path: '/tmp/project', host: 'localhost', name: 'My title', nameSource: 'user'
+        }, null, 'default')
+        const result = store.sessions.updateSessionMetadata(created.id, {
+            name: 'Planned title', tools: ['new_tool']
+        }, created.metadataVersion - 1, 'default')
+        expect(result).toMatchObject({ result: 'version-mismatch', value: { name: 'My title', nameSource: 'user' } })
+        expect(getMetadata(store, created.id)?.tools).toBeUndefined()
         store.close()
     })
 })
@@ -518,6 +566,71 @@ describe('updateSessionMetadata: refuse un-archive (#1911 M1)', () => {
 })
 
 describe('updateSessionMetadata: protocol resume token preservation', () => {
+    it('preserves a generated fork summary across sparse child startup metadata', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'fork-summary-preserve',
+            { path: '/tmp/project', host: 'example', summary: { text: 'Fork: Source title', updatedAt: 1234 } },
+            null,
+            'default'
+        )
+        const result = store.sessions.updateSessionMetadata(
+            session.id,
+            { path: '/tmp/project', host: 'example', lifecycleState: 'running' },
+            session.metadataVersion,
+            'default'
+        )
+        expect(result.result).toBe('success')
+        expect(getMetadata(store, session.id)?.summary).toEqual({ text: 'Fork: Source title', updatedAt: 1234 })
+        store.close()
+    })
+
+    it('does not globally preserve ordinary summaries across sparse metadata updates', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'ordinary-summary-replace',
+            { path: '/tmp/project', host: 'example', summary: { text: 'Generated title', updatedAt: 1234 } },
+            null,
+            'default'
+        )
+        const result = store.sessions.updateSessionMetadata(
+            session.id,
+            { path: '/tmp/project', host: 'example', lifecycleState: 'running' },
+            session.metadataVersion,
+            'default'
+        )
+        expect(result.result).toBe('success')
+        expect(getMetadata(store, session.id)?.summary).toBeUndefined()
+        store.close()
+    })
+
+    it('preserves the automatic title attempt marker across sparse metadata updates', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession(
+            'auto-title-marker',
+            {
+                path: '/tmp/project',
+                host: 'example',
+                titleSuggestionAutoAttemptedAt: 1234,
+                titleSuggestionTurn: { first: true, completed: false }
+            },
+            null,
+            'default'
+        )
+
+        const result = store.sessions.updateSessionMetadata(
+            session.id,
+            { path: '/tmp/project', host: 'example', lifecycleState: 'archived' },
+            session.metadataVersion,
+            'default'
+        )
+
+        expect(result.result).toBe('success')
+        expect(getMetadata(store, session.id)?.titleSuggestionAutoAttemptedAt).toBe(1234)
+        expect(getMetadata(store, session.id)?.titleSuggestionTurn).toEqual({ first: true, completed: false })
+        store.close()
+    })
+
     it('preserves cursorSessionId when archive payload omits it (Cursor crash-archive)', () => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(
@@ -602,7 +715,8 @@ describe('updateSessionMetadata: protocol resume token preservation', () => {
         ['cursorSessionId', 'cursor-thread-x'],
         ['kimiSessionId', 'kimi-thread-x'],
         ['copilotSessionId', 'copilot-thread-x'],
-        ['piSessionId', 'pi-thread-x']
+        ['piSessionId', 'pi-thread-x'],
+        ['dshSessionId', 'dsh-thread-x']
     ])('preserves %s across an archive metadata replacement', (field, value) => {
         const store = makeStore()
         const session = store.sessions.getOrCreateSession(
@@ -1369,5 +1483,29 @@ describe('session todo recency and watermark', () => {
         expect(after?.todosUpdatedAt).toBe(51)
 
         store.close()
+    })
+})
+
+describe('updateSessionAgentState: updated_at (#1855)', () => {
+    it('only advances updated_at when a new permission request arrives', () => {
+        const store = makeStore()
+        const session = store.sessions.getOrCreateSession('agent-state-recency', { path: '/tmp/p', host: 'h' }, null, 'default')
+        const resetUpdatedAt = () => (store as unknown as { db: Database }).db
+            .prepare('UPDATE sessions SET updated_at = 1000 WHERE id = ?').run(session.id)
+        resetUpdatedAt()
+        const update = (state: unknown, version: number) =>
+            store.sessions.updateSessionAgentState(session.id, state, version, 'default')
+
+        expect(update({ codexUsage: { primary: 1 }, requests: {} }, 1).result).toBe('success')
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBe(1000)
+
+        expect(update({ requests: { r1: { tool: 'Bash', arguments: {} } } }, 2).result).toBe('success')
+        const touched = store.sessions.getSession(session.id)?.updatedAt ?? 0
+        expect(touched).toBeGreaterThan(1000)
+
+        resetUpdatedAt()
+        expect(update({ requests: {}, completedRequests: { r1: { tool: 'Bash', arguments: {}, status: 'approved' } } }, 3).result).toBe('success')
+        expect(store.sessions.getSession(session.id)?.updatedAt).toBe(1000)
+        expect(update({}, 3).result).toBe('version-mismatch')
     })
 })

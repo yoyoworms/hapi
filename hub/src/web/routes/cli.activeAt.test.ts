@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
 import type { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { createConfiguration } from '../../configuration'
@@ -29,10 +29,27 @@ function nullOutActiveAt(store: Store, sessionId: string): void {
     db.prepare('UPDATE sessions SET active_at = NULL WHERE id = ?').run(sessionId)
 }
 
+const testCliApiToken = 'test-cli-token-0123456789abcdef'
+let previousCliApiToken: string | undefined
+
+function restoreCliApiTokenEnv(): void {
+    if (previousCliApiToken === undefined) delete process.env.CLI_API_TOKEN
+    else process.env.CLI_API_TOKEN = previousCliApiToken
+}
+
 beforeAll(async () => {
-    const config = await createConfiguration()
-    config._setCliApiToken('test-token', 'env', false)
+    previousCliApiToken = process.env.CLI_API_TOKEN
+    // Keep this test independent of the user's persisted CLI token.
+    process.env.CLI_API_TOKEN = testCliApiToken
+    try {
+        const config = await createConfiguration()
+        config._setCliApiToken('test-token', 'env', false)
+    } finally {
+        restoreCliApiTokenEnv()
+    }
 })
+
+afterAll(restoreCliApiTokenEnv)
 
 describe('CLI GET /sessions/:id with null active_at', () => {
     it('returns numeric activeAt coerced from createdAt', async () => {
