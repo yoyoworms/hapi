@@ -45,8 +45,14 @@ export function mergeSessionMetadataForSessionMerge(
     const merged: Record<string, unknown> = { ...newObj }
     let changed = false
 
-    if (typeof oldObj.name === 'string' && typeof newObj.name !== 'string') {
+    const oldOwnsTitle = oldObj.titleLocked === true
+        || (oldObj.titleLocked !== false && oldObj.nameSource === 'user')
+    const newOwnsTitle = newObj.titleLocked === true
+        || (newObj.titleLocked !== false && newObj.nameSource === 'user')
+    if (typeof oldObj.name === 'string'
+        && (typeof newObj.name !== 'string' || (oldOwnsTitle && !newOwnsTitle))) {
         merged.name = oldObj.name
+        if (oldOwnsTitle) merged.nameSource = 'user'
         changed = true
     }
 

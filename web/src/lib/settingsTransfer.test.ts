@@ -30,6 +30,7 @@ const NOT_SETTINGS_KEYS = new Set([
     'hapi:newSession:launchSettings:v1',
     'hapi-share-transfers',
     'hapi:composer-drafts',
+    'hapi:composer-input-history:v2',
     'hapi:ask-user-question-drafts',
     'hapi:new-session-form-draft',
     'hapi:queued-edit-recovery',

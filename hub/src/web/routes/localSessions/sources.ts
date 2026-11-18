@@ -244,7 +244,7 @@ export const CODEX_LOCAL_SESSION_SOURCE: HubLocalSessionSource = {
     requestMetadata: (body) => (body.yolo === true ? { preferredPermissionMode: 'yolo' } : {}),
     legacy: {
         resultIdKey: 'codexSessionId',
-        async fetch({ engine, machineId, cwd, sessionIds }) {
+        async fetch({ engine, machineId, cwd, sessionIds, codexAccountId }) {
             const result = await engine.listCodexSessionsForMachine(machineId, cwd, sessionIds ?? undefined, codexAccountId)
             if (!result.success) return { success: false, error: result.error }
             return { success: true, sessions: result.sessions }

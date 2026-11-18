@@ -351,6 +351,7 @@ describe('agentQuotas parsers and probes', () => {
         vi.spyOn(CodexAppServerClient.prototype, 'initialize').mockResolvedValue({} as never)
         vi.spyOn(CodexAppServerClient.prototype, 'disconnect').mockResolvedValue(undefined)
         vi.spyOn(CodexAppServerClient.prototype, 'readAccount').mockResolvedValue({
+            requiresOpenaiAuth: true,
             account: {
                 type: 'chatgpt',
                 email: 'user@example.com',
@@ -857,6 +858,7 @@ describe('agentQuotas parsers and probes', () => {
 
         // 1. account/read succeeds, account/rateLimits/read rejects
         vi.spyOn(CodexAppServerClient.prototype, 'readAccount').mockResolvedValueOnce({
+            requiresOpenaiAuth: true,
             account: {
                 type: 'chatgpt',
                 email: 'user@example.com',

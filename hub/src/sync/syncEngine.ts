@@ -3209,6 +3209,10 @@ export class SyncEngine {
                 undefined,
                 rpcResult.forkSession === true,
                 undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
                 rpcResult.resumeSessionAt
             )
             if (spawn.type !== 'success') {
