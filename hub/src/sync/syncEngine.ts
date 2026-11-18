@@ -3796,9 +3796,10 @@ export class SyncEngine {
         if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const existing = this.archiveRequests.get(sessionId)
         if (existing) return existing
-        if (this.historyActionsInFlight.has(sessionId) || this.archivedForkPending(sessionId)) {
+        if (this.archivedForkPending(sessionId)) {
             throw new Error('Archived fork is in progress; retry the fork to reconcile it before archiving')
         }
+        if (this.historyActionsInFlight.has(sessionId)) throw new Error('Conversation history action already in progress')
         this.historyActionsInFlight.add(sessionId)
         const operation = this.archiveSessionUnlocked(sessionId)
         this.archiveRequests.set(sessionId, operation)
@@ -5380,7 +5381,7 @@ export class SyncEngine {
         }
 
         if (this.historyActionsInFlight.has(sessionId)) {
-            return { type: 'error', message: 'Archived fork is in progress; retry the fork before reopening', code: 'resume_failed' }
+            return { type: 'error', message: 'Conversation history action already in progress', code: 'resume_failed' }
         }
         this.historyActionsInFlight.add(sessionId)
         const promise = (async () => {
@@ -5935,7 +5936,7 @@ export class SyncEngine {
         }
 
         if (this.historyActionsInFlight.has(sessionId)) {
-            return { type: 'error', message: 'Archived fork is in progress; retry the fork before reopening', code: 'resume_failed' }
+            return { type: 'error', message: 'Conversation history action already in progress', code: 'resume_failed' }
         }
         this.historyActionsInFlight.add(sessionId)
         const promise = (async () => {
