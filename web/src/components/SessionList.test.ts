@@ -21,6 +21,7 @@ import {
     normalizeSearch,
     prepareSidebarSessions,
     sessionMatchesQuery,
+    sessionMatchesSearchMode,
     shouldShowPinnedDivider,
     shouldShowSessionInSidebar
 } from './SessionList'
@@ -127,6 +128,18 @@ describe('deduplicateSessionsByAgentId', () => {
         expect(result[0].id).toBe('b') // more recent wins
     })
 
+    it('keeps machine-local agent ids recorded on different machines apart', () => {
+        for (const flavor of ['codex', 'claude', 'pi', 'opencode']) {
+            const sessions = [
+                makeSession({ id: `${flavor}-a`, metadata: { path: '/p', agentSessionId: 'native-1', flavor, machineId: 'machine-a' }, updatedAt: 100 }),
+                makeSession({ id: `${flavor}-b`, metadata: { path: '/p', agentSessionId: 'native-1', flavor, machineId: 'machine-b' }, updatedAt: 200 }),
+                makeSession({ id: `${flavor}-b2`, metadata: { path: '/p', agentSessionId: 'native-1', flavor, machineId: 'machine-b' }, updatedAt: 300 })
+            ]
+            expect(deduplicateSessionsByAgentId(sessions).map((session) => session.id).sort())
+                .toEqual([`${flavor}-a`, `${flavor}-b2`])
+        }
+    })
+
     it('keeps active session over inactive duplicate', () => {
         const sessions = [
             makeSession({ id: 'a', active: true, metadata: { path: '/p', agentSessionId: 'thread-1' }, updatedAt: 100 }),
@@ -162,6 +175,24 @@ describe('deduplicateSessionsByAgentId', () => {
         ]
         const result = deduplicateSessionsByAgentId(sessions)
         expect(result.map((s) => s.id).sort()).toEqual(['job-loser', 'winner-active'])
+    })
+
+    it('keeps every live Claude duplicate visible (hub does not merge two live rows)', () => {
+        const sessions = [
+            makeSession({ id: 'runner', active: true, metadata: { path: '/p', agentSessionId: 'claude-1', flavor: 'claude' }, updatedAt: 100 }),
+            makeSession({ id: 'terminal', active: true, metadata: { path: '/p', agentSessionId: 'claude-1', flavor: 'claude' }, updatedAt: 200 }),
+            makeSession({ id: 'old', metadata: { path: '/p', agentSessionId: 'claude-1', flavor: 'claude' }, updatedAt: 300 })
+        ]
+        const result = deduplicateSessionsByAgentId(sessions)
+        expect(result.map((s) => s.id)).toEqual(['terminal', 'runner'])
+    })
+
+    it('still collapses live Codex duplicates', () => {
+        const sessions = [
+            makeSession({ id: 'a', active: true, metadata: { path: '/p', agentSessionId: 'thread-1', flavor: 'codex' }, updatedAt: 100 }),
+            makeSession({ id: 'b', active: true, metadata: { path: '/p', agentSessionId: 'thread-1', flavor: 'codex' }, updatedAt: 200 })
+        ]
+        expect(deduplicateSessionsByAgentId(sessions).map((s) => s.id)).toEqual(['b'])
     })
 
     it('prefers selected session among inactive duplicates', () => {
@@ -479,6 +510,32 @@ describe('session list search helpers', () => {
         expect(sessionMatchesQuery(session, normalizeSearch('session-???'), 'desktop')).toBe(true)
         expect(sessionMatchesQuery(session, normalizeSearch('bot*review'), 'desktop')).toBe(false)
         expect(sessionMatchesQuery(session, normalizeSearch('bot review'), 'desktop')).toBe(true)
+    })
+
+    it('negates the existing matcher in exclude mode and keeps empty queries neutral', () => {
+        const matching = makeSession({
+            id: 'matching-session',
+            metadata: { path: '/work/archive', name: 'Archive task' }
+        })
+        const nonMatching = makeSession({
+            id: 'non-matching-session',
+            metadata: { path: '/work/hapi', name: 'Current task' }
+        })
+
+        expect(sessionMatchesSearchMode(matching, 'archive', 'desktop', 'default')).toBe(true)
+        expect(sessionMatchesSearchMode(matching, 'archive', 'desktop', 'exclude')).toBe(false)
+        expect(sessionMatchesSearchMode(nonMatching, 'archive', 'desktop', 'exclude')).toBe(true)
+        expect(sessionMatchesSearchMode(matching, '', 'desktop', 'exclude')).toBe(true)
+    })
+
+    it('preserves wildcard matching when excluding sessions', () => {
+        const matching = makeSession({
+            id: 'session-123',
+            metadata: { path: '/work/hapi', name: 'Fix Bot Review' }
+        })
+
+        expect(sessionMatchesSearchMode(matching, '*bot*', 'desktop', 'exclude')).toBe(false)
+        expect(sessionMatchesSearchMode(matching, '*missing*', 'desktop', 'exclude')).toBe(true)
     })
 })
 

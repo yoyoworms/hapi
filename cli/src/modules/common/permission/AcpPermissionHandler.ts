@@ -3,6 +3,7 @@ import type { AgentBackend, PermissionRequest, PermissionResponse } from '@/agen
 import type { PermissionMode } from '@hapi/protocol/types'
 import { deriveToolInput, deriveToolName } from '@/agent/utils'
 import { logger } from '@/ui/logger'
+import { settleRequestsOfPreviousAgentProcess } from '@/modules/common/permission/settleStaleRequests'
 import {
     BasePermissionHandler,
     type AutoApprovalDecision,
@@ -73,9 +74,17 @@ export class AcpPermissionHandler extends BasePermissionHandler<PermissionRespon
             // Called when a request starts waiting for the user; the returned
             // callback runs once it is answered (agents timing their own work).
             onUserWait?: () => () => void
+            // Called synchronously when a permission 'abort' decision cancels
+            // the prompt through the backend directly (never via the
+            // launcher's abort handler). Flavors that track cancels — e.g.
+            // dsh's implicit session-end detection on custom wrappers that
+            // close the session on session/cancel — use this to arm their
+            // detector for that cancel.
+            onCancelIssued?: () => void
         } = {}
     ) {
         super(session)
+        settleRequestsOfPreviousAgentProcess(this.backend, session)
         this.backend.onPermissionRequest((request) => this.handlePermissionRequest(request))
     }
 
@@ -108,7 +117,7 @@ export class AcpPermissionHandler extends BasePermissionHandler<PermissionRespon
         this.addPendingRequest(request.id, toolName, toolInput, {
             resolve: () => {},
             reject: () => {}
-        })
+        }, request.toolCallId)
         logger.debug(`[ACP] Permission request queued for ${toolName} (${request.id})`)
     }
 
@@ -126,6 +135,7 @@ export class AcpPermissionHandler extends BasePermissionHandler<PermissionRespon
                 ...currentState.completedRequests,
                 [request.id]: {
                     tool: toolName,
+                    toolCallId: request.toolCallId,
                     arguments: toolInput,
                     createdAt: timestamp,
                     completedAt: timestamp,
@@ -140,12 +150,12 @@ export class AcpPermissionHandler extends BasePermissionHandler<PermissionRespon
      * A question the agent asks the user, shown as `toolName` with `input`.
      * Never answered automatically, whatever the permission mode.
      */
-    askUser(id: string, toolName: string, input: unknown): Promise<UserAnswer> {
+    askUser(id: string, toolName: string, input: unknown, toolCallId?: string): Promise<UserAnswer> {
         return new Promise((resolve) => {
             this.userQuestions.set(id, resolve)
             this.usedIds.add(id)
             this.startUserWait(id)
-            this.addPendingRequest(id, toolName, input, { resolve: () => {}, reject: () => {} })
+            this.addPendingRequest(id, toolName, input, { resolve: () => {}, reject: () => {} }, toolCallId)
         })
     }
 
@@ -172,6 +182,7 @@ export class AcpPermissionHandler extends BasePermissionHandler<PermissionRespon
         const decision = response.decision ?? (response.approved ? 'approved' : 'denied')
 
         if (decision === 'abort' && request) {
+            this.options.onCancelIssued?.()
             await this.backend.cancelPrompt(request.sessionId)
         }
         if (request) {

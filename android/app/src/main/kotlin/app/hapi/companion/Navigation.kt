@@ -15,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -58,6 +59,10 @@ import app.hapi.companion.feature.newsession.NewSessionStrings
 import app.hapi.companion.feature.newsession.NewSessionViewModel
 import app.hapi.companion.feature.pairing.ManualEntryScreen
 import app.hapi.companion.feature.pairing.PairingScreen
+import app.hapi.companion.feature.pairing.PasskeySignInScreen
+import app.hapi.companion.feature.passkey.CredentialManagerPasskeyPlatform
+import app.hapi.companion.feature.passkey.findActivity
+import app.hapi.companion.feature.pairing.PairingError
 import app.hapi.companion.feature.pairing.PairingUiState
 import app.hapi.companion.feature.pairing.PairingViewModel
 import app.hapi.companion.feature.pairing.QrScanScreen
@@ -65,11 +70,16 @@ import app.hapi.companion.feature.scratchlist.ContentResolverAttachmentImporter
 import app.hapi.companion.feature.scratchlist.ScratchlistMedia
 import app.hapi.companion.feature.scratchlist.ScratchlistScreen
 import app.hapi.companion.feature.scratchlist.ScratchlistViewModel
+import app.hapi.companion.feature.sessions.InMemorySessionListOrderStore
+import app.hapi.companion.feature.sessions.SessionListOrderStore
 import app.hapi.companion.feature.sessions.SessionListViewModel
 import app.hapi.companion.feature.share.ShareScreen
 import app.hapi.companion.feature.share.ShareSessionGateway
 import app.hapi.companion.feature.share.ShareTarget
 import app.hapi.companion.feature.share.ShareTargetController
+import app.hapi.companion.feature.settings.PasskeysGateway
+import app.hapi.companion.feature.settings.PasskeysScreen
+import app.hapi.companion.feature.settings.PasskeysViewModel
 import app.hapi.companion.feature.settings.SettingsGeneralScreen
 import app.hapi.companion.feature.settings.SettingsHubScreen
 import app.hapi.companion.feature.settings.SettingsViewModel
@@ -79,6 +89,9 @@ import app.hapi.companion.feature.settings.UsageScreen
 import app.hapi.companion.feature.settings.UsageViewModel
 import app.hapi.data.auth.AuthTerminalReason
 import app.hapi.data.sse.SseSubscriptionKey
+import app.hapi.protocol.wire.PasskeySummary
+import app.hapi.protocol.wire.SessionListOrder
+import kotlinx.serialization.json.JsonObject
 import java.util.Base64
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -149,6 +162,7 @@ object Routes {
     const val PAIRING_LANDING = "pairing/landing"
     const val PAIRING_SCAN = "pairing/scan"
     const val PAIRING_MANUAL = "pairing/manual"
+    const val PAIRING_PASSKEY = "pairing/passkey"
 
     /**
      * Settings hub (category directory) + flat subpage routes (B-M4e → P2
@@ -159,6 +173,7 @@ object Routes {
     const val SETTINGS_GENERAL = "settings/general"
     const val SETTINGS_USAGE = "settings/usage"
     const val SETTINGS_STORAGE = "settings/storage"
+    const val SETTINGS_PASSKEYS = "settings/passkeys"
 }
 
 /**
@@ -360,7 +375,7 @@ fun HapiNavigation() {
                 factory = viewModelFactory { SessionListViewModelHolder() },
             )
             HomeScreen(
-                viewModel = holder.forHub(hubGraph),
+                viewModel = holder.forHub(hubGraph, graph.sessionListOrderPrefs),
                 activeHubUrl = activeHubUrl,
                 pairedHubs = registryState.hubs,
                 onSwitchHub = { hub -> scope.launch { graph.hubRegistry.setActiveHub(hub) } },
@@ -394,6 +409,18 @@ fun HapiNavigation() {
                 factory = viewModelFactory { SettingsViewModelHolder(graph, hubGraph) },
             )
             SettingsGeneralScreen(
+                viewModel = holder.viewModel,
+                onBack = { navController.popBackStack() },
+            )
+        }
+
+        composable(Routes.SETTINGS_PASSKEYS) {
+            val hubGraph = activeHubGraph ?: return@composable
+            val holder = viewModel<PasskeysViewModelHolder>(
+                key = "settingsPasskeys:${hubGraph.hubUrl}",
+                factory = viewModelFactory { PasskeysViewModelHolder(hubGraph) },
+            )
+            PasskeysScreen(
                 viewModel = holder.viewModel,
                 onBack = { navController.popBackStack() },
             )
@@ -686,6 +713,19 @@ fun HapiNavigation() {
                     }
                 }
                 NavigateHomeOnSuccess(navController, state)
+                val context = LocalContext.current
+                // Passkey sign-in starts the single system sheet right here.
+                // A passkey failure (incl. "enter the Hub address") continues
+                // on the passkey screen, which shares this ViewModel's state.
+                // Plain remember: returning to this screen must not re-navigate.
+                var passkeyStarted by remember { mutableStateOf(false) }
+                LaunchedEffect(state, passkeyStarted) {
+                    if (!passkeyStarted || state == PairingUiState.Validating) return@LaunchedEffect
+                    passkeyStarted = false
+                    if ((state as? PairingUiState.Error)?.error is PairingError.Passkey) {
+                        navController.navigate(Routes.PAIRING_PASSKEY)
+                    }
+                }
 
                 PairingScreen(
                     state = state,
@@ -697,6 +737,12 @@ fun HapiNavigation() {
                     },
                     onScanQr = { navController.navigate(Routes.PAIRING_SCAN) },
                     onManualEntry = { navController.navigate(Routes.PAIRING_MANUAL) },
+                    onPasskeySignIn = {
+                        context.findActivity()?.let { activity ->
+                            passkeyStarted = true
+                            viewModel.signInWithPasskey(null, CredentialManagerPasskeyPlatform(activity))
+                        }
+                    },
                     onPairPrefill = viewModel::pairFromPrefill,
                     onSwitchToPrefilledHub = viewModel::switchToPrefilledHub,
                     onDismissPrefill = viewModel::dismissPrefill,
@@ -726,6 +772,27 @@ fun HapiNavigation() {
                 ManualEntryScreen(
                     state = state,
                     onPair = viewModel::pair,
+                    onBack = { navController.popBackStack() },
+                    onDismissError = viewModel::dismissError,
+                )
+            }
+
+            composable(Routes.PAIRING_PASSKEY) { entry ->
+                val viewModel = pairingViewModel(navController, entry)
+                val state by viewModel.state.collectAsState()
+                val prefill by viewModel.prefill.collectAsState()
+                val context = LocalContext.current
+                NavigateHomeOnSuccess(navController, state)
+
+                PasskeySignInScreen(
+                    state = state,
+                    initialHubUrl = prefill?.hubUrl.orEmpty(),
+                    onSignIn = { hubUrl ->
+                        // The system sheet needs the hosting Activity.
+                        context.findActivity()?.let { activity ->
+                            viewModel.signInWithPasskey(hubUrl, CredentialManagerPasskeyPlatform(activity))
+                        }
+                    },
                     onBack = { navController.popBackStack() },
                     onDismissError = viewModel::dismissError,
                 )
@@ -772,7 +839,11 @@ private class ShareViewModelHolder : ViewModel() {
             }
         }
         return ShareModels(
-            SessionListViewModel(hub.sessionStore, hub.machineStore, hub.lastSeenStore, nextScope, hub.hubUrl),
+            SessionListViewModel(
+                hub.sessionStore, hub.machineStore, hub.lastSeenStore, nextScope, hub.hubUrl,
+                // The picker keeps the base order, not Home's sort preference.
+                orderStore = InMemorySessionListOrderStore(SessionListOrder.Base),
+            ),
             ShareTargetController(gateway, nextScope),
         ).also { models = it }
     }
@@ -796,7 +867,7 @@ private class SessionListViewModelHolder : ViewModel() {
     private var scope: CoroutineScope? = null
     private var model: SessionListViewModel? = null
 
-    fun forHub(hubGraph: HubGraph): SessionListViewModel {
+    fun forHub(hubGraph: HubGraph, orderStore: SessionListOrderStore): SessionListViewModel {
         model?.takeIf { graph === hubGraph }?.let { return it }
         model?.stop()
         scope?.cancel()
@@ -810,6 +881,7 @@ private class SessionListViewModelHolder : ViewModel() {
             scope = nextScope,
             hubKey = hubGraph.hubUrl,
             connectionState = hubGraph.sseEngine.connectionState(SseSubscriptionKey.Global),
+            orderStore = orderStore,
         ).also { model = it }
     }
 
@@ -943,6 +1015,27 @@ private class SettingsViewModelHolder(
     }
 }
 
+private class PasskeysViewModelHolder(hubGraph: HubGraph) : ViewModel() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    val viewModel = PasskeysViewModel(
+        gateway = object : PasskeysGateway {
+            override val hubUrl: String = hubGraph.hubUrl
+            private val api = hubGraph.session.api
+            override suspend fun list(): List<PasskeySummary> = api.getPasskeys().passkeys
+            override suspend fun registerOptions(): String = api.passkeyRegisterOptions()
+            override suspend fun registerVerify(response: JsonObject, name: String?) =
+                api.passkeyRegisterVerify(response, name)
+            override suspend fun delete(id: String) = api.deletePasskey(id)
+        },
+        scope = scope,
+    )
+
+    override fun onCleared() {
+        scope.cancel()
+    }
+}
+
 private class UsageViewModelHolder(hubGraph: HubGraph) : ViewModel() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -1059,6 +1152,7 @@ private fun NavHostController.navigateClearingBackStack(route: String) {
 /** Why the app fell back to pairing (resolved with a Context at the emit site). */
 private fun terminalNoticeRes(reason: AuthTerminalReason): Int = when (reason) {
     AuthTerminalReason.ACCESS_TOKEN_REJECTED -> R.string.pairing_notice_token_revoked
+    AuthTerminalReason.PASSKEY_SESSION_INVALID -> R.string.pairing_notice_passkey_session_invalid
     AuthTerminalReason.RETRY_EXHAUSTED -> R.string.pairing_notice_retry_exhausted
     AuthTerminalReason.MISSING_CREDENTIALS -> R.string.pairing_notice_missing_credentials
 }

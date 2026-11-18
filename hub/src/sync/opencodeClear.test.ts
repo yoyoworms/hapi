@@ -703,6 +703,7 @@ describe('SyncEngine.clearOpenCodeSession', () => {
                 undefined,
                 undefined,
                 undefined,
+                // resumeSessionAt — Claude-only history flag (drops guard not emitted)
                 undefined
             )
             expect(engine.getSessionByNamespace(replacementSessionId, 'default')?.metadata).toMatchObject({

@@ -45,6 +45,16 @@ describe('getPendingRequestKinds', () => {
         expect(kinds).toEqual(['input'])
     })
 
+    it('classifies Cursor questions as input', () => {
+        const kinds = getPendingRequestKinds(makeSession({
+            agentState: {
+                requests: {
+                    req1: { tool: 'CursorAskQuestion', arguments: {} }
+                }
+            }
+        }))
+        expect(kinds).toEqual(['input'])
+    })
     it('classifies other pending tools as permission', () => {
         const kinds = getPendingRequestKinds(makeSession({
             agentState: {
@@ -202,6 +212,25 @@ describe('toSessionSummary', () => {
         }))
 
         expect(summary.metadata?.hapiMcpUrl).toBe('http://127.0.0.1:42133/')
+    })
+
+    it('includes externalRefs in summary metadata', () => {
+        const externalRefs = [{
+            kind: 'github_pr' as const,
+            repo: 'tiann/hapi',
+            number: 1160,
+            url: 'https://github.com/tiann/hapi/pull/1160',
+            role: 'primary' as const
+        }]
+        const summary = toSessionSummary(makeSession({
+            metadata: {
+                path: '/proj',
+                host: 'local',
+                externalRefs
+            }
+        }))
+
+        expect(summary.metadata?.externalRefs).toEqual(externalRefs)
     })
 
     it('includes structured pendingRequests for hover-tooltip copy', () => {
@@ -374,6 +403,13 @@ describe('summary derivation helpers', () => {
         expect(toSessionSummary(makeSession()).attachedJobUpdatedAt).toBe(0)
     })
 
+    it('preserves server-owned Codex import state, including explicit clearing', () => {
+        for (const codexImportedAt of [123, null, undefined]) {
+            expect(toSessionSummaryMetadata({ path: '/work', host: 'test', codexImportedAt })?.codexImportedAt)
+                .toBe(codexImportedAt)
+        }
+    })
+
     it('toSessionSummaryMetadata returns null for null metadata', () => {
         expect(toSessionSummaryMetadata(null)).toBeNull()
         expect(toSessionSummaryMetadata(undefined)).toBeNull()
@@ -386,6 +422,24 @@ describe('summary derivation helpers', () => {
             cursorSessionId: 'cursor-xyz'
         })
         expect(summary?.agentSessionId).toBe('cursor-xyz')
+    })
+
+    it('toSessionSummaryMetadata omits lastModelError.lastUserMessage', () => {
+        const summary = toSessionSummaryMetadata({
+            path: '/p',
+            host: 'h',
+            lastModelError: {
+                eventId: 'evt-1',
+                kind: 'transport_closed',
+                transient: true,
+                rawSnippet: 'WritableIterable is closed',
+                atTs: 1,
+                priorAssistantClaimsDone: false,
+                lastUserMessage: 'secret prompt text that must not leak into list payloads'
+            }
+        })
+        expect(summary?.lastModelError?.eventId).toBe('evt-1')
+        expect(summary?.lastModelError).not.toHaveProperty('lastUserMessage')
     })
 
     it('carries current-fork capability into list summaries', () => {

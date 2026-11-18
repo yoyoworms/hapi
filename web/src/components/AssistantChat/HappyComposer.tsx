@@ -308,6 +308,7 @@ export function HappyComposer(props: {
     /** False when SessionChat has no attachment adapter for this session. */
     attachmentsEnabled?: boolean
     disabled?: boolean
+    isAborting?: boolean
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     copilotAgentMode?: CopilotAgentMode
@@ -318,6 +319,7 @@ export function HappyComposer(props: {
     allowSendWhenInactive?: boolean
     thinking?: boolean
     agentState?: AgentState | null
+    onPendingRequestClick?: (requestId: string) => void
     backgroundTaskCount?: number
     contextSize?: number
     contextCacheRead?: number
@@ -326,6 +328,8 @@ export function HappyComposer(props: {
     contextModel?: string | null
     controlledByUser?: boolean
     agentFlavor?: string | null
+    /** Session machine, for the plan-quota readout in the status bar. */
+    machineId?: string | null
     availableModelOptions?: Array<{ value: string | null; label: string; group?: string }>
     /** Full Pi model data with thinkingLevelMap for provider grouping + thinking level filtering */
     piModels?: PiModelSummary[]
@@ -440,6 +444,7 @@ export function HappyComposer(props: {
         allowSendWhenInactive = false,
         thinking = false,
         agentState,
+        onPendingRequestClick,
         backgroundTaskCount,
         contextSize,
         contextCacheRead,
@@ -447,6 +452,7 @@ export function HappyComposer(props: {
         contextModel,
         controlledByUser = false,
         agentFlavor,
+        machineId,
         availableModelOptions,
         piModels,
         piSelectedModel,
@@ -607,7 +613,7 @@ export function HappyComposer(props: {
     // Anchored settings sheet: the model/effort value buttons open only their
     // own section; the gear (null) opens the full sheet.
     const [settingsSection, setSettingsSection] = useState<'model' | 'effort' | null>(null)
-    const [isAborting, setIsAborting] = useState(false)
+    const isAborting = props.isAborting ?? false
     const [isSwitching, setIsSwitching] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
     // pendingSchedule is controlled externally when onSchedule prop is provided; otherwise local state
@@ -1041,12 +1047,6 @@ export function HappyComposer(props: {
     const terminalLabel = terminalUnsupported ? t('terminal.unsupportedWindows') : t('composer.terminal')
 
     useEffect(() => {
-        if (!isAborting) return
-        if (threadIsRunning) return
-        setIsAborting(false)
-    }, [isAborting, threadIsRunning])
-
-    useEffect(() => {
         if (!isSwitching) return
         if (controlledByUser) return
         setIsSwitching(false)
@@ -1055,7 +1055,6 @@ export function HappyComposer(props: {
     const handleAbort = useCallback(() => {
         if (abortDisabled) return
         haptic('error')
-        setIsAborting(true)
         api.thread().cancelRun()
     }, [abortDisabled, api, haptic])
 
@@ -1111,7 +1110,7 @@ export function HappyComposer(props: {
 
     const visibleModelEffortOptions = cursorDrillDownVariantOptions ?? modelEffortOptions
     const codexReasoningEffortOptions = useMemo(
-        () => agentFlavor === 'codex' || agentFlavor === 'opencode'
+        () => agentFlavor === 'codex' || agentFlavor === 'opencode' || agentFlavor === 'dsh'
             ? getCodexComposerReasoningEffortOptions(
                 modelReasoningEffort,
                 agentFlavor,
@@ -1393,6 +1392,23 @@ export function HappyComposer(props: {
 
         // Avoid intercepting IME composition keystrokes (Enter, arrows, etc.)
         if (e.nativeEvent.isComposing) {
+            return
+        }
+
+        // Alt+S is an explicit send shortcut, independent of the Enter setting.
+        // Match the logical key so keyboard layouts can map Alt+S to another physical key.
+        const isAltSShortcut =
+            (e.key === 's' || e.key === 'S')
+            && e.altKey
+            && !e.ctrlKey
+            && !e.metaKey
+            && !e.shiftKey
+        if (isAltSShortcut) {
+            e.preventDefault()
+            if (canSend) {
+                flushAndSend()
+                setShowContinueHint(false)
+            }
             return
         }
 
@@ -2434,8 +2450,10 @@ export function HappyComposer(props: {
 
                     <StatusBar
                         active={active}
+                        machineId={machineId}
                         thinking={thinking}
                         agentState={agentState}
+                        onPendingRequestClick={onPendingRequestClick}
                         backgroundTaskCount={backgroundTaskCount}
                         contextSize={contextSize}
                         contextCacheRead={contextCacheRead}

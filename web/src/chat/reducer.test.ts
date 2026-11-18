@@ -405,6 +405,57 @@ describe('reduceChatBlocks', () => {
         })
     })
 
+    it('renders reused agent tool call ids as separate cards via per-lifetime ids, next to legacy rows', () => {
+        // Some agents reuse `question:0` every turn. The CLI now stores each
+        // call lifetime as `<agent id>#<uuid>`; a session stored before that
+        // keeps its plain `question:0` row and request.
+        const questionCall = (messageId: string, callId: string, createdAt: number): NormalizedMessage => ({
+            id: messageId, localId: null, createdAt, role: 'agent', isSidechain: false,
+            content: [{
+                type: 'tool-call', id: callId, name: 'AskUserQuestion',
+                input: { questions: [{ question: 'Pick?', options: [{ label: 'A' }, { label: 'B' }] }] },
+                description: null, uuid: `u-${messageId}`, parentUUID: null
+            }]
+        })
+        const aborted = 'question:0#3f0e8b9a-1d2c-4e5f-8a9b-0c1d2e3f4a5b'
+        const reused = 'question:0#9b1c2d3e-4f5a-4b6c-8d7e-0f1a2b3c4d5e'
+        const messages = [
+            userMessage('u1', 'first', 1_700_000_000_000),
+            questionCall('legacy', 'question:0', 1_700_000_000_100),
+            userMessage('u2', 'second', 1_700_000_000_200),
+            questionCall('aborted', aborted, 1_700_000_000_300),
+            userMessage('u3', 'third', 1_700_000_000_400),
+            questionCall('reused', reused, 1_700_000_000_500)
+        ]
+        const agentState = {
+            requests: {
+                [reused]: { tool: 'AskUserQuestion', toolCallId: reused, arguments: {}, createdAt: 1_700_000_000_510 }
+            },
+            completedRequests: {
+                'question:0': {
+                    tool: 'AskUserQuestion', arguments: {}, status: 'approved', decision: 'approved',
+                    answers: { 0: ['A'] }, createdAt: 1_700_000_000_110, completedAt: 1_700_000_000_150
+                },
+                [aborted]: {
+                    tool: 'AskUserQuestion', toolCallId: aborted, arguments: {}, status: 'canceled', decision: 'abort',
+                    createdAt: 1_700_000_000_310, completedAt: 1_700_000_000_350
+                }
+            }
+        } as unknown as AgentState
+
+        const render = () => reduceChatBlocks(messages, agentState).blocks.flatMap((block) => (
+            block.kind === 'tool-call' ? [{ id: block.id, permission: block.tool.permission }] : []
+        ))
+        const cards = render()
+
+        expect(cards.map((card) => card.id)).toEqual(['question:0', aborted, reused])
+        expect(cards[0].permission).toMatchObject({ id: 'question:0', status: 'approved', answers: { 0: ['A'] } })
+        expect(cards[1].permission).toMatchObject({ id: aborted, status: 'canceled' })
+        expect(cards[2].permission).toMatchObject({ id: reused, status: 'pending' })
+        // A reload reduces the same stored rows and state to the same cards.
+        expect(render()).toEqual(cards)
+    })
+
     it('does not pin a resolved request as a bottom card when its message is not in the window', () => {
         // agentState keeps completedRequests after an ask is answered. With no
         // tool_use message loaded for it, the permission-only synthesis used to
@@ -426,6 +477,62 @@ describe('reduceChatBlocks', () => {
 
         const reduced = reduceChatBlocks(messages, agentState)
         expect(reduced.blocks.some(b => b.kind === 'tool-call' && b.id === 'ask-done')).toBe(false)
+    })
+
+    describe('question card free-text flag from the pending request', () => {
+        const toolCall = (input: unknown): NormalizedMessage => ({
+            id: 'agent-ask', localId: null, createdAt: 1_700_000_000_100, role: 'agent', isSidechain: false,
+            content: [{
+                type: 'tool-call', id: 'call_q', name: 'AskUserQuestion', input,
+                description: null, uuid: 'u-ask', parentUUID: null
+            }]
+        })
+        const pending = (allowFreeText?: boolean) => ({
+            requests: {
+                call_q: {
+                    tool: 'AskUserQuestion',
+                    arguments: { questions: [{ question: 'Pick?', options: [{ label: 'A' }], ...(allowFreeText === undefined ? {} : { allowFreeText }) }] },
+                    createdAt: 1_700_000_000_200
+                }
+            },
+            completedRequests: {}
+        }) as unknown as AgentState
+        const renderedFlag = (agentState: AgentState) => {
+            // agy's tool call input carries no flag: the form arrives later.
+            const reduced = reduceChatBlocks([
+                userMessage('u1', 'hello', 1_700_000_000_000),
+                toolCall({ questions: [{ question: 'Pick?', header: null, options: [{ label: 'A', description: null }], multiSelect: false }] })
+            ], agentState)
+            const block = reduced.blocks.find(b => b.kind === 'tool-call' && b.id === 'call_q')
+            const input = block?.kind === 'tool-call' ? block.tool.input as { questions: Array<{ allowFreeText?: boolean }> } : null
+            return input?.questions[0]?.allowFreeText
+        }
+
+        it('carries allowFreeText=false from the pending request onto the tool call input', () => {
+            expect(renderedFlag(pending(false))).toBe(false)
+        })
+
+        it('leaves the input without a flag when the request has none', () => {
+            expect(renderedFlag(pending())).toBeUndefined()
+        })
+    })
+
+    it('synthesizes the selected live-only request even when it predates the window', () => {
+        const messages = [userMessage('u1', 'hello', 1_700_000_000_000)]
+        const agentState = {
+            requests: {
+                'cursor-old': { tool: 'CursorAskQuestion', toolCallId: 'cursor-tool-call', arguments: { prompt: 'Pick one' }, createdAt: 1_600_000_000_000 },
+                'other-old': { tool: 'Bash', arguments: {}, createdAt: 1_600_000_000_100 }
+            },
+            completedRequests: {}
+        } as unknown as AgentState
+
+        const reduced = reduceChatBlocks(messages, agentState, { pendingRequestTargetId: 'cursor-old' })
+        const rendered = reduced.blocks.filter((block) => block.kind === 'tool-call').map((block) => block.kind === 'tool-call' ? block.id : null)
+        expect(rendered).toContain('cursor-tool-call')
+        const selectedBlock = reduced.blocks.find((block) => block.kind === 'tool-call' && block.id === 'cursor-tool-call')
+        expect(selectedBlock?.kind === 'tool-call' ? selectedBlock.tool.permission?.id : null).toBe('cursor-old')
+        expect(rendered).not.toContain('other-old')
     })
 
     it('still synthesizes a card for a pending request with no message in the window', () => {

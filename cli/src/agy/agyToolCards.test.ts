@@ -43,6 +43,20 @@ describe('mapAgyToolCall', () => {
         });
     });
 
+    it('keeps an empty replacement so a deletion edit still has a diff', () => {
+        expect(mapAgyToolCall(call('edit_file', { Path: '/a', Target: 'foo', Replacement: '' }))).toMatchObject({
+            name: 'Edit',
+            input: { file_path: '/a', old_string: 'foo', new_string: '' }
+        });
+    });
+
+    it('keeps empty content so an empty-file write still renders', () => {
+        expect(mapAgyToolCall(call('write_file', { Path: '/a', Content: '' }))).toMatchObject({
+            name: 'Write',
+            input: { file_path: '/a', content: '' }
+        });
+    });
+
     it('maps write_file to Write', () => {
         expect(mapAgyToolCall(call('write_file', { Path: '/a/c.md', Content: 'hello\n' }))).toMatchObject({
             name: 'Write', input: { file_path: '/a/c.md', content: 'hello\n' }
@@ -80,6 +94,93 @@ describe('mapAgyToolCall', () => {
         }))).toMatchObject({
             name: 'Task',
             input: { description: 'Image Generator', prompt: 'Draw it', subagent_type: 'image-generator' }
+        });
+    });
+
+    it('maps native swarm, post_message, send_message, swarm_wait, and read_board calls', () => {
+        expect(mapAgyToolCall(call('swarm', {
+            action: 'add',
+            name: 'parser',
+            brief: 'Fix parser tests',
+            model: 'gemini-4-argon-medium'
+        }))).toMatchObject({
+            name: 'Task',
+            input: {
+                description: 'Swarm worker: @parser',
+                prompt: 'Fix parser tests',
+                subagent_type: 'gemini-4-argon-medium'
+            }
+        });
+
+        expect(mapAgyToolCall(call('swarm', {
+            action: 'title',
+            title: 'the parser rewrite'
+        }))).toMatchObject({
+            name: 'TeamCreate',
+            input: { team_name: 'the parser rewrite' }
+        });
+
+        expect(mapAgyToolCall(call('swarm', {
+            action: 'kill',
+            name: 'parser'
+        }))).toMatchObject({
+            name: 'close_agent',
+            input: { target: 'parser' }
+        });
+
+        expect(mapAgyToolCall(call('swarm', {
+            action: 'status'
+        }))).toMatchObject({
+            name: 'list_agents',
+            input: { path_prefix: 'status' }
+        });
+
+        expect(mapAgyToolCall(call('swarm', {
+            action: 'model',
+            name: 'parser',
+            model: 'gemini-4-carbon-high'
+        }))).toMatchObject({
+            name: 'swarm',
+            title: 'Switch @parser model',
+            input: { name: 'gemini-4-carbon-high' }
+        });
+
+        expect(mapAgyToolCall(call('post_message', {
+            text: '@parser check src/api.rs',
+            channel: 'parser'
+        }))).toMatchObject({
+            name: 'SendMessage',
+            input: {
+                recipient: '#parser',
+                summary: '@parser check src/api.rs'
+            }
+        });
+
+        expect(mapAgyToolCall(call('send_message', {
+            Recipient: 'conv-123',
+            Message: 'Done with research'
+        }))).toMatchObject({
+            name: 'SendMessage',
+            input: {
+                recipient: 'conv-123',
+                summary: 'Done with research'
+            }
+        });
+
+        expect(mapAgyToolCall(call('swarm_wait', {
+            since: 4
+        }))).toMatchObject({
+            name: 'wait_agent',
+            input: { target: 'board > #4' }
+        });
+
+        expect(mapAgyToolCall(call('read_board', {
+            since: 2,
+            channel: 'parser'
+        }))).toMatchObject({
+            name: 'read_board',
+            title: 'Read swarm board (#parser)',
+            input: { name: 'since #2' }
         });
     });
 

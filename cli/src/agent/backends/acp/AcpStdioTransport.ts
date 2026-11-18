@@ -158,6 +158,12 @@ export class AcpStdioTransport {
             logger.debug('[ACP] agent CLI guard armed', describeAgentAcpGuardState(childPid));
         }
 
+        // A child can exit between the liveness check and a write. Node emits
+        // stream errors separately from the write callback; handle both paths.
+        this.process.stdin.on('error', (error) => {
+            this.markClosed(markAcpIndeterminate(error));
+        });
+
         this.process.stdout.setEncoding('utf8');
         this.process.stdout.on('data', (chunk) => this.handleStdout(chunk));
 
@@ -415,11 +421,13 @@ export class AcpStdioTransport {
         this.writePayload(payload);
     }
 
-    async close(): Promise<void> {
+    /** Ends the agent process; resolves true once its whole process tree is confirmed gone. */
+    async close(): Promise<boolean> {
         this.process.stdin.end();
-        await killProcessByChildProcess(this.process);
+        const treeGone = await killProcessByChildProcess(this.process);
         this.releaseAgentCliGuard();
         this.markClosed(new Error('ACP transport closed'));
+        return treeGone;
     }
 
     private formatExitAttribution(code: number | null, signal: NodeJS.Signals | null): string {

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import agySteeredTurn from './__fixtures__/agy-steered-turn.json';
-import type { AgentMessage } from '@/agent/types';
+import type { AgentMessage, PermissionRequest } from '@/agent/types';
 import { logger } from '@/ui/logger';
 import { AcpSdkBackend } from './AcpSdkBackend';
 import { AcpMessageHandler } from './AcpMessageHandler';
-import { buildAcpStdioSpawnOptions } from './AcpStdioTransport';
+import { ACP_INDETERMINATE_SYMBOL, AcpStdioTransport, buildAcpStdioSpawnOptions } from './AcpStdioTransport';
 import { ACP_SESSION_UPDATE_TYPES } from './constants';
 
 function sleep(ms: number): Promise<void> {
@@ -54,6 +54,99 @@ afterEach(() => {
 });
 
 describe('AcpSdkBackend', () => {
+    it('closes an opening transport without sending initialize', async () => {
+        const opening = Promise.withResolvers<AcpStdioTransport>();
+        const transport = {
+            onNotification: vi.fn(),
+            onStderrError: vi.fn(),
+            registerRequestHandler: vi.fn(),
+            sendRequest: vi.fn(),
+            close: vi.fn(async () => {})
+        };
+        const create = vi.spyOn(AcpStdioTransport, 'create').mockReturnValueOnce(opening.promise);
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        const initializing = backend.initialize().catch((error: unknown) => error);
+        const settled = vi.fn();
+        try {
+            const disconnect = backend.disconnect({ waitForTransport: true }).then(settled);
+            await Promise.resolve();
+            expect(settled).not.toHaveBeenCalled();
+            opening.resolve(transport as unknown as AcpStdioTransport);
+            await disconnect;
+            expect(transport.sendRequest).not.toHaveBeenCalled();
+            expect(await initializing).toMatchObject({ name: 'AbortError' });
+            expect(transport.close).toHaveBeenCalledOnce();
+        } finally {
+            opening.resolve(transport as unknown as AcpStdioTransport);
+            await initializing;
+            create.mockRestore();
+        }
+    });
+
+    it('retries a transient initialize failure without shutdown', async () => {
+        const transport = {
+            onNotification: vi.fn(),
+            onStderrError: vi.fn(),
+            registerRequestHandler: vi.fn(),
+            sendRequest: vi.fn()
+                .mockRejectedValueOnce(new Error('transient initialize failure'))
+                .mockResolvedValueOnce({ protocolVersion: 1, agentCapabilities: { loadSession: true } }),
+            close: vi.fn(async () => {})
+        };
+        const create = vi.spyOn(AcpStdioTransport, 'create')
+            .mockResolvedValueOnce(transport as unknown as AcpStdioTransport);
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        vi.useFakeTimers();
+        try {
+            const initializing = backend.initialize();
+            void initializing.catch(() => undefined);
+            await vi.advanceTimersByTimeAsync(1_500);
+            await expect(initializing).resolves.toBeUndefined();
+            expect(transport.sendRequest).toHaveBeenCalledTimes(2);
+            expect(backend.supportsLoadSession()).toBe(true);
+            expect(transport.close).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+            await backend.disconnect();
+            create.mockRestore();
+        }
+    });
+
+    it.each([false, true])('cancels initialize retries on shutdown (already backing off: %s)', async (backingOff) => {
+        const reply = Promise.withResolvers<never>();
+        const transport = {
+            onNotification: vi.fn(),
+            onStderrError: vi.fn(),
+            registerRequestHandler: vi.fn(),
+            sendRequest: vi.fn(() => reply.promise),
+            close: vi.fn(async () => { reply.reject(new Error('transport closed')); })
+        };
+        const create = vi.spyOn(AcpStdioTransport, 'create')
+            .mockResolvedValueOnce(transport as unknown as AcpStdioTransport);
+        const backend = new AcpSdkBackend({ command: 'agent' });
+        const rejected = vi.fn();
+        vi.useFakeTimers();
+        const initializing = backend.initialize().catch(rejected);
+        try {
+            await vi.advanceTimersByTimeAsync(0);
+            expect(transport.sendRequest).toHaveBeenCalledOnce();
+            if (backingOff) {
+                reply.reject(new Error('initialize failed'));
+                await vi.advanceTimersByTimeAsync(0);
+                expect(rejected).not.toHaveBeenCalled();
+            }
+            await backend.disconnect({ waitForTransport: true });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(rejected).toHaveBeenCalledOnce();
+            expect(transport.sendRequest).toHaveBeenCalledOnce();
+        } finally {
+            await vi.runAllTimersAsync();
+            await initializing;
+            vi.useRealTimers();
+            create.mockRestore();
+        }
+    });
+
     it('forwards ACP session_info_update titles without requiring an active prompt', () => {
         const backend = new AcpSdkBackend({ command: 'agent' });
         const updates: Array<{ sessionId: string | null; title: string | null }> = [];
@@ -222,7 +315,7 @@ describe('AcpSdkBackend', () => {
             }
         });
 
-        expect(capturedRequestId).toBe('tool-approve');
+        expect(capturedRequestId).toMatch(/^tool-approve#[0-9a-f-]{36}$/);
     });
 
     it('uses session/set_model by default (gemini flavor)', async () => {
@@ -361,7 +454,10 @@ describe('AcpSdkBackend', () => {
                             }]
                         },
                         _meta: {
-                            availableCommands: [{ name: 'auto' }],
+                            availableCommands: [
+                                { name: 'auto', description: 'Auto-approve safe tool calls' },
+                                { name: '/swarm', description: 'Run a native swarm' }
+                            ],
                             'x.ai/sessionConfig': {
                                 options: [
                                     { id: 'high', category: 'mode', label: 'High Effort', selected: false },
@@ -398,6 +494,11 @@ describe('AcpSdkBackend', () => {
             ]
         });
         expect(backend.hasAvailableCommand(sessionId, 'auto')).toBe(true);
+        expect(backend.hasAvailableCommand(sessionId, 'swarm')).toBe(true);
+        expect(backend.getAvailableCommands(sessionId)).toEqual([
+            { name: 'auto', description: 'Auto-approve safe tool calls' },
+            { name: 'swarm', description: 'Run a native swarm' }
+        ]);
 
         await backend.setMode(sessionId, 'high');
 
@@ -822,8 +923,10 @@ describe('AcpSdkBackend', () => {
         };
 
         await backend.prompt('session-1', [{ type: 'text', text: 'hello' }], () => {}, {
-            onSent: () => events.push('sent'),
-            onAnswered: () => events.push('answered')
+            timing: {
+                onSent: () => events.push('sent'),
+                onAnswered: () => events.push('answered')
+            }
         });
         events.push('resolved');
 
@@ -1002,6 +1105,39 @@ describe('AcpSdkBackend', () => {
 
         expect(lateIdx).toBeGreaterThanOrEqual(0);
         expect(turnCompleteIdx).toBeGreaterThan(lateIdx);
+    });
+
+    it('skips session/prompt when shouldSend is false after pre-prompt drain', async () => {
+        backendStatics.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS = 1;
+        backendStatics.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS = 50;
+        backendStatics.UPDATE_QUIET_PERIOD_MS = 1;
+        backendStatics.UPDATE_DRAIN_TIMEOUT_MS = 50;
+        backendStatics.LATE_FLUSH_WINDOW_MS = 1;
+
+        const backend = new AcpSdkBackend({ command: 'opencode' });
+        const backendInternal = backend as unknown as {
+            transport: {
+                sendRequest: (...args: unknown[]) => Promise<unknown>;
+                close: () => Promise<void>;
+            } | null;
+        };
+        let sendCalls = 0;
+        backendInternal.transport = {
+            sendRequest: async () => {
+                sendCalls += 1;
+                return { stopReason: 'end_turn' };
+            },
+            close: async () => {}
+        };
+
+        const sent = await backend.prompt(
+            'session-1',
+            [{ type: 'text', text: 'hi' }],
+            () => {},
+            { shouldSend: () => false }
+        );
+        expect(sent).toBe(false);
+        expect(sendCalls).toBe(0);
     });
 
     it('attributes pre-prompt straggler chunks to the previous turn\'s onUpdate', async () => {
@@ -1417,6 +1553,74 @@ describe('AcpSdkBackend', () => {
                 mcpServers: []
             }
         }]);
+    });
+
+    it('does not retry a terminal session/resume rejection (dsh: mismatched cwd / active session)', async () => {
+        // dsh answers a resume whose cwd does not realpath-match the stored
+        // session (or one that is still active elsewhere) with a TERMINAL
+        // invalidParams JSON-RPC error. Retrying it would only delay the
+        // caller's fresh-session fallback by the full backoff chain.
+        const backend = new AcpSdkBackend({ command: 'dsh' });
+        const calls: Array<{ method: string; params: unknown }> = [];
+        const backendInternal = backend as unknown as {
+            transport: {
+                sendRequest: (method: string, params: unknown) => Promise<unknown>;
+                close: () => Promise<void>;
+            } | null;
+        };
+        backendInternal.transport = {
+            sendRequest: async (method, params) => {
+                calls.push({ method, params });
+                throw new Error('Session cwd mismatch: session belongs to /other/path (-32602 invalidParams)');
+            },
+            close: async () => {}
+        };
+
+        await expect(backend.resumeSession({
+            sessionId: 'dsh-stored-1',
+            cwd: '/tmp',
+            mcpServers: []
+        })).rejects.toThrow('invalidParams');
+
+        // Exactly one session/resume request — no retry of the terminal error.
+        expect(calls.filter((call) => call.method === 'session/resume')).toHaveLength(1);
+    });
+
+    it('retries a transport-indeterminate session/resume failure and then succeeds', async () => {
+        // The child process died mid-request: the failure carries the
+        // transport's indeterminate marker (after a respawn the same request
+        // can succeed, so retrying it is correct).
+        const backend = new AcpSdkBackend({ command: 'dsh' });
+        const calls: Array<{ method: string; params: unknown }> = [];
+        let attempts = 0;
+        const backendInternal = backend as unknown as {
+            transport: {
+                sendRequest: (method: string, params: unknown) => Promise<unknown>;
+                close: () => Promise<void>;
+            } | null;
+        };
+        backendInternal.transport = {
+            sendRequest: async (method, params) => {
+                calls.push({ method, params });
+                attempts += 1;
+                if (attempts === 1) {
+                    const error = new Error('ACP process exited (code=1, signal=null)');
+                    Object.defineProperty(error, ACP_INDETERMINATE_SYMBOL, { value: true });
+                    throw error;
+                }
+                return { configOptions: [] };
+            },
+            close: async () => {}
+        };
+
+        const sessionId = await backend.resumeSession({
+            sessionId: 'dsh-stored-1',
+            cwd: '/tmp',
+            mcpServers: []
+        });
+
+        expect(sessionId).toBe('dsh-stored-1');
+        expect(calls.filter((call) => call.method === 'session/resume')).toHaveLength(2);
     });
 
     it('setMode falls back to session/set_config_option when session/set_mode is missing', async () => {
@@ -1903,6 +2107,113 @@ describe('AcpSdkBackend', () => {
         expect(turn1.some((m) => m.type === 'plan')).toBe(true);
     });
 
+    it('starts the suppression quiet window at operation completion when the previous turn was already idle', async () => {
+        backendStatics.UPDATE_QUIET_PERIOD_MS = 5;
+        backendStatics.UPDATE_DRAIN_TIMEOUT_MS = 100;
+        backendStatics.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS = 30;
+        backendStatics.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS = 300;
+        backendStatics.LATE_FLUSH_INTERVAL_MS = 5;
+        backendStatics.LATE_FLUSH_QUIET_PERIOD_MS = 5;
+        backendStatics.LATE_FLUSH_WINDOW_MS = 30;
+        const backend = new AcpSdkBackend({ command: 'opencode', flavor: 'opencode', textChunkMode: 'delta' });
+        const internal = backend as unknown as {
+            transport: unknown;
+            handleNotification(method: string, params: unknown): void;
+            sessionUpdateQueue: Promise<void>;
+            lastSessionUpdateAt: number;
+        };
+        internal.transport = { sendRequest: async () => ({ stopReason: 'end_turn' }), close: async () => {} };
+        const updates: AgentMessage[] = [];
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let delivered!: () => void;
+        const notificationDelivered = new Promise<void>(resolve => { delivered = resolve; });
+        const emitPlan = (text: string) => internal.handleNotification('session/update', {
+            sessionId: 'session-1', update: { sessionUpdate: ACP_SESSION_UPDATE_TYPES.plan,
+                entries: [{ content: text, priority: 'medium', status: 'pending' }] }
+        });
+        try {
+            await backend.prompt('session-1', [{ type: 'text', text: 'completed turn' }], update => updates.push(update));
+            // No notification has arrived during a long idle period before reload.
+            internal.lastSessionUpdateAt = Date.now() - 1_000;
+            const idleActivity = backend.getLastSessionUpdateAt();
+            const result = await backend.suppressUpdatesDuring(async () => {
+                timer = setTimeout(() => { emitPlan('late-reload-history'); delivered(); }, 15);
+                return 'loaded';
+            });
+            await notificationDelivered;
+            await internal.sessionUpdateQueue;
+            expect(result).toBe('loaded');
+            expect(JSON.stringify(updates)).not.toContain('late-reload-history');
+            expect(backend.getLastSessionUpdateAt()).toBeGreaterThan(idleActivity);
+            emitPlan('ordinary-update-after-reload');
+            await internal.sessionUpdateQueue;
+            expect(JSON.stringify(updates)).toContain('ordinary-update-after-reload');
+        } finally {
+            if (timer) clearTimeout(timer);
+            await backend.disconnect();
+        }
+    });
+
+    it('restores suppression after a load failure without discarding metadata, usage or the next response', async () => {
+        backendStatics.UPDATE_QUIET_PERIOD_MS = 5;
+        backendStatics.UPDATE_DRAIN_TIMEOUT_MS = 100;
+        backendStatics.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS = 30;
+        backendStatics.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS = 300;
+        backendStatics.LATE_FLUSH_INTERVAL_MS = 5;
+        backendStatics.LATE_FLUSH_QUIET_PERIOD_MS = 5;
+        backendStatics.LATE_FLUSH_WINDOW_MS = 30;
+        const retryOptions = (AcpSdkBackend as unknown as { INIT_RETRY_OPTIONS: { maxAttempts: number } }).INIT_RETRY_OPTIONS;
+        const originalMaxAttempts = retryOptions.maxAttempts;
+        retryOptions.maxAttempts = 1;
+        const backend = new AcpSdkBackend({ command: 'opencode', flavor: 'opencode', textChunkMode: 'delta' });
+        const internal = backend as unknown as {
+            transport: unknown;
+            handleNotification(method: string, params: unknown): void;
+            sessionUpdateQueue: Promise<void>;
+            messageHandler: unknown;
+            latestUsageUpdate: unknown;
+        };
+        const emit = (update: unknown) => internal.handleNotification('session/update', { sessionId: 'session-1', update });
+        let promptCount = 0;
+        internal.transport = {
+            close: async () => {},
+            sendRequest: async (method: string) => {
+                if (method === 'session/load') {
+                    emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'failed-load-replay' } });
+                    emit({ sessionUpdate: 'session_info_update', title: 'loaded-session-title' });
+                    emit({ sessionUpdate: 'usage_update', used: 4_200, size: 200_000 });
+                    throw new Error('fixture load rejection');
+                }
+                if (++promptCount === 2) emit({ sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: 'normal-after-load-failure' } });
+                return { stopReason: 'end_turn' };
+            }
+        };
+        const previous: AgentMessage[] = [];
+        const titles: unknown[] = [];
+        backend.setSessionInfoUpdateListener(update => titles.push(update));
+        try {
+            await backend.prompt('session-1', [{ type: 'text', text: 'previous prompt' }], update => previous.push(update));
+            const previousHandler = internal.messageHandler;
+            await expect(backend.suppressUpdatesDuring(() => backend.loadSession({
+                sessionId: 'session-1', cwd: '/tmp/project', mcpServers: []
+            }))).rejects.toThrow('fixture load rejection');
+            await internal.sessionUpdateQueue;
+            expect(internal.messageHandler).toBe(previousHandler);
+            expect(JSON.stringify(previous)).not.toContain('failed-load-replay');
+            expect(titles).toEqual([{ sessionId: 'session-1', title: 'loaded-session-title' }]);
+            expect(internal.latestUsageUpdate).toMatchObject({ contextTokens: 4_200, contextWindow: 200_000 });
+            const next: AgentMessage[] = [];
+            await backend.prompt('session-1', [{ type: 'text', text: 'next prompt' }], update => next.push(update));
+            expect(JSON.stringify(previous)).not.toContain('failed-load-replay');
+            expect(JSON.stringify(next)).toContain('normal-after-load-failure');
+            expect(JSON.stringify(next)).not.toContain('failed-load-replay');
+        } finally {
+            retryOptions.maxAttempts = originalMaxAttempts;
+            await backend.disconnect();
+        }
+    });
+
     it('drops updates enqueued while suppressed even if the queue drains after the handler is restored', async () => {
         // If handleSessionUpdate looked up this.messageHandler when the queued
         // microtask ran (instead of capturing it at enqueue), a compact-era
@@ -2130,8 +2441,10 @@ describe('AcpSdkBackend', () => {
         backend.setAgentActivityListener((thinking) => {
             activity.push(thinking);
         });
-        backend.onPermissionRequest(() => {
+        let request: PermissionRequest | null = null;
+        backend.onPermissionRequest((received) => {
             // leave pending; we only care that activity fired first
+            request = received;
         });
 
         const backendInternal = backend as unknown as {
@@ -2151,14 +2464,8 @@ describe('AcpSdkBackend', () => {
 
         expect(activity).toEqual([true]);
         // Cancel so the promise does not hang the suite.
-        await backend.respondToPermission('session-1', {
-            id: 'tc-1',
-            sessionId: 'session-1',
-            toolCallId: 'tc-1',
-            title: 'Shell',
-            kind: 'execute',
-            options: []
-        }, { outcome: 'cancelled' });
+        expect(request).not.toBeNull();
+        await backend.respondToPermission('session-1', request!, { outcome: 'cancelled' });
         await pending;
     });
 });
@@ -2609,5 +2916,28 @@ describe('AcpSdkBackend config_option_update', () => {
             (backend as unknown as { handleNotification: (m: string, p: unknown) => void }).handleNotification('session/update', update);
             expect(backend.getThoughtLevelConfigOption('s1')?.currentValue).toBe(configOptionUpdates ? 'low' : undefined);
         }
+    });
+});
+
+describe('AcpSdkBackend num_turns extraction (google-antigravity/antigravity-cli#1045)', () => {
+    const backend = new AcpSdkBackend({ command: 'agy', args: ['acp'] });
+
+    it('prefers usage.num_turns over the response top level and _meta', () => {
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', usage: { num_turns: 7 } })).toBe(7);
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', usage: { numTurns: 3 }, _meta: { num_turns: 9 } })).toBe(3);
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', num_turns: 4 })).toBe(4);
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', _meta: { numTurns: 5 } })).toBe(5);
+    });
+
+    it('ignores non-positive, garbage, and missing values', () => {
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', usage: {} })).toBeUndefined();
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', usage: { num_turns: 0 } })).toBeUndefined();
+        expect(backend.extractNumTurns({ stopReason: 'end_turn', usage: { num_turns: 'many' } })).toBeUndefined();
+        expect(backend.extractNumTurns({})).toBeUndefined();
+        expect(backend.extractNumTurns(null)).toBeUndefined();
+    });
+
+    it('rounds fractional numbers instead of dropping them', () => {
+        expect(backend.extractNumTurns({ usage: { num_turns: 2.9 } })).toBe(3);
     });
 });

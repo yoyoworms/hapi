@@ -71,7 +71,15 @@ export class SessionStore {
         metadata: unknown,
         expectedVersion: number,
         namespace: string,
-        options?: { touchUpdatedAt?: boolean; allowUnarchive?: boolean; allowTitleUpdate?: boolean; allowNameChange?: boolean; titleLocked?: boolean; inheritTitleLockFrom?: string }
+        options?: {
+            allowNameChange?: boolean
+            touchUpdatedAt?: boolean
+            allowUnarchive?: boolean
+            allowTitleUpdate?: boolean
+            preservePreallocation?: boolean
+            titleLocked?: boolean
+            inheritTitleLockFrom?: string
+        }
     ): VersionedUpdateResult<unknown | null> {
         return updateSessionMetadata(this.db, id, metadata, expectedVersion, namespace, options)
     }

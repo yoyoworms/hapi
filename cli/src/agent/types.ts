@@ -18,10 +18,22 @@ export type AgentSessionConfig = {
     mcpServers: McpServerStdio[];
 };
 
-export type PromptContent = {
-    type: 'text';
-    text: string;
-};
+/**
+ * ACP prompt content blocks. Text blocks are universal; image blocks carry
+ * the canonical base64 form and are only accepted by agents that advertise
+ * `agentCapabilities.promptCapabilities.image` in their initialize result
+ * (e.g. DSH 0.2.2+).
+ */
+export type PromptContent =
+    | {
+        type: 'text';
+        text: string;
+    }
+    | {
+        type: 'image';
+        data: string;
+        mimeType: string;
+    };
 
 export type PlanItem = {
     content: string;
@@ -78,7 +90,7 @@ export type AgentMessage =
     }
     | { type: 'plan'; items: PlanItem[] }
     | { type: 'generated_image'; imageId: string; fileName: string; mimeType: string; source?: InlineMediaSource }
-    | { type: 'turn_complete'; stopReason: string }
+    | { type: 'turn_complete'; stopReason: string; numTurns?: number }
     | { type: 'round_summary'; summary: AgentRoundSummary }
     | { type: 'error'; message: string };
 
@@ -108,6 +120,11 @@ export type FormElicitationRequest = {
     sessionId: string;
     /** Tool call that triggered the form, when the agent links one. */
     toolCallId?: string;
+    /**
+     * Id for this question's request, set with toolCallId. The first request
+     * of a call uses the call id; a later one gets its own id.
+     */
+    requestId?: string;
     message: string;
     /** JSON-Schema-like object schema; shape is owned by the agent. */
     requestedSchema: unknown;
@@ -150,7 +167,12 @@ export interface AgentBackend {
     setConfigOption?(sessionId: string, configId: string, value: string): Promise<void>;
     getSessionModelsMetadata?(sessionId: string): AgentSessionModelsMetadata | undefined;
     getThoughtLevelConfigOption?(sessionId: string): AgentSessionConfigOptionDescriptor | undefined;
-    prompt(sessionId: string, content: PromptContent[], onUpdate: (msg: AgentMessage) => void): Promise<void>;
+    prompt(
+        sessionId: string,
+        content: PromptContent[],
+        onUpdate: (msg: AgentMessage) => void,
+        options?: { shouldSend?: () => boolean }
+    ): Promise<void | boolean>;
     cancelPrompt(sessionId: string): Promise<void>;
     respondToPermission(sessionId: string, request: PermissionRequest, response: PermissionResponse): Promise<void>;
     onPermissionRequest(handler: (request: PermissionRequest) => void): void;
@@ -160,6 +182,12 @@ export interface AgentBackend {
      * on abort and disconnect.
      */
     onFormElicitation?(handler: (request: FormElicitationRequest) => Promise<FormElicitationResponse>): void;
+    /**
+     * Whether the agent still waits for an answer to `requestId`. Backends
+     * that know it let permission writers settle requests stored by an agent
+     * process that no longer exists.
+     */
+    hasLiveRequest?(requestId: string): boolean;
     disconnect(): Promise<void>;
 }
 

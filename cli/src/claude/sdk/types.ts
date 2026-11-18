@@ -101,6 +101,12 @@ export interface SDKResultMessage extends SDKMessage {
     duration_api_ms: number
     is_error: boolean
     session_id: string
+    /**
+     * Set in-process by claudeRemote on the result of a manual /compact turn,
+     * so the log converter can skip tok/s fields for it: a compaction call is
+     * not an assistant round. Never present on the wire from Claude itself.
+     */
+    hapi_compact_turn?: boolean
 }
 
 export interface SDKControlResponse extends SDKMessage {
@@ -215,6 +221,11 @@ export interface QueryOptions {
      * existing Claude session id.
      */
     forkSession?: boolean
+    /**
+     * Resume the session truncated to the entry with this uuid (everything
+     * after it is discarded, no drops guard). Requires Claude Code v2.1.223+.
+     */
+    resumeSessionAt?: string
     model?: string
     effort?: string
     fallbackModel?: string

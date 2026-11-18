@@ -44,6 +44,15 @@ function runInTransaction<T>(db: Database, operation: () => T): T {
 //     write-once-keep semantics. Mirror of pickExistingSessionMetadata
 //     in cli/src/agent/sessionFactory.ts.
 //
+//   - CONTRIBUTION_FIELDS: structured session↔PR links (externalRefs).
+//     Sparse resume/bootstrap writes must not wipe a prior primary PR
+//     association. tiann/hapi#1160 / PR #1161.
+//
+//   - ALERT_STATE_FIELDS: durable operator-facing alert state that must
+//     survive sparse metadata writes (e.g. archive). Without this,
+//     lastModelError (banner / amber dot / ack) vanishes when a write
+//     omits it — the user never dismissed the error.
+//
 // `cursorSessionProtocol` is paired with `cursorSessionId`: protocol is
 // tied to a specific chat id, so a write that explicitly sets a new
 // `cursorSessionId` must drop a stale prior protocol. Handled in
@@ -81,8 +90,13 @@ const HUB_OWNED_METADATA_FIELDS = [
     'codexResumePending',
     'titleSuggestionAutoAttemptedAt',
     'titleSuggestionTurn',
-    'promptTitle'
+    'promptTitle',
+    'forkedFrom',
+    'conversationBranch'
 ] as const
+
+const CONTRIBUTION_FIELDS = ['externalRefs'] as const
+const ALERT_STATE_FIELDS = ['lastModelError'] as const
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -144,16 +158,78 @@ function preserveForkSummary(
     next: Record<string, unknown>,
     merged: Record<string, unknown> | null
 ): Record<string, unknown> | null {
-    // A fork's provisional title is Hub-generated. CLI bootstrap writes are
-    // sparse and historically drop it, leaving the child titled by its path.
-    // Explicit `summary: null` or a replacement summary still wins.
+    // A fork or branch's provisional title is Hub-generated. CLI bootstrap
+    // writes are sparse and historically drop it, leaving the child titled by
+    // its path. Explicit `summary: null` or a replacement summary still wins.
     if (next.summary !== undefined) return merged
     const summary = prior.summary
-    if (!isPlainObject(summary) || typeof summary.text !== 'string' || !summary.text.startsWith('Fork: ')) {
+    if (!isPlainObject(summary) || typeof summary.text !== 'string'
+        || !(summary.text.startsWith('Fork: ') || summary.text.startsWith('Branch: '))) {
         return merged
     }
     const result = merged ?? { ...next }
     result.summary = summary
+    return result
+}
+
+/**
+ * Hub-owned fields on lastModelError (ack + delivery watermark) must survive
+ * stale CLI metadata rewrites of the same eventId. Web ack / NotificationHub
+ * write these on the hub copy; the CLI's local snapshot often lacks them.
+ * Identity is eventId — wall-clock atTs is display-only.
+ */
+function preserveModelErrorHubFields(
+    prior: Record<string, unknown>,
+    next: Record<string, unknown>,
+    merged: Record<string, unknown> | null
+): Record<string, unknown> | null {
+    const oldError = isPlainObject(prior.lastModelError) ? prior.lastModelError : null
+    const newError = isPlainObject(next.lastModelError) ? next.lastModelError : null
+    if (
+        !oldError
+        || !newError
+        || typeof oldError.eventId !== 'string'
+        || oldError.eventId !== newError.eventId
+    ) {
+        return merged
+    }
+
+    const preserved: Record<string, unknown> = { ...newError }
+    let changed = false
+    if (typeof oldError.acknowledgedAt === 'number' && newError.acknowledgedAt === undefined) {
+        preserved.acknowledgedAt = oldError.acknowledgedAt
+        changed = true
+    }
+    if (typeof oldError.notifiedAt === 'number' && newError.notifiedAt === undefined) {
+        preserved.notifiedAt = oldError.notifiedAt
+        changed = true
+    }
+    if (typeof oldError.bridgedForEventId === 'string' && newError.bridgedForEventId === undefined) {
+        preserved.bridgedForEventId = oldError.bridgedForEventId
+        changed = true
+    }
+    if (oldError.retriedAndFailed === true && newError.retriedAndFailed !== true) {
+        preserved.retriedAndFailed = true
+        changed = true
+    }
+    if (oldError.supersededByUserTurn === true && newError.supersededByUserTurn !== true) {
+        preserved.supersededByUserTurn = true
+        changed = true
+    }
+    if (oldError.bridgeable === false && newError.bridgeable !== false) {
+        preserved.bridgeable = false
+        changed = true
+    }
+    if (typeof oldError.lastUserMessage === 'string' && newError.lastUserMessage === undefined) {
+        preserved.lastUserMessage = oldError.lastUserMessage
+        changed = true
+    }
+    if (!changed) {
+        return merged
+    }
+
+    const result = merged ?? { ...next }
+    result.lastModelError = preserved
     return result
 }
 
@@ -173,9 +249,19 @@ export function mergeSessionMetadata(prior: unknown, next: unknown, options?: { 
     merged = carryForwardIfMissing(prior, next, merged, PARSE_IDENTITY_FIELDS)
     merged = carryForwardIfMissing(prior, next, merged, ROUTING_FIELDS)
     merged = carryForwardIfMissing(prior, next, merged, SIMPLE_RESUME_TOKENS)
+    merged = carryForwardIfMissing(prior, next, merged, CONTRIBUTION_FIELDS)
+    merged = carryForwardIfMissing(prior, next, merged, ALERT_STATE_FIELDS)
     merged = carryForwardIfMissing(prior, next, merged, HUB_OWNED_METADATA_FIELDS)
     merged = preserveForkSummary(prior, next, merged)
+    // A stale CLI cache may still contain the pre-launch branch state. Once
+    // delivery succeeded, sparse/full CLI updates must not regress its outcome.
+    if (isPlainObject(prior.conversationBranch) && isPlainObject(next.conversationBranch)
+        && prior.conversationBranch.requestFingerprint === next.conversationBranch.requestFingerprint
+        && prior.conversationBranch.state === 'started') {
+        merged = { ...(merged ?? next), conversationBranch: prior.conversationBranch }
+    }
     merged = preserveCursorProtocolPair(prior, next, merged)
+    merged = preserveModelErrorHubFields(prior, next, merged)
     if (protectName) {
         merged ??= { ...next }
         merged.name = prior.name
@@ -471,7 +557,16 @@ export function updateSessionMetadata(
     metadata: unknown,
     expectedVersion: number,
     namespace: string,
-    options?: { touchUpdatedAt?: boolean; allowUnarchive?: boolean; allowTitleUpdate?: boolean; allowNameChange?: boolean; titleLocked?: boolean; inheritTitleLockFrom?: string }
+    options?: {
+        allowNameChange?: boolean
+        touchUpdatedAt?: boolean
+        allowUnarchive?: boolean
+        allowTitleUpdate?: boolean
+        /** Keep machine-spawn stub tag so adoptPreallocatedSession can still bind. */
+        preservePreallocation?: boolean
+        titleLocked?: boolean
+        inheritTitleLockFrom?: string
+    }
 ): VersionedUpdateResult<unknown | null> {
     const now = Date.now()
     const touchUpdatedAt = options?.touchUpdatedAt !== false
@@ -537,6 +632,7 @@ export function updateSessionMetadata(
             if (
                 result.result === 'success'
                 && !options?.allowTitleUpdate
+                && !options?.preservePreallocation
                 && isMachineSpawnPreallocatedStub(existing)
                 && !isHubArchivedSessionMetadata(merged)
             ) {

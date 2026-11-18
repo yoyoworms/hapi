@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -8,15 +11,16 @@ import type { AcpSdkBackend } from '@/agent/backends/acp';
 import { ACP_INDETERMINATE_SYMBOL } from '@/agent/backends/acp/AcpStdioTransport';
 import agySteeredTurn from '@/agent/backends/acp/__fixtures__/agy-steered-turn.json';
 import { AgySession } from './session';
+import * as agyNativeTitle from './agyNativeTitle';
 import type { AgyMode } from './types';
 import {
     AgyAcpRemoteLauncher,
     addAgyUsage,
     agyAcpModeForPermission,
-    agyGenerationMs,
     agyRoundSummary,
     resolveAgyAcpModelId
 } from './agyAcpRemoteLauncher';
+import { generationTimeMs } from '@/agent/generationClock';
 
 vi.mock('@/ui/ink/RemoteModeDisplay', () => ({ RemoteModeDisplay: () => null }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), warn: vi.fn(), info: vi.fn() } }));
@@ -89,8 +93,12 @@ class FakeAgyBackend {
         _sessionId: string,
         content: PromptContent[],
         onUpdate: (message: AgentMessage) => void,
-        timing?: { onSent?: () => void; onAnswered?: () => void }
+        options?: {
+            shouldSend?: () => boolean
+            timing?: { onSent?: () => void; onAnswered?: () => void }
+        }
     ): Promise<void> {
+        const timing = options?.timing;
         if (this.preSendDelayMs) await new Promise((resolve) => setTimeout(resolve, this.preSendDelayMs));
         if (this.disconnected) {
             const error = new Error('ACP transport closed');
@@ -160,6 +168,16 @@ class FakeAgyBackend {
     }
     async refreshSessionInfo(): Promise<void> {}
     setSessionInfoUpdateListener(): void {}
+    availableCommands: Array<{ name: string; description?: string }> = [];
+    availableCommandsListener: ((sessionId: string | null, commands: Array<{ name: string; description?: string }>) => void) | null = null;
+    getAvailableCommands(): Array<{ name: string; description?: string }> {
+        return this.availableCommands;
+    }
+    setAvailableCommandsUpdateListener(
+        listener: ((sessionId: string | null, commands: Array<{ name: string; description?: string }>) => void) | null
+    ): void {
+        this.availableCommandsListener = listener;
+    }
     echo: ((text: string) => void) | null = null;
     setUserMessageChunkListener(listener: ((text: string) => void) | null): void {
         this.echo = listener;
@@ -234,12 +252,17 @@ function makeSession(sessionId: string | null = null) {
     return { session, queue, client };
 }
 
-function launch(session: AgySession, backends: FakeAgyBackend[], opts: { cancelHardStopMs?: number; killSettleMs?: number } = {}) {
+function launch(
+    session: AgySession,
+    backends: FakeAgyBackend[],
+    opts: { cancelHardStopMs?: number; killSettleMs?: number; brainDir?: string } = {}
+) {
     const created: FakeAgyBackend[] = [];
     const launcher = new AgyAcpRemoteLauncher(session, {
         steerCancelGraceMs: 50,
         cancelHardStopMs: opts.cancelHardStopMs ?? 2_000,
         killSettleMs: opts.killSettleMs,
+        brainDir: opts.brainDir,
         createBackend: () => {
             const backend = backends.shift() ?? new FakeAgyBackend();
             created.push(backend);
@@ -294,7 +317,7 @@ describe('AgyAcpRemoteLauncher', () => {
         expect(session.sessionId).toBe('agy-conv-new');
         const metadata = client.updateMetadata.mock.calls
             .reduce((current, [update]) => (update as (m: object) => object)(current), {});
-        expect(metadata).toMatchObject({ agySessionId: 'agy-conv-new', agyProtocol: 'acp' });
+        expect(metadata).toMatchObject({ agySessionId: 'agy-conv-new', agyProtocol: 'acp', summary: { text: 'hello' } });
         expect(backend.prompts).toEqual([[{ type: 'text', text: 'hello' }]]);
         expect(client.sendAgentMessage).toHaveBeenCalledWith({ type: 'message', message: 'answer' });
         expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['local-1']);
@@ -328,6 +351,22 @@ describe('AgyAcpRemoteLauncher', () => {
         expect(backend.resumeCalls).toEqual(['agy-conv-old']);
         expect(backend.calls).toEqual(['initialize']);
         expect(session.sessionId).toBe('agy-conv-old');
+    });
+
+    it('restores a missing title from the native conversation when resuming', async () => {
+        const readTitle = vi.spyOn(agyNativeTitle, 'readAgyConversationTitle').mockResolvedValue('Original task');
+        const { session, queue, client } = makeSession('agy-conv-old');
+        const backend = new FakeAgyBackend();
+        queue.close();
+        try {
+            await launch(session, [backend]).run;
+            const metadata = client.updateMetadata.mock.calls
+                .reduce((current, [update]) => (update as (m: object) => object)(current), {});
+            expect(metadata).toMatchObject({ summary: { text: 'Original task' } });
+            expect(readTitle).toHaveBeenCalledWith('agy-conv-old');
+        } finally {
+            readTitle.mockRestore();
+        }
     });
 
     it('starts a new conversation when resume fails and says so', async () => {
@@ -1654,18 +1693,18 @@ describe('agy ACP helpers', () => {
 
     it('takes tool runs and waits for the user out of the generation time', () => {
         // A tool run and, separately, a wait for an approval.
-        expect(agyGenerationMs(0, 10_000, [{ start: 1_000, end: 4_000 }, { start: 6_000, end: 7_000 }])).toBe(6_000);
+        expect(generationTimeMs(0, 10_000, [{ start: 1_000, end: 4_000 }, { start: 6_000, end: 7_000 }])).toBe(6_000);
         // A steered turn: windows from both requests, in any order.
-        expect(agyGenerationMs(0, 20_000, [{ start: 12_000, end: 15_000 }, { start: 2_000, end: 8_000 }])).toBe(11_000);
+        expect(generationTimeMs(0, 20_000, [{ start: 12_000, end: 15_000 }, { start: 2_000, end: 8_000 }])).toBe(11_000);
         // An approval wait inside a tool's span counts once.
-        expect(agyGenerationMs(0, 10_000, [{ start: 1_000, end: 6_000 }, { start: 2_000, end: 3_000 }, { start: 5_000, end: 8_000 }])).toBe(3_000);
+        expect(generationTimeMs(0, 10_000, [{ start: 1_000, end: 6_000 }, { start: 2_000, end: 3_000 }, { start: 5_000, end: 8_000 }])).toBe(3_000);
         // Cancelled mid-tool: the open window ends with the round; spans
         // outside the round do not count.
-        expect(agyGenerationMs(1_000, 5_000, [{ start: 0, end: 2_000 }, { start: 3_000, end: null }])).toBe(1_000);
+        expect(generationTimeMs(1_000, 5_000, [{ start: 0, end: 2_000 }, { start: 3_000, end: null }])).toBe(1_000);
         // No answer, or nothing left but tools.
-        expect(agyGenerationMs(0, null, [])).toBeNull();
-        expect(agyGenerationMs(null, 5_000, [])).toBeNull();
-        expect(agyGenerationMs(0, 5_000, [{ start: 0, end: 5_000 }])).toBe(0);
+        expect(generationTimeMs(0, null, [])).toBeNull();
+        expect(generationTimeMs(null, 5_000, [])).toBeNull();
+        expect(generationTimeMs(0, 5_000, [{ start: 0, end: 5_000 }])).toBe(0);
     });
 
     it('reports generation tokens, thinking included, only with a positive generation time', () => {
@@ -2213,5 +2252,136 @@ describe('AgyAcpRemoteLauncher questions (agy ask_question)', () => {
         finish();
         queue.close();
         await run;
+    });
+
+    it('negotiates slash commands from ACP available_commands_update and serves them via ListSlashCommands RPC', async () => {
+        const { session, queue, client } = makeSession();
+        const backend = new FakeAgyBackend();
+        const { run } = launch(session, [backend]);
+
+        await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+        backend.availableCommandsListener?.('agy-conv-new', [
+            { name: 'swarm', description: 'Run a native swarm' },
+            { name: 'run-workflow', description: 'Run a Python workflow script' },
+            { name: 'custom-skill', description: 'Project skill advertised over ACP' }
+        ]);
+
+        const metadataUpdates = client.updateMetadata.mock.calls.map(
+            ([updater]) => (updater as (m: Record<string, unknown>) => Record<string, unknown>)({})
+        );
+        expect(metadataUpdates).toContainEqual(expect.objectContaining({
+            slashCommands: ['swarm', 'run-workflow', 'custom-skill']
+        }));
+
+        const listHandler = client.rpcHandlerManager.handlers.get(RPC_METHODS.ListSlashCommands)!;
+        const result = await listHandler({ agent: 'agy' }) as {
+            success: boolean;
+            commands: Array<{ name: string; description?: string; source: string }>;
+        };
+        expect(result.success).toBe(true);
+        expect(result.commands).toEqual(expect.arrayContaining([
+            expect.objectContaining({ name: 'swarm', description: 'Run a native swarm', source: 'builtin' }),
+            expect.objectContaining({ name: 'run-workflow', description: 'Run a Python workflow script', source: 'builtin' }),
+            expect.objectContaining({ name: 'custom-skill', description: 'Project skill advertised over ACP', source: 'builtin' }),
+            expect.objectContaining({ name: 'goal', source: 'builtin' })
+        ]));
+
+        // A subsequent empty catalog update replaces the cached catalog and clears metadata.slashCommands.
+        backend.availableCommands = [
+            { name: 'stale-backend-command', description: 'Should not be re-read after empty update' }
+        ];
+        backend.availableCommandsListener?.('agy-conv-new', []);
+
+        const updatedMetadata = client.updateMetadata.mock.calls.map(
+            ([updater]) => (updater as (m: Record<string, unknown>) => Record<string, unknown>)({})
+        );
+        expect(updatedMetadata.at(-1)).toEqual(expect.objectContaining({
+            slashCommands: []
+        }));
+
+        const clearedResult = await listHandler({ agent: 'agy' }) as {
+            success: boolean;
+            commands: Array<{ name: string; description?: string; source: string }>;
+        };
+        expect(clearedResult.success).toBe(true);
+        const clearedNames = clearedResult.commands.map((cmd) => cmd.name);
+        expect(clearedNames).not.toContain('custom-skill');
+        expect(clearedNames).not.toContain('run-workflow');
+        expect(clearedNames).not.toContain('stale-backend-command');
+        expect(clearedNames).toContain('swarm');
+
+        queue.close();
+        await run;
+    });
+
+    it('renders the local swarm board for /swarm board without sending a prompt turn to agy acp', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-swarm-board-'));
+        try {
+            const swarmDir = join(brainDir, 'agy-conv-new', '.system_generated', 'swarm');
+            mkdirSync(swarmDir, { recursive: true });
+            writeFileSync(join(swarmDir, 'members.json'), JSON.stringify({
+                title: 'parser rewrite',
+                members: {
+                    coordinator: {
+                        role: 'coordinator',
+                        phase: 'WAITING',
+                        applied_model: 'gemini-4-argon-high',
+                        workspace_mode: 'inherit'
+                    },
+                    parser: {
+                        role: 'worker',
+                        phase: 'RUNNING',
+                        applied_model: 'gemini-4-argon-high',
+                        workspace_mode: 'share'
+                    }
+                }
+            }));
+            writeFileSync(join(swarmDir, 'board.jsonl'), [
+                JSON.stringify({
+                    seq: 1,
+                    agent: 'coordinator',
+                    text: '@parser fix parser_test.rs',
+                    time: '2026-11-17 04:00:00',
+                    channel: 'parser'
+                }),
+                JSON.stringify({
+                    seq: 2,
+                    agent: 'parser',
+                    text: '@coordinator [done] all 3 tests pass',
+                    time: '2026-11-17 04:01:00',
+                    channel: 'parser'
+                })
+            ].join('\n') + '\n');
+
+            const { session, queue, client } = makeSession();
+            const backend = new FakeAgyBackend();
+            const { run } = launch(session, [backend], { brainDir });
+
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+            queue.pushIsolated('/swarm board --channel parser', REVIEW, 'local-board-1');
+            await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['local-board-1']));
+
+            expect(backend.prompts).toHaveLength(0);
+            expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({
+                type: 'message',
+                message: expect.stringContaining('### Swarm Board — parser rewrite (#parser)')
+            }));
+            expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({
+                type: 'message',
+                message: expect.stringContaining('@coordinator [done] all 3 tests pass')
+            }));
+
+            // Normal /swarm <task> prompts are forwarded to agy acp as usual.
+            queue.push('/swarm split the lexer into modules', REVIEW, 'local-swarm-task-1');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(1));
+            expect(backend.prompts[0]).toEqual([{ type: 'text', text: '/swarm split the lexer into modules' }]);
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
     });
 });

@@ -9,6 +9,7 @@ import type { DecryptedMessage, MessageContextResponse, MessagesResponse } from 
 import {
     HISTORY_WINDOW_SIZE,
     INITIAL_PAGE_SIZE,
+    MAX_RETAINED_INACTIVE_WINDOWS,
     VISIBLE_WINDOW_SIZE,
     activateMessageWindow,
     appendOptimisticMessage,
@@ -27,7 +28,9 @@ import {
     rewindMessageWindow,
     setMessageWindowTargetLock,
     setMessageViewMode,
+    subscribeMessageWindow,
     syncTailMessages,
+    recoverWindowAfterGapResume,
     updateMessageStatus,
 } from '@/lib/message-window-store'
 
@@ -77,8 +80,8 @@ function makeAgentMessage(props: {
         content: {
             role: 'agent',
             content: {
-                type: 'codex',
-                data: { type: 'message', message: props.id }
+                type: 'text',
+                text: props.id
             }
         },
         createdAt: props.at,
@@ -236,8 +239,11 @@ function beforeResponse(
     }
 }
 
-function createApi(getMessages: ApiClient['getMessages']): ApiClient {
-    return { getMessages, getMessageContext: async () => null } as unknown as ApiClient
+function createApi(
+    getMessages: ApiClient['getMessages'],
+    getMessageContext: ApiClient['getMessageContext'] = async () => null
+): ApiClient {
+    return { getMessages, getMessageContext } as unknown as ApiClient
 }
 
 function contextResponse(
@@ -685,6 +691,10 @@ it('fetches one older context page before first paint when the cold page is tool
         expect(getMessages).toHaveBeenCalledWith(id, { limit: INITIAL_PAGE_SIZE })
         expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['cached'])
         expect(getMessageWindowState(id).isSyncingTail).toBe(true)
+        // Cached re-entry exposes the in-flight catch-up window so the view
+        // can render a "fetching latest messages" affordance over the stale
+        // rows instead of silently swapping them for fresh ones.
+        expect(getMessageWindowState(id).preferLatestOnActivation).toBe(true)
 
         const latest = makeAgentMessage({ id: 'latest', seq: 2_040, at: 2_040_000 })
         response.resolve(latestResponse([latest], {
@@ -699,6 +709,49 @@ it('fetches one older context page before first paint when the cold page is tool
         expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['latest'])
         expect(getMessageWindowState(id).hasMore).toBe(true)
         expect('pending' in getMessageWindowState(id)).toBe(false)
+        // The catch-up window closes once the authoritative tail lands.
+        expect(getMessageWindowState(id).preferLatestOnActivation).toBe(false)
+    })
+
+    it('keeps the catch-up flag across a failed re-entry sync and clears it once a retry lands', async () => {
+        const id = sessionId('reentry-failure')
+        const cached = makeAgentMessage({ id: 'cached', seq: 40, at: 40_000 })
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [cached],
+            hasMore: true,
+            oldestPositionAt: 40_000,
+            oldestPositionSeq: 40,
+            newestPositionAt: 40_000,
+            newestPositionSeq: 40,
+            epoch: 3,
+            requiresLatestReset: false
+        }))
+        setMessageViewMode(id, 'history')
+        activateMessageWindow(id)
+        expect(getMessageWindowState(id).preferLatestOnActivation).toBe(true)
+
+        await syncTailMessages(createApi(vi.fn(async () => {
+            throw new Error('offline')
+        })), id)
+        // The failed tail sync settles (no endless spinner state), surfaces a
+        // warning, and deliberately retains the catch-up flag so the next
+        // sync still prefers the authoritative latest page over the stale
+        // cache.
+        expect(getMessageWindowState(id).isSyncingTail).toBe(false)
+        expect(getMessageWindowState(id).preferLatestOnActivation).toBe(true)
+        expect(getMessageWindowState(id).warning).toBeTruthy()
+
+        const latest = makeAgentMessage({ id: 'latest', seq: 2_040, at: 2_040_000 })
+        await syncTailMessages(createApi(vi.fn(async () => await latestResponse([latest], {
+            limit: 20,
+            epoch: 3,
+            hasMore: true,
+            nextBeforeAt: 1_841_000,
+            nextBeforeSeq: 1_841
+        }))), id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['latest'])
+        expect(getMessageWindowState(id).preferLatestOnActivation).toBe(false)
+        expect(getMessageWindowState(id).isSyncingTail).toBe(false)
     })
 
     it('retains Codex round duration through persisted re-entry and a user-free latest tail', async () => {
@@ -2524,6 +2577,26 @@ describe('search-target message context', () => {
         ]))
     })
 
+    it('accepts a resolved context target when the request uses a tool-call alias', async () => {
+        const id = sessionId('search-context-tool-alias')
+        const target = makeAgentMessage({ id: 'raw-target', seq: 40, at: 40_000 })
+        const getMessageContext = vi.fn(async () => contextResponse([target], {
+            epoch: 7,
+            hasMore: false,
+            nextBeforeAt: 40_000,
+            nextBeforeSeq: 40,
+            snapshotHeadAt: 40_000,
+            snapshotHeadSeq: 40,
+            targetMessageId: target.id
+        }))
+        const api = createApi(vi.fn(async () => latestResponse([])))
+        api.getMessageContext = getMessageContext
+
+        await expect(loadMessageContext(api, id, 'tool-call:call-1')).resolves.toBe(true)
+        expect(getMessageContext).toHaveBeenCalledWith(id, 'tool-call:call-1')
+        expect(getMessageWindowState(id).messages).toContainEqual(expect.objectContaining({ id: target.id }))
+    })
+
     it('does not persist a stale latest-reset boundary for historical contexts', async () => {
         const id = sessionId('search-context-persistence')
         const target = makeAgentMessage({ id: 'target', seq: 40, at: 40_000 })
@@ -2796,5 +2869,923 @@ describe('reasoning snapshot compaction', () => {
         const state = getMessageWindowState(id)
         expect(state.oldestSeq).toBe(2)
         expect(state.newestSeq).toBe(3)
+    })
+})
+
+describe('gap recovery', () => {
+    function toolCallRow(id: string, seq: number, at: number, status: 'in_progress' | 'completed'): DecryptedMessage {
+        return {
+            id,
+            seq,
+            localId: null,
+            content: {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'tool-call', callId: 'call-1', name: 'Bash', input: { command: 'ls' }, status } }
+            },
+            createdAt: at,
+            invokedAt: at
+        } as DecryptedMessage
+    }
+
+    function mergedContentOf(state: ReturnType<typeof getMessageWindowState>): unknown {
+        return state.messages.find(message => message.id === 'call-row')?.content
+    }
+
+    it('replaces a merged row with its current content after a gap resume', async () => {
+        const id = sessionId('gap-recovery')
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const merged = toolCallRow('call-row', 10, 1_000, 'completed')
+        let latestPayload = stale
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                // The cursor delta after the gap is empty: the merged row kept
+                // its original position, which is why the window must be
+                // invalidated instead of synced incrementally.
+                return afterResponse([], {
+                    epoch: 1,
+                    nextAfterAt: 1_000,
+                    nextAfterSeq: 10,
+                    snapshotHeadAt: 1_000,
+                    snapshotHeadSeq: 10
+                })
+            }
+            return latestResponse([latestPayload], { epoch: 1 })
+        })
+
+        await syncTailMessages(api, id)
+        expect(mergedContentOf(getMessageWindowState(id))).toEqual(stale.content)
+
+        // While the window is disconnected the hub merges the tick in place;
+        // the next latest page carries the merged content.
+        latestPayload = merged
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(mergedContentOf(state)).toEqual(merged.content)
+        expect(state.messages).toHaveLength(1)
+    })
+
+    it('keeps the stale merged row when only a cursor sync runs (documents the gap hole)', async () => {
+        const id = sessionId('gap-cursor-only')
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const merged = toolCallRow('call-row', 10, 1_000, 'completed')
+        let latestPayload = stale
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse([], {
+                    epoch: 1,
+                    nextAfterAt: 1_000,
+                    nextAfterSeq: 10,
+                    snapshotHeadAt: 1_000,
+                    snapshotHeadSeq: 10
+                })
+            }
+            return latestResponse([latestPayload], { epoch: 1 })
+        })
+
+        await syncTailMessages(api, id)
+        expect(mergedContentOf(getMessageWindowState(id))).toEqual(stale.content)
+
+        // The hub merged the tick, but a bare cursor sync never re-delivers it.
+        latestPayload = merged
+        await syncTailMessages(api, id)
+
+        expect(mergedContentOf(getMessageWindowState(id))).toEqual(stale.content)
+    })
+
+    it('preserves loaded older rows, hasMore and the oldest cursor across gap recovery', async () => {
+        const id = sessionId('gap-recovery-history')
+        const older = makeUserMessage({ id: 'older-1', seq: 5, invokedAt: 900, createdAt: 900 })
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const merged = toolCallRow('call-row', 10, 1_000, 'completed')
+        let latestPayload: DecryptedMessage[] = [older, stale]
+        let latestPage = { hasMore: true, nextBeforeAt: 900, nextBeforeSeq: 5 }
+        const olderQueries: Array<{ beforeAt?: number | null; beforeSeq?: number | null }> = []
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse([], {
+                    epoch: 1,
+                    nextAfterAt: 1_000,
+                    nextAfterSeq: 10,
+                    snapshotHeadAt: 1_000,
+                    snapshotHeadSeq: 10
+                })
+            }
+            if (query.beforeAt !== undefined) {
+                olderQueries.push(query)
+                return beforeResponse([], { epoch: 1, hasMore: false, nextBeforeAt: null, nextBeforeSeq: null })
+            }
+            // The recovery latest page carries the merged tick and its own
+            // older bound; rows older than the newest page are not re-fetched.
+            return latestResponse(latestPayload, { epoch: 1, ...latestPage })
+        })
+
+        await syncTailMessages(api, id)
+        const before = getMessageWindowState(id)
+        expect(before.messages).toHaveLength(2)
+        expect(before.hasMore).toBe(true)
+        expect(before.oldestSeq).toBe(5)
+
+        // While disconnected the hub merged the tick in place; the recovery
+        // latest page only holds the newest rows.
+        latestPayload = [merged]
+        latestPage = { hasMore: true, nextBeforeAt: 1_000, nextBeforeSeq: 10 }
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(state.messages.map((message) => message.id)).toEqual(['older-1', 'call-row'])
+        expect(mergedContentOf(state)).toEqual(merged.content)
+        expect(state.messages.find((message) => message.id === 'older-1')?.content).toEqual(older.content)
+        expect(state.hasMore).toBe(true)
+        expect(state.oldestSeq).toBe(5)
+
+        // The preserved oldest cursor: the next older-page load pages from
+        // the loaded history, not from the recovery page's own bound.
+        const outcome = await fetchOlderMessages(api, id)
+        expect(outcome.kind).toBe('applied')
+        expect(olderQueries).toEqual([{ beforeAt: 900, beforeSeq: 5, limit: 200 }])
+    })
+
+    it('catches up the disconnected interval before the recovery latest page', async () => {
+        const id = sessionId('gap-recovery-interval')
+        const cached = [
+            makeUserMessage({ id: 'r15', seq: 15, invokedAt: 1_500, createdAt: 1_500 }),
+            makeUserMessage({ id: 'r20', seq: 20, invokedAt: 2_000, createdAt: 2_000 })
+        ]
+        // Rows that arrived while disconnected but fall between the cached
+        // tail and the recovery latest page's oldest row.
+        const interval = [21, 22, 23, 24, 25].map((seq) => (
+            makeUserMessage({ id: `r${seq}`, seq, invokedAt: seq * 100, createdAt: seq * 100 })
+        ))
+        // The recovery latest page only holds the newest rows: upserting it
+        // alone would leave rows 21-25 as a permanent hole below the advanced
+        // newest cursor.
+        const page = [26, 27, 28, 29, 30].map((seq) => (
+            makeUserMessage({ id: `r${seq}`, seq, invokedAt: seq * 100, createdAt: seq * 100 })
+        ))
+        let latestPayload = cached
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(interval, {
+                    epoch: 1,
+                    nextAfterAt: 3_000,
+                    nextAfterSeq: 30,
+                    snapshotHeadAt: 3_000,
+                    snapshotHeadSeq: 30
+                })
+            }
+            return latestResponse(latestPayload, { epoch: 1 })
+        })
+
+        await syncTailMessages(api, id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['r15', 'r20'])
+
+        latestPayload = page
+        await recoverWindowAfterGapResume(api, id)
+
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual([
+            'r15', 'r20', 'r21', 'r22', 'r23', 'r24', 'r25', 'r26', 'r27', 'r28', 'r29', 'r30'
+        ])
+    })
+
+    it('replaces retained rows when gap recovery observes a different epoch', async () => {
+        const id = sessionId('gap-recovery-epoch')
+        const keep = makeUserMessage({ id: 'keep-1', seq: 5, invokedAt: 500, createdAt: 500 })
+        const removed = makeUserMessage({ id: 'removed-1', seq: 6, invokedAt: 600, createdAt: 600 })
+        const stale = toolCallRow('tool-1', 10, 1_000, 'in_progress')
+        let latestPayload: DecryptedMessage[] = [keep, removed, stale]
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse([], {
+                    epoch: 1,
+                    nextAfterAt: 1_000,
+                    nextAfterSeq: 10,
+                    snapshotHeadAt: 1_000,
+                    snapshotHeadSeq: 10
+                })
+            }
+            // The catch-up cursor sync still sees the old epoch; the recovery
+            // page comes back under the new one.
+            return latestResponse(latestPayload, { epoch: latestPayload === stalePayload ? 1 : 2 })
+        })
+        const stalePayload: DecryptedMessage[] = [keep, removed, stale]
+
+        await syncTailMessages(api, id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual([
+            'keep-1', 'removed-1', 'tool-1'
+        ])
+
+        // A remote rewind removed the row while we were disconnected and the
+        // messages-invalidated event was missed; the recovery page comes back
+        // under a new epoch without the removed row.
+        latestPayload = [keep, toolCallRow('tool-1', 10, 1_000, 'completed')]
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(state.messages.map((message) => message.id)).toEqual(['keep-1', 'tool-1'])
+        expect(state.messages.find((message) => message.id === 'tool-1')?.content)
+            .toEqual(toolCallRow('tool-1', 10, 1_000, 'completed').content)
+        expect(state.epoch).toBe(2)
+    })
+
+    it('does not advance to the latest page when the catch-up fails, and retries on the next recovery', async () => {
+        const id = sessionId('gap-recovery-catchup-fail')
+        const cached = makeUserMessage({ id: 'row-10', seq: 10, invokedAt: 1_000, createdAt: 1_000 })
+        const caughtUp = [11, 12, 13, 14, 15].map((seq) => (
+            makeUserMessage({ id: `row-${seq}`, seq, invokedAt: seq * 100, createdAt: seq * 100 })
+        ))
+        let latestPayload: DecryptedMessage[] = [cached]
+        let catchUpCalls = 0
+        let latestCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                catchUpCalls += 1
+                if (catchUpCalls === 1) {
+                    throw new Error('catch-up request failed')
+                }
+                return afterResponse(caughtUp, {
+                    epoch: 1,
+                    nextAfterAt: 1_500,
+                    nextAfterSeq: 15,
+                    snapshotHeadAt: 1_500,
+                    snapshotHeadSeq: 15
+                })
+            }
+            latestCalls += 1
+            return latestResponse(latestPayload, { epoch: 1 })
+        })
+
+        await syncTailMessages(api, id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['row-10'])
+        expect(latestCalls).toBe(1)
+
+        // The catch-up request fails; the latest page would succeed. Advancing
+        // to it anyway would strand rows 11-15 below the advanced newest
+        // cursor, so recovery must stop at the failed catch-up.
+        latestPayload = caughtUp
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(state.messages.map((message) => message.id)).toEqual(['row-10'])
+        expect(state.newestSeq).toBe(10)
+        expect(latestCalls).toBe(1)
+        expect(state.warning).toBeTruthy()
+
+        // The next recovery retries the catch-up with the original cursor and
+        // only then reconciles the latest page.
+        await recoverWindowAfterGapResume(api, id)
+
+        const retried = getMessageWindowState(id)
+        expect(retried.messages.map((message) => message.id)).toEqual([
+            'row-10', 'row-11', 'row-12', 'row-13', 'row-14', 'row-15'
+        ])
+        expect(retried.newestSeq).toBe(15)
+        expect(retried.warning).toBeNull()
+    })
+
+    it('keeps the loaded history window across a no-news recovery', async () => {
+        const id = sessionId('gap-recovery-budget-2')
+        const newestRows = Array.from({ length: 400 }, (_, i) => (
+            makeUserMessage({ id: `r${301 + i}`, seq: 301 + i, invokedAt: (301 + i) * 10, createdAt: (301 + i) * 10 })
+        ))
+        const olderRows = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `r${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const newestPage = newestRows.slice(-200)
+        let latestCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse([], {
+                    epoch: 1,
+                    nextAfterAt: 6_000,
+                    nextAfterSeq: 600,
+                    snapshotHeadAt: 6_000,
+                    snapshotHeadSeq: 600
+                })
+            }
+            if (query.beforeAt !== undefined) {
+                return beforeResponse(olderRows, { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            latestCalls += 1
+            // Initial sync: newest 400. Recovery's latest page: newest 200.
+            return latestResponse(latestCalls === 1 ? newestRows : newestPage, {
+                epoch: 1,
+                hasMore: true,
+                nextBeforeAt: latestCalls === 1 ? 3_010 : 4_010,
+                nextBeforeSeq: latestCalls === 1 ? 301 : 401
+            })
+        })
+
+        await syncTailMessages(api, id)
+        await fetchOlderMessages(api, id)
+        const loaded = getMessageWindowState(id)
+        expect(loaded.messages).toHaveLength(700)
+        expect(loaded.oldestSeq).toBe(1)
+
+        // A same-epoch reconnect with no new messages must not shrink the
+        // loaded history below what the reader already had: the upsert's trim
+        // uses the window's own history budget, not the 400-row tail budget.
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(state.messages).toHaveLength(700)
+        expect(state.messages.some((message) => message.id === 'r1')).toBe(true)
+        expect(state.oldestSeq).toBe(1)
+        expect(state.hasMore).toBe(true)
+    })
+
+    it('refreshes a retained non-terminal tool-call row the latest page cannot reach', async () => {
+        const id = sessionId('gap-recovery-row-refresh')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        let catchUpCalls = 0
+        let latestCalls = 0
+        const contextQueries: string[] = []
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                catchUpCalls += 1
+                if (catchUpCalls === 1) {
+                    return afterResponse(missed.filter((message) => (message.seq ?? 0) <= 210), {
+                        epoch: 1,
+                        hasMore: true,
+                        nextAfterAt: 2_100,
+                        nextAfterSeq: 210,
+                        snapshotHeadAt: 3_100,
+                        snapshotHeadSeq: 310
+                    })
+                }
+                return afterResponse(missed.filter((message) => (message.seq ?? 0) >= 211), {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse([...cachedTail, stale], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            return latestResponse(latestPage, { epoch: 1, hasMore: true, nextBeforeAt: 1_110, nextBeforeSeq: 111 })
+        }, async (_sessionId, messageId) => {
+            contextQueries.push(messageId)
+            return contextResponse([toolCallRow('call-row', 10, 1_000, 'completed')], {
+                epoch: 1,
+                nextBeforeAt: 10,
+                nextBeforeSeq: 1,
+                snapshotHeadAt: 3_100,
+                snapshotHeadSeq: 310,
+                targetMessageId: 'call-row'
+            })
+        })
+
+        await syncTailMessages(api, id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(
+            [...cachedTail.map((message) => message.id), 'call-row']
+        )
+
+        // The call was enriched while disconnected and 300 newer rows pushed it
+        // beyond the latest page: the catch-up returns only newer rows and the
+        // page starts at row 111, so only a by-id context refresh can converge
+        // the cached card.
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(contextQueries).toEqual(['call-row'])
+        expect(mergedContentOf(state)).toEqual(toolCallRow('call-row', 10, 1_000, 'completed').content)
+        expect(state.messages).toHaveLength(310)
+        expect([...state.messages].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0)).map((message) => message.id)).toEqual(
+            [...cachedTail.map((message) => message.id), 'call-row', ...missed.map((message) => message.id)]
+        )
+        expect(state.newestSeq).toBe(310)
+    })
+
+    it('skips the refresh sweep when no non-terminal rows sit outside the latest page', async () => {
+        const id = sessionId('gap-recovery-sweep-skip')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const done = toolCallRow('call-row', 10, 1_000, 'completed')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        const contextQueries: string[] = []
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(missed, {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            return latestResponse([...cachedTail, done], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+        }, async (_sessionId, messageId) => {
+            contextQueries.push(messageId)
+            return contextResponse([done], {
+                epoch: 1,
+                nextBeforeAt: 10,
+                nextBeforeSeq: 1,
+                snapshotHeadAt: 3_100,
+                snapshotHeadSeq: 310,
+                targetMessageId: 'call-row'
+            })
+        })
+
+        await syncTailMessages(api, id)
+        await recoverWindowAfterGapResume(api, id)
+
+        // The only out-of-page tool-call row is terminal (merge status only
+        // advances), so the sweep must issue zero extra requests.
+        const state = getMessageWindowState(id)
+        expect(contextQueries).toEqual([])
+        expect(state.messages).toHaveLength(310)
+        expect(mergedContentOf(state)).toEqual(done.content)
+    })
+
+    it('leaves the row as is and surfaces the usual warning when its context refresh fails', async () => {
+        const id = sessionId('gap-recovery-refresh-fail')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        let latestCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(missed, {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse([...cachedTail, stale], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            return latestResponse(latestPage, { epoch: 1, hasMore: true, nextBeforeAt: 1_110, nextBeforeSeq: 111 })
+        }, async () => {
+            throw new Error('context fetch failed')
+        })
+
+        await syncTailMessages(api, id)
+        await recoverWindowAfterGapResume(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(mergedContentOf(state)).toEqual(stale.content)
+        expect(state.warning).toBeTruthy()
+        expect(state.messages).toHaveLength(310)
+    })
+
+    it('finishes the run with a warning when the context refresh finds no row', async () => {
+        const id = sessionId('gap-recovery-refresh-missing')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        let latestCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(missed, {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse([...cachedTail, stale], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            return latestResponse(latestPage, { epoch: 1, hasMore: true, nextBeforeAt: 1_110, nextBeforeSeq: 111 })
+        }, async () => null)
+
+        await syncTailMessages(api, id)
+        await recoverWindowAfterGapResume(api, id)
+
+        // The context endpoint no longer knows the row: the sweep leaves it
+        // as is, surfaces the warning, and — critically — finishes the run's
+        // bookkeeping instead of leaving the window marked syncing.
+        const state = getMessageWindowState(id)
+        expect(mergedContentOf(state)).toEqual(stale.content)
+        expect(state.warning).toBeTruthy()
+        expect(state.isSyncingTail).toBe(false)
+        expect(state.messages).toHaveLength(310)
+    })
+
+    it('marks the window for authoritative recovery when the context refresh answers under a different epoch', async () => {
+        const id = sessionId('gap-recovery-refresh-epoch')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        let latestCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(missed, {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse([...cachedTail, stale], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            return latestResponse(latestPage, { epoch: 1, hasMore: true, nextBeforeAt: 1_110, nextBeforeSeq: 111 })
+        }, async (_sessionId, messageId) => (
+            contextResponse([toolCallRow(messageId, 10, 1_000, 'completed')], {
+                epoch: 2,
+                nextBeforeAt: 10,
+                nextBeforeSeq: 1,
+                snapshotHeadAt: 3_100,
+                snapshotHeadSeq: 310,
+                targetMessageId: messageId
+            })
+        ))
+
+        await syncTailMessages(api, id)
+        await recoverWindowAfterGapResume(api, id)
+
+        // A refresh under a different epoch means server rows may have been
+        // deleted since the page was fetched: the window is marked for the
+        // authoritative replacement instead of being left marked syncing.
+        const state = getMessageWindowState(id)
+        expect(mergedContentOf(state)).toEqual(stale.content)
+        expect(state.warning).toBeTruthy()
+        expect(state.requiresLatestReset).toBe(true)
+        expect(state.isSyncingTail).toBe(false)
+    })
+
+    it('leaves the window reset-marked when the recovery catch-up overflows the history budget', async () => {
+        const id = sessionId('gap-recovery-overflow')
+        const cached = Array.from({ length: 600 }, (_, i) => (
+            makeUserMessage({ id: `r${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const caughtUp = Array.from({ length: 200 }, (_, i) => (
+            makeUserMessage({ id: `r${601 + i}`, seq: 601 + i, invokedAt: (601 + i) * 10, createdAt: (601 + i) * 10 })
+        ))
+        const recoveryPage = Array.from({ length: 200 }, (_, i) => (
+            makeUserMessage({ id: `r${901 + i}`, seq: 901 + i, invokedAt: (901 + i) * 10, createdAt: (901 + i) * 10 })
+        ))
+        let latestCalls = 0
+        let beforeCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                // The catch-up page overflows the 600-row history budget:
+                // merging 601-800 into the held 1-600 trims the newer rows
+                // away and marks the window for a reset.
+                return afterResponse(caughtUp, {
+                    epoch: 1,
+                    hasMore: true,
+                    nextAfterAt: 8_000,
+                    nextAfterSeq: 800,
+                    snapshotHeadAt: 11_000,
+                    snapshotHeadSeq: 1_100
+                })
+            }
+            if (query.beforeAt !== undefined) {
+                beforeCalls += 1
+                const from = beforeCalls === 1 ? 201 : 1
+                return beforeResponse(cached.filter((message) => (message.seq ?? 0) >= from && (message.seq ?? 0) <= from + 199), {
+                    epoch: 1,
+                    hasMore: beforeCalls === 1,
+                    nextBeforeAt: (from - 1) * 10,
+                    nextBeforeSeq: from - 1
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse(cached.filter((message) => (message.seq ?? 0) >= 401), {
+                    epoch: 1,
+                    hasMore: true,
+                    nextBeforeAt: 4_000,
+                    nextBeforeSeq: 400
+                })
+            }
+            return latestResponse(recoveryPage, { epoch: 1, hasMore: true, nextBeforeAt: 9_010, nextBeforeSeq: 900 })
+        })
+
+        await syncTailMessages(api, id)
+        setMessageViewMode(id, 'history')
+        await fetchOlderMessages(api, id)
+        await fetchOlderMessages(api, id)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(
+            cached.map((message) => message.id)
+        )
+
+        // The catch-up overflowed: history-mode trimming kept rows 1-600,
+        // dropped the caught-up 601-800, and marked the window for a reset.
+        // The recovery must NOT reconcile the latest page on top of that —
+        // rows 601-900 would sit between the two cursors, unreachable from
+        // either — and must not consume the recovery flags.
+        await recoverWindowAfterGapResume(api, id)
+
+        const overflowed = getMessageWindowState(id)
+        expect(overflowed.messages.map((message) => message.id)).toEqual(cached.map((message) => message.id))
+        expect(overflowed.requiresLatestReset).toBe(true)
+        expect(overflowed.pendingGapRecovery).toBe(true)
+        expect(overflowed.warning).toBeNull()
+
+        // The next sync takes the reset-marked authoritative replacement and
+        // closes the hole: the window becomes the fresh latest page and older
+        // paging resumes from its bound.
+        await syncTailMessages(api, id)
+
+        const replaced = getMessageWindowState(id)
+        expect(replaced.messages.map((message) => message.id)).toEqual(recoveryPage.map((message) => message.id))
+        expect(replaced.requiresLatestReset).toBe(false)
+        expect(replaced.pendingGapRecovery).toBe(false)
+        expect(replaced.oldestSeq).toBe(901)
+        expect(replaced.warning).toBeNull()
+    })
+
+    it('retries the row refresh on the next ordinary sync when the context request fails', async () => {
+        const id = sessionId('gap-recovery-refresh-retry')
+        const cachedTail = Array.from({ length: 9 }, (_, i) => (
+            makeUserMessage({ id: `n${1 + i}`, seq: 1 + i, invokedAt: (1 + i) * 10, createdAt: (1 + i) * 10 })
+        ))
+        const stale = toolCallRow('call-row', 10, 1_000, 'in_progress')
+        const missed = Array.from({ length: 300 }, (_, i) => (
+            makeUserMessage({ id: `n${11 + i}`, seq: 11 + i, invokedAt: (11 + i) * 10, createdAt: (11 + i) * 10 })
+        ))
+        const latestPage = missed.filter((message) => (message.seq ?? 0) >= 111)
+        let latestCalls = 0
+        let contextCalls = 0
+        const api = createApi(async (_sessionId, query) => {
+            if (query.afterAt !== undefined) {
+                return afterResponse(missed, {
+                    epoch: 1,
+                    hasMore: false,
+                    nextAfterAt: 3_100,
+                    nextAfterSeq: 310,
+                    snapshotHeadAt: 3_100,
+                    snapshotHeadSeq: 310
+                })
+            }
+            latestCalls += 1
+            if (latestCalls === 1) {
+                return latestResponse([...cachedTail, stale], { epoch: 1, hasMore: true, nextBeforeAt: 10, nextBeforeSeq: 1 })
+            }
+            return latestResponse(latestPage, { epoch: 1, hasMore: true, nextBeforeAt: 1_110, nextBeforeSeq: 111 })
+        }, async (_sessionId, messageId) => {
+            contextCalls += 1
+            if (contextCalls === 1) throw new Error('context fetch failed')
+            return contextResponse([toolCallRow(messageId, 10, 1_000, 'completed')], {
+                epoch: 1,
+                nextBeforeAt: 10,
+                nextBeforeSeq: 1,
+                snapshotHeadAt: 3_100,
+                snapshotHeadSeq: 310,
+                targetMessageId: messageId
+            })
+        })
+
+        await syncTailMessages(api, id)
+        await recoverWindowAfterGapResume(api, id)
+
+        // The failed refresh surfaces the warning and leaves the recovery
+        // pending, so the next ORDINARY sync retries the sweep instead of
+        // leaving the enriched cached call stale with no retry path.
+        const failed = getMessageWindowState(id)
+        expect(failed.warning).toBeTruthy()
+        expect(failed.pendingGapRecovery).toBe(true)
+        expect(contextCalls).toBe(1)
+
+        await syncTailMessages(api, id)
+
+        const state = getMessageWindowState(id)
+        expect(contextCalls).toBe(2)
+        expect(mergedContentOf(state)).toEqual(toolCallRow('call-row', 10, 1_000, 'completed').content)
+        expect(state.pendingGapRecovery).toBe(false)
+        expect(state.warning).toBeNull()
+        expect(state.messages).toHaveLength(310)
+    })
+
+    it('bounds retained inactive windows using LRU eviction while protecting active or unconfirmed ones', () => {
+        vi.useFakeTimers()
+        try {
+            const ids = Array.from({ length: MAX_RETAINED_INACTIVE_WINDOWS + 4 }, (_, index) => sessionId(`lru-${index}`))
+            const protectedSendingId = ids[0]!
+            const protectedLockedId = ids[1]!
+            const protectedSubscribedId = ids[2]!
+            const evictableOldestId = ids[3]!
+
+            ingestIncomingMessages(protectedSendingId, [
+                makeUserMessage({ id: 'opt-1', localId: 'loc-1', status: 'sending', createdAt: 100, invokedAt: null })
+            ])
+            ingestIncomingMessages(protectedLockedId, [
+                makeUserMessage({ id: 'msg-locked', seq: 1, createdAt: 200, invokedAt: 200 })
+            ])
+            setMessageWindowTargetLock(protectedLockedId, true)
+
+            const unsubscribeActive = subscribeMessageWindow(protectedSubscribedId, () => {})
+            ingestIncomingMessages(protectedSubscribedId, [
+                makeUserMessage({ id: 'msg-sub', seq: 1, createdAt: 300, invokedAt: 300 })
+            ])
+
+            for (let i = 3; i < ids.length; i += 1) {
+                const id = ids[i]!
+                ingestIncomingMessages(id, [
+                    makeUserMessage({ id: `msg-${i}`, seq: 1, createdAt: (i + 1) * 1_000, invokedAt: (i + 1) * 1_000 })
+                ])
+            }
+
+            vi.advanceTimersByTime(300)
+
+            // Protected windows must survive even though they are oldest.
+            expect(getMessageWindowState(protectedSendingId).messages).toHaveLength(1)
+            expect(getMessageWindowState(protectedLockedId).messages).toHaveLength(1)
+            expect(getMessageWindowState(protectedSubscribedId).messages).toHaveLength(1)
+
+            // Wait until the newest sessions settle so evictableOldestId (ids[3]) was evicted
+            // once inactive count exceeded MAX_RETAINED_INACTIVE_WINDOWS.
+            // Note: calling getMessageWindowState(evictableOldestId) re-creates an empty shell,
+            // so verify both in-memory emptiness and sessionStorage cleanup.
+            expect(sessionStorage.getItem(`hapi:message-window:v2:${evictableOldestId}`)).toBeNull()
+            expect(getMessageWindowState(evictableOldestId).messages).toEqual([])
+            expect(getMessageWindowState(ids.at(-1)!).messages).toHaveLength(1)
+
+            unsubscribeActive()
+            setMessageWindowTargetLock(protectedLockedId, false)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('preserves unhydrated persisted windows containing unconfirmed or failed messages across reload pruning', () => {
+        vi.useFakeTimers()
+        try {
+            const unhydratedFailedId = sessionId('reload-failed')
+            const unhydratedIndeterminateId = sessionId('reload-indeterminate')
+            const unhydratedEvictableId = sessionId('reload-evictable')
+            const failedKey = `hapi:message-window:v2:${unhydratedFailedId}`
+            const indeterminateKey = `hapi:message-window:v2:${unhydratedIndeterminateId}`
+            const evictableKey = `hapi:message-window:v2:${unhydratedEvictableId}`
+
+            sessionStorage.setItem(failedKey, JSON.stringify({
+                messages: [
+                    makeUserMessage({ id: 'opt-reload', localId: 'loc-reload', status: 'failed', createdAt: 100, invokedAt: null })
+                ],
+                hasMore: false,
+                oldestPositionAt: 100,
+                oldestPositionSeq: 1,
+                newestPositionAt: 100,
+                newestPositionSeq: 1,
+                contextNewestAt: null,
+                contextNewestSeq: null,
+                epoch: 1,
+                requiresLatestReset: false
+            }))
+            sessionStorage.setItem(indeterminateKey, JSON.stringify({
+                messages: [
+                    {
+                        ...makeUserMessage({ id: 'opt-indet', localId: 'loc-indet', createdAt: 150, invokedAt: null }),
+                        deliveryState: 'indeterminate'
+                    }
+                ],
+                hasMore: false,
+                oldestPositionAt: 150,
+                oldestPositionSeq: 1,
+                newestPositionAt: 150,
+                newestPositionSeq: 1,
+                contextNewestAt: null,
+                contextNewestSeq: null,
+                epoch: 1,
+                requiresLatestReset: false
+            }))
+            sessionStorage.setItem(evictableKey, JSON.stringify({
+                messages: [
+                    makeUserMessage({ id: 'msg-reload-old', seq: 1, createdAt: 200, invokedAt: 200 })
+                ],
+                hasMore: false,
+                oldestPositionAt: 200,
+                oldestPositionSeq: 1,
+                newestPositionAt: 200,
+                newestPositionSeq: 1,
+                contextNewestAt: null,
+                contextNewestSeq: null,
+                epoch: 1,
+                requiresLatestReset: false
+            }))
+
+            for (let i = 0; i < MAX_RETAINED_INACTIVE_WINDOWS + 2; i += 1) {
+                const id = sessionId(`reload-new-${i}`)
+                ingestIncomingMessages(id, [
+                    makeUserMessage({ id: `msg-new-${i}`, seq: 1, createdAt: (i + 1) * 1_000, invokedAt: (i + 1) * 1_000 })
+                ])
+            }
+
+            vi.advanceTimersByTime(300)
+
+            expect(sessionStorage.getItem(evictableKey)).toBeNull()
+            expect(sessionStorage.getItem(failedKey)).not.toBeNull()
+            expect(sessionStorage.getItem(indeterminateKey)).not.toBeNull()
+            expect(getMessageWindowState(unhydratedFailedId).messages).toHaveLength(1)
+            expect(getMessageWindowState(unhydratedIndeterminateId).messages).toHaveLength(1)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('rejects a stale tail response even after the session is evicted and recreated', async () => {
+        const targetId = sessionId('evict-gen-floor')
+        const staleResponse = deferred<MessagesResponse>()
+        const freshMessage = makeUserMessage({ id: 'fresh-msg', seq: 2, createdAt: 2_000, invokedAt: 2_000 })
+        const obsoleteMessage = makeUserMessage({ id: 'obsolete-rewound', seq: 1, createdAt: 1_000, invokedAt: 1_000 })
+
+        let calls = 0
+        const api = createApi(async () => {
+            calls += 1
+            if (calls === 1) {
+                return staleResponse.promise
+            }
+            return latestResponse([freshMessage], { epoch: 2 })
+        })
+
+        // Start a tail sync that remains in flight, invalidate it, then evict targetId under LRU pressure.
+        const firstSync = syncTailMessages(api, targetId)
+        clearMessageWindow(targetId)
+
+        for (let i = 0; i < MAX_RETAINED_INACTIVE_WINDOWS + 2; i += 1) {
+            const fillerId = sessionId(`evict-filler-${i}`)
+            ingestIncomingMessages(fillerId, [
+                makeUserMessage({ id: `filler-msg-${i}`, seq: 1, createdAt: (i + 1) * 1_000, invokedAt: (i + 1) * 1_000 })
+            ])
+        }
+
+        // Recreate targetId after eviction and load fresh state.
+        await syncTailMessages(api, targetId)
+        expect(getMessageWindowState(targetId).messages.map((m) => m.id)).toEqual(['fresh-msg'])
+
+        // Late completion of the pre-eviction request must not overwrite or merge obsolete rows.
+        staleResponse.resolve(latestResponse([obsoleteMessage], { epoch: 1 }))
+        await firstSync
+
+        expect(getMessageWindowState(targetId).messages.map((m) => m.id)).toEqual(['fresh-msg'])
+    })
+
+    it('does not parse unhydrated sessionStorage payloads when inactive storage count is within the limit', () => {
+        vi.useFakeTimers()
+        const parseSpy = vi.spyOn(JSON, 'parse')
+        try {
+            const unhydratedId = sessionId('unhydrated-under-limit')
+            sessionStorage.setItem(`hapi:message-window:v2:${unhydratedId}`, JSON.stringify({
+                messages: [makeUserMessage({ id: 'msg-unhydrated', seq: 1, createdAt: 100, invokedAt: 100 })],
+                hasMore: false,
+                oldestPositionAt: 100,
+                oldestPositionSeq: 1,
+                newestPositionAt: 100,
+                newestPositionSeq: 1,
+                contextNewestAt: null,
+                contextNewestSeq: null,
+                epoch: 1,
+                requiresLatestReset: false
+            }))
+
+            parseSpy.mockClear()
+
+            const activeId = sessionId('active-under-limit')
+            ingestIncomingMessages(activeId, [
+                makeUserMessage({ id: 'msg-active', seq: 1, createdAt: 200, invokedAt: 200 })
+            ])
+
+            vi.advanceTimersByTime(300)
+
+            expect(parseSpy).not.toHaveBeenCalled()
+            expect(sessionStorage.getItem(`hapi:message-window:v2:${unhydratedId}`)).not.toBeNull()
+        } finally {
+            parseSpy.mockRestore()
+            vi.useRealTimers()
+        }
     })
 })

@@ -318,6 +318,34 @@ describe('buildCliArgs', () => {
         expect(args).toContain('hapi-child-id')
     })
 
+    it('passes --resume-session-at for Claude fork at a message and rewind (no drops guard)', () => {
+        const args = buildCliArgs('claude', {
+            directory: '/tmp',
+            resumeSessionId: 'claude-source-id',
+            existingSessionId: 'hapi-child-id',
+            forkSession: true,
+            resumeSessionAt: 'keep-boundary-uuid',
+        })
+        expect(args).toContain('--resume-session-at')
+        expect(args[args.indexOf('--resume-session-at') + 1]).toBe('keep-boundary-uuid')
+        // claude 2.1.322's --resume-drops-turn takes ONE uuid (repeated flags overwrite,
+        // last wins) and its guard refuses any range holding a second external prompt,
+        // so multi-turn drops cannot be expressed with it. resume-session-at alone
+        // truncates unconditionally, which is the semantics rewind/fork-at-message need.
+        expect(args).not.toContain('--resume-drops-turn')
+        expect(args.indexOf('--resume-session-at')).toBeGreaterThan(args.indexOf('--fork-session'))
+    })
+
+    it('omits resume-at flags for non-claude agents', () => {
+        const args = buildCliArgs('codex', {
+            directory: '/tmp',
+            resumeSessionId: 'codex-thread-id',
+            resumeSessionAt: 'keep-boundary-uuid',
+        })
+        expect(args).not.toContain('--resume-session-at')
+        expect(args).not.toContain('--resume-drops-turn')
+    })
+
     it('passes --effort for pi agent', () => {
         const args = buildCliArgs('pi', {
             directory: '/tmp',
@@ -374,7 +402,9 @@ describe('buildCliArgs', () => {
         expect(args).not.toContain('--hapi-session-id')
     })
 
-    it('builds a remote DSH ACP runner command without unsupported policy flags', () => {
+    it('builds a remote DSH ACP runner command with the spawn-time policy flag', () => {
+        // dsh accepts the standard permission flags since the DSH_PERMISSION_MODE
+        // spawn mapping: read-only/yolo pin the server's sandbox preset.
         const args = buildCliArgs('dsh', {
             directory: '/tmp',
             existingSessionId: 'existing-hub-id',
@@ -385,7 +415,8 @@ describe('buildCliArgs', () => {
             'dsh',
             '--hapi-starting-mode', 'remote',
             '--started-by', 'runner',
-            '--existing-session-id', 'existing-hub-id'
+            '--existing-session-id', 'existing-hub-id',
+            '--permission-mode', 'read-only'
         ])
     })
 
@@ -574,6 +605,15 @@ describe('createSpawnDeduplicator', () => {
 })
 
 describe('classifyRecoveredProcessGeneration', () => {
+    it('uses the process table liveness evidence without probing the PID again', () => {
+        const pid = 2147483647
+        const record = { processStartMarker: 'expected' }
+        expect(probeRecoveredProcessGeneration(pid, record, 'expected', true)).toBe('verified')
+        expect(probeRecoveredProcessGeneration(pid, record, null, true)).toBe('quarantined')
+        expect(probeRecoveredProcessGeneration(pid, record, 'different', true)).toBe('exited')
+        expect(probeRecoveredProcessGeneration(pid, record, 'expected')).toBe('exited')
+    })
+
     it('releases a recovered record from a different boot even when its PID is alive and its marker is unavailable', () => {
         expect(classifyRecoveredProcessGeneration(true, null, 'old-marker', {
             pid: 123, threadGroupId: 123,

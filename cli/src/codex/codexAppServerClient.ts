@@ -8,6 +8,8 @@ import { CODEX_WEBSOCKET_MAX_PAYLOAD } from './websocketLimits';
 import { resolveModelCatalogArgs } from './utils/modelCatalog';
 import { resolveSelectedCodexCommand } from './utils/codexExecutable';
 import type {
+    AccountRateLimitsReadResponse,
+    AccountReadResponse,
     CollaborationModeListResponse,
     InitializeParams,
     InitializeResponse,
@@ -398,6 +400,13 @@ export class CodexAppServerClient extends JsonLineParser {
 
     async readAccountRateLimits(): Promise<GetAccountRateLimitsResponse> {
         return await this.sendRequest('account/rateLimits/read', {}, { timeoutMs: 30_000 }) as GetAccountRateLimitsResponse;
+    }
+
+    async readRateLimits(): Promise<AccountRateLimitsReadResponse> {
+        const response = await this.sendRequest('account/rateLimits/read', {}, {
+            timeoutMs: 15_000
+        });
+        return response as AccountRateLimitsReadResponse;
     }
 
     async listSkills(params: SkillsListParams): Promise<SkillsListResponse> {

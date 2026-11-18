@@ -50,6 +50,7 @@ export interface HapiMcpBridgeOptions {
     exportSessionEnv?: boolean;
     emitTitleSummary?: boolean;
     enableChangeTitle?: boolean;
+    enableLinkPr?: boolean;
     onChangeTitle?: (title: string) => void;
     /** Session project cwd for relative spawn_peer directories (Codex --cd aware). */
     workingDirectory?: string;
@@ -88,6 +89,7 @@ export async function buildHapiMcpBridge(
     const happyServer = await startHappyServer(client, {
         emitTitleSummary: options.emitTitleSummary,
         enableChangeTitle: options.enableChangeTitle,
+        enableLinkPr: options.enableLinkPr,
         onChangeTitle: options.onChangeTitle,
         workingDirectory: options.workingDirectory ?? options.skillLookup?.workingDirectory,
         enablePeerCollaboration: options.enablePeerCollaboration,
@@ -120,6 +122,14 @@ export async function buildHapiMcpBridge(
             approval_mode: 'approve'
         };
     }
+    // Prompt — not approve: link_pr mutates session metadata. Native
+    // pre-approval would bypass BasePermissionHandler's read-only guard.
+    if (happyServer.toolNames.includes('link_pr')) {
+        tools.link_pr = {
+            approval_mode: 'prompt'
+        };
+    }
+
     if (!isPeerToolsDisabled() && (options.enablePeerCollaboration ?? isPeerCollaborationEnabled())) {
         // Discovery is only available in explicitly opted-in collaboration mode.
         tools.list_peers = {

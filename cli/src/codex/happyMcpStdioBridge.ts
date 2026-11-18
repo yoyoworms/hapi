@@ -17,7 +17,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { z } from 'zod';
 import { PeerDeliveryModeSchema } from '@/modules/pingPeer/deliveryMode';
-import { DISPLAY_IMAGE_PROMPT_CURSOR, DISPLAY_MEDIA_PROMPT_CURSOR, DISPLAY_VIDEO_PROMPT_CURSOR } from '@/modules/common/displayImagePrompt';
+import { DISPLAY_IMAGE_TOOL_DESCRIPTION, DISPLAY_MEDIA_TOOL_DESCRIPTION, DISPLAY_VIDEO_TOOL_DESCRIPTION } from '@/modules/common/displayToolDescriptions';
 import {
   INSPECT_PEER_TOOL_DESCRIPTION,
   LIST_PEERS_INCLUDE_INACTIVE_PARAM_DESCRIPTION,
@@ -137,7 +137,76 @@ export async function runHappyMcpStdioBridge(argv: string[]): Promise<void> {
       );
     }
 
+    const linkPrInputSchema: z.ZodTypeAny = z.object({
+      url: z.string().optional().describe('GitHub PR URL'),
+      repo: z.string().optional().describe('owner/repo'),
+      number: z.number().int().positive().optional().describe('PR number'),
+      role: z.enum(['primary', 'secondary']).optional(),
+    });
 
+    if (toolNames.has('link_pr')) {
+      const linkPrTool = server.registerTool<any, any>(
+        'link_pr',
+        {
+          description: 'Attach the current HAPI session to a GitHub pull request',
+          title: 'Link Pull Request',
+          inputSchema: linkPrInputSchema,
+        },
+        async (args: Record<string, unknown>) => {
+          try {
+            const client = await ensureHttpClient();
+            await syncLinkPrVisibilityFromHttp(client);
+            if (!linkPrTool.enabled) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: 'GitHub PR awareness is disabled in Settings → Features. Enable it, then retry link_pr.',
+                  },
+                ],
+                isError: true,
+              };
+            }
+            const response = await client.callTool({ name: 'link_pr', arguments: args });
+            return response as any;
+          } catch (error) {
+            return {
+              content: [
+                { type: 'text' as const, text: `Failed to link PR: ${error instanceof Error ? error.message : String(error)}` },
+              ],
+              isError: true,
+            };
+          }
+        }
+      );
+      // Start hidden until the first HTTP listTools sync confirms awareness.
+      linkPrTool.disable();
+
+      async function syncLinkPrVisibilityFromHttp(client: Client): Promise<void> {
+        try {
+          const listed = await client.listTools();
+          const visible = listed.tools.some((tool) => tool.name === 'link_pr');
+          // Guard: SDK enable/disable always emit list_changed even when unchanged.
+          if (visible === linkPrTool.enabled) return;
+          if (visible) linkPrTool.enable();
+          else linkPrTool.disable();
+        } catch {
+          // Keep prior visibility on transient HTTP errors.
+        }
+      }
+
+      // Periodic sync so Codex listTools tracks hub toggles without destroying
+      // the cached HTTP MCP session.
+      const visibilityTimer = setInterval(() => {
+        void ensureHttpClient()
+          .then((client) => syncLinkPrVisibilityFromHttp(client))
+          .catch(() => undefined);
+      }, 15_000);
+      visibilityTimer.unref?.();
+      void ensureHttpClient()
+        .then((client) => syncLinkPrVisibilityFromHttp(client))
+        .catch(() => undefined);
+    }
 
     const displayImageInputSchema: z.ZodTypeAny = z.object({
       path: z.string().describe('Absolute filesystem path of the local image to display to the human user. This file is sent for user display, not provided to the model for image inspection'),
@@ -148,7 +217,7 @@ export async function runHappyMcpStdioBridge(argv: string[]): Promise<void> {
       server.registerTool<any, any>(
         'display_image',
         {
-          description: `Display a local image file to the human user inline in the current HAPI chat session. ${DISPLAY_IMAGE_PROMPT_CURSOR}`,
+          description: DISPLAY_IMAGE_TOOL_DESCRIPTION,
           title: 'Display Image',
           inputSchema: displayImageInputSchema,
         },
@@ -178,7 +247,7 @@ export async function runHappyMcpStdioBridge(argv: string[]): Promise<void> {
       server.registerTool<any, any>(
         'display_video',
         {
-          description: `Display a local mp4 or webm file inline in the current HAPI chat session. ${DISPLAY_VIDEO_PROMPT_CURSOR}`,
+          description: DISPLAY_VIDEO_TOOL_DESCRIPTION,
           title: 'Display Video',
           inputSchema: displayVideoInputSchema,
         },
@@ -208,7 +277,7 @@ export async function runHappyMcpStdioBridge(argv: string[]): Promise<void> {
       server.registerTool<any, any>(
         'display_media',
         {
-          description: `Send a local image, video, audio, or other file to the current HAPI chat session. ${DISPLAY_MEDIA_PROMPT_CURSOR}`,
+          description: DISPLAY_MEDIA_TOOL_DESCRIPTION,
           title: 'Display Media',
           inputSchema: displayMediaInputSchema,
         },

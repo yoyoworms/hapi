@@ -1,10 +1,19 @@
 import type { AgentFlavor } from '@hapi/protocol';
 import type { AgentBackend, AgentMessage, AgentSessionConfig, FormElicitationRequest, FormElicitationResponse, PermissionRequest, PermissionResponse, PromptContent } from '@/agent/types';
 import { asString, isObject } from '@hapi/protocol';
-import { AcpStdioTransport, type AcpStderrError } from './AcpStdioTransport';
+import { AcpStdioTransport, isAcpIndeterminateError, type AcpStderrError } from './AcpStdioTransport';
 import { AcpMessageHandler, type AcpTextChunkMode } from './AcpMessageHandler';
 import { ACP_SESSION_UPDATE_TYPES, OPENCODE_CHILD_SESSION_UPDATES, OPENCODE_CHILD_UPDATE_METHOD } from './constants';
 import { thinkingHintFromSessionUpdate } from './shouldBumpThinkingFromSessionUpdate';
+import {
+    AcpToolCallLifetimes,
+    childToolCallScope,
+    MAIN_TOOL_CALL_SCOPE,
+    type ToolCallEventKind,
+    type ToolCallScope
+} from './toolCallLifetimes';
+import { defaultToolCallLifetimeStore, type ToolCallLifetimeStore } from './toolCallLifetimeStore';
+import { randomUUID } from 'node:crypto';
 
 /** Why the backend is bumping/clearing hub thinking — launchers filter chatter here (#1553). */
 export type AgentActivitySource =
@@ -65,6 +74,11 @@ export type AcpConfigOptionDescriptor = {
     options: Array<{ value: string; name?: string }>;
 };
 
+export type AcpAvailableCommand = {
+    name: string;
+    description?: string;
+};
+
 /**
  * Normalize ACP config-option choices to a flat `{ value, name }` list.
  * Most agents send flat `options: [{ value, name }]`, but Zed-style grouped
@@ -114,18 +128,33 @@ export class AcpSdkBackend implements AgentBackend {
     private permissionHandler: ((request: PermissionRequest) => void) | null = null;
     private stderrErrorHandler: ((error: AcpStderrError) => void) | null = null;
     private readonly pendingPermissions = new Map<string, PendingPermission>();
+    /**
+     * HAPI id per agent tool call lifetime. Agents may reuse their ids every
+     * turn (for example, `question:0`, `shell:0`), so every tool message,
+     * permission request and form elicitation leaves this backend under the
+     * lifetime id instead of the agent's id. Kept across prompts and child
+     * turns; see AcpToolCallLifetimes for the rules.
+     */
+    private toolCallLifetimes = this.createToolCallLifetimes();
+    private readonly toolCallLifetimeStore: ToolCallLifetimeStore | null;
+    private toolCallLifetimeSaveTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Permission requests and questions the agent is still waiting on, by request id. */
+    private readonly liveRequestIds = new Set<string>();
     private formElicitationHandler: ((request: FormElicitationRequest) => Promise<FormElicitationResponse>) | null = null;
     private readonly pendingElicitations = new Set<PendingElicitation>();
     private readonly sessionModelsMetadata = new Map<string, AcpSessionModelsMetadata>();
     private readonly sessionConfigOptions = new Map<string, AcpConfigOptionDescriptor[]>();
     private readonly sessionInfoRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    private readonly initialAvailableCommands = new Set<string>();
-    private readonly sessionAvailableCommands = new Map<string, Set<string>>();
+    private readonly initialAvailableCommands = new Map<string, AcpAvailableCommand>();
+    private readonly sessionAvailableCommands = new Map<string, Map<string, AcpAvailableCommand>>();
+    private availableCommandsUpdateListener: ((sessionId: string | null, commands: AcpAvailableCommand[]) => void) | null = null;
     private autoPermissionModeEnabled: boolean | null = null;
     private messageHandler: AcpMessageHandler | null = null;
     private activeSessionId: string | null = null;
     private initializeResult: AcpInitializeResult | null = null;
     private initializeInFlight: Promise<void> | null = null;
+    private initializeRetryAbort: AbortController | null = null;
+    private transportOpening: Promise<AcpStdioTransport> | null = null;
     private setModeSupported: boolean | undefined = undefined;
     private isProcessingMessage = false;
     private promptRequestInFlight = false;
@@ -194,6 +223,7 @@ export class AcpSdkBackend implements AgentBackend {
     private static readonly LATE_FLUSH_INTERVAL_MS = 50;
     private static readonly LATE_FLUSH_QUIET_PERIOD_MS = 250;
     private static readonly LATE_FLUSH_WINDOW_MS = 6000;
+    private static readonly TOOL_CALL_LIFETIME_SAVE_DELAY_MS = 200;
 
     constructor(private readonly options: {
         command: string;
@@ -226,7 +256,17 @@ export class AcpSdkBackend implements AgentBackend {
         configOptionUpdates?: boolean;
         textChunkMode?: AcpTextChunkMode;
         flavor?: AgentFlavor;
-    }) {}
+        /**
+         * Where open tool call lifetimes survive a restart. Defaults to a file
+         * per ACP session under the HAPI home when this process serves a HAPI
+         * session; `null` disables persistence.
+         */
+        toolCallLifetimeStore?: ToolCallLifetimeStore | null;
+    }) {
+        this.toolCallLifetimeStore = options.toolCallLifetimeStore === undefined
+            ? defaultToolCallLifetimeStore()
+            : options.toolCallLifetimeStore;
+    }
 
     async initialize(): Promise<void> {
         if (this.transport) return;
@@ -235,23 +275,27 @@ export class AcpSdkBackend implements AgentBackend {
             return;
         }
 
-        this.initializeInFlight = this.bootstrapTransport();
+        this.initializeRetryAbort = new AbortController();
+        this.initializeInFlight = this.bootstrapTransport(this.initializeRetryAbort.signal);
         try {
             await this.initializeInFlight;
         } finally {
             this.initializeInFlight = null;
+            this.transportOpening = null;
+            this.initializeRetryAbort = null;
         }
     }
 
-    private async bootstrapTransport(): Promise<void> {
+    private async bootstrapTransport(signal: AbortSignal): Promise<void> {
         if (this.transport) return;
 
-        const transport = await AcpStdioTransport.create({
+        this.transportOpening = AcpStdioTransport.create({
             command: this.options.command,
             args: this.options.args,
             env: this.options.env,
             cwd: this.options.spawnCwd
         });
+        const transport = await this.transportOpening;
 
         if (this.transport) {
             await transport.close();
@@ -300,6 +344,7 @@ export class AcpSdkBackend implements AgentBackend {
             }),
             {
                 ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                signal,
                 onRetry: (error, attempt, nextDelayMs) => {
                     logger.debug(`[ACP] Initialize attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
                 }
@@ -366,6 +411,19 @@ export class AcpSdkBackend implements AgentBackend {
     supportsSessionResume(): boolean {
         const capabilities = this.initializeResult?.agentCapabilities?.sessionCapabilities;
         return Boolean(capabilities && Object.prototype.hasOwnProperty.call(capabilities, 'resume'));
+    }
+
+    /**
+     * Whether the initialize result advertises inline image prompt content
+     * (`agentCapabilities.promptCapabilities.image`, e.g. DSH 0.2.2+).
+     *
+     * Callers must gate image content blocks on this: sending
+     * `{type:'image'}` blocks to an agent that never advertised the
+     * capability rejects the whole session/prompt.
+     */
+    supportsImagePrompts(): boolean {
+        const promptCapabilities = this.initializeResult?.agentCapabilities?.promptCapabilities;
+        return isObject(promptCapabilities) && promptCapabilities.image === true;
     }
 
     getSessionConfigOptions(sessionId: string): AcpConfigOptionDescriptor[] | undefined {
@@ -440,7 +498,7 @@ export class AcpSdkBackend implements AgentBackend {
             throw new Error('Invalid session/new response from ACP agent');
         }
 
-        this.activeSessionId = sessionId;
+        this.setActiveSessionId(sessionId);
         this.captureSessionMetadata(sessionId, response);
         return sessionId;
     }
@@ -466,7 +524,7 @@ export class AcpSdkBackend implements AgentBackend {
 
         const loadedSessionId = isObject(response) ? asString(response.sessionId) : null;
         const sessionId = loadedSessionId ?? config.sessionId;
-        this.activeSessionId = sessionId;
+        this.setActiveSessionId(sessionId);
         this.captureSessionMetadata(sessionId, response);
         return sessionId;
     }
@@ -489,6 +547,13 @@ export class AcpSdkBackend implements AgentBackend {
             }),
             {
                 ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                // Only transport-indeterminate failures (child exited,
+                // transport closed, failed stdin write) are worth retrying.
+                // dsh answers a mismatched cwd (compared by realpath) or an
+                // already-active session with a TERMINAL invalidParams
+                // rejection; retrying it just delays the caller's
+                // fresh-session fallback by the full backoff chain.
+                shouldRetry: isAcpIndeterminateError,
                 onRetry: (error, attempt, nextDelayMs) => {
                     logger.debug(`[ACP] session/resume attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
                 }
@@ -497,7 +562,7 @@ export class AcpSdkBackend implements AgentBackend {
 
         const resumedSessionId = isObject(response) ? asString(response.sessionId) : null;
         const sessionId = resumedSessionId ?? config.sessionId;
-        this.activeSessionId = sessionId;
+        this.setActiveSessionId(sessionId);
         this.captureSessionMetadata(sessionId, response);
         return sessionId;
     }
@@ -653,6 +718,23 @@ export class AcpSdkBackend implements AgentBackend {
             ?? this.initialAvailableCommands.has(command);
     }
 
+    /**
+     * Returns the slash commands negotiated via ACP `available_commands_update`
+     * (or `initialize` / `session/new` / `session/resume` metadata) for the
+     * given session, falling back to commands advertised during `initialize`.
+     */
+    getAvailableCommands(sessionId?: string | null): AcpAvailableCommand[] {
+        const sessionCommands = sessionId ? this.sessionAvailableCommands.get(sessionId) : undefined;
+        const source = sessionCommands ?? this.initialAvailableCommands;
+        return Array.from(source.values(), (command) => ({ ...command }));
+    }
+
+    setAvailableCommandsUpdateListener(
+        listener: ((sessionId: string | null, commands: AcpAvailableCommand[]) => void) | null
+    ): void {
+        this.availableCommandsUpdateListener = listener;
+    }
+
     /** Forwards ACP `usage_update` to the web status bar when no prompt is active (e.g. session resume). */
     setUsageUpdateListener(listener: ((msg: AgentMessage) => void) | null): void {
         this.usageUpdateListener = listener;
@@ -733,15 +815,23 @@ export class AcpSdkBackend implements AgentBackend {
         sessionId: string,
         content: PromptContent[],
         onUpdate: (msg: AgentMessage) => void,
-        // prompt() waits for earlier output before it sends and for late output
-        // after the answer; callers timing the agent itself need both moments.
-        timing?: { onSent?: () => void; onAnswered?: () => void }
-    ): Promise<void> {
+        options?: {
+            /**
+             * Re-checked immediately before the send. Returning false aborts
+             * the turn without prompting (e.g. a queued bridge superseded by a
+             * real user turn); prompt() then resolves false.
+             */
+            shouldSend?: () => boolean
+            // prompt() waits for earlier output before it sends and for late output
+            // after the answer; callers timing the agent itself need both moments.
+            timing?: { onSent?: () => void; onAnswered?: () => void }
+        }
+    ): Promise<boolean> {
         if (!this.transport) {
             throw new Error('ACP transport not initialized');
         }
 
-        this.activeSessionId = sessionId;
+        this.setActiveSessionId(sessionId);
         // Single-phase handler swap: drain any chunks still buffered in the
         // previous turn's handler so they emit via that turn's onUpdate, then
         // immediately install the new handler. The post-prompt drainLateBuffers
@@ -754,11 +844,15 @@ export class AcpSdkBackend implements AgentBackend {
         );
         await this.sessionUpdateQueue;
         this.messageHandler?.drainBuffers();
+        if (options?.shouldSend && !options.shouldSend()) {
+            return false;
+        }
         this.messageHandler = new AcpMessageHandler(onUpdate, {
             textChunkMode: this.options.textChunkMode,
             flavor: this.options.flavor,
         });
         this.promptGeneration++;
+        this.toolCallLifetimes.beginGeneration();
         this.foregroundPromptRequests++;
         const promptRequestEpoch = this.beginPromptRequest();
         this.lastSessionUpdateAt = Date.now();
@@ -767,6 +861,7 @@ export class AcpSdkBackend implements AgentBackend {
         this.promptUsageCallback = onUpdate;
         this.childEmitSink = onUpdate;
         let stopReason: string | null = null;
+        let numTurns: number | undefined = undefined;
         let promptUsage: AcpPromptUsage | null = null;
 
         try {
@@ -779,15 +874,16 @@ export class AcpSdkBackend implements AgentBackend {
                     sessionId,
                     prompt: content
                 }, { timeoutMs: Infinity });
-                timing?.onSent?.();
+                options?.timing?.onSent?.();
                 response = await request;
             } finally {
                 this.promptRequestInFlight = false;
-                timing?.onAnswered?.();
+                options?.timing?.onAnswered?.();
             }
 
             stopReason = isObject(response) ? asString(response.stopReason) : null;
             promptUsage = this.extractPromptUsage(response);
+            numTurns = this.extractNumTurns(response);
         } finally {
             // Cursor (#2267/#2268): drain any session updates already queued with
             // the native response, then seal a done footer before the quiet
@@ -811,6 +907,9 @@ export class AcpSdkBackend implements AgentBackend {
             // before turn_complete so generated_image precedes turn boundary.
             await this.sessionUpdateQueue;
             this.messageHandler?.drainBuffers();
+            // A call cancelled in this prompt has had its tail; the agent
+            // starting that id again from now on is a new call.
+            this.toolCallLifetimes.settleCancelled();
             try {
                 const latestUsageUpdate = this.readLatestUsageUpdate();
                 if (promptUsage) {
@@ -845,7 +944,11 @@ export class AcpSdkBackend implements AgentBackend {
                     });
                 }
                 if (stopReason) {
-                    onUpdate({ type: 'turn_complete', stopReason });
+                    onUpdate({
+                        type: 'turn_complete',
+                        stopReason,
+                        ...(numTurns !== undefined ? { numTurns } : {})
+                    });
                 }
             } finally {
                 this.promptUsageCallback = null;
@@ -859,6 +962,7 @@ export class AcpSdkBackend implements AgentBackend {
                 }
             }
         }
+        return true;
     }
 
     async cancelPrompt(sessionId: string): Promise<void> {
@@ -866,6 +970,7 @@ export class AcpSdkBackend implements AgentBackend {
             return;
         }
 
+        this.toolCallLifetimes.cancel();
         this.transport.sendNotification('session/cancel', { sessionId });
         // The agent keeps waiting on an unanswered form until its request is
         // answered, so cancelling the prompt must settle the form too.
@@ -984,6 +1089,8 @@ export class AcpSdkBackend implements AgentBackend {
         }
 
         this.pendingPermissions.delete(request.id);
+        this.liveRequestIds.delete(request.id);
+        this.toolCallLifetimes.settleRequest(request.toolCallId);
 
         if (response.outcome === 'cancelled') {
             pending.resolve({ outcome: { outcome: 'cancelled' } });
@@ -1024,9 +1131,14 @@ export class AcpSdkBackend implements AgentBackend {
             return cancel;
         }
 
+        const agentToolCallId = asString(params.toolCallId);
+        const toolCallId = agentToolCallId
+            ? this.resolveToolCallLifetimeId(agentToolCallId, 'request', sessionId)
+            : null;
+        const requestId = toolCallId ? this.toolCallLifetimes.allocateRequestId(toolCallId) : null;
         const request: FormElicitationRequest = {
             sessionId,
-            ...(asString(params.toolCallId) ? { toolCallId: asString(params.toolCallId) as string } : {}),
+            ...(toolCallId && requestId ? { toolCallId, requestId } : {}),
             message: asString(params.message) ?? '',
             requestedSchema: params.requestedSchema
         };
@@ -1036,10 +1148,13 @@ export class AcpSdkBackend implements AgentBackend {
                 sessionId,
                 settle: (response) => {
                     this.pendingElicitations.delete(pending);
+                    if (requestId) this.liveRequestIds.delete(requestId);
+                    if (toolCallId) this.toolCallLifetimes.settleRequest(toolCallId);
                     resolve(response);
                 }
             };
             this.pendingElicitations.add(pending);
+            if (requestId) this.liveRequestIds.add(requestId);
             this.agentActivityListener?.(true, 'form_elicitation');
             this.formElicitationHandler!(request).then(
                 (response) => pending.settle(response),
@@ -1107,9 +1222,12 @@ export class AcpSdkBackend implements AgentBackend {
         try {
             return await fn();
         } finally {
+            // A load/compact can finish before its first notification. Measure
+            // quiet from completion too, not only the previous prompt's idle time.
             await this.waitForSessionUpdateQuiet(
                 AcpSdkBackend.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS,
-                AcpSdkBackend.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS
+                AcpSdkBackend.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS,
+                Date.now()
             );
             if (this.messageHandler === null) {
                 this.messageHandler = previousHandler;
@@ -1172,7 +1290,14 @@ export class AcpSdkBackend implements AgentBackend {
         });
     }
 
-    async disconnect(): Promise<void> {
+    async disconnect(options?: { waitForTransport?: boolean }): Promise<void> {
+        if (options?.waitForTransport) {
+            this.initializeRetryAbort?.abort();
+            if (!this.transport) {
+                // Wait for process ownership, without waiting for the ACP initialize reply.
+                await this.transportOpening?.catch(() => undefined);
+            }
+        }
         if (!this.transport) return;
         for (const timer of this.sessionInfoRefreshTimers.values()) {
             clearTimeout(timer);
@@ -1185,6 +1310,7 @@ export class AcpSdkBackend implements AgentBackend {
             entry.handler.drainBuffers();
         }
         this.childHandlers.clear();
+        const recordSessionId = this.activeSessionId;
         this.childEmitSink = null;
         this.messageHandler?.drainBuffers();
         this.messageHandler = null;
@@ -1198,8 +1324,121 @@ export class AcpSdkBackend implements AgentBackend {
         this.autoPermissionModeEnabled = null;
         this.notifyResponseComplete();
         this.settlePendingElicitations();
-        await this.transport.close();
-        this.transport = null;
+        let agentEnded = false;
+        try {
+            agentEnded = (await this.transport.close()) === true;
+        } finally {
+            this.transport = null;
+            // Delete transition: only once the agent process tree is confirmed
+            // gone can no call of this session report any more. Otherwise
+            // (kill unverified, close threw, or this process dies first) the
+            // record stays for a restore.
+            this.settleToolCallLifetimeRecord(recordSessionId, agentEnded);
+        }
+    }
+
+    /**
+     * The HAPI id of the agent tool call `agentToolCallId` for an event of
+     * `kind`. For launcher code that receives agent ids outside session
+     * updates (extension requests), so its cards match the tool messages.
+     */
+    resolveToolCallLifetimeId(agentToolCallId: string, kind: ToolCallEventKind, sessionId?: string | null): string {
+        return this.toolCallLifetimes.resolve(agentToolCallId, kind, this.toolCallScopeFor(sessionId));
+    }
+
+    /** The id for the next request asked under the lifetime `lifetimeId` (see AcpToolCallLifetimes.allocateRequestId). */
+    allocateToolCallRequestId(lifetimeId: string): string {
+        return this.toolCallLifetimes.allocateRequestId(lifetimeId);
+    }
+
+    /** Whether the agent is still waiting for an answer to the request `requestId`. */
+    hasLiveRequest(requestId: string): boolean {
+        return this.liveRequestIds.has(requestId);
+    }
+
+    private createToolCallLifetimes(): AcpToolCallLifetimes {
+        // A call that opens is journaled at once (one small append), so a
+        // crash right after it still leaves its id on disk. The full set is
+        // only rewritten by the debounced compaction.
+        // A finished call is journaled too, so a crash before compaction
+        // never restores it as open in place of a newer call with its id.
+        return new AcpToolCallLifetimes(undefined, (change, lifetime) => {
+            if (lifetime && this.toolCallLifetimeStore && this.activeSessionId) {
+                if (change === 'open') this.toolCallLifetimeStore.append(this.activeSessionId, lifetime);
+                else this.toolCallLifetimeStore.appendClose(this.activeSessionId, lifetime.id);
+            }
+            this.scheduleToolCallLifetimeSave();
+        });
+    }
+
+    private scheduleToolCallLifetimeSave(): void {
+        if (!this.toolCallLifetimeStore || this.toolCallLifetimeSaveTimer) return;
+        const timer = setTimeout(() => {
+            this.toolCallLifetimeSaveTimer = null;
+            this.flushToolCallLifetimes();
+        }, AcpSdkBackend.TOOL_CALL_LIFETIME_SAVE_DELAY_MS);
+        timer.unref?.();
+        this.toolCallLifetimeSaveTimer = timer;
+    }
+
+    private settleToolCallLifetimeRecord(sessionId: string | null, agentEnded: boolean): void {
+        if (this.toolCallLifetimeSaveTimer) {
+            clearTimeout(this.toolCallLifetimeSaveTimer);
+            this.toolCallLifetimeSaveTimer = null;
+        }
+        if (!this.toolCallLifetimeStore || !sessionId) return;
+        this.toolCallLifetimeStore.save(sessionId, agentEnded ? [] : this.toolCallLifetimes.openLifetimes());
+    }
+
+    private flushToolCallLifetimes(): void {
+        if (this.toolCallLifetimeSaveTimer) {
+            clearTimeout(this.toolCallLifetimeSaveTimer);
+            this.toolCallLifetimeSaveTimer = null;
+        }
+        if (!this.toolCallLifetimeStore || !this.activeSessionId) return;
+        this.toolCallLifetimeStore.save(this.activeSessionId, this.toolCallLifetimes.openLifetimes());
+    }
+
+    /**
+     * Agent tool call ids are only meaningful within one ACP session: another
+     * session (new, loaded or resumed on this connection) starts from its own
+     * stored lifetimes, so its ids never join calls of the previous one.
+     */
+    private setActiveSessionId(sessionId: string): void {
+        if (this.activeSessionId === sessionId) return;
+        if (this.activeSessionId) {
+            this.flushToolCallLifetimes();
+            this.toolCallLifetimes = this.createToolCallLifetimes();
+        }
+        this.activeSessionId = sessionId;
+        // Calls of this session still open when a previous process stopped
+        // keep their ids (an agent that outlives HAPI's restart may report them).
+        const stored = this.toolCallLifetimeStore?.load(sessionId) ?? [];
+        if (stored.length > 0) this.toolCallLifetimes.restore(stored);
+    }
+
+    private toolCallScopeFor(sessionId: string | null | undefined): ToolCallScope {
+        if (sessionId && sessionId !== this.activeSessionId && this.childHandlers.has(sessionId)) {
+            return childToolCallScope(sessionId);
+        }
+        return MAIN_TOOL_CALL_SCOPE;
+    }
+
+    /** Rewrites a tool_call / tool_call_update to carry the call's lifetime id. */
+    private withToolCallLifetimeId(update: unknown, scope: ToolCallScope): unknown {
+        if (!isObject(update)) return update;
+        const sessionUpdate = asString(update.sessionUpdate);
+        const isStart = sessionUpdate === ACP_SESSION_UPDATE_TYPES.toolCall;
+        if (!isStart && sessionUpdate !== ACP_SESSION_UPDATE_TYPES.toolCallUpdate) return update;
+        const agentToolCallId = asString(update.toolCallId);
+        if (!agentToolCallId) return update;
+        const terminal = update.status === 'completed' || update.status === 'failed';
+        let toolCallId = this.toolCallLifetimes.resolve(agentToolCallId, isStart ? 'start' : terminal ? 'terminal' : 'update', scope);
+        if (isStart && terminal) {
+            // Announced already finished: the same lifetime, now closed.
+            toolCallId = this.toolCallLifetimes.resolve(agentToolCallId, 'terminal', scope);
+        }
+        return { ...update, toolCallId };
     }
 
     private handleNotification(method: string, params: unknown): void {
@@ -1242,6 +1481,9 @@ export class AcpSdkBackend implements AgentBackend {
         if (params.type === 'status') {
             const status = asString(params.status);
             if (status === 'completed' || status === 'failed' || status === 'interrupted') {
+                const scope = childToolCallScope(childSessionId);
+                if (status === 'interrupted') this.toolCallLifetimes.cancel(scope);
+                this.toolCallLifetimes.beginGeneration(scope);
                 this.finishChildHandler(childSessionId);
             }
             // created/running have no handler to manage yet.
@@ -1251,7 +1493,7 @@ export class AcpSdkBackend implements AgentBackend {
 
         const entry = this.childHandlers.get(childSessionId) ?? this.createChildHandler(childSessionId);
         if (!entry) return;
-        const update = params.update;
+        const update = this.withToolCallLifetimeId(params.update, childToolCallScope(childSessionId));
         this.sessionUpdateQueue = this.sessionUpdateQueue
             .then(async () => {
                 await entry.handler.handleUpdate(update);
@@ -1327,7 +1569,19 @@ export class AcpSdkBackend implements AgentBackend {
             return;
         }
         this.lastSessionUpdateAt = Date.now();
-        const update = params.update;
+        // Capture the handler at enqueue time. Looking up `this.messageHandler`
+        // when the queued microtask runs can leak a suppressUpdatesDuring
+        // update into the restored handler if earlier async image work kept
+        // the queue busy past restore.
+        const handler = this.messageHandler;
+        // Mapped on arrival, not in the queue, so tool updates and permission
+        // requests see the lifetimes in the order the agent sent them. Updates
+        // nobody shows (no handler: before the first prompt or while
+        // suppressed, i.e. a session/load replaying history) must not open or
+        // close lifetimes, nor displace ones restored from stored state.
+        const update = handler
+            ? this.withToolCallLifetimeId(params.update, MAIN_TOOL_CALL_SCOPE)
+            : params.update;
         // Title/usage/commands stay synchronous (#1028). Only message-handler
         // work is queued so async image registration preserves event order.
         if (sessionId) {
@@ -1339,11 +1593,6 @@ export class AcpSdkBackend implements AgentBackend {
         this.forwardSessionInfoUpdate(sessionId, update);
         this.captureUsageUpdate(update);
         this.notifyAgentActivity(update);
-        // Capture the handler at enqueue time. Looking up `this.messageHandler`
-        // when the queued microtask runs can leak a suppressUpdatesDuring
-        // update into the restored handler if earlier async image work kept
-        // the queue busy past restore.
-        const handler = this.messageHandler;
         const echoedText = this.userMessageChunkListener ? userMessageChunkText(update) : null;
         this.sessionUpdateQueue = this.sessionUpdateQueue
             .then(async () => {
@@ -1527,7 +1776,7 @@ export class AcpSdkBackend implements AgentBackend {
         }
     }
 
-    private async waitForSessionUpdateQuiet(quietMs: number, timeoutMs: number): Promise<void> {
+    private async waitForSessionUpdateQuiet(quietMs: number, timeoutMs: number, quietBaseline = 0): Promise<void> {
         if (quietMs <= 0 || timeoutMs <= 0) {
             return;
         }
@@ -1535,7 +1784,7 @@ export class AcpSdkBackend implements AgentBackend {
         const deadline = Date.now() + timeoutMs;
 
         while (Date.now() < deadline) {
-            const elapsedSinceUpdate = Date.now() - this.lastSessionUpdateAt;
+            const elapsedSinceUpdate = Date.now() - Math.max(this.lastSessionUpdateAt, quietBaseline);
             if (elapsedSinceUpdate >= quietMs) {
                 return;
             }
@@ -1554,7 +1803,12 @@ export class AcpSdkBackend implements AgentBackend {
 
         const sessionId = asString(params.sessionId) ?? this.activeSessionId ?? 'unknown';
         const toolCall = isObject(params.toolCall) ? params.toolCall : {};
-        const toolCallId = asString(toolCall.toolCallId) ?? `tool-${Date.now()}`;
+        const agentToolCallId = asString(toolCall.toolCallId);
+        const toolCallId = agentToolCallId
+            ? this.resolveToolCallLifetimeId(agentToolCallId, 'request', sessionId)
+            : `tool-${randomUUID()}`;
+        // Its own id per request; toolCallId keeps it on the call's card.
+        const hapiRequestId = agentToolCallId ? this.toolCallLifetimes.allocateRequestId(toolCallId) : toolCallId;
         const title = asString(toolCall.title) ?? undefined;
         const kind = asString(toolCall.kind) ?? undefined;
         const rawInput = 'rawInput' in toolCall ? toolCall.rawInput : undefined;
@@ -1570,7 +1824,7 @@ export class AcpSdkBackend implements AgentBackend {
             : [];
 
         const request: PermissionRequest = {
-            id: toolCallId,
+            id: hapiRequestId,
             sessionId,
             toolCallId,
             title,
@@ -1581,7 +1835,8 @@ export class AcpSdkBackend implements AgentBackend {
         };
 
         const responsePromise = new Promise((resolve) => {
-            this.pendingPermissions.set(toolCallId, { resolve });
+            this.pendingPermissions.set(hapiRequestId, { resolve });
+            this.liveRequestIds.add(hapiRequestId);
         });
 
         if (this.permissionHandler) {
@@ -1590,12 +1845,14 @@ export class AcpSdkBackend implements AgentBackend {
                 this.agentActivityListener?.(true, 'permission');
                 this.permissionHandler(request);
             } catch (error) {
-                this.pendingPermissions.delete(toolCallId);
+                this.pendingPermissions.delete(hapiRequestId);
+                this.liveRequestIds.delete(hapiRequestId);
                 throw error;
             }
         } else {
             logger.debug('[ACP] No permission handler registered; cancelling request');
-            this.pendingPermissions.delete(toolCallId);
+            this.pendingPermissions.delete(hapiRequestId);
+            this.liveRequestIds.delete(hapiRequestId);
             return { outcome: { outcome: 'cancelled' } };
         }
 
@@ -1707,6 +1964,26 @@ export class AcpSdkBackend implements AgentBackend {
     }
 
 
+    /**
+     * The agent's own per-prompt turn count when its result carries one
+     * (google-antigravity/antigravity-cli#1045: agy ACP does not report it —
+     * HAPI then counts model calls from agy's transcript instead). Accepted
+     * from `usage.num_turns`/`numTurns`, the response top level, or `_meta`.
+     */
+    extractNumTurns(response: unknown): number | undefined {
+        if (!isObject(response)) return undefined;
+        const candidates: unknown[] = [];
+        if (isObject(response.usage)) candidates.push(response.usage.num_turns, response.usage.numTurns);
+        candidates.push(response.num_turns, response.numTurns);
+        if (isObject(response._meta)) candidates.push(response._meta.num_turns, response._meta.numTurns);
+        for (const candidate of candidates) {
+            if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+                return Math.round(candidate);
+            }
+        }
+        return undefined;
+    }
+
     private captureSessionMetadata(sessionId: string, response: unknown): void {
         this.captureSessionModelsMetadata(sessionId, response);
         this.captureSessionConfigOptions(sessionId, response);
@@ -1724,21 +2001,32 @@ export class AcpSdkBackend implements AgentBackend {
                 : null;
         if (!rawCommands) return;
 
-        const commands = new Set(
-            rawCommands
-                .filter((entry): entry is Record<string, unknown> => isObject(entry))
-                .map((entry) => asString(entry.name) ?? '')
-                .filter((name) => name.length > 0)
-        );
+        const commands = new Map<string, AcpAvailableCommand>();
+        for (const entry of rawCommands) {
+            if (!isObject(entry)) continue;
+            const rawName = asString(entry.name)?.trim() ?? '';
+            const name = rawName.startsWith('/') ? rawName.slice(1).trim() : rawName;
+            if (!name) continue;
+            const description = asString(entry.description)?.trim() || undefined;
+            commands.set(name, description ? { name, description } : { name });
+        }
         if (sessionId) {
             this.sessionAvailableCommands.set(sessionId, commands);
+            this.availableCommandsUpdateListener?.(
+                sessionId,
+                Array.from(commands.values(), (command) => ({ ...command }))
+            );
             return;
         }
 
         this.initialAvailableCommands.clear();
-        for (const command of commands) {
-            this.initialAvailableCommands.add(command);
+        for (const [name, command] of commands) {
+            this.initialAvailableCommands.set(name, command);
         }
+        this.availableCommandsUpdateListener?.(
+            null,
+            Array.from(commands.values(), (command) => ({ ...command }))
+        );
     }
 
     private captureSessionConfigOptions(sessionId: string, response: unknown): void {

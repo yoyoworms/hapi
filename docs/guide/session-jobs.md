@@ -1,3 +1,7 @@
+---
+description: "Attach long-running processes such as batch imports or overnight scripts to a HAPI session so the session list shows their progress after the agent goes idle."
+---
+
 # Session-attached jobs
 
 Hub-persisted progress for work that **outlives the agent** — batch imports, `nohup` scripts, long drains — so the session list still shows something truthful while the chat is idle (`active: false`).
@@ -22,6 +26,8 @@ HAPI's Agent-to-Agent control plane ([discussion #1332](https://github.com/tiann
 Jobs enrich **Layer 0** session summaries (same layer as cite / inspect / ping). They are **not** Google A2A Tasks, and they are **not** a substitute for handoffs or work ads. Do not write job heartbeats into the A2A ledger. A privileged reader may *observe* `attachedJob` later; workers still must not poll the ledger as a work queue.
 
 ## When to attach
+
+**Default is not to attach.** A job is worth the operator's list chrome only when a process must keep running after this agent goes idle *and* someone would reopen the chat to ask "how's it doing?". Short work — tests, builds, installs, typechecks, one-shot scripts — never belongs here, even when the command takes a while.
 
 Attach a job **before** (or immediately when) you start process-shaped work that will keep running after the agent goes idle:
 
@@ -57,20 +63,32 @@ Treat this like `ping_peer` / `inspect_peer`: it is first-class HAPI tooling, no
 
 Prefer `"$HAPI_SESSION_ID"` only when it matches the operator chat URL uuid. Remote Cursor runner: pass `/sessions/<id>` explicitly (see "Which session id").
 
-#### Progress mode (required on `run` / `set`)
+#### Progress mode
 
-`--progress` is **required** on create. Omission used to default to indeterminate stripes and hid known-duration countdowns (dogfood postmortem 2026-11-08). Pick deliberately:
+`--progress` is required on `run` / `set`, except when `run` directly wraps a numeric `sleep` command without progress flags. In that case the CLI infers a countdown from the duration. Other commands still require an explicit mode:
 
 | Mode | Flags | List chrome |
 |------|-------|-------------|
 | `unknown` | no counts / no `--until` | `running · elapsed` + indeterminate stripes |
 | `fraction` | `--remaining N --total M` **or** `--done N --total M` | determinate fill |
-| `until` | `--until <ISO-8601\|epoch-ms>` | determinate countdown (`s`); `job run` heartbeats re-stamp `remaining` |
+| `until` | `--until <ISO-8601\|epoch-ms\|duration>` | determinate countdown (`s`); `job run` heartbeats re-stamp `remaining` |
 
-The bar and stripes are the Web list. The iOS list shows the same job as one
-text line in place of the project name (`label · remaining or percent ·
-elapsed`, amber with `no heartbeat` after ~15m) and a working presence badge,
-without a bar. Android does not show attached jobs yet.
+Relative deadlines accept positive integer durations with `s`, `m`, `h`, or `d` units, optionally prefixed by `+` (for example, `--until +5m`). Existing ISO timestamps and epochs remain supported.
+
+For a direct `sleep N` (or GNU `sleep N M`), omit both `--progress` and `--until` to infer the countdown:
+
+```bash
+hapi job run "$HAPI_SESSION_ID" wait --label 'Wait five minutes' \
+  --wake-on-terminal -- sleep 300
+```
+
+Inference applies only to direct positive integer sleep operands. Shell scripts, wrappers, `sleep infinity`, and other commands still require an explicit mode. Explicit progress flags are validated as supplied.
+
+The bar and stripes are the Web list. The native lists show the same job as one
+text line (`label · remaining or percent · elapsed`, amber with `no heartbeat`
+after ~15m) and a working presence badge: Android adds a thin bar under the
+row's meta line (Material indeterminate animation instead of stripes); iOS puts
+the line in place of the project name, without a bar.
 
 #### Alive-only / indeterminate (`--progress unknown`)
 
@@ -107,7 +125,7 @@ hapi job run "$HAPI_SESSION_ID" beets \
 hapi job run "$HAPI_SESSION_ID" beets --label 'beets import' --progress unknown -- ./beets-import.sh &
 # …and from t=0, something continuously: hapi job update … --done N --total 1787
 
-# Dogfood / countdown window (numeric sleep N without until is refused):
+# Countdown window with an explicit deadline:
 hapi job run "$HAPI_SESSION_ID" dogfood-1424-48h \
   --label 'dogfood #1424 48h' --progress until --until 2026-11-09T21:20:14Z \
   --wake-on-terminal -- sleep 999999
@@ -129,7 +147,7 @@ Do **not**:
 
 - MCP `session_job` `set` or one-shot CLI `set` + background the real work (no heartbeat).
 - `hapi job run --done 0 --total N -- cmd` with **no** continuous count writer (**frozen 0/N under a live heartbeat** — the common agent footgun).
-- `hapi job run --progress unknown -- sleep 150747` (or any numeric `sleep N`) — that is a known-duration countdown; CLI refuses it. Use `--progress until --until …` (or `sleep infinity` under `unknown`).
+- `hapi job run --progress unknown -- sleep 150747` (or any numeric `sleep N`) — that is a known-duration countdown; CLI refuses it under `unknown`. Use `--progress until --until …` (supports relative durations like `+5m` or `300s`, and running `hapi job run <session> <key> -- sleep N` automatically infers countdown progress).
 - Wrap `hapi-restart-hub` / `hapi-use-worktree` / `hapi-use-driver` / `hapi-watch-activate-driver` inside `hapi job run`. The hub is down exactly when the terminal `completed`/`failed` PATCH must land → `ECONNREFUSED` → zombie `running` meter (CLI refuses these argv tokens). Run remat/work under the job; run the hub restart **after** the job exits (same shape as soup remat `#205`).
 - Claim done / invite archive while a zombie `running` meter remains.
 
@@ -203,10 +221,11 @@ hapi job run "$HAPI_SESSION_ID" beets \
 When the hub accepts terminal status (and the opt-in was set on that run):
 
 1. Claims a one-shot wake for that `runId` (retries / duplicate terminal PATCH do not re-fire).
-2. Resumes the owning session if inactive (same resume path as `ping-peer`).
-3. Posts a user message naming job key, status, last detail, plus optional `--wake-prompt`.
+2. **If a turn is already running (`active && thinking`), drops the wake** — the agent is present and can read `job list`; injecting a message would interrupt it. The claim is settled so a later idle flip does not re-fire.
+3. Otherwise resumes the owning session if inactive (same resume path as `ping-peer`).
+4. Posts a message naming job key, status, last detail, plus optional `--wake-prompt`. It is tagged `sentFrom: 'hapi-system'` and renders as a quiet status line, not as operator input.
 
-This does **not** treat heartbeats as thinking. Default remains off until dogfood proves the loop.
+This does **not** treat heartbeats as thinking. Default remains off: `--wake-on-terminal` is only for batches the operator asked to be woken for, never a default on every `job run`.
 
 ## Progress honesty (tiers)
 
@@ -292,7 +311,7 @@ hapi job run <session> <job-key> --label <text> --progress unknown|fraction|unti
 hapi job --help
 ```
 
-Needs a hub/CLI build that includes `job` (soup / feat — global npm releases may lag).
+Requires HAPI 0.34.5 or newer on both the hub and the CLI. Run `hapi --version` to check, and upgrade if `hapi job` is not recognized.
 
 | Method | Path | Notes |
 |--------|------|-------|

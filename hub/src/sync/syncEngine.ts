@@ -7,19 +7,26 @@
  * - No E2E encryption; data is stored as JSON in SQLite
  */
 
-import { type SessionReadStateRequest, isKnownFlavor, isLiveLifecycleState, isSteeringSupportedForSession, MACHINE_CAPABILITIES, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
+import { type SessionReadStateRequest, isKnownFlavor, matchesClaudeSessionId, isLiveLifecycleState, isSteeringSupportedForSession, MACHINE_CAPABILITIES, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
 import {
     cliBinaryUpdatedOnDisk,
     isMachineCapabilitySkewed,
 } from '@hapi/protocol/runnerCapabilities'
-import type { AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, MessageContextResponse, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse } from '@hapi/protocol/apiTypes'
+import type { AbortChunkedUploadResponse, AddCodexApiEndpointRequest, CursorChatStoreStatus, CursorMigrateOutcome, CursorMigrateToAcpRequest, InitChunkedUploadRequest, InitChunkedUploadResponse, MessageContextResponse, MessageDeliveryMode, MessagesResponse, QueuedStateResponse, RewindConversationErrorCode, SlashCommandsResponse, UploadChunkResponse } from '@hapi/protocol/apiTypes'
+import { FORK_PREVIEW_TAIL_ROWS, type ForkBoundary, type ForkBoundaryErrorCode, type ForkPreviewRequest, type ForkPreviewResponse, type ForkPreviewRow } from '@hapi/protocol/forkBoundary'
+import type { UsageQueryAgent, UsageQueryAgentSettings, UsageQueryResult, UsageQuerySettingsResponse, UsageQueryTemplate } from '@hapi/protocol/usageQuery'
 import type { SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
+import type { SessionStopPreparationLease } from '@hapi/protocol/rpcMethods'
+import type { ListLocalSessionsRpcResponse, LocalSessionFlavor } from '@hapi/protocol/localTranscript'
 import type { CopilotReasoningEffortResponse, ImplementCodexPlanResult, KimiReasoningEffortResponse } from '@hapi/protocol/apiTypes'
-import type { AgentFlavor, BackgroundTask, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
+import type { AgentFlavor, BackgroundTask, CodexCollaborationMode, CopilotAgentMode, DecryptedMessage, ExternalRef, PermissionMode, Session, SyncEvent } from '@hapi/protocol/types'
 import { hasConversationMessageContent, unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
 import type { Server } from 'socket.io'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import type { BranchConversationRequest, BranchConversationResponse } from '@hapi/protocol/apiTypes'
+import { branchSessionId, buildBranchPrompt } from './branchTranscript'
 import type { Store, CancelQueuedMessageResult } from '../store'
+import type { StoredMessage } from '../store/types'
 import type {
     MessageContentSearchMatch,
     SessionMessageContentSearchResult
@@ -43,7 +50,7 @@ import { MachineCache, type Machine } from './machineCache'
 import { MessageService, type RetryIndeterminateMessageResult } from './messageService'
 import { createTitleSuggestionService, type TitleSuggestionService } from './titleSuggestion'
 import { createPromptTitle } from './promptTitle'
-import { selectForkTranscriptPrefix } from './forkTranscript'
+import { resolveForkBoundary, resolveRewindBoundary, invokedTailSeq, type ResolvedBoundary } from './forkBoundary'
 import { buildForkSessionSummary } from './forkSessionSummary'
 import { isMachineSpawnPreallocatedStub } from '../store/sessions'
 import {
@@ -86,6 +93,14 @@ import { AutomaticTitleSuggestionService } from './automaticTitleSuggestion'
 import { extractMessageEventType } from '../notifications/eventParsing'
 import { SessionEnumerationCache } from './sessionEnumerationCache'
 import { ingestNotifySummaryFromMessage } from './workGraphNotifyIngest'
+import { MetadataSchema, type OpenCodeRewindOperation } from '@hapi/protocol/schemas'
+import type { OpenCodeRewindReport } from '@hapi/protocol/apiTypes'
+import { extractTodoWriteTodosFromMessageContent } from './todos'
+import {
+    readAutoBridgeTransientModelErrorsEnabled,
+    writeAutoBridgeTransientModelErrorsEnabled
+} from '../config/autoBridgeTransientModelErrors'
+import { getConfiguration } from '../configuration'
 
 type PiResumeAttempt = NonNullable<NonNullable<Session['metadata']>['piResumeAttempt']>
 type PtyResumeAttempt = NonNullable<NonNullable<Session['metadata']>['ptyResumeAttempt']>
@@ -134,6 +149,14 @@ export type ReopenSessionResult =
 export type LocalResumeTargetResult =
     | { type: 'success'; target: LocalResumeTarget }
     | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'resume_unavailable' }
+
+export type LocalResumeTargetByAgentResult =
+    | { type: 'success'; target: LocalResumeTarget | null; historical: boolean }
+    | { type: 'error'; message: string; code: 'resume_unavailable' }
+
+export type LocalResumePrepareResult =
+    | { type: 'success'; revived: boolean }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'session_active' }
 
 export type LocalHandoffResult =
     | { type: 'success' }
@@ -202,6 +225,11 @@ function extractClaudeUserMessageTextFromAgentOutput(content: unknown): string |
 
 export class SyncEngine {
     private readonly archiveRequests = new Map<string, Promise<void>>()
+    // KillSession's beforeKill drain completes before the CLI's async cleanup
+    // closes the session socket, so a runner prepare-stop that loses that race
+    // can still be honored for the exact killed generation while its archive
+    // is in flight.
+    private readonly archiveDrainedGenerations = new Map<string, { machineId: string; pid: number; processStartMarker: string }>()
     private readonly eventPublisher: EventPublisher
     private readonly sessionCache: SessionCache
     private readonly machineCache: MachineCache
@@ -233,6 +261,8 @@ export class SyncEngine {
     private readonly reopenTails = new Map<string, Promise<ReopenSessionResult>>()
     /** Serialize fork/rewind per session so concurrent native rollbacks cannot stack. */
     private readonly historyActionsInFlight = new Set<string>()
+    /** Track Claude rewind RPCs in flight on this hub process so live metadata writes wait for the RPC outcome. */
+    private readonly claudeRewindRpcsInFlight = new Map<string, string>()
     /** Pending #1489 wake retries after recoverable pre-delivery failures. */
     private readonly jobTerminalWakeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
     private readonly jobTerminalWakeRetryAttempts = new Map<string, number>()
@@ -287,6 +317,15 @@ export class SyncEngine {
      * Defaults to "1" for unit tests; startHub overwrites with getOrCreateOwnerId().
      */
     private hubOwnerUserId: string = '1'
+    /** Test-only settings root so session-ready reconcile can run without full hub boot. */
+    private settingsDataDirForTests: string | null = null
+    /** Serialize settings write/fanout with first-activation / session-ready reconcile. */
+    private autoBridgeConfigTail: Promise<unknown> = Promise.resolve()
+    /**
+     * Active Cursor sessions whose last auto-bridge Settings RPC failed.
+     * Heartbeats retry persisted desired state until reconcile succeeds.
+     */
+    private readonly pendingAutoBridgeReconcile = new Set<string>()
 
     constructor(
         private readonly store: Store,
@@ -552,11 +591,20 @@ export class SyncEngine {
         return session
     }
 
+    /**
+     * Session lookup for route handlers. With `followRedirects`, a merged-away
+     * id resolves to its surviving session and callers must continue with the
+     * returned `sessionId`; only clients that rebind to that id opt in (CLI
+     * REST always; web via FOLLOW_SESSION_REDIRECTS_HEADER).
+     */
     resolveSessionAccess(
         sessionId: string,
-        namespace: string
+        namespace: string,
+        opts?: { followRedirects?: boolean }
     ): { ok: true; sessionId: string; session: Session } | { ok: false; reason: 'not-found' | 'access-denied' } {
-        return this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        return opts?.followRedirects
+            ? this.sessionCache.resolveSessionAccessFollowingRedirects(sessionId, namespace)
+            : this.sessionCache.resolveSessionAccess(sessionId, namespace)
     }
 
     /** Follow job-owner redirects after merge/dedup (tiann/hapi#1404 cold review). */
@@ -657,6 +705,7 @@ export class SyncEngine {
     }
 
     getDeliverableMessagesAfter(sessionId: string, options: { afterSeq: number; limit: number; now: number }): DecryptedMessage[] {
+        if (this.openCodeRewindPending(sessionId)) return []
         return this.messageService.getDeliverableMessagesAfter(sessionId, options)
     }
 
@@ -691,6 +740,7 @@ export class SyncEngine {
                 this.eventPublisher.emit(event)
                 const after = this.sessionCache.getSession(event.sessionId)
                 this.reconcileSteerDeliveryOwner(beforeMetadata, after)
+                this.reconcilePendingClaudeRewind(after)
                 if (after?.metadata && !this.hasSameAgentSessionIds(beforeMetadata, after.metadata)) {
                     if (!this.canRunCursorDedup(after)) {
                         return
@@ -708,6 +758,7 @@ export class SyncEngine {
             this.sessionCache.refreshSession(event.sessionId)
             const after = this.sessionCache.getSession(event.sessionId)
             this.reconcileSteerDeliveryOwner(beforeMetadata, after)
+            this.reconcilePendingClaudeRewind(after)
             if (after?.metadata && !this.hasSameAgentSessionIds(beforeMetadata, after.metadata)) {
                 if (!this.canRunCursorDedup(after)) {
                     return
@@ -793,7 +844,9 @@ export class SyncEngine {
         serviceTier?: string | null
         collaborationMode?: CodexCollaborationMode
     }): void {
-        const wasThinking = this.sessionCache.getSession(payload.sid)?.thinking === true
+        const before = this.sessionCache.getSession(payload.sid)
+        const wasActive = before?.active === true
+        const wasThinking = before?.thinking === true
         if (!wasThinking && payload.thinking === true) {
             this.automaticTitleSuggestionService.onTurnStarted(payload.sid)
         }
@@ -804,11 +857,27 @@ export class SyncEngine {
         }
         this.messageService.replayImmediateQueuedMessages(payload.sid)
         this.triggerDedupIfNeeded(payload.sid)
+        // First inactive → active: catch toggles while inactive (fanout is
+        // active-only). Also retry sessions whose prior fanout/rollback RPC failed.
+        if (!wasActive || this.pendingAutoBridgeReconcile.has(payload.sid)) {
+            void this.reconcileCursorAutoBridgeSetting(payload.sid)
+        }
     }
 
     handleSessionReady(payload: { sid: string; time: number }): void {
-        this.sessionReadyIds.add(payload.sid)
         const session = this.sessionCache.getSession(payload.sid)
+        if (session?.metadata?.flavor === 'opencode' && session.metadata.opencodeForkPending) {
+            if (session.metadata.conversationHistoryDiverged
+                || session.metadata.opencodeHistoryCheckpoint?.sessionId !== session.metadata.opencodeSessionId
+                || session.metadata.opencodeHistoryCheckpoint?.localMessageIds?.length !== 0
+                || session.metadata.opencodeHistoryCheckpoint?.localPublicationPending) return
+            try {
+                this.completeOpencodeForkValidation(payload.sid, session.namespace)
+            } catch {
+                return
+            }
+        }
+        this.sessionReadyIds.add(payload.sid)
         if (session?.active && session.metadata?.codexResumePending
             && session.metadata.codexResumePending.nativeSessionId === session.metadata.codexSessionId) {
             this.writeCodexResumePending(session.id, session.namespace, undefined)
@@ -821,7 +890,121 @@ export class SyncEngine {
                 })
                 .catch(() => {})
         }
+        // session-ready fires after set-session-config is registered (alive can
+        // race earlier). Re-read under the same lock as Settings fanout.
+        void this.reconcileCursorAutoBridgeSetting(payload.sid)
         this.triggerDedupIfNeeded(payload.sid)
+    }
+
+    /** @internal test hook — hub settings dataDir without createConfiguration(). */
+    setSettingsDataDirForTests(dataDir: string | null): void {
+        this.settingsDataDirForTests = dataDir
+    }
+
+    /**
+     * Owner hub setting changed: push to every active default-namespace Cursor CLI.
+     * Serialized with first-activation / session-ready reconcile.
+     */
+    async fanoutAutoBridgeTransientModelErrors(enabled: boolean): Promise<void> {
+        await this.withAutoBridgeConfigLock(async () => {
+            await this.pushAutoBridgeSettingToActiveCursorSessions(enabled)
+        })
+    }
+
+    /**
+     * Persist the owner auto-bridge pref and fanout under one lock so concurrent
+     * Settings PUTs cannot interleave disk write / rollback / RPC push.
+     */
+    async applyAutoBridgeTransientModelErrorsSetting(
+        dataDir: string,
+        enabled: boolean
+    ): Promise<void> {
+        await this.withAutoBridgeConfigLock(async () => {
+            const previous = await readAutoBridgeTransientModelErrorsEnabled(dataDir)
+            await writeAutoBridgeTransientModelErrorsEnabled(dataDir, enabled)
+            try {
+                await this.pushAutoBridgeSettingToActiveCursorSessions(enabled)
+            } catch (error) {
+                await writeAutoBridgeTransientModelErrorsEnabled(dataDir, previous)
+                await this.pushAutoBridgeSettingToActiveCursorSessions(previous).catch(() => {})
+                throw error
+            }
+        })
+    }
+
+    private async pushAutoBridgeSettingToActiveCursorSessions(enabled: boolean): Promise<void> {
+        const targets = this.sessionCache.getSessions().filter(
+            (session) => session.active
+                && session.namespace === 'default'
+                && session.metadata?.flavor === 'cursor'
+        )
+        const results = await Promise.allSettled(
+            targets.map((session) => this.rpcGateway.requestSessionConfig(session.id, {
+                autoBridgeTransientModelErrors: enabled
+            }))
+        )
+        results.forEach((result, index) => {
+            const id = targets[index]!.id
+            if (result.status === 'rejected') {
+                this.pendingAutoBridgeReconcile.add(id)
+            } else {
+                this.pendingAutoBridgeReconcile.delete(id)
+            }
+        })
+        if (results.some((result) => result.status === 'rejected')) {
+            throw new Error('Failed to update every active Cursor session')
+        }
+    }
+
+    /**
+     * Push the current owner hub auto-bridge pref to one Cursor CLI.
+     * Best-effort: never throws into the socket path.
+     */
+    async reconcileCursorAutoBridgeSetting(sessionId: string): Promise<void> {
+        try {
+            await this.withAutoBridgeConfigLock(async () => {
+                const session = this.sessionCache.getSession(sessionId)
+                    ?? this.sessionCache.refreshSession(sessionId)
+                if (!session) {
+                    return
+                }
+                if (session.namespace !== 'default' || session.metadata?.flavor !== 'cursor') {
+                    return
+                }
+                const dataDir = this.resolveSettingsDataDir()
+                if (!dataDir) {
+                    return
+                }
+                const enabled = await readAutoBridgeTransientModelErrorsEnabled(dataDir)
+                await this.rpcGateway.requestSessionConfig(sessionId, {
+                    autoBridgeTransientModelErrors: enabled
+                })
+                this.pendingAutoBridgeReconcile.delete(sessionId)
+            })
+        } catch (error) {
+            this.pendingAutoBridgeReconcile.add(sessionId)
+            console.warn(
+                `[sync] failed to reconcile auto-bridge setting for session ${sessionId}`,
+                error
+            )
+        }
+    }
+
+    private withAutoBridgeConfigLock<T>(fn: () => Promise<T>): Promise<T> {
+        const run = this.autoBridgeConfigTail.then(fn, fn)
+        this.autoBridgeConfigTail = run.then(() => undefined, () => undefined)
+        return run
+    }
+
+    private resolveSettingsDataDir(): string | null {
+        if (this.settingsDataDirForTests) {
+            return this.settingsDataDirForTests
+        }
+        try {
+            return getConfiguration().dataDir
+        } catch {
+            return null
+        }
     }
 
     clearQueuedThinkingGrace(sessionId: string): void {
@@ -1358,6 +1541,15 @@ export class SyncEngine {
             namespace = session.namespace
             let targetId = ownerSessionId
 
+            // A turn is running: the agent is present and can read `job list`.
+            // Injecting a message here would interrupt it, so drop the wake.
+            if (session.active && session.thinking) {
+                this.store.sessionJobs.markTerminalWakeDelivered(ownerSessionId, ownerJobKey, claimId)
+                this.clearJobTerminalWakeRetry(ownerSessionId, ownerJobKey)
+                this.clearJobTerminalWakeRetry(sessionId, job.key)
+                return
+            }
+
             if (!session.active) {
                 const resume = await this.resumeSession(ownerSessionId, namespace)
                 if (resume.type !== 'success') {
@@ -1461,7 +1653,7 @@ export class SyncEngine {
             // MessageService.sweepImmediateQueuedOnSessionEnd).
             await this.sendMessage(targetId, {
                 text,
-                sentFrom: 'webapp',
+                sentFrom: 'hapi-system',
                 localId: buildJobWakeLocalId(ownerJobKey, claimId),
             })
             this.store.sessionJobs.markTerminalWakeDelivered(ownerSessionId, ownerJobKey, claimId)
@@ -1677,8 +1869,53 @@ export class SyncEngine {
         this.sessionCache.reconcileKeepaliveIdle()
         // Piggybacked on the inactivity tick; not a logical part of expireInactive
         // but shares its 5s cadence (avoids a second timer).
-        this.messageService.releaseMatureScheduledMessages(Date.now(), this.historyActionsInFlight)
+        const held = new Set(this.historyActionsInFlight)
+        for (const session of this.sessionCache.getSessions()) if (this.openCodeRewindPending(session.id)) held.add(session.id)
+        this.messageService.releaseMatureScheduledMessages(Date.now(), held)
         void this.reconcileOpenCodeClears()
+        this.reconcileDerivedToolWork()
+    }
+
+    /**
+     * Work-scoped liveness sweep, piggybacked on the 5s inactivity tick.
+     *
+     * `thinking` is turn-scoped: the CLI flips it false at the SDK result
+     * even while autonomous rounds (background tasks, scheduled follow-ups)
+     * keep streaming tool calls. For connected sessions that claim neither
+     * thinking nor background tasks nor an attached job, derive "open tool
+     * work" straight from the transcript tail and broadcast it as
+     * `derivedToolWork`, so the session row shows work instead of a stale
+     * "waiting". Sessions inside the queued-prompt thinking grace are left
+     * alone — their spinner is already accounted for. When a session stops
+     * being eligible while the flag is still set, clear it so the derived
+     * signal never outlives the state it vouched for.
+     */
+    private reconcileDerivedToolWork(): void {
+        const now = Date.now()
+        const candidates: Session[] = []
+        for (const session of this.sessionCache.getSessions()) {
+            if (this.isDerivedToolWorkCandidate(session)) {
+                candidates.push(session)
+            } else if (session.derivedToolWork === true) {
+                this.sessionCache.noteDerivedWork(session.id, false)
+            }
+        }
+        if (candidates.length === 0) return
+        // One batched primary-job read: a session with a running attached
+        // job already renders work; the sweep must not double-report.
+        const primaryJobs = this.getPrimaryAttachedJobsBySessionIds(candidates.map((session) => session.id))
+        for (const session of candidates) {
+            if ((primaryJobs.get(session.id) ?? null) !== null) continue
+            this.sessionCache.noteDerivedWork(session.id, this.store.messages.getLiveToolWork(session.id))
+        }
+    }
+
+    /** Eligibility for the derived-work sweep: connected, no thinking flag,
+     *  and no declared background tasks. */
+    private isDerivedToolWorkCandidate(session: Session): boolean {
+        if (!session.active || session.thinking) return false
+        if ((session.backgroundTaskCount ?? 0) > 0) return false
+        return true
     }
 
     private async reconcileOpenCodeClears(): Promise<void> {
@@ -1708,6 +1945,26 @@ export class SyncEngine {
     private reloadAll(): void {
         this.sessionCache.reloadAll()
         this.machineCache.reloadAll()
+        this.reconcilePendingClaudeRewinds()
+        this.queuePersistedActiveCursorAutoBridgeReconcile()
+    }
+
+    /**
+     * Hub restart: in-memory pendingAutoBridgeReconcile is empty. If SQLite
+     * restored a Cursor row as already active, the first heartbeat is not an
+     * inactive→active transition — seed those ids so handleSessionAlive still
+     * pushes persisted settings.json.
+     */
+    private queuePersistedActiveCursorAutoBridgeReconcile(): void {
+        for (const session of this.sessionCache.getSessions()) {
+            if (
+                session.active
+                && session.namespace === 'default'
+                && session.metadata?.flavor === 'cursor'
+            ) {
+                this.pendingAutoBridgeReconcile.add(session.id)
+            }
+        }
     }
 
     getOrCreateSession(
@@ -1771,18 +2028,26 @@ export class SyncEngine {
                 path: string
                 previewUrl?: string
             }>
-            sentFrom?: 'telegram-bot' | 'webapp'
+            sentFrom?: 'telegram-bot' | 'webapp' | 'hapi-system'
             scheduledAt?: number | null
             deliveryMode?: MessageDeliveryMode
         }
     ): Promise<void> {
-        if (this.historyActionsInFlight.has(sessionId)) {
+        if (this.historyActionsInFlight.has(sessionId) || this.openCodeRewindPending(sessionId)) {
             throw new Error('Conversation history action already in progress')
         }
         if (!this.sessionCache.getSession(sessionId)?.thinking) {
             this.automaticTitleSuggestionService.onTurnStarted(sessionId)
         }
         const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
+        const current = this.store.sessions.getSession(actualSessionId)
+        const metadata = current?.metadata as Record<string, unknown> | null | undefined
+        if (current && typeof metadata?.codexImportedAt === 'number') {
+            this.store.sessions.updateSessionMetadata(actualSessionId,
+                { ...metadata, codexImportedAt: null }, current.metadataVersion, current.namespace,
+                { touchUpdatedAt: false })
+            this.sessionCache.refreshSession(actualSessionId)
+        }
         this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
     }
@@ -1798,6 +2063,7 @@ export class SyncEngine {
         sessionId: string,
         messageId: string
     ): Promise<RetryIndeterminateMessageResult> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         return this.messageService.retryIndeterminateMessage(sessionId, messageId)
     }
 
@@ -1812,6 +2078,7 @@ export class SyncEngine {
         sessionId: string,
         messageId: string
     ): Promise<SteerQueuedMessageResponse> {
+        if (this.openCodeRewindPending(sessionId)) return { status: 'failed', error: 'OpenCode rewind requires reconciliation', localId: null }
         const session = this.getSession(sessionId)
         if (!session) {
             return { status: 'failed', error: 'Session not found', localId: null }
@@ -1889,6 +2156,10 @@ export class SyncEngine {
         decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
         answers?: Record<string, string[]> | Record<string, { answers: string[] }>
     ): Promise<void> {
+        // Do not clear agentState.requests here on PermissionRequestNotFoundError.
+        // A concurrent first answer may still be finalizing asynchronously; hub-side
+        // cancel would race it into "canceled" and drop the real decision
+        // (tiann/hapi#2415 review). CLI orphan finalize owns sticky-badge cleanup.
         await this.rpcGateway.approvePermission(sessionId, requestId, mode, allowTools, decision, answers)
     }
 
@@ -1901,14 +2172,16 @@ export class SyncEngine {
     }
 
     async abortSession(sessionId: string): Promise<void> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         await this.rpcGateway.abortSession(sessionId)
     }
 
-    private assertConversationHistoryIdle(session: Session, allowRunningHistoricalFork = false): void {
-        if (!session.active) {
+    private assertConversationHistoryIdle(session: Session, allowRunningHistoricalFork = false, requireActive = true): void {
+        if (this.openCodeRewindPending(session.id)) throw new Error('OpenCode rewind requires reconciliation')
+        if (requireActive && !session.active) {
             throw new Error('Session must be active')
         }
-        if (session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
+        if (session.active && session.agentState?.controlledByUser === true && !session.metadata?.capabilities?.concurrentClients) {
             throw new Error('Conversation history actions require a remote session')
         }
         if (session.thinking && !allowRunningHistoricalFork) {
@@ -1920,6 +2193,14 @@ export class SyncEngine {
         const queued = this.store.messages.getUninvokedLocalMessages(session.id)
         if (queued.length > 0) {
             throw new Error('Session has queued messages')
+        }
+        // A pending Claude rewind means the hub transcript and the native
+        // boundary are mid-handoff: the hub truncated at RPC success and the
+        // CLI is re-arming the native boundary. Forking or rewinding here
+        // would copy rows the native side already dropped (the #1673 class of
+        // drift), so history actions wait for the next prompt to settle it.
+        if (session.metadata?.claudeRewind) {
+            throw new Error('A Claude rewind is pending; send a message to settle it first')
         }
     }
 
@@ -1993,7 +2274,7 @@ export class SyncEngine {
     private async waitForExactNativeForkBound(
         childId: string,
         expectedNativeSessionId: string,
-        metadataKey: 'grokSessionId' | 'piSessionId' | 'codexSessionId',
+        metadataKey: 'grokSessionId' | 'piSessionId' | 'opencodeSessionId' | 'codexSessionId',
         requireSessionReady: boolean,
         timeoutMs: number = 60_000
     ): Promise<boolean> {
@@ -2106,6 +2387,22 @@ export class SyncEngine {
         }
     }
 
+    private completeOpencodeForkValidation(sessionId: string, namespace: string): void {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const session = this.sessionCache.refreshSession(sessionId)
+            if (!session?.metadata || session.namespace !== namespace) throw new Error('OpenCode fork child disappeared')
+            if (!session.metadata.opencodeForkPending) return
+            const result = this.store.sessions.updateSessionMetadata(sessionId,
+                { ...session.metadata, opencodeForkPending: undefined }, session.metadataVersion, namespace, { touchUpdatedAt: false })
+            if (result.result === 'success') {
+                this.sessionCache.refreshSession(sessionId)
+                return
+            }
+            if (result.result !== 'version-mismatch') break
+        }
+        throw new Error('OpenCode fork child validation could not be committed')
+    }
+
     private markConversationHistoryDiverged(sessionId: string, namespace: string): void {
         for (let attempt = 0; attempt < 3; attempt += 1) {
             const session = this.sessionCache.getSessionByNamespace(sessionId, namespace)
@@ -2187,17 +2484,8 @@ export class SyncEngine {
         { type: 'success'; sessionId: string } | { type: 'error'; message: string }
     > {
         try {
-            const metadata = source.metadata
-            if (metadata?.flavor !== 'codex' || !metadata.codexSessionId || !metadata.machineId || !metadata.path) {
-                throw new Error('Inactive fork requires a Codex session with native history and a machine binding')
-            }
-            if (metadata.conversationHistoryDiverged) throw new Error('Conversation history is diverged; refuse further fork/rewind')
-            if (this.store.messages.getUninvokedLocalMessages(source.id).length) throw new Error('Session has queued messages')
-            const machine = this.getMachine(metadata.machineId)
-            if (!machine?.active || machine.namespace !== namespace) throw new Error('Source machine is offline')
-            if (!machine.metadata?.capabilities?.includes(MACHINE_CAPABILITIES.ForkArchivedCodex)) {
-                throw new Error('Upgrade the source Runner to fork archived Codex sessions')
-            }
+            const metadata = source.metadata!
+            const { machineId, codexSessionId, path } = this.assertArchivedForkEligible(source, namespace, messageLocalId)
             let attempt = metadata.codexArchivedFork
             if (attempt && attempt.boundaryLocalId !== messageLocalId) throw new Error('A previous archived fork is pending at another boundary; retry that fork first')
             const turnId = attempt ? attempt.boundaryTurnId : messageLocalId ? metadata.conversationHistoryTurns?.[messageLocalId] : undefined
@@ -2222,19 +2510,19 @@ export class SyncEngine {
             }
             if (!child) {
                 child = this.sessionCache.getOrCreateSession(`archived-fork:${attempt.operationId}`, {
-                    path: metadata.path, host: metadata.host, machineId: metadata.machineId, flavor: 'codex',
+                    path: path, host: metadata.host, machineId: machineId, flavor: 'codex',
                     forkedFrom: source.id, startedBy: 'runner',
                     summary: buildForkSessionSummary(metadata)
                 }, null, namespace, source.model ?? undefined, source.effort ?? undefined, source.modelReasoningEffort ?? undefined, childId)
             } else if (child.namespace !== namespace || child.metadata?.forkedFrom !== source.id) throw new Error('Invalid archived fork reservation')
             if (attempt.spawnAttempted) {
-                const stopped = await this.rpcGateway.stopRunnerSession(metadata.machineId, childId)
+                const stopped = await this.rpcGateway.stopRunnerSession(machineId, childId)
                 if (stopped !== 'stopped' && stopped !== 'already_gone') throw new Error('Previous fork launcher outcome is unconfirmed; retry after cleanup')
             }
             if (!attempt.nativeSessionId) {
-                const result = await this.rpcGateway.forkArchivedCodex(metadata.machineId, {
+                const result = await this.rpcGateway.forkArchivedCodex(machineId, {
                     operationId: attempt.operationId, sourceSessionId: source.id,
-                    sourceThreadId: metadata.codexSessionId, directory: metadata.path,
+                    sourceThreadId: codexSessionId, directory: path,
                     ...(messageLocalId ? { boundary: { localId: messageLocalId, turnId: turnId! } } : {})
                 })
                 if ('error' in result) {
@@ -2244,7 +2532,7 @@ export class SyncEngine {
                     }
                     throw new Error(result.error)
                 }
-                if (result.nativeSessionId === metadata.codexSessionId) throw new Error('Native fork reused the source identity')
+                if (result.nativeSessionId === codexSessionId) throw new Error('Native fork reused the source identity')
                 attempt = { ...attempt, nativeSessionId: result.nativeSessionId }
                 this.setArchivedForkAttempt(source.id, namespace, attempt)
             }
@@ -2255,7 +2543,7 @@ export class SyncEngine {
             this.sessionCache.refreshSession(childId)
             attempt = { ...attempt, spawnAttempted: true }
             this.setArchivedForkAttempt(source.id, namespace, attempt)
-            const spawn = await this.rpcGateway.spawnSession(metadata.machineId, metadata.path, 'codex',
+            const spawn = await this.rpcGateway.spawnSession(machineId, path, 'codex',
                 source.model ?? undefined, source.modelReasoningEffort ?? undefined, undefined, 'simple', undefined,
                 attempt.nativeSessionId, source.effort ?? undefined, source.permissionMode, source.serviceTier ?? undefined,
                 childId, source.collaborationMode)
@@ -2280,11 +2568,124 @@ export class SyncEngine {
         }
     }
 
+    async branchConversation(
+        sessionId: string,
+        namespace: string,
+        request: BranchConversationRequest
+    ): Promise<({ type: 'success' } & BranchConversationResponse) | { type: 'error'; message: string }> {
+        if (this.historyActionsInFlight.has(sessionId)) {
+            return { type: 'error', message: 'Conversation history action already in progress' }
+        }
+        this.historyActionsInFlight.add(sessionId)
+        try {
+            const access = this.resolveSessionAccess(sessionId, namespace)
+            if (!access.ok) throw new Error('Session not found or access denied')
+            const source = access.session
+            const childId = branchSessionId(namespace, sessionId, request.requestId)
+            const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex')
+            const existing = this.getSessionByNamespace(childId, namespace)
+            if (existing) {
+                if (existing.metadata?.conversationBranch?.requestFingerprint !== fingerprint) {
+                    throw new Error('Branch request id was already used with different options')
+                }
+                return { type: 'success', sessionId: childId,
+                    ...(existing.metadata.conversationBranch.state !== 'started'
+                        ? { warning: 'Launch outcome is uncertain. Inspect this child before starting another branch.' } : {}) }
+            }
+            this.assertConversationHistoryIdle(source, false, false)
+            if (!['claude', 'codex'].includes(source.metadata?.flavor ?? 'claude')) {
+                throw new Error('Portable branches currently support Claude Code and Codex source sessions')
+            }
+            const machineId = source.metadata?.machineId
+            const directory = source.metadata?.path
+            const machine = machineId ? this.getMachineByNamespace(machineId, namespace) : undefined
+            if (!machineId || !directory || !machine?.active) throw new Error('Source machine must be online')
+            if (request.model) {
+                const catalog = request.agent === 'claude'
+                    ? await this.listClaudeModelsForMachine(machineId)
+                    : await this.listCodexModelsForMachine(machineId)
+                const models = 'availableModels' in catalog
+                    ? catalog.availableModels?.map(model => model.value)
+                    : 'models' in catalog ? catalog.models?.map(model => model.id) : []
+                if (!catalog.success || !models?.includes(request.model)) throw new Error('Selected model is not available on the source machine')
+            }
+            // Catalog discovery is asynchronous; reject if a new turn began meanwhile.
+            const latestSource = this.getSessionByNamespace(sessionId, namespace)
+            if (!latestSource) throw new Error('Source session no longer exists')
+            this.assertConversationHistoryIdle(latestSource, false, false)
+            if (latestSource.metadata?.machineId !== machineId || latestSource.metadata?.path !== directory) {
+                throw new Error('Source location changed; reopen the branch dialog')
+            }
+            // Freeze the invoked prefix before any asynchronous spawn work. Pending
+            // inputs and subsequent source events can never enter this reference.
+            const reference = buildBranchPrompt(this.store.messages.getAllMessages(sessionId), request)
+            const branch = {
+                sourceSessionId: sessionId, messageLocalId: request.messageLocalId, messageId: request.messageId,
+                boundary: request.boundary, mode: 'visible-text' as const,
+                requestFingerprint: fingerprint, state: 'launching' as const,
+                createdAt: Date.now(), messageCount: reference.messageCount, workspace: request.workspace
+            }
+            this.sessionCache.getOrCreateSession(`machine-spawn:${childId}`, {
+                path: directory, host: source.metadata?.host ?? 'unknown', machineId,
+                flavor: request.agent, startedBy: 'runner', startedFromRunner: true,
+                forkedFrom: sessionId, conversationBranch: branch,
+                summary: { text: `Branch: ${source.metadata?.name ?? source.metadata?.summary?.text ?? 'Conversation'}`, updatedAt: Date.now() }
+            }, null, namespace, request.model, undefined, undefined, childId)
+            // Persist before dispatch so a lost RPC response never loses the
+            // reference/instruction. A mature scheduled row is redelivered until
+            // CLI acknowledgement, including after hub restart. A retry returns
+            // this same child without spawning.
+            const localId = `branch-${request.requestId}`
+            const scheduledAt = Date.now()
+            this.store.messages.addMessage(childId, {
+                role: 'user', content: { type: 'text', text: reference.text },
+                meta: { sentFrom: 'webapp', deliveryMode: 'queue' }
+            }, localId, scheduledAt)
+            let warning: string | undefined
+            try {
+                const spawn = await this.rpcGateway.spawnSession(
+                    machineId, directory, request.agent, request.model,
+                    undefined, undefined, request.workspace === 'worktree' ? 'worktree' : 'simple',
+                    request.worktreeName, undefined, undefined, undefined, undefined,
+                    undefined, undefined, undefined, 'remote', undefined, childId
+                )
+                if (spawn.type !== 'success') {
+                    if (spawn.childStarted === false) {
+                        await this.deleteSession(childId)
+                        return { type: 'error', message: spawn.message }
+                    }
+                    throw new Error(spawn.message)
+                }
+                if (spawn.sessionId !== childId) throw new Error('Runner returned a different branch session id')
+                await this.sendMessage(childId, { text: reference.text, localId, scheduledAt, deliveryMode: 'queue' })
+            } catch (error) {
+                warning = `Launch outcome is uncertain. Inspect this child before retrying: ${error instanceof Error ? error.message : String(error)}`
+            }
+            // Merge with CLI metadata using version checks; never overwrite a native binding.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const child = this.sessionCache.refreshSession(childId)
+                if (!child?.metadata) break
+                const result = this.store.sessions.updateSessionMetadata(childId, {
+                    ...child.metadata, conversationBranch: { ...branch, state: warning ? 'uncertain' : 'started' }
+                }, child.metadataVersion, namespace, { touchUpdatedAt: false })
+                if (result.result !== 'version-mismatch') break
+            }
+            this.sessionCache.refreshSession(childId)
+            return { type: 'success', sessionId: childId, ...(warning ? { warning } : {}) }
+        } catch (error) {
+            return { type: 'error', message: error instanceof Error ? error.message : String(error) }
+        } finally {
+            this.historyActionsInFlight.delete(sessionId)
+        }
+    }
+
     async forkConversation(
         sessionId: string,
         namespace: string,
-        messageLocalId?: string
-    ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
+        messageLocalId?: string,
+        latestCompleted = false,
+        boundary?: ForkBoundary
+    ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string; code?: ForkBoundaryErrorCode }> {
         const candidate = this.sessionCache.getSessionByNamespace(sessionId, namespace)
         if (candidate?.metadata?.codexResumePending) {
             return { type: 'error', message: 'Codex resume startup is unconfirmed; retry resume or archive to confirm its process stopped before forking' }
@@ -2297,25 +2698,326 @@ export class SyncEngine {
         }
         this.historyActionsInFlight.add(sessionId)
         try {
-            return await this.forkConversationUnlocked(sessionId, namespace, messageLocalId)
+            return await this.forkConversationUnlocked(sessionId, namespace, messageLocalId, latestCompleted, boundary)
         } finally {
             this.historyActionsInFlight.delete(sessionId)
         }
     }
 
+    /**
+     * Re-check a fork-preview boundary against the live transcript, right
+     * after the confirm lock is taken and before any flavor dispatch. Returns
+     * a human-readable reason when the source moved since the preview.
+     */
+    /** Admission guards shared by the archived-fork confirm and its preview:
+     *  a preview must never answer a boundary the confirm would refuse.
+     *  Returns the machine binding the guards verified. */
+    private assertArchivedForkEligible(source: Session, namespace: string, messageLocalId?: string): {
+        machineId: string
+        codexSessionId: string
+        path: string
+    } {
+        const metadata = source.metadata
+        // An attached runtime is the desktop's own thread: fork it there,
+        // not through HAPI.
+        if (metadata?.codexRuntime?.kind === 'attached') {
+            throw new Error('Fork external threads in the owning desktop, then use hapi attach')
+        }
+        if (metadata?.flavor !== 'codex' || !metadata.codexSessionId || !metadata.machineId || !metadata.path) {
+            throw new Error('Inactive fork requires a Codex session with native history and a machine binding')
+        }
+        if (metadata.conversationHistoryDiverged) throw new Error('Conversation history is diverged; refuse further fork/rewind')
+        if (this.store.messages.getUninvokedLocalMessages(source.id).length) throw new Error('Session has queued messages')
+        const machine = this.getMachine(metadata.machineId)
+        if (!machine?.active || machine.namespace !== namespace) throw new Error('Source machine is offline')
+        if (!machine.metadata?.capabilities?.includes(MACHINE_CAPABILITIES.ForkArchivedCodex)) {
+            throw new Error('Upgrade the source Runner to fork archived Codex sessions')
+        }
+        const attempt = metadata.codexArchivedFork
+        if (attempt && attempt.boundaryLocalId !== messageLocalId) throw new Error('A previous archived fork is pending at another boundary; retry that fork first')
+        return { machineId: metadata.machineId, codexSessionId: metadata.codexSessionId, path: metadata.path }
+    }
+
+    private boundaryMovedReason(
+        sessionId: string,
+        source: Session,
+        boundary: ForkBoundary,
+        expectedMode: ForkBoundary['mode'],
+        messageLocalId?: string
+    ): string | null {
+        if (boundary.mode !== expectedMode) {
+            return `Boundary token describes a ${boundary.mode} boundary, not ${expectedMode}`
+        }
+        if ((expectedMode === 'message' || expectedMode === 'rewind') && boundary.messageLocalId !== messageLocalId) {
+            return 'Boundary token does not match the requested message'
+        }
+        // The preview chose its admission path (live guards vs archived-fork
+        // rules) from the source's active state; a transition between preview
+        // and confirm routes the confirm onto a path the token was not minted
+        // for: an inactive source fails the archived-fork admission (or forks
+        // archived state that ignores a live cut), a reopened one runs the
+        // live path with an archived cut.
+        if (boundary.sourceActive !== undefined && boundary.sourceActive !== source.active) {
+            return boundary.sourceActive
+                ? 'The source session stopped running since the preview'
+                : 'The source session was reopened since the preview'
+        }
+        if (boundary.epoch !== this.store.messages.getMessageEpoch(sessionId)) {
+            return 'Conversation history changed since the preview'
+        }
+        const rows = this.store.messages.getAllMessages(sessionId)
+        switch (boundary.mode) {
+            case 'current':
+                if (invokedTailSeq(rows) > boundary.tailSeq) {
+                    return 'New conversation rows appeared since the preview'
+                }
+                if (source.thinking) {
+                    return 'The source session started running since the preview'
+                }
+                break
+            case 'message': {
+                const boundaryRow = rows.find((row) => row.localId === boundary.messageLocalId)
+                if (!boundaryRow || boundaryRow.invokedAt == null) {
+                    return 'The boundary message is no longer part of the invoked history'
+                }
+                // A live non-Codex message fork must still be idle at confirm
+                // (Codex message forks legitimately run); without this the
+                // busy rejection surfaces as an uncoded dead end.
+                if (source.thinking && this.resolveFlavor(source) !== 'codex') {
+                    return 'The source session started running since the preview'
+                }
+                break
+            }
+            case 'latestCompleted':
+                // The pinned native turn is re-verified by the runner against
+                // native history; epoch covers hub-side truncation.
+                // A latestCompleted token is only minted for a running source,
+                // so an inactive source at confirm means the runner exited:
+                // refresh instead of confirming into the archived path, which
+                // ignores the pin.
+                if (!source.active) {
+                    return 'The source session stopped running since the preview'
+                }
+                break
+            case 'rewind':
+                if (invokedTailSeq(rows) > boundary.tailSeq) {
+                    return 'New conversation rows appeared since the preview'
+                }
+                // The rewind confirm demands an idle source; a thinking edge
+                // would otherwise fail as an uncoded 'Session is busy'.
+                if (source.thinking) {
+                    return 'The source session started running since the preview'
+                }
+                break
+        }
+        return null
+    }
+
+    /**
+     * Read-only fork/rewind preview answered by the boundary owner. Runs the
+     * same admission guards as confirm, without taking the history-action
+     * lock, so previewing never blocks or races a concurrent confirm.
+     */
+    async forkPreview(
+        sessionId: string,
+        namespace: string,
+        intent: ForkPreviewRequest['intent'],
+        messageLocalId?: string
+    ): Promise<{ type: 'success'; preview: ForkPreviewResponse } | { type: 'error'; message: string }> {
+        const access = this.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return { type: 'error', message: access.reason === 'not-found' ? 'Session not found' : 'Access denied' }
+        }
+        const source = access.session
+        const flavor = this.resolveFlavor(source)
+        const history = source.metadata?.capabilities?.conversationHistory
+        const guardError = (error: unknown) =>
+            ({ type: 'error' as const, message: error instanceof Error ? error.message : String(error) })
+
+        if (intent === 'rewind') {
+            if (!source.active) {
+                return { type: 'error', message: 'Rewind is not supported for this session' }
+            }
+            try {
+                this.assertConversationHistoryIdle(source)
+            } catch (error) {
+                return guardError(error)
+            }
+            if (history?.rewindToMessage !== true) {
+                return { type: 'error', message: 'Rewind is not supported for this session' }
+            }
+            try {
+                this.assertInvokedHistoryBoundary(sessionId, messageLocalId!)
+            } catch (error) {
+                return guardError(error)
+            }
+            return this.buildForkPreviewResponse(sessionId, source, flavor, 'rewind', messageLocalId)
+        }
+
+        // Mirror forkConversation's admission guards on the fork intents: the
+        // preview must never open a dialog whose confirm the engine refuses
+        // outright. (The rewind confirm runs its own guards, so rewind
+        // previews keep theirs.)
+        if (source.metadata?.codexResumePending) {
+            return { type: 'error', message: 'Codex resume startup is unconfirmed; retry resume or archive to confirm its process stopped before forking' }
+        }
+        if (this.archivedForkPending(sessionId, namespace) && (!source.metadata?.codexArchivedFork || source.active)) {
+            return { type: 'error', message: 'Archived fork is pending; wait for its child binding before creating another branch' }
+        }
+
+        if (!source.active) {
+            // Archived fork is hub-decided and the transcript is static; run
+            // the same admission guards as the confirm so the preview cannot
+            // answer a boundary the confirm would refuse.
+            try {
+                this.assertArchivedForkEligible(source, namespace, intent === 'message' ? messageLocalId : undefined)
+            } catch (error) {
+                return guardError(error)
+            }
+            if (intent === 'message') {
+                try {
+                    this.assertInvokedHistoryBoundary(sessionId, messageLocalId!)
+                } catch (error) {
+                    return guardError(error)
+                }
+                // forkArchivedCodexSession resolves the native turn from a
+                // pending attempt or the conversationHistoryTurns map and
+                // throws 'No native history point' without either; refuse the
+                // same message up front.
+                if (!source.metadata?.codexArchivedFork
+                    && !source.metadata?.conversationHistoryTurns?.[messageLocalId!]) {
+                    return { type: 'error', message: 'No native history point for this message' }
+                }
+            }
+            return this.buildForkPreviewResponse(sessionId, source, flavor, intent === 'message' ? 'message' : 'current', messageLocalId)
+        }
+
+        // The hub resolves the mode from the live session; a running Codex
+        // with a verified completed turn previews through that turn.
+        let mode: 'current' | 'message' | 'latestCompleted' = intent === 'message' ? 'message' : 'current'
+        if (intent === 'current' && flavor === 'codex' && source.thinking
+            && history?.forkLatestCompleted === true) {
+            mode = 'latestCompleted'
+        }
+
+        try {
+            this.assertConversationHistoryIdle(source,
+                (Boolean(messageLocalId) || mode === 'latestCompleted') && flavor === 'codex')
+        } catch (error) {
+            return guardError(error)
+        }
+
+        if (mode === 'message') {
+            if (history?.forkAtMessage !== true) {
+                return { type: 'error', message: 'Historical fork is not supported for this session' }
+            }
+            try {
+                this.assertInvokedHistoryBoundary(sessionId, messageLocalId!)
+            } catch (error) {
+                return guardError(error)
+            }
+        } else if (mode === 'latestCompleted') {
+            // latestCompleted is CLI-decided: an old runner cannot answer it
+            // without re-introducing the drift the preview exists to prevent.
+            if (history?.forkPreview !== true) {
+                return { type: 'error', message: 'Update the runner to preview this fork' }
+            }
+        } else if (history?.forkCurrent !== true) {
+            return { type: 'error', message: 'Fork current is not supported for this session' }
+        }
+
+        return this.buildForkPreviewResponse(sessionId, source, flavor, mode, messageLocalId)
+    }
+
+    private async buildForkPreviewResponse(
+        sessionId: string,
+        source: Session,
+        flavor: AgentFlavor,
+        mode: ForkBoundary['mode'],
+        messageLocalId?: string
+    ): Promise<{ type: 'success'; preview: ForkPreviewResponse } | { type: 'error'; message: string }> {
+        // A preview-capable shared runtime decides its own boundary: ask it
+        // where the native history cut sits instead of mirroring it from hub
+        // rows. Every other flavor is hub-decided and answered from rows.
+        let nativeCut: { nativeTurnId?: string; cutBeforeLocalId?: string } = {}
+        let rows = this.store.messages.getAllMessages(sessionId)
+        if (mode !== 'rewind' && source.active && flavor === 'codex'
+            && source.metadata?.capabilities?.conversationHistory?.forkPreview === true) {
+            // The native cut and the hub transcript must describe the same
+            // history: fingerprint the transcript before the boundary RPC and
+            // reject when a turn completes in between, so the token never pins
+            // a tail the sampled cut does not cover (same guard as the
+            // OpenCode rewind reservation).
+            const fingerprintBefore = createHash('sha256').update(JSON.stringify(rows)).digest('hex')
+            try {
+                nativeCut = await this.rpcGateway.previewForkBoundary(sessionId,
+                    mode === 'message' ? { mode, messageLocalId } : { mode })
+            } catch (error) {
+                return { type: 'error', message: error instanceof Error ? error.message : String(error) }
+            }
+            rows = this.store.messages.getAllMessages(sessionId)
+            if (createHash('sha256').update(JSON.stringify(rows)).digest('hex') !== fingerprintBefore) {
+                return { type: 'error', message: 'The source conversation changed while the preview was prepared; try again' }
+            }
+        }
+        let resolved: ResolvedBoundary<StoredMessage>
+        try {
+            resolved = mode === 'rewind'
+                ? resolveRewindBoundary(rows, messageLocalId!)
+                : resolveForkBoundary(rows, { mode, messageLocalId, cutBeforeLocalId: nativeCut.cutBeforeLocalId })
+        } catch (error) {
+            return { type: 'error', message: error instanceof Error ? error.message : String(error) }
+        }
+        const toRow = (message: StoredMessage): ForkPreviewRow =>
+            ({ id: message.id, seq: message.seq, localId: message.localId, content: message.content, createdAt: message.createdAt, invokedAt: message.invokedAt })
+        const keptTail = resolved.prefix.slice(-FORK_PREVIEW_TAIL_ROWS).map(toRow)
+        const excluded = mode === 'rewind'
+            ? resolved.excluded.slice(0, FORK_PREVIEW_TAIL_ROWS).map(toRow)
+            : resolved.excluded.slice(0, 1).map(toRow)
+        const preview: ForkPreviewResponse = {
+            mode,
+            boundary: {
+                v: 1,
+                mode,
+                ...(messageLocalId && (mode === 'message' || mode === 'rewind') ? { messageLocalId } : {}),
+                ...(nativeCut.nativeTurnId ? { nativeTurnId: nativeCut.nativeTurnId } : {}),
+                sourceActive: source.active,
+                epoch: this.store.messages.getMessageEpoch(sessionId),
+                tailSeq: resolved.tailSeq
+            },
+            keptTail,
+            excluded,
+            counts: { kept: resolved.prefix.length, excluded: resolved.excluded.length }
+        }
+        return { type: 'success', preview }
+    }
+
     private async forkConversationUnlocked(
         sessionId: string,
         namespace: string,
-        messageLocalId?: string
-    ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
+        messageLocalId?: string,
+        latestCompleted = false,
+        boundary?: ForkBoundary
+    ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string; code?: ForkBoundaryErrorCode }> {
         const access = this.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return { type: 'error', message: access.reason === 'not-found' ? 'Session not found' : 'Access denied' }
         }
         let source = access.session
+        if (boundary) {
+            const expectedMode: ForkBoundary['mode'] = messageLocalId ? 'message' : latestCompleted ? 'latestCompleted' : 'current'
+            const moved = this.boundaryMovedReason(sessionId, source, boundary, expectedMode, messageLocalId)
+            if (moved) {
+                return { type: 'error', message: moved, code: 'boundary_moved' }
+            }
+        }
+        if (latestCompleted && (messageLocalId || !source.active || this.resolveFlavor(source) !== 'codex'
+            || source.metadata?.capabilities?.conversationHistory?.forkLatestCompleted !== true)) {
+            return { type: 'error', message: 'No verified completed turn is available for this session' }
+        }
         if (!source.active) return this.forkArchivedCodexSession(source, namespace, messageLocalId)
         try {
-            this.assertConversationHistoryIdle(source, Boolean(messageLocalId) && this.resolveFlavor(source) === 'codex')
+            this.assertConversationHistoryIdle(source, (Boolean(messageLocalId) || latestCompleted) && this.resolveFlavor(source) === 'codex')
         } catch (error) {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }
@@ -2344,7 +3046,11 @@ export class SyncEngine {
         try {
             rpcResult = await this.rpcGateway.forkConversation(
                 sessionId,
-                messageLocalId ? { messageLocalId } : {}
+                latestCompleted
+                    ? { latestCompleted: true, ...(boundary?.nativeTurnId ? { lastTurnId: boundary.nativeTurnId } : {}) }
+                    : messageLocalId
+                        ? { messageLocalId }
+                        : boundary?.nativeTurnId ? { lastTurnId: boundary.nativeTurnId } : {}
             )
         } catch (error) {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
@@ -2368,6 +3074,9 @@ export class SyncEngine {
         ) {
             return { type: 'error', message: 'Native fork did not return a session id' }
         }
+        if (latestCompleted && (!rpcResult.sessionId || !rpcResult.completedTurnId)) {
+            return { type: 'error', message: 'Runner did not verify the completed-turn fork boundary' }
+        }
         if (rpcResult.sessionId) {
             const child = await this.validateSharedChild(source, rpcResult.sessionId, rpcResult.nativeSessionId)
             if (!child || child.metadata?.forkedFrom !== sessionId) return { type: 'error', message: 'Invalid shared-runtime fork binding' }
@@ -2384,10 +3093,19 @@ export class SyncEngine {
         source = refreshedSource
 
         const flavor = this.resolveFlavor(source)
+        if (flavor === 'opencode'
+            && (rpcResult.opencodeHistoryCheckpoint?.sessionId !== rpcResult.nativeSessionId
+                || rpcResult.opencodeHistoryCheckpoint.localMessageIds?.length !== 0
+                || rpcResult.opencodeHistoryCheckpoint.localPublicationPending)) {
+            return { type: 'error', message: 'OpenCode fork did not return a verified child history checkpoint' }
+        }
         const childId = randomUUID()
         let prefix
         try {
-            prefix = selectForkTranscriptPrefix(this.store.messages.getAllMessages(sessionId), messageLocalId)
+            prefix = resolveForkBoundary(this.store.messages.getAllMessages(sessionId), {
+                mode: messageLocalId ? 'message' : 'current',
+                messageLocalId
+            }).prefix
         } catch (error) {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }
@@ -2423,6 +3141,9 @@ export class SyncEngine {
         }
         if (flavor === 'codex') {
             childMetadata.codexSessionId = rpcResult.nativeSessionId
+        } else if (flavor === 'opencode') {
+            childMetadata.opencodeHistoryCheckpoint = rpcResult.opencodeHistoryCheckpoint
+            childMetadata.opencodeForkPending = true
         } else if (flavor === 'grok') {
             childMetadata.grokSessionId = rpcResult.nativeSessionId
         } else if (flavor === 'pi') {
@@ -2486,7 +3207,9 @@ export class SyncEngine {
                 source.collaborationMode,
                 undefined,
                 undefined,
-                rpcResult.forkSession === true
+                rpcResult.forkSession === true,
+                undefined,
+                rpcResult.resumeSessionAt
             )
             if (spawn.type !== 'success') {
                 throw new Error(spawn.message)
@@ -2528,6 +3251,19 @@ export class SyncEngine {
                 }
             }
 
+            if (flavor === 'opencode') {
+                // The CLI seeds opencodeSessionId from the resume id before ACP
+                // initialize, so only the validated session-ready fence proves
+                // the forked native session actually loaded.
+                const bound = await this.waitForExactNativeForkBound(
+                    childId, rpcResult.nativeSessionId, 'opencodeSessionId', true
+                )
+                if (!bound) {
+                    throw new Error('OpenCode fork could not load the forked native session')
+                }
+                this.completeOpencodeForkValidation(childId, namespace)
+            }
+
             return { type: 'success', sessionId: childId }
         } catch (error) {
             if (childCreated) {
@@ -2564,29 +3300,241 @@ export class SyncEngine {
     async rewindConversation(
         sessionId: string,
         namespace: string,
-        messageLocalId: string
+        messageLocalId: string,
+        boundary?: ForkBoundary
     ): Promise<{ type: 'success' } | { type: 'error'; message: string; code?: RewindConversationErrorCode; hydrateFailed?: boolean }> {
         if (this.historyActionsInFlight.has(sessionId)) {
             return { type: 'error', message: 'Conversation history action already in progress' }
         }
         this.historyActionsInFlight.add(sessionId)
         try {
-            return await this.rewindConversationUnlocked(sessionId, namespace, messageLocalId)
+            return await this.rewindConversationUnlocked(sessionId, namespace, messageLocalId, boundary)
         } finally {
             this.historyActionsInFlight.delete(sessionId)
+        }
+    }
+
+    /**
+     * Hub-restart recovery for interrupted Claude rewind RPCs: if a committed
+     * `claudeRewind` intent persisted in metadata still has its boundary in SQLite,
+     * apply the idempotent transcript cut before accepting CLI or user traffic.
+     */
+    private reconcilePendingClaudeRewinds(): void {
+        for (const session of this.sessionCache.getSessions()) {
+            this.reconcilePendingClaudeRewind(session)
+        }
+    }
+
+    /** Clear the in-flight RPC marker only if it still belongs to the same rewind request. */
+    private clearClaudeRewindInFlight(sessionId: string, messageLocalId: string): void {
+        if (this.claudeRewindRpcsInFlight.get(sessionId) === messageLocalId) {
+            this.claudeRewindRpcsInFlight.delete(sessionId)
+        }
+    }
+
+    /** Idempotently reconcile a persisted claudeRewind intent when no matching rewind RPC is active. */
+    private reconcilePendingClaudeRewind(session: Session | undefined): void {
+        if (!session) {
+            return
+        }
+        const stored = this.store.sessions.getSession(session.id)
+        const rawMetadata = asRecord(stored?.metadata)
+        const hasRawRewind = rawMetadata !== null && rawMetadata.claudeRewind !== undefined
+        const intent = session.metadata?.claudeRewind
+        if (!intent && !hasRawRewind) {
+            return
+        }
+        if (session.metadata?.conversationHistoryDiverged === true || rawMetadata?.conversationHistoryDiverged === true) {
+            return
+        }
+
+        const truncateFromLocalId = typeof intent?.truncateFromLocalId === 'string' && intent.truncateFromLocalId.length > 0
+            ? intent.truncateFromLocalId
+            : null
+        if (truncateFromLocalId && this.claudeRewindRpcsInFlight.get(session.id) === truncateFromLocalId) {
+            return
+        }
+        if (!truncateFromLocalId) {
+            if (session.metadata) {
+                this.markConversationHistoryDiverged(session.id, session.namespace)
+            } else if (rawMetadata && stored) {
+                const { claudeRewind: _invalid, ...rest } = rawMetadata
+                this.store.sessions.updateSessionMetadata(
+                    session.id,
+                    { ...rest, conversationHistoryDiverged: true } as unknown as Session['metadata'],
+                    stored.metadataVersion,
+                    session.namespace,
+                    { touchUpdatedAt: false }
+                )
+                this.sessionCache.refreshSession(session.id)
+            }
+            return
+        }
+
+        const states = this.store.messages.getLocalMessageStates(session.id, [truncateFromLocalId])
+        if (states.length === 0) {
+            // Already truncated (RPC reply, catch recovery, or prior startup).
+            // Record the commitment so the CLI's native proof can clear the
+            // intent instead of holding it until the next restart.
+            this.markClaudeRewindCutApplied(session.id, session.namespace, truncateFromLocalId)
+            return
+        }
+
+        const targetState = states[0]
+        // The cut is bounded by the intent's discardedThroughSeq: uninvoked
+        // rows queued after that bound are newer input the recovery cut must
+        // preserve, not evidence of an unsafe transcript. Intents without a
+        // bound (written by an older CLI or hub) cut unbounded, so any
+        // uninvoked row still blocks the cut.
+        const discardedThroughSeq = intent?.discardedThroughSeq
+        const uninvokedMessages = this.store.messages.getUninvokedLocalMessages(session.id)
+        const hasUninvokedMessages = discardedThroughSeq === undefined
+            ? uninvokedMessages.length > 0
+            : uninvokedMessages.some((message) => message.seq <= discardedThroughSeq)
+        const isClaudeSession = session.metadata?.flavor === undefined || session.metadata.flavor === 'claude'
+        if (!isClaudeSession || targetState?.invokedAt == null || hasUninvokedMessages) {
+            this.markConversationHistoryDiverged(session.id, session.namespace)
+            return
+        }
+
+        try {
+            this.truncateHubTranscriptFrom(session.id, session.namespace, truncateFromLocalId, intent?.discardedThroughSeq)
+        } catch {
+            this.markConversationHistoryDiverged(session.id, session.namespace)
+        }
+    }
+
+    /**
+     * Hub-side half of a rewind: delete the transcript from the keyed localId
+     * on, refresh derived state, and tell clients to refetch. Runs once, at
+     * rewind-RPC success — the native re-arm is the CLI's durable intent, so
+     * no later metadata-driven truncation pass can eat post-rewind turns.
+     * `discardedThroughSeq` is the newest row that existed when the rewind was
+     * dispatched: a delayed or recovery cut never deletes rows created later.
+     */
+    private truncateHubTranscriptFrom(
+        sessionId: string,
+        namespace: string,
+        truncateFromLocalId: string,
+        discardedThroughSeq?: number
+    ): void {
+        this.store.messages.truncateMessagesFromLocalId(sessionId, truncateFromLocalId, [], discardedThroughSeq)
+        this.scrubHistoryLocators(sessionId, namespace)
+        this.sessionCache.rebuildTodosFromTranscript(sessionId)
+        this.markClaudeRewindCutApplied(sessionId, namespace, truncateFromLocalId)
+        this.eventPublisher.emit({
+            type: 'messages-invalidated',
+            sessionId,
+            namespace,
+            reason: 'rewind',
+            truncateFromLocalId
+        })
+        this.sessionCache.refreshSession(sessionId)
+    }
+
+    /**
+     * Record on the intent that this hub has applied the transcript cut.
+     *
+     * The CLI owns the native branch and deletes the intent as soon as its
+     * proof (post-rewind input re-parented onto the kept boundary) lands. A
+     * transient disconnect can drop the rewind RPC reply, so the proof may be
+     * observed while the hub cut has not happened yet: the pending guard then
+     * skips reconciliation for this hub process, and the deletion would leave
+     * the transcript mismatched with no intent left to repair it. The marker
+     * is what lets the CLI tell the two apart - it only clears the intent once
+     * the cut is confirmed, so the timeout/reconnect reconcile still finds it.
+     */
+    private markClaudeRewindCutApplied(sessionId: string, namespace: string, truncateFromLocalId: string): void {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const session = this.sessionCache.getSessionByNamespace(sessionId, namespace)
+                ?? this.sessionCache.refreshSession(sessionId)
+            if (!session?.metadata) return
+            const intent = asRecord(session.metadata.claudeRewind)
+            if (intent === null || intent.truncateFromLocalId !== truncateFromLocalId || intent.hubCutApplied === true) return
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...session.metadata, claudeRewind: { ...intent, hubCutApplied: true } },
+                session.metadataVersion,
+                namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'success') {
+                this.sessionCache.refreshSession(sessionId)
+                // A CLI holding native proof clears the intent on this update;
+                // without the push it waits for its next write or a reconnect,
+                // keeping fork/rewind blocked on an already-applied cut.
+                this.emitCliSessionMetadataUpdate(sessionId)
+                return
+            }
+            if (result.result !== 'version-mismatch') return
+        }
+    }
+
+    /**
+     * A `claudeRewind` intent visible in hub metadata means the rewind is
+     * committed: the CLI's unknown-outcome settlement arms the native boundary
+     * as soon as it sees the intent (flush timeout released the local launch),
+     * so the hub transcript cut has to happen here too. The RPC reply can be a
+     * rejection that was produced after the write landed; deleting the intent
+     * then would leave the hub with turns the native side already dropped.
+     * Returns the truncate key when that committed intent matches the request.
+     */
+    private committedClaudeRewindLocalId(sessionId: string, messageLocalId: string): string | null {
+        const intent = asRecord(asRecord(this.sessionCache.refreshSession(sessionId)?.metadata)?.claudeRewind)
+        const truncateFromLocalId = typeof intent?.truncateFromLocalId === 'string' && intent.truncateFromLocalId.length > 0
+            ? intent.truncateFromLocalId
+            : null
+        return truncateFromLocalId === messageLocalId ? truncateFromLocalId : null
+    }
+
+    /**
+     * Drop a `claudeRewind` intent that the RPC outcome proved was never
+     * committed: this rewind's own target (`messageLocalId`), or a stale
+     * intent for an older target whose retrying metadata write lost its
+     * version race (that write's rejection finds nothing matching and lands
+     * here). Leaving one behind would arm a bogus native boundary on the next
+     * start and block history actions behind the pending-rewind guard.
+     */
+    private clearUncommittedClaudeRewind(sessionId: string, namespace: string): void {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const session = this.sessionCache.getSessionByNamespace(sessionId, namespace)
+                ?? this.sessionCache.refreshSession(sessionId)
+            if (!session?.metadata) return
+            if (asRecord(session.metadata.claudeRewind) === null) return
+
+            const { claudeRewind: _cleared, ...nextMetadata } = session.metadata
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                nextMetadata,
+                session.metadataVersion,
+                namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'success') {
+                this.sessionCache.refreshSession(sessionId)
+                return
+            }
+            if (result.result !== 'version-mismatch') return
         }
     }
 
     private async rewindConversationUnlocked(
         sessionId: string,
         namespace: string,
-        messageLocalId: string
+        messageLocalId: string,
+        boundary?: ForkBoundary
     ): Promise<{ type: 'success' } | { type: 'error'; message: string; code?: RewindConversationErrorCode; hydrateFailed?: boolean }> {
         const access = this.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return { type: 'error', message: access.reason === 'not-found' ? 'Session not found' : 'Access denied' }
         }
         const session = access.session
+        if (boundary) {
+            const moved = this.boundaryMovedReason(sessionId, session, boundary, 'rewind', messageLocalId)
+            if (moved) {
+                return { type: 'error', message: moved, code: 'boundary_moved' }
+            }
+        }
         try {
             this.assertConversationHistoryIdle(session)
         } catch (error) {
@@ -2601,45 +3549,81 @@ export class SyncEngine {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }
 
+        if (session.metadata?.flavor === 'opencode') return await this.rewindOpenCode(session, namespace, messageLocalId)
+
+        this.claudeRewindRpcsInFlight.set(sessionId, messageLocalId)
+        // The CLI persists this bound with its intent, so recovery after a
+        // lost reply or a hub restart cuts exactly what was discarded now.
+        const discardedThroughSeq = this.store.messages.getMaxSeq(sessionId)
         let rpcResult: Awaited<ReturnType<RpcGateway['rewindConversation']>>
         try {
-            rpcResult = await this.rpcGateway.rewindConversation(sessionId, { messageLocalId })
+            rpcResult = await this.rpcGateway.rewindConversation(sessionId, { messageLocalId, discardedThroughSeq })
         } catch (error) {
-            if (!(error instanceof RpcTargetMissingError)) {
-                this.markConversationHistoryDiverged(sessionId, namespace)
-                return {
-                    type: 'error',
-                    hydrateFailed: true,
-                    message: 'Rewind outcome is unknown; session history requires reconciliation'
+            // Crash window: the runner persists the durable rewind intent
+            // BEFORE it starts the restart teardown, and the native branch
+            // re-arms from that intent on the next start. If the intent for
+            // exactly this rewind is already visible here, the rewind is
+            // committed - truncate now (idempotent with the success path)
+            // instead of leaving the hub transcript diverged from the native
+            // side that will inevitably cut the same turns.
+            try {
+                this.sessionCache.refreshSession(sessionId)
+                const intent = this.getSession(sessionId)?.metadata?.claudeRewind as { truncateFromLocalId?: string } | undefined
+                if (intent?.truncateFromLocalId === messageLocalId) {
+                    try {
+                        this.truncateHubTranscriptFrom(sessionId, namespace, messageLocalId, discardedThroughSeq)
+                        return { type: 'success' }
+                    } catch {
+                        // Fall through: the diverged marker below is the honest state.
+                    }
                 }
-            }
-            return { type: 'error', message: error.message }
-        }
-
-        if (rpcResult?.success !== true) {
-            return {
-                type: 'error',
-                message: rpcResult?.error ?? 'Native rewind failed',
-                ...(rpcResult?.success === false && rpcResult.code ? { code: rpcResult.code } : {})
+                if (!(error instanceof RpcTargetMissingError)) {
+                    this.markConversationHistoryDiverged(sessionId, namespace)
+                    return {
+                        type: 'error',
+                        hydrateFailed: true,
+                        message: 'Rewind outcome is unknown; session history requires reconciliation'
+                    }
+                }
+                return { type: 'error', message: error.message }
+            } finally {
+                this.clearClaudeRewindInFlight(sessionId, messageLocalId)
             }
         }
 
         try {
-            this.store.messages.truncateMessagesFromLocalId(
-                sessionId,
-                rpcResult.truncateFromLocalId ?? messageLocalId,
-                rpcResult.messages ?? []
-            )
-            this.scrubHistoryLocators(sessionId, namespace)
-            this.sessionCache.rebuildTodosFromTranscript(sessionId)
-            this.eventPublisher.emit({
-                type: 'messages-invalidated',
-                sessionId,
-                namespace,
-                reason: 'rewind',
-                truncateFromLocalId: rpcResult.truncateFromLocalId ?? messageLocalId
-            })
-            this.sessionCache.refreshSession(sessionId)
+            if (rpcResult?.success !== true) {
+                // The write can land while the RPC reply is still a rejection
+                // (the CLI aborts the retrying write on a flush timeout but the
+                // first attempt persisted). A rejection then must not delete an
+                // intent that the CLI's local settlement already consumed:
+                // treat it as committed and reconcile the cut idempotently.
+                // (The lost-RPC catch above does the same.)
+                const committedLocalId = this.committedClaudeRewindLocalId(sessionId, messageLocalId)
+                if (committedLocalId) {
+                    // Nothing to truncate (already cut) or the boundary is gone:
+                    // the native side already dropped those turns either way.
+                    try {
+                        this.truncateHubTranscriptFrom(sessionId, namespace, committedLocalId, discardedThroughSeq)
+                    } catch {
+                        // Preserve the committed intent: the startup reconcile
+                        // owns the cut once the transcript is repairable again.
+                    }
+                    return { type: 'success' }
+                }
+                this.clearUncommittedClaudeRewind(sessionId, namespace)
+                return {
+                    type: 'error',
+                    message: rpcResult?.error ?? 'Native rewind failed',
+                    ...(rpcResult?.success === false && rpcResult.code ? { code: rpcResult.code } : {})
+                }
+            }
+        } finally {
+            this.clearClaudeRewindInFlight(sessionId, messageLocalId)
+        }
+
+        try {
+            this.truncateHubTranscriptFrom(sessionId, namespace, rpcResult.truncateFromLocalId ?? messageLocalId, discardedThroughSeq)
             return { type: 'success' }
         } catch (error) {
             // Native history already changed; refuse further history actions until repaired.
@@ -2652,13 +3636,167 @@ export class SyncEngine {
         }
     }
 
+    private openCodeRewindPending(sessionId: string): boolean {
+        const phase = (this.store.sessions.getSession(sessionId)?.metadata as Session['metadata'])?.opencodeRewind?.phase
+        return phase === 'reserved' || phase === 'prepared' || phase === 'unknown'
+    }
+
+    private async rewindOpenCode(session: Session, namespace: string, localId: string): Promise<{ type: 'success' } | { type: 'error'; message: string }> {
+        const current = this.store.sessions.getSession(session.id)!
+        const metadata = MetadataSchema.parse(current.metadata)
+        const checkpoint = metadata.opencodeHistoryCheckpoint
+        const index = metadata.conversationHistoryIndexes?.[localId]
+        const nativeMessageId = index === undefined ? undefined : checkpoint?.userMessageIds[index]
+        if (!metadata.opencodeWorkerId || !metadata.opencodeWorkerProcess
+            || metadata.opencodeWorkerProcess.workerId !== metadata.opencodeWorkerId
+            || !checkpoint || !nativeMessageId || checkpoint.localPublicationPending
+            || checkpoint.localMessageIds === undefined || checkpoint.sessionId !== metadata.opencodeSessionId) {
+            return { type: 'error', message: 'OpenCode rewind requires a verified native boundary and worker' }
+        }
+        const messages = this.store.messages.getAllMessages(session.id)
+        const boundary = messages.find(m => m.localId === localId && m.invokedAt != null)
+        if (!boundary) return { type: 'error', message: 'History boundary is not invoked' }
+        const operation: OpenCodeRewindOperation = { operationId: randomUUID(), nativeSessionId: checkpoint.sessionId,
+            workerId: metadata.opencodeWorkerId, workerPid: metadata.opencodeWorkerProcess.pid, workerStartMarker: metadata.opencodeWorkerProcess.startMarker,
+            requestedLocalId: localId, nativeMessageId, cutoffSeq: boundary.seq,
+            sourceEpoch: this.store.messages.getMessageEpoch(session.id), sourceMaxSeq: Math.max(0, ...messages.map(m => m.seq)),
+            sourceTranscriptHash: createHash('sha256').update(JSON.stringify(messages)).digest('hex'),
+            reservationVersion: current.metadataVersion + 1, phase: 'reserved' }
+        // Durable reservation before the first native/RPC await. No generic
+        // metadata retry can reserve against a different source version.
+        const reserved = this.store.sessions.updateSessionMetadata(session.id, { ...metadata, opencodeRewind: operation }, current.metadataVersion, namespace)
+        if (reserved.result !== 'success') return { type: 'error', message: 'OpenCode source metadata changed before reservation' }
+        this.sessionCache.refreshSession(session.id)
+        try {
+            await this.rpcGateway.rewindConversation(session.id, { messageLocalId: localId, opencodeRewind: operation })
+        } catch { /* durable state below is authoritative, never an RPC success alone */ }
+        const latest = (this.store.sessions.getSession(session.id)?.metadata as Session['metadata'])?.opencodeRewind
+        if (latest?.operationId === operation.operationId && latest.phase === 'committed') return { type: 'success' }
+        return { type: 'error', message: 'OpenCode rewind remains blocked pending native/Hub reconciliation' }
+    }
+
+    reportOpenCodeRewind(sessionId: string, namespace: string, report: OpenCodeRewindReport, expectedVersion: number): OpenCodeRewindOperation {
+        let invalidated = false
+        const operation = this.store.runInTransaction(() => {
+            const current = this.store.sessions.getSession(sessionId)
+            if (!current || current.namespace !== namespace) throw new Error('Session access denied')
+            const metadata = MetadataSchema.parse(current.metadata)
+            const op = metadata.opencodeRewind
+            const incoming = report.operation
+            const keys = ['operationId', 'nativeSessionId', 'workerId', 'workerPid', 'workerStartMarker', 'requestedLocalId', 'nativeMessageId',
+                'cutoffSeq', 'sourceEpoch', 'sourceMaxSeq', 'reservationVersion', 'sourceTranscriptHash'] as const
+            if (!op || keys.some(key => op[key] !== incoming[key]) || metadata.opencodeSessionId !== op.nativeSessionId) throw new Error('OpenCode rewind operation mismatch')
+            // Check the operation tombstone BEFORE the optimistic version/cutoff.
+            // An old report after a new turn cannot truncate that turn again.
+            if (op.phase === 'committed') {
+                if (report.phase === 'applied' && (report.sourceHash !== op.sourceHash || report.prefixHash !== op.prefixHash)) throw new Error('Committed proof mismatch')
+                return op
+            }
+            if (op.phase === 'rejected') return op
+            if (current.metadataVersion !== expectedVersion) throw new Error('OpenCode rewind metadata version changed')
+            let next: OpenCodeRewindOperation = { ...op }
+            let nextMetadata = metadata
+            // A reserved operation has not durably authorized native mutation.
+            // Keep it rejectable when preparation failed before persistence.
+            if (report.phase === 'unknown') next.phase = op.phase === 'reserved' ? 'reserved' : 'unknown'
+            else if (report.phase === 'rejected') {
+                if (op.phase !== 'reserved' && !(report.unchanged && op.sourceHash === report.sourceHash && op.prefixHash === report.prefixHash)) {
+                    throw new Error('Native mutation cannot be rejected without recovery evidence')
+                }
+                next.phase = 'rejected'
+            } else {
+                const rows = this.store.messages.getAllMessages(sessionId)
+                const hubBoundary = rows.find(m => m.localId === op.requestedLocalId && m.seq === op.cutoffSeq && m.invokedAt != null)
+                if (this.store.messages.getMessageEpoch(sessionId) !== op.sourceEpoch
+                    || createHash('sha256').update(JSON.stringify(rows)).digest('hex') !== op.sourceTranscriptHash
+                    || Math.max(0, ...rows.map(m => m.seq)) !== op.sourceMaxSeq
+                    || !hubBoundary
+                    || this.store.messages.getUninvokedLocalMessages(sessionId).length) throw new Error('OpenCode source transcript changed')
+                if (!report.sourceHash?.match(/^[a-f0-9]{64}$/) || !report.prefixHash?.match(/^[a-f0-9]{64}$/)) throw new Error('Missing native source/prefix proof')
+                if (report.phase === 'prepared') {
+                    if (op.phase !== 'reserved') throw new Error('OpenCode preparation is not repeatable after mutation')
+                    next = { ...op, phase: 'prepared', sourceHash: report.sourceHash, prefixHash: report.prefixHash }
+                } else {
+                    if (op.sourceHash !== report.sourceHash || op.prefixHash !== report.prefixHash) throw new Error('Native proof does not match the prepared operation')
+                    const checkpoint = report.checkpoint
+                    const source = metadata.opencodeHistoryCheckpoint
+                    const boundary = source?.messageIds.indexOf(op.nativeMessageId) ?? -1
+                    const expected = source?.messageIds.slice(0, boundary)
+                    if (!checkpoint || boundary < 0 || checkpoint.sessionId !== op.nativeSessionId || checkpoint.localPublicationPending
+                        || checkpoint.localMessageIds === undefined || JSON.stringify(checkpoint.messageIds) !== JSON.stringify(expected)
+                        || JSON.stringify(checkpoint.userMessageIds) !== JSON.stringify(source!.userMessageIds.slice(0, source!.userMessageIds.indexOf(op.nativeMessageId)))) {
+                        throw new Error('Retained native checkpoint does not match the requested boundary')
+                    }
+                    const indexes: Record<string, number> = {}
+                    for (const [local, index] of Object.entries(metadata.conversationHistoryIndexes ?? {})) {
+                        const target = source!.userMessageIds[index]
+                        const nextIndex = checkpoint.userMessageIds.indexOf(target!)
+                        if (nextIndex >= 0) indexes[local] = nextIndex
+                    }
+                    if (JSON.stringify(Object.entries(indexes).sort()) !== JSON.stringify(Object.entries(report.indexes ?? {}).sort())) throw new Error('Retained locator mismatch')
+                    this.store.messages.truncateOpenCodeRewind(sessionId, op.cutoffSeq, hubBoundary.id)
+                    next = { ...op, phase: 'committed' }
+                    nextMetadata = { ...metadata, opencodeHistoryCheckpoint: checkpoint, conversationHistoryIndexes: indexes,
+                        conversationHistoryPoints: Object.fromEntries(Object.keys(indexes).map(key => [key, true as const])) }
+                    invalidated = true
+                }
+            }
+            const updated = this.store.sessions.updateSessionMetadata(sessionId, { ...nextMetadata, opencodeRewind: next }, current.metadataVersion, namespace)
+            if (updated.result !== 'success') throw new Error('OpenCode rewind metadata CAS failed')
+            if (invalidated) {
+                const todos = this.store.messages.getAllMessages(sessionId).map(m => extractTodoWriteTodosFromMessageContent(m.content)).filter(Boolean).at(-1) ?? null
+                this.store.sessions.replaceSessionTodos(sessionId, todos, namespace)
+            }
+            return next
+        })
+        // Only publish after the encompassing database transaction commits.
+        this.sessionCache.refreshSession(sessionId)
+        if (invalidated) this.eventPublisher.emit({ type: 'messages-invalidated', sessionId, namespace, reason: 'rewind', truncateFromLocalId: operation.requestedLocalId })
+        return operation
+    }
+
+    async prepareOpenCodeSessionStop(sessionId: string, pid: number, processStartMarker: string,
+        preparationLease: SessionStopPreparationLease, machineId: string): Promise<'ready' | 'not_required'> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
+        const metadata = this.sessionCache.getSession(sessionId)?.metadata
+        if (metadata?.machineId !== machineId) throw new Error('Session machine does not match runner')
+        if (metadata?.flavor !== 'opencode') return 'not_required'
+        // Only request the session RPC here. Calling archiveSession would
+        // recurse into the runner's StopSession handler that is awaiting us.
+        const requestPreparation = async () => this.rpcGateway.killSession(sessionId, {
+            prepareOnly: true, expectedMachineId: machineId, expectedPid: pid, expectedProcessStartMarker: processStartMarker, preparationLease
+        })
+        let result: Awaited<ReturnType<typeof requestPreparation>>
+        try {
+            result = await requestPreparation()
+        } catch (error) {
+            // KillSession's beforeKill drain may already have completed while
+            // the CLI's async cleanup closed the session socket: honor the
+            // remembered drained generation for this exact target instead of
+            // failing the runner's stop coordination.
+            const drained = this.archiveDrainedGenerations.get(sessionId)
+            if (!drained || drained.machineId !== machineId || drained.pid !== pid
+                || drained.processStartMarker !== processStartMarker) throw error
+            result = { pid, machineId, processStartMarker, preparationLease }
+        }
+        if (result.pid !== pid || result.processStartMarker !== processStartMarker || result.machineId !== machineId) {
+            throw new Error('Session shutdown preparation did not confirm the target generation')
+        }
+        if (result.preparationLease?.id !== preparationLease.id || result.preparationLease.expiresAt !== preparationLease.expiresAt) {
+            throw new Error('Session shutdown preparation did not confirm the lease')
+        }
+        return 'ready'
+    }
+
     async archiveSession(sessionId: string): Promise<void> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const existing = this.archiveRequests.get(sessionId)
         if (existing) return existing
         const operation = this.archiveSessionOnce(sessionId)
         this.archiveRequests.set(sessionId, operation)
         try { await operation } finally {
             if (this.archiveRequests.get(sessionId) === operation) this.archiveRequests.delete(sessionId)
+            this.archiveDrainedGenerations.delete(sessionId)
         }
     }
 
@@ -2710,6 +3848,12 @@ export class SyncEngine {
 
         const sessionMeta = this.sessionCache.getSession(sessionId)?.metadata
         const machineId = sessionMeta?.codexResumePending?.machineId ?? sessionMeta?.machineId
+        // Remember the drained generation so a concurrent prepare-stop can
+        // still be honored after the CLI's cleanup disconnects the socket.
+        if (machineId && typeof killPid === 'number' && killPid > 0
+            && typeof killProcessStartMarker === 'string' && killProcessStartMarker.length > 0) {
+            this.archiveDrainedGenerations.set(sessionId, { machineId, pid: killPid, processStartMarker: killProcessStartMarker })
+        }
         const runnerSpawned = Boolean(sessionMeta?.codexResumePending) || sessionMeta?.startedBy === 'runner'
             || sessionMeta?.startedFromRunner === true
         if (machineId && runnerSpawned) {
@@ -2999,6 +4143,7 @@ export class SyncEngine {
     }
 
     async clearConversation(sessionId: string, namespace: string): Promise<{ sessionId: string }> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok || !access.session.active || !access.session.metadata?.capabilities?.concurrentClients) {
             throw new Error('Clear requires an active shared session')
@@ -3022,6 +4167,7 @@ export class SyncEngine {
     }
 
     async switchSession(sessionId: string, to: 'remote' | 'local'): Promise<void> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         if (this.getSession(sessionId)?.metadata?.capabilities?.concurrentClients) throw new Error('control_mode_not_applicable')
         if (this.historyActionsInFlight.has(sessionId)) {
             throw new Error('Conversation history action already in progress')
@@ -3033,6 +4179,17 @@ export class SyncEngine {
         await this.sessionCache.renameSession(sessionId, name, titleLocked)
     }
 
+    async setSessionExternalRefs(sessionId: string, externalRefs: ExternalRef[]): Promise<void> {
+        await this.sessionCache.setSessionExternalRefs(sessionId, externalRefs)
+    }
+
+    async mutateSessionExternalRefs(
+        sessionId: string,
+        mutate: (current: ExternalRef[]) => ExternalRef[]
+    ): Promise<ExternalRef[]> {
+        return await this.sessionCache.mutateSessionExternalRefs(sessionId, mutate)
+    }
+
     async suggestSessionTitle(sessionId: string): Promise<string> {
         return await this.titleSuggestionService.suggestTitle(sessionId)
     }
@@ -3041,7 +4198,63 @@ export class SyncEngine {
         await this.sessionCache.updateSessionSummary(sessionId, text, titleLocked)
     }
 
+    async acknowledgeModelError(sessionId: string, eventId: string): Promise<void> {
+        await this.sessionCache.acknowledgeModelError(sessionId, eventId)
+    }
+
+    async markModelErrorNotified(sessionId: string, eventId: string): Promise<void> {
+        await this.sessionCache.markModelErrorNotified(sessionId, eventId)
+    }
+
+    async bridgeModelError(sessionId: string, eventId: string): Promise<{ ok: boolean; reason?: string }> {
+        const session = this.sessionCache.refreshSession(sessionId)
+            ?? this.sessionCache.getSession(sessionId)
+        if (!session) {
+            throw new Error('Session not found')
+        }
+
+        const err = session.metadata?.lastModelError
+        if (!err) {
+            throw new Error('No model error to bridge')
+        }
+        if (err.eventId !== eventId) {
+            throw new Error('Model error changed; refresh before bridging.')
+        }
+        if (!err.transient) {
+            throw new Error('Model error is not transient')
+        }
+        if (err.bridgedForEventId === err.eventId) {
+            throw new Error('Model error was already bridged')
+        }
+        if (err.retriedAndFailed) {
+            throw new Error('Bridge already failed for this error')
+        }
+        if (err.supersededByUserTurn) {
+            throw new Error('Model error was superseded by a newer turn')
+        }
+        if (err.bridgeable === false) {
+            throw new Error('Model error is not bridgeable')
+        }
+
+        // Do not mark bridgedForEventId here — CLI persists recovery only after
+        // the bridge prompt actually succeeds.
+        return await this.rpcGateway.bridgeModelError(sessionId, {
+            eventId: err.eventId,
+            atTs: err.atTs,
+            kind: err.kind,
+            rawSnippet: err.rawSnippet,
+            lastUserMessage: err.lastUserMessage,
+            priorAssistantClaimsDone: err.priorAssistantClaimsDone,
+            transient: err.transient,
+            bridgedForEventId: err.bridgedForEventId,
+            retriedAndFailed: err.retriedAndFailed,
+            supersededByUserTurn: err.supersededByUserTurn,
+            bridgeable: err.bridgeable
+        })
+    }
+
     async deleteSession(sessionId: string): Promise<void> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         if (this.sessionCache.getSession(sessionId)?.metadata?.codexResumePending) throw new Error('Codex resume startup is unconfirmed; archive to confirm termination before deleting')
         if (this.historyActionsInFlight.has(sessionId) || this.archivedForkPending(sessionId)) {
             throw new Error('Archived fork is pending; reconcile it before deleting the source')
@@ -3062,9 +4275,11 @@ export class SyncEngine {
             serviceTier?: string | null
             collaborationMode?: CodexCollaborationMode
             copilotAgentMode?: CopilotAgentMode
+            autoBridgeTransientModelErrors?: boolean
         }
     ): Promise<void> {
         const session = this.sessionCache.getSession(sessionId)
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         if (!session?.active) {
             // For inactive sessions, update the in-memory cache directly without
             // an RPC call — the CLI is not running yet. The updated value will be
@@ -3130,7 +4345,9 @@ export class SyncEngine {
         sandbox?: boolean,
         continueLatest?: boolean,
         codexAccountId?: string,
-        codexSourceAccountId?: string
+        codexSourceAccountId?: string,
+        /** Claude: resume the spawned child truncated to this entry uuid. */
+        resumeSessionAt?: string
     ): ReturnType<RpcGateway['spawnSession']> {
         // Fresh machine spawns historically omitted existingSessionId, so
         // buildCliArgs could not stamp --hapi-session-id / --existing-session-id.
@@ -3189,7 +4406,8 @@ export class SyncEngine {
                 sandbox,
                 continueLatest,
                 codexAccountId,
-                codexSourceAccountId
+                codexSourceAccountId,
+                resumeSessionAt
             )
         } catch (error) {
             // Ambiguous post-dispatch failure — keep the stub (child may exist).
@@ -3261,6 +4479,7 @@ export class SyncEngine {
      * source still owns an in-flight OpenCode turn or native compaction.
      */
     async clearOpenCodeSession(sessionId: string, namespace: string): Promise<ClearOpencodeSessionResult> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const clearTailKey = `${namespace}:${sessionId}`
         const existing = this.opencodeClearTails.get(clearTailKey)
         if (existing) {
@@ -3723,6 +4942,9 @@ export class SyncEngine {
 
         const session = access.session
         const metadata = session.metadata
+        if (metadata?.codexRuntime?.kind === 'attached') {
+            return { type: 'error', message: 'Externally attached Codex session: run hapi attach on its machine; owned cold resume is disabled', code: 'resume_unavailable' }
+        }
         if (!metadata || typeof metadata.path !== 'string' || metadata.path.length === 0) {
             return { type: 'error', message: 'Session metadata missing path', code: 'resume_unavailable' }
         }
@@ -3788,6 +5010,68 @@ export class SyncEngine {
             })
             .filter((session) => !opts?.machineId || session.machineId === opts.machineId)
             .sort((a, b) => b.updatedAt - a.updatedAt)
+    }
+
+    /**
+     * Intentional terminal revive of an inactive session (`hapi resume`,
+     * `hapi claude --resume`): clear a hub-authored archive before the CLI
+     * reopens the row with `--existing-session-id`, the same way hub reopen
+     * does before spawning. The #1911 guard still rejects CLI metadata writes
+     * that try to un-archive on their own.
+     */
+    async prepareLocalResume(sessionId: string, namespace: string): Promise<LocalResumePrepareResult> {
+        const access = this.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return access.reason === 'access-denied'
+                ? { type: 'error', message: 'Session access denied', code: 'access_denied' }
+                : { type: 'error', message: 'Session not found', code: 'session_not_found' }
+        }
+        if (access.session.active) {
+            return { type: 'error', message: 'Session is active; hand it off before reopening locally', code: 'session_active' }
+        }
+        const metadata = access.session.metadata
+        if (metadata?.lifecycleState !== 'archived' || metadata.archivedBy !== 'hub') {
+            return { type: 'success', revived: false }
+        }
+        await this.sessionCache.clearSessionArchiveMetadata(access.sessionId)
+        return { type: 'success', revived: true }
+    }
+
+    /**
+     * Find the HAPI session that owns a native Claude session id (current or
+     * rotated-away), so a terminal `hapi claude --resume <id>` reopens that
+     * session instead of minting a duplicate HAPI id. `target: null` means no
+     * HAPI session owns the id yet.
+     */
+    resolveLocalResumeTargetByAgentSessionId(
+        agentSessionId: string,
+        namespace: string,
+        opts?: { machineId?: string }
+    ): LocalResumeTargetByAgentResult {
+        const candidates: Array<{ session: Session; match: 'current' | 'historical' }> = []
+        for (const session of this.getSessionsByNamespace(namespace)) {
+            if (this.resolveFlavor(session) !== 'claude') continue
+            const metadata = session.metadata
+            if (opts?.machineId && metadata?.machineId && metadata.machineId !== opts.machineId) continue
+            const match = matchesClaudeSessionId(metadata, agentSessionId)
+            if (match) candidates.push({ session, match })
+        }
+        if (candidates.length === 0) {
+            return { type: 'success', target: null, historical: false }
+        }
+
+        // Current-id owners beat historical ones; then the live row; then recency.
+        candidates.sort((a, b) => {
+            if (a.match !== b.match) return a.match === 'current' ? -1 : 1
+            if (a.session.active !== b.session.active) return a.session.active ? -1 : 1
+            return b.session.updatedAt - a.session.updatedAt
+        })
+        const best = candidates[0]!
+        const result = this.resolveLocalResumeTarget(best.session.id, namespace)
+        if (result.type === 'error') {
+            return { type: 'error', message: result.message, code: 'resume_unavailable' }
+        }
+        return { type: 'success', target: result.target, historical: best.match === 'historical' }
     }
 
     private resolveFirstUserMessage(sessionId: string): string | undefined {
@@ -4051,6 +5335,7 @@ export class SyncEngine {
     /** Inactive session with directory path but no agent thread and no prior user turn. */
     private canFreshSpawnNeverStartedSession(session: Session, sessionId: string, namespace: string): boolean {
         const metadata = session.metadata
+        if (metadata?.codexRuntime?.kind === 'attached') return false
         if (!metadata || typeof metadata.path !== 'string' || metadata.path.length === 0) {
             return false
         }
@@ -4804,6 +6089,7 @@ export class SyncEngine {
     }
 
     async handoffSessionToLocal(sessionId: string, namespace: string): Promise<LocalHandoffResult> {
+        if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -5339,6 +6625,38 @@ export class SyncEngine {
         return await this.rpcGateway.getAgentAvailability(machineId)
     }
 
+    async getUsageQuerySettings(machineId: string, agent: UsageQueryAgent): Promise<UsageQuerySettingsResponse> {
+        return await this.rpcGateway.getUsageQuerySettings(machineId, agent)
+    }
+
+    async saveUsageQuerySettings(
+        machineId: string,
+        agent: UsageQueryAgent,
+        settings: UsageQueryAgentSettings
+    ): Promise<UsageQuerySettingsResponse> {
+        return await this.rpcGateway.saveUsageQuerySettings(machineId, agent, settings)
+    }
+
+    async testUsageQueryTemplate(
+        machineId: string,
+        agent: UsageQueryAgent,
+        template: UsageQueryTemplate
+    ): Promise<UsageQueryResult> {
+        return await this.rpcGateway.testUsageQueryTemplate(machineId, agent, template)
+    }
+
+    async queryUsage(
+        machineId: string,
+        agent: UsageQueryAgent,
+        force = false
+    ): Promise<UsageQueryResult> {
+        return await this.rpcGateway.queryUsage(machineId, agent, force)
+    }
+
+    async getAgentQuotas(machineId: string, options?: { refresh?: boolean }): ReturnType<RpcGateway['getAgentQuotas']> {
+        return await this.rpcGateway.getAgentQuotas(machineId, options)
+    }
+
     async listMachineDirectory(machineId: string, path: string, includeHidden?: boolean): Promise<RpcListDirectoryResponse> {
         return await this.rpcGateway.listMachineDirectory(machineId, path, includeHidden)
     }
@@ -5417,6 +6735,22 @@ export class SyncEngine {
 
     async uploadFile(sessionId: string, filename: string, content: string, mimeType: string): Promise<RpcUploadFileResponse> {
         return await this.rpcGateway.uploadFile(sessionId, filename, content, mimeType)
+    }
+
+    async initChunkedUpload(sessionId: string, request: InitChunkedUploadRequest): Promise<InitChunkedUploadResponse> {
+        return await this.rpcGateway.initChunkedUpload(sessionId, request)
+    }
+
+    async uploadFileChunk(sessionId: string, uploadId: string, index: number, content: string): Promise<UploadChunkResponse> {
+        return await this.rpcGateway.uploadFileChunk(sessionId, uploadId, index, content)
+    }
+
+    async finalizeChunkedUpload(sessionId: string, uploadId: string): Promise<RpcUploadFileResponse> {
+        return await this.rpcGateway.finalizeChunkedUpload(sessionId, uploadId)
+    }
+
+    async abortChunkedUpload(sessionId: string, uploadId: string): Promise<AbortChunkedUploadResponse> {
+        return await this.rpcGateway.abortChunkedUpload(sessionId, uploadId)
     }
 
     async deleteUploadFile(sessionId: string, path: string): Promise<RpcDeleteUploadResponse> {
@@ -5544,6 +6878,15 @@ export class SyncEngine {
 
     async archiveCodexSessionForMachine(machineId: string, sessionId: string, codexAccountId?: string | null): Promise<RpcArchiveCodexSessionResponse> {
         return await this.rpcGateway.archiveCodexSessionForMachine(machineId, sessionId, codexAccountId)
+    }
+
+    async listLocalSessionsForMachine(machineId: string, params: {
+        flavor: LocalSessionFlavor
+        codexAccountId?: string | null
+        cwd?: string | null
+        sessionIds?: string[] | null
+    }): Promise<ListLocalSessionsRpcResponse> {
+        return await this.rpcGateway.listLocalSessionsForMachine(machineId, params)
     }
 
     async listCursorModelsForSession(sessionId: string): Promise<RpcListCursorModelsResponse> {
