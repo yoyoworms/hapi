@@ -123,8 +123,18 @@ export class SharedCodexAsyncQuestions {
         if (!reply.approved) {
             // Dismissing an optional follow-up must not interrupt the running turn.
             const resolution = { status: 'canceled', decision: 'denied' } as const;
-            this.completed.set(question.id, resolution);
-            this.resolve(question, resolution);
+            pending.submitted = true;
+            try {
+                await this.session.updateAgentStateConfirmed(state => this.settleState(state, question, resolution));
+            } catch (error) {
+                pending.submitted = false;
+                throw error;
+            }
+            if (this.completed.get(question.id)?.status !== 'resolved') {
+                this.completed.set(question.id, resolution);
+                this.pending.delete(question.id);
+                this.emitResolution(question, resolution);
+            }
             return true;
         }
         const raw = reply.answers?.[question.questionItemId];
@@ -152,26 +162,41 @@ export class SharedCodexAsyncQuestions {
 
     private resolve(question: AsyncQuestion, resolution: Resolution, emitResult = true): void {
         this.pending.delete(question.id);
-        const answers = resolution.status === 'resolved' ? {
+        if (emitResult) this.emitResolution(question, resolution);
+        this.session.updateAgentState(state => this.settleState(state, question, resolution));
+    }
+
+    private answersFor(question: AsyncQuestion, resolution: Resolution) {
+        return resolution.status === 'resolved' ? {
             [question.questionItemId]: { answers: [question.options.includes(resolution.answer) ? resolution.answer : `user_note: ${resolution.answer}`] }
         } : undefined;
+    }
+
+    private emitResolution(question: AsyncQuestion, resolution: Resolution): void {
+        const answers = this.answersFor(question, resolution);
         const id = `codex:${question.threadId}:${question.id}:${resolution.status}`;
         const message = { type: 'tool-call-result', callId: question.id, output: { status: resolution.status, ...(answers ? { answers } : {}) }, id };
         const rootThreadId = this.session.getMetadata()?.codexSessionId;
-        if (emitResult) this.session.sendAgentMessage(rootThreadId && rootThreadId !== question.threadId ? {
+        this.session.sendAgentMessage(rootThreadId && rootThreadId !== question.threadId ? {
             type: 'agent-run-trace', agentId: question.threadId, cardId: `codex-agent:${question.threadId}`, message, id,
             scope: { role: 'child', threadId: question.threadId, parentThreadId: rootThreadId }, scope_role: 'child'
         } : message, id);
-        this.session.updateAgentState(state => {
-            const requests = { ...state.requests };
-            const prior = requests[question.id] ?? state.completedRequests?.[question.id];
-            delete requests[question.id];
-            return { ...state, requests, completedRequests: { ...state.completedRequests, [question.id]: {
-                tool: 'request_user_input', toolCallId: question.id, arguments: question.input,
-                createdAt: prior?.createdAt, completedAt: state.completedRequests?.[question.id]?.completedAt ?? Date.now(),
-                status: resolution.status, ...(answers ? { answers } : {}), decision: resolution.status === 'canceled' ? resolution.decision : undefined
-            } } };
-        });
+    }
+
+    private settleState(state: AgentState, question: AsyncQuestion, resolution: Resolution): AgentState {
+        const completed = state.completedRequests?.[question.id];
+        // Shutdown cleanup must not overwrite a dismissal or a native answer.
+        if (resolution.status === 'canceled' && (completed?.status === 'resolved'
+            || (!resolution.decision && completed?.decision === 'denied'))) return state;
+        const requests = { ...state.requests };
+        const prior = requests[question.id] ?? completed;
+        const answers = this.answersFor(question, resolution);
+        delete requests[question.id];
+        return { ...state, requests, completedRequests: { ...state.completedRequests, [question.id]: {
+            tool: 'request_user_input', toolCallId: question.id, arguments: question.input,
+            createdAt: prior?.createdAt, completedAt: completed?.completedAt ?? Date.now(),
+            status: resolution.status, ...(answers ? { answers } : {}), decision: resolution.status === 'canceled' ? resolution.decision : undefined
+        } } };
     }
 
     close(): void {

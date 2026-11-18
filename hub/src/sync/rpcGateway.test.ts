@@ -300,6 +300,12 @@ describe('RpcGateway permission RPC error surfacing (tiann/hapi#1735)', () => {
         expect(error).toBeInstanceOf(PermissionRequestNotFoundError)
     })
 
+    it('does not acknowledge a dismissal that the CLI failed to persist', async () => {
+        const failure = 'Hub did not confirm the agent state update'
+        const gateway = createGatewayWithResponse(failure)
+        await expect(gateway.denyPermission('session-1', 'request-1')).rejects.toThrow(failure)
+    })
+
     it('does not relabel an unrelated RPC error as PermissionRequestNotFoundError', async () => {
         const gateway = createGatewayWithResponse('Some other failure unrelated to a missing request')
         // Only the specific shared message is treated as "not found"; anything

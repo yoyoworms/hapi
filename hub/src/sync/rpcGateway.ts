@@ -212,6 +212,9 @@ export class RpcGateway {
         if (isPermissionRequestNotFoundResponse(response)) {
             throw new PermissionRequestNotFoundError(requestId)
         }
+        if (response && typeof response === 'object' && 'error' in response && typeof response.error === 'string') {
+            throw new Error(response.error)
+        }
     }
 
     async abortSession(sessionId: string): Promise<void> {

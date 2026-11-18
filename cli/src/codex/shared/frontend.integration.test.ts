@@ -63,6 +63,97 @@ function hasReply(value: Record<string, unknown>, prompt: string): boolean {
 // Actual CLI/Runner -> app-server + MCP + hub sockets -> actual native TUI.
 // Separate from the protocol integration whose HAPI transport is mocked.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1' || process.platform === 'win32')('shared Codex full stack', () => {
+    it('keeps ignored follow-up questions closed after archive and reopen', async () => {
+        const home = await mkdtemp('/tmp/hapi-codex-dismiss-e2e-');
+        const cwd = join(home, 'work'); const ch = join(home, '.codex'); const hh = join(home, 'hapi');
+        await Promise.all([cwd, ch, hh].map(path => mkdir(path)));
+        let asked = false;
+        let modelRequests = 0;
+        const model = createServer((request, response) => {
+            request.resume();
+            request.on('end', () => {
+                if (!request.url?.endsWith('/responses')) { response.writeHead(404).end(); return; }
+                modelRequests += 1;
+                const id = randomUUID();
+                const item = !asked ? { type: 'function_call', call_id: 'call_async_reopen', name: 'request_user_input_async',
+                    arguments: JSON.stringify({ questions: [{ title: 'Ignore this', options: ['Yes', 'No'] }, { title: 'Keep this pending' }] }) }
+                    : { type: 'message', role: 'assistant', id: `msg_${id}`, content: [{ type: 'output_text', text: 'MOCK DONE' }] };
+                asked = true;
+                const events = [{ type: 'response.created', response: { id } }, { type: 'response.output_item.done', item },
+                    { type: 'response.completed', response: { id, usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } }];
+                response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+                response.end(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''));
+            });
+        });
+        await new Promise<void>(resolve => model.listen(0, '127.0.0.1', resolve));
+        const port = (model.address() as { port: number }).port;
+        const base = process.env.HAPI_API_URL!;
+        const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: home, CODEX_HOME: ch, HAPI_HOME: hh,
+            HAPI_API_URL: base, CLI_API_TOKEN: process.env.CLI_API_TOKEN, HAPI_TEST_MARKER: process.env.HAPI_HOME };
+        let runner: ChildProcessWithoutNullStreams | undefined;
+        let sessionId: string | undefined;
+        let runnerOutput = '';
+        let jwt = '';
+        const api = async (path: string, body?: unknown) => {
+            const response = await fetch(`${base}/api${path}`, { method: body === undefined ? 'GET' : 'POST',
+                headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+            const value = record(await response.json()); if (!response.ok) throw new Error(`${path}: ${JSON.stringify(value)}`);
+            return value;
+        };
+        try {
+            await writeFile(join(ch, 'config.toml'), `model = "gpt-6.1-sol"\nmodel_provider = "mock_provider"\napproval_policy = "never"\nsandbox_mode = "read-only"\ncheck_for_update_on_startup = false\n[features]\nsend_message_to_user_async = true\n[model_providers.mock_provider]\nname = "Isolated mock"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n[feedback]\nenabled = false\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
+            const auth = await api('/auth', { accessToken: env.CLI_API_TOKEN });
+            jwt = String(auth.token);
+            runner = spawn(process.env.HAPI_BUN_EXEC!, ['--cwd', resolve('.'), resolve('src/index.ts'), 'runner', 'start-sync'], { cwd, env });
+            runner.stdout.on('data', data => { runnerOutput += data.toString(); });
+            runner.stderr.on('data', data => { runnerOutput += data.toString(); });
+            const list = await eventually(() => api('/machines'), value => Array.isArray(value.machines) && value.machines.length === 1, 'Runner registered');
+            const machineId = String(record((list.machines as unknown[])[0]).id);
+            const created = await api(`/machines/${machineId}/spawn`, { directory: cwd, agent: 'codex', codexAccountId: 'system', model: 'gpt-6.1-sol' });
+            expect(created.type).toBe('success');
+            sessionId = String(created.sessionId);
+            const route = `/sessions/${sessionId}`;
+            const details = async () => record((await api(route)).session);
+            const pending = (session: Record<string, unknown>) => record(record(session.agentState).requests);
+            const completed = (session: Record<string, unknown>) => record(record(session.agentState).completedRequests);
+            await api(`${route}/messages`, { text: 'Ask two optional questions', localId: randomUUID() });
+            const ready = await eventually(details, value => !value.thinking && Object.keys(pending(value)).length === 2, 'two optional questions');
+            const keys = Object.keys(pending(ready));
+            const ignored = keys.find(key => JSON.stringify(pending(ready)[key]).includes('Ignore this'))!;
+            expect(ignored).toBeDefined();
+            const nativeThread = record(ready.metadata).codexSessionId;
+            const dismissed = await api(`${route}/permissions/${encodeURIComponent(ignored)}/deny`, {});
+            expect(dismissed.ok).toBe(true);
+            for (let cycle = 0; cycle < 2; cycle += 1) {
+                await api(`${route}/archive`, {});
+                const archived = await details();
+                expect(archived.active).toBe(false);
+                expect(completed(archived)[ignored]).toMatchObject({ status: 'canceled', decision: 'denied' });
+                const reopened = await api(`${route}/reopen`, {});
+                expect(reopened.sessionId).toBe(sessionId);
+                await api(`${route}/messages`, { text: `AFTER_REOPEN_${cycle}`, localId: randomUUID() });
+                await eventually(details, value => value.active === true && !value.thinking, 'reopened session idle');
+                const active = await details();
+                expect(record(active.metadata).codexSessionId).toBe(nativeThread);
+                expect(pending(active)[ignored]).toBeUndefined();
+                expect(completed(active)[ignored]).toMatchObject({ status: 'canceled', decision: 'denied' });
+            }
+        } catch (error) {
+            if (runnerOutput) console.error(runnerOutput.slice(-4_000));
+            if (sessionId) {
+                const lastMessages = await api(`/sessions/${sessionId}/messages?limit=12`).catch(() => null);
+                console.error({ modelRequests, messages: JSON.stringify(lastMessages).slice(-3_000) });
+            }
+            throw error;
+        } finally {
+            if (sessionId) await api(`/sessions/${sessionId}/archive`, {}).catch(() => {});
+            if (runner?.pid && runner.exitCode === null) await killProcessTreeByPid(runner.pid);
+            await new Promise<void>(resolve => model.close(() => resolve()));
+            await rm(home, { recursive: true, force: true, maxRetries: 3 });
+        }
+    }, 120_000);
+
     it('shares interaction, stops the primary execution, resumes through Runner and only detaches secondary terminals', async () => {
         const home = await mkdtemp('/tmp/hapi-shared-e2e-');
         const cwd = join(home, 'work'); const ch = join(home, 'codex'); const hh = join(home, 'hapi');

@@ -15,7 +15,8 @@ function fixture(initialState: AgentState = {}) {
     let state = initialState;
     const send = vi.fn();
     const session = { getMetadata: () => ({ codexSessionId: 'thread' }), sendAgentMessage: send,
-        updateAgentState: (fn: (state: AgentState) => AgentState) => { state = fn(state); }
+        updateAgentState: (fn: (state: AgentState) => AgentState) => { state = fn(state); },
+        updateAgentStateConfirmed: async (fn: (state: AgentState) => AgentState) => { state = fn(state); }
     } as unknown as ApiSessionClient;
     const submit = vi.fn(async (_threadId: string, _text: string, _id: string) => {});
     const manager = new SharedCodexAsyncQuestions(session, submit, initialState.completedRequests);

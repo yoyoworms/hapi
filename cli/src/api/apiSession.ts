@@ -5,7 +5,7 @@ import { io, type Socket } from 'socket.io-client'
 import axios from 'axios'
 import type { ZodType } from 'zod'
 import { logger } from '@/ui/logger'
-import { backoff } from '@/utils/time'
+import { backoff, withRetry } from '@/utils/time'
 import { apiValidationError } from '@/utils/errorUtils'
 import { AsyncLock } from '@/utils/lock'
 import type { RawJSONLines } from '@/claude/types'
@@ -1561,37 +1561,55 @@ if (isReconnect) {
             return
         }
         this.agentStateLock.inLock(async () => {
-            await backoff(async () => {
-                const current = this.agentState ?? ({} as AgentState)
-                const updated = handler(current)
+            await backoff(() => this.writeAgentState(handler))
+        })
+    }
 
-                const answer = await this.socket.emitWithAck('update-state', {
-                    sid: this.sessionId,
-                    expectedVersion: this.agentStateVersion,
-                    agentState: updated
-                }) as unknown
+    /** For user actions which must survive an immediate archive after the RPC succeeds. */
+    async updateAgentStateConfirmed(handler: (state: AgentState) => AgentState, timeoutMs = 5_000): Promise<void> {
+        const deadline = Date.now() + timeoutMs
+        const failed = () => new Error('Hub did not confirm the agent state update')
+        const write = this.agentStateLock.inLock(() => withRetry(async () => {
+            const remaining = deadline - Date.now()
+            if (this.state !== 'active' || !this.socket.connected || remaining <= 0) throw failed()
+            await this.writeAgentState(handler, remaining)
+        }, {
+            maxAttempts: 3,
+            minDelay: 0,
+            shouldRetry: error => error instanceof Error && error.message === 'Agent state version mismatch',
+        }))
+        if (!await this.waitForPromise(write, timeoutMs)) throw failed()
+        await write
+    }
 
-                applyVersionedAck(answer, {
-                    valueKey: 'agentState',
-                    parseValue: (value) => {
-                        const parsed = AgentStateSchema.safeParse(value)
-                        return parsed.success ? parsed.data : null
-                    },
-                    applyValue: (value) => {
-                        this.agentState = value
-                    },
-                    applyVersion: (version) => {
-                        this.agentStateVersion = version
-                    },
-                    logInvalidValue: (context, version) => {
-                        const suffix = context === 'success' ? 'ack' : 'version-mismatch ack'
-                        logger.debug(`[API] Ignoring invalid agentState value from ${suffix}`, { version })
-                    },
-                    invalidResponseMessage: 'Invalid update-state response',
-                    errorMessage: 'Agent state update failed',
-                    versionMismatchMessage: 'Agent state version mismatch'
-                })
-            })
+    private async writeAgentState(handler: (state: AgentState) => AgentState, timeoutMs?: number): Promise<void> {
+        const updated = handler(this.agentState ?? {})
+        const socket = timeoutMs === undefined ? this.socket : this.socket.timeout(timeoutMs)
+        const answer: unknown = await socket.emitWithAck('update-state', {
+            sid: this.sessionId,
+            expectedVersion: this.agentStateVersion,
+            agentState: updated
+        })
+
+        applyVersionedAck(answer, {
+            valueKey: 'agentState',
+            parseValue: (value) => {
+                const parsed = AgentStateSchema.safeParse(value)
+                return parsed.success ? parsed.data : null
+            },
+            applyValue: (value) => {
+                this.agentState = value
+            },
+            applyVersion: (version) => {
+                this.agentStateVersion = version
+            },
+            logInvalidValue: (context, version) => {
+                const suffix = context === 'success' ? 'ack' : 'version-mismatch ack'
+                logger.debug(`[API] Ignoring invalid agentState value from ${suffix}`, { version })
+            },
+            invalidResponseMessage: 'Invalid update-state response',
+            errorMessage: 'Agent state update failed',
+            versionMismatchMessage: 'Agent state version mismatch'
         })
     }
 

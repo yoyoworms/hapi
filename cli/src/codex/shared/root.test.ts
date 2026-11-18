@@ -84,6 +84,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
     let userMessage: Parameters<ApiSessionClient['onUserMessage']>[0] | undefined;
     let retryMessage: Parameters<ApiSessionClient['onRetryQueuedMessage']>[0] | undefined;
     const updateState = vi.fn((fn: (value: AgentState) => AgentState) => { state = fn(state); });
+    const confirmState = vi.fn(async (fn: (value: AgentState) => AgentState) => { state = fn(state); });
     const updateMetadata = vi.fn((fn: (value: Metadata) => Metadata) => { metadata = fn(metadata); });
     const rpc = new Map<string, (raw: unknown) => Promise<unknown>>();
     const send = vi.fn();
@@ -96,7 +97,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
         sessionId: 'sid', getMetadata: () => metadata,
         hubArchived: opts?.hubArchived ?? false,
         updateMetadata,
-        updateAgentState: updateState, keepAlive() {},
+        updateAgentState: updateState, updateAgentStateConfirmed: confirmState, keepAlive() {},
         onUserMessage: (callback: Parameters<ApiSessionClient['onUserMessage']>[0]) => { userMessage = callback; },
         onCancelQueuedMessage() {},
         onRetryQueuedMessage: (callback: Parameters<ApiSessionClient['onRetryQueuedMessage']>[0]) => { retryMessage = callback; },
@@ -130,7 +131,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
         responses: Array<{ id: string | number; result: unknown }>;
     };
     return {
-session, root, native, rpc, send, events, consumed, uncertain, sessionReady,
+        session, root, native, rpc, send, events, consumed, uncertain, sessionReady, confirmState,
         ledger: async () => JSON.parse(await readFile(join(directory, 'sid.queue.json'), 'utf8')),
         retry: (id: string) => retryMessage?.(id),
         submit: (text: string, id: string) => userMessage?.({ role: 'user', content: { type: 'text', text } }, id), metadata: () => metadata, state: () => state, updateState, updateMetadata,
@@ -281,19 +282,55 @@ describe('async question delivery', () => {
         } finally { request.mockRestore(); }
     });
 
-    it('preserves an explicit dismissal when a new root replays the same native thread', async () => {
+    it('acknowledges a dismissal after persistence and preserves it through two archive/reopen cycles', async () => {
         const before = await fixture(); await before.root.activate();
-        before.native.notify('item/completed', { threadId: 'thread', turnId: 'turn', item });
+        const withSibling = { ...item, questions: [...item.questions, { title: 'Still unanswered', options: null }] };
+        before.native.notify('item/completed', { threadId: 'thread', turnId: 'turn', item: withSibling });
         await before.drain();
-        const q = asyncQuestionsForItem('thread', item)[0];
-        await before.rpc.get(RPC_METHODS.Permission)!({ id: q.id, approved: false });
-        await before.root.close(false);
+        const [dismissed, unanswered] = asyncQuestionsForItem('thread', withSibling);
+        const confirmState = before.confirmState.getMockImplementation()!;
+        let release!: () => void;
+        const delayedAck = new Promise<void>(resolve => { release = resolve; });
+        before.confirmState.mockImplementationOnce(async update => {
+            await delayedAck;
+            await confirmState(update);
+        });
+        let acknowledged = false;
+        const reply = before.rpc.get(RPC_METHODS.Permission)!({ id: dismissed.id, approved: false })
+            .then(() => { acknowledged = true; });
+        try {
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(acknowledged).toBe(false);
+            expect(before.state().requests?.[dismissed.id]).toBeDefined();
+        } finally {
+            release();
+            await reply;
+        }
 
-        const after = await fixture({ initialState: before.state() });
-        after.native.thread.turns = [{ id: 'turn', status: 'completed', items: [item] }];
-        await after.root.refresh();
-        expect(after.state().requests?.[q.id]).toBeUndefined();
-        expect(after.state().completedRequests?.[q.id]).toMatchObject({ status: 'canceled', decision: 'denied' });
+        let current = before;
+        for (let cycle = 0; cycle < 2; cycle += 1) {
+            await current.root.close(true);
+            current = await fixture({ initialState: structuredClone(current.state()) });
+            current.native.thread.turns = [{ id: 'turn', status: 'completed', items: [withSibling] }];
+            await current.root.refresh();
+            expect(Object.keys(current.state().requests ?? {})).toEqual([unanswered.id]);
+            expect(current.state().completedRequests?.[dismissed.id]).toMatchObject({ status: 'canceled', decision: 'denied' });
+        }
+    });
+
+    it('allows retrying a dismissal when it could not be persisted', async () => {
+        const f = await fixture(); await f.root.activate();
+        f.native.notify('item/completed', { threadId: 'thread', turnId: 'turn', item });
+        await f.drain();
+        const [q] = asyncQuestionsForItem('thread', item);
+        f.confirmState.mockRejectedValueOnce(new Error('Hub did not confirm state update'));
+        const dismiss = () => f.rpc.get(RPC_METHODS.Permission)!({ id: q.id, approved: false });
+        await expect(dismiss()).rejects.toThrow('Hub did not confirm state update');
+        expect(f.state().requests?.[q.id]).toBeDefined();
+        expect(f.state().completedRequests?.[q.id]).toBeUndefined();
+        await dismiss();
+        expect(f.state().requests?.[q.id]).toBeUndefined();
     });
 
     it('retains unanswered questions across turn completion and native reconnect', async () => {
