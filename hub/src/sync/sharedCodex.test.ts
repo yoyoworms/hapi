@@ -20,6 +20,52 @@ function fixture() {
 }
 
 describe('shared Codex hub binding', () => {
+    it.each(['stopped', 'still_alive'] as const)('switches an active Codex account only after runner cleanup is confirmed (%s)', async (stopStatus) => {
+        const { store, engine, create, rpc } = fixture()
+        try {
+            const source = create('account-switch', { startedBy: 'runner', codexAccountId: 'source-account' })
+            engine.getOrCreateMachine('machine', { host: 'test', platform: 'darwin', happyCliVersion: '0.36.5' }, null, 'default')
+            engine.handleMachineAlive({ machineId: 'machine', time: Date.now() })
+            store.messages.addMessage(source.id, { role: 'user', content: 'keep this history' }, 'history-message')
+            store.messages.markMessagesInvoked(source.id, ['history-message'], Date.now())
+            const calls: string[] = []
+            rpc.killSession = async (sessionId) => {
+                expect(sessionId).toBe(source.id)
+                calls.push('kill')
+                return { pid: 42, processStartMarker: 'source-generation' }
+            }
+            rpc.stopRunnerSession = async (machineId, sessionId) => {
+                expect([machineId, sessionId]).toEqual(['machine', source.id])
+                calls.push('stop')
+                return stopStatus
+            }
+            rpc.spawnSession = async (...args) => {
+                calls.push('spawn')
+                expect([args[8], args[12], args[20], args[21]]).toEqual([
+                    'native-account-switch', source.id, 'target-account', 'source-account'
+                ])
+                expect(engine.getSession(source.id)?.active).toBe(false)
+                await expect(engine.sendMessage(source.id, { text: 'sent during switch' })).rejects.toThrow('Conversation history action already in progress')
+                engine.handleSessionAlive({ sid: source.id, time: Date.now() })
+                engine.handleSessionReady({ sid: source.id, time: Date.now() })
+                return { type: 'success', sessionId: source.id }
+            }
+
+            const result = await engine.resumeSession(source.id, 'default', { codexAccountId: 'target-account' })
+
+            if (stopStatus === 'stopped') {
+                expect(result).toEqual({ type: 'success', sessionId: source.id })
+                expect(calls).toEqual(['kill', 'stop', 'spawn'])
+            } else {
+                expect(result).toMatchObject({ type: 'error', code: 'resume_failed' })
+                expect(calls).toEqual(['kill', 'stop'])
+                expect(engine.getSession(source.id)?.metadata?.codexAccountId).toBe('source-account')
+            }
+            expect(engine.getSession(source.id)?.active).toBe(true)
+            expect(store.messages.getAllMessages(source.id).map(message => message.localId)).toEqual(['history-message'])
+        } finally { engine.stop() }
+    })
+
     it('restores the generated fork summary after child startup replaces provisional metadata', async () => {
         const { store, engine, create, rpc } = fixture()
         try {

@@ -3796,22 +3796,19 @@ export class SyncEngine {
         if (this.openCodeRewindPending(sessionId)) throw new Error('OpenCode rewind requires reconciliation')
         const existing = this.archiveRequests.get(sessionId)
         if (existing) return existing
-        const operation = this.archiveSessionOnce(sessionId)
-        this.archiveRequests.set(sessionId, operation)
-        try { await operation } finally {
-            if (this.archiveRequests.get(sessionId) === operation) this.archiveRequests.delete(sessionId)
-            this.archiveDrainedGenerations.delete(sessionId)
-        }
-    }
-
-    private async archiveSessionOnce(sessionId: string): Promise<void> {
         if (this.historyActionsInFlight.has(sessionId) || this.archivedForkPending(sessionId)) {
             throw new Error('Archived fork is in progress; retry the fork to reconcile it before archiving')
         }
         this.historyActionsInFlight.add(sessionId)
+        const operation = this.archiveSessionUnlocked(sessionId)
+        this.archiveRequests.set(sessionId, operation)
         try {
-            await this.archiveSessionUnlocked(sessionId)
-        } finally { this.historyActionsInFlight.delete(sessionId) }
+            await operation
+        } finally {
+            this.archiveRequests.delete(sessionId)
+            this.archiveDrainedGenerations.delete(sessionId)
+            this.historyActionsInFlight.delete(sessionId)
+        }
     }
 
     private async archiveSessionUnlocked(sessionId: string): Promise<void> {
@@ -5462,13 +5459,15 @@ export class SyncEngine {
             // shared runtime first so the source transcript is fully flushed
             // before the target account receives its copied rollout.
             try {
-                await this.archiveSession(access.sessionId)
+                await this.archiveSessionUnlocked(access.sessionId)
             } catch (error) {
                 return {
                     type: 'error',
                     message: error instanceof Error ? error.message : 'Failed to stop the active Codex session',
                     code: 'resume_failed'
                 }
+            } finally {
+                this.archiveDrainedGenerations.delete(access.sessionId)
             }
             initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
