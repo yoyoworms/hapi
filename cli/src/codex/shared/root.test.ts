@@ -11,6 +11,7 @@ import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { asyncQuestionsForItem } from './asyncQuestions';
 import { CodexAppServerClient } from '../codexAppServerClient';
 import { buildHapiMcpBridge } from '../utils/buildHapiMcpBridge';
+import { supplementCodexApiModels } from '@/modules/common/codexApiModels';
 
 type NativeTurn = { id: string; status: string; items: unknown[] };
 type NativeRequest = { id: string | number; method: string; params: unknown };
@@ -33,6 +34,7 @@ vi.mock('../codexAppServerClient', () => ({
         async initialize() { this.initialized = true; }
         isInitialized() { return this.initialized; }
         async disconnect() { this.initialized = false; }
+        async listModels() { return { data: [], nextCursor: null }; }
         async request(method: string, params: Record<string, unknown> = {}) {
             if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
             if (method === 'thread/list') return { data: [] };
@@ -61,6 +63,9 @@ vi.mock('../codexAppServerClient', () => ({
 vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: vi.fn(async () => ({
     mcpServers: {}, server: { stop() {} }
 })) }));
+vi.mock('@/modules/common/codexApiModels', () => ({
+    supplementCodexApiModels: vi.fn(async models => models)
+}));
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -69,6 +74,7 @@ afterEach(async () => {
 });
 
 async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; create?: RootHost['create'];
+    modelEnvironment?: RootHost['modelEnvironment'];
     attached?: boolean; beforeSubscribe?: RootHost['beforeSubscribe']; validateHistory?: RootHost['validateHistory']; initialState?: AgentState; metadata?: Partial<Metadata> }) {
     const directory = await mkdtemp(join(tmpdir(), 'hapi-shared-root-'));
     let state: AgentState = opts?.initialState ?? { steeringActive: true };
@@ -106,6 +112,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
     const end = opts?.end ?? (async () => { throw new Error('Unexpected root archive'); });
     const root = new SharedCodexRoot({ session, sessionInfo: { agentState: state }, workingDirectory: directory } as SessionBootstrapResult, {
         directory, generation: 'test', endpoint: 'mock', settingsFor: () => undefined,
+        modelEnvironment: opts?.modelEnvironment,
         create: opts?.create ?? (async () => { throw new Error('Unexpected root creation'); }),
         attached: opts?.attached, beforeSubscribe: opts?.beforeSubscribe, validateHistory: opts?.validateHistory,
         end
@@ -134,6 +141,30 @@ session, root, native, rpc, send, events, consumed, uncertain, sessionReady,
         end,
     };
 }
+
+describe('shared root model discovery', () => {
+    it('supplements the live native model list with models from the runtime account', async () => {
+        const modelEnvironment = { CODEX_HOME: '/runtime-account', HAPI_CODEX_ACCOUNT_KIND: 'api', HAPI_CODEX_API_KEY: 'test-key' };
+        const f = await fixture({ modelEnvironment });
+        await f.root.activate();
+        vi.mocked(supplementCodexApiModels).mockClear();
+        vi.mocked(supplementCodexApiModels).mockResolvedValueOnce([{
+            id: 'gpt-6.2-astra', displayName: 'gpt-6.2-astra', isDefault: false,
+            defaultReasoningEffort: null, defaultServiceTier: null
+        }]);
+        const response = await f.rpc.get(RPC_METHODS.ListCodexModels)!({});
+        expect(response).toMatchObject({ success: true, models: [{ id: 'gpt-6.2-astra' }] });
+        expect(supplementCodexApiModels).toHaveBeenCalledWith([], modelEnvironment);
+    });
+
+    it('keeps external desktop model discovery on its native account catalog', async () => {
+        const f = await fixture({ attached: true });
+        await f.root.activate();
+        vi.mocked(supplementCodexApiModels).mockClear();
+        expect(await f.rpc.get(RPC_METHODS.ListCodexModels)!({})).toEqual({ success: true, models: [] });
+        expect(supplementCodexApiModels).not.toHaveBeenCalled();
+    });
+});
 
 describe('externally attached root', () => {
     it('skips MCP, instructions and initial settings injection, and disables lifecycle actions', async () => {

@@ -4,10 +4,10 @@ import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { CodexModelsResponse, CodexModelSummary } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
-import { codexAccountManager } from '@/codex/codexAccountManager';
 import { resolveModelCatalogArgs } from '@/codex/utils/modelCatalog';
 import { resolveCodexHome } from '@/codex/utils/codexHome';
 import { getErrorMessage } from './rpcResponses';
+import { supplementCodexApiModels } from './codexApiModels';
 
 export interface ListCodexModelsRequest {
     includeHidden?: boolean;
@@ -143,6 +143,10 @@ function getCacheKey(includeHidden: boolean, environment?: Record<string, string
 }
 
 export async function listCodexModels(includeHidden: boolean = false, environment?: Record<string, string>): Promise<CodexModelSummary[]> {
+    return supplementCodexApiModels(await listNativeCodexModels(includeHidden, environment), environment);
+}
+
+async function listNativeCodexModels(includeHidden: boolean, environment?: Record<string, string>): Promise<CodexModelSummary[]> {
     const cacheKey = getCacheKey(includeHidden, environment);
     const fingerprint = await catalogFingerprint(environment);
     const cached = cache.get(cacheKey);

@@ -29,16 +29,21 @@ vi.mock('@/codex/codexAppServerClient', () => ({
 }));
 
 import { listCodexModels, _resetCodexModelsCacheForTests } from './codexModels';
+import { _resetCodexApiModelsCacheForTests } from './codexApiModels';
 
 describe('listCodexModels cwd', () => {
     const temporaryHomes: string[] = [];
     beforeEach(() => {
+        vi.stubEnv('HAPI_CODEX_ACCOUNT_KIND', 'managed');
         constructorOptions.length = 0;
         listModelsMock.mockReset();
         _resetCodexModelsCacheForTests();
+        _resetCodexApiModelsCacheForTests();
     });
     afterEach(async () => {
         vi.unstubAllEnvs();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
         await Promise.all(temporaryHomes.splice(0).map(home => rm(home, { recursive: true, force: true })));
     });
 
@@ -241,5 +246,27 @@ describe('listCodexModels cwd', () => {
         await expect(listCodexModels()).rejects.toThrow('app-server exploded');
         await expect(listCodexModels()).rejects.toThrow('app-server exploded');
         expect(constructorOptions).toHaveLength(4);
+    });
+
+    it('discovers new provider models even while the native catalog remains cached', async () => {
+        const home = await mkdtemp(join(tmpdir(), 'hapi-codex-api-models-'));
+        temporaryHomes.push(home);
+        await writeFile(join(home, 'config.toml'), [
+            'model_provider = "hapi_endpoint"', '[model_providers.hapi_endpoint]',
+            'base_url = "https://provider.example/v1"', 'env_key = "HAPI_CODEX_API_KEY"'
+        ].join('\n'));
+        const env = { CODEX_HOME: home, HAPI_CODEX_ACCOUNT_KIND: 'api', HAPI_CODEX_API_KEY: 'test-key' };
+        const fetchMock = vi.fn().mockImplementation(async () => Response.json({ data: [{ id: 'gpt-6-astra' }] }));
+        vi.stubGlobal('fetch', fetchMock);
+        const now = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+        listModelsMock.mockResolvedValue({ data: [{ id: 'gpt-6-astra' }] });
+        await listCodexModels(false, env);
+
+        clock.mockReturnValue(now + 5 * 60_000 + 1);
+        fetchMock.mockImplementation(async () => Response.json({ data: [{ id: 'gpt-6.2-astra' }] }));
+        expect((await listCodexModels(false, env)).map(model => model.id)).toContain('gpt-6.2-astra');
+        expect(listModelsMock).toHaveBeenCalledTimes(1);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 });

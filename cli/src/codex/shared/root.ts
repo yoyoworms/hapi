@@ -7,6 +7,7 @@ import { SESSION_KEEP_ALIVE_INTERVAL_MS } from '@/api/keepAlive';
 import { logger } from '@/ui/logger';
 import { listSlashCommands } from '@/modules/common/slashCommands';
 import { normalizeCodexModel } from '@/modules/common/codexModels';
+import { supplementCodexApiModels } from '@/modules/common/codexApiModels';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { ImplementCodexPlanRequestSchema, type ImplementCodexPlanResult } from '@hapi/protocol/apiTypes';
@@ -29,6 +30,7 @@ import { planImplementationMessageId, planProposalForItem, planProposalForTurn }
 type RuntimeSettings = NonNullable<Parameters<ApiSessionClient['keepAlive']>[2]>;
 export type RootHost = {
     directory: string; generation: string; endpoint: string; token?: string;
+    modelEnvironment?: Record<string, string>;
     attached?: boolean;
     beforeSubscribe?(threadId: string): Promise<void>;
     validateHistory?(threadId: string, thread: unknown): Promise<void>;
@@ -671,7 +673,7 @@ export class SharedCodexRoot {
                 const response = await this.client.listModels({ includeHidden: record(raw).includeHidden === true, cursor });
                 models.push(...(response.data ?? []).map(normalizeCodexModel).filter(model => model !== null)); cursor = response.nextCursor ?? undefined;
             } while (cursor);
-            return { success: true, models };
+            return { success: true, models: this.host.attached ? models : await supplementCodexApiModels(models, this.host.modelEnvironment) };
         });
         rpc.registerHandler(RPC_METHODS.Switch, async () => { throw new Error('control_mode_not_applicable'); });
         rpc.registerHandler(RPC_METHODS.HandoffLocal, async () => { throw new Error('control_mode_not_applicable'); });

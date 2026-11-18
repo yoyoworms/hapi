@@ -286,6 +286,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                 agentState: { controlledByUser: false },
             });
         const root = new SharedCodexRoot(bootstrap, { directory: join(runtimeDirectory(), 'queues'), generation: id, endpoint: upstream, token: upstreamToken,
+            modelEnvironment: { CODEX_HOME: home, HAPI_CODEX_ACCOUNT_KIND: account.kind, HAPI_CODEX_API_KEY: account.env?.HAPI_CODEX_API_KEY ?? '' },
             settingsFor: threadId => nativeSettings.get(threadId), create, end });
         prepared.add(root);
         try { assertRunning(); await root.prepare(); assertRunning(); return root; }
