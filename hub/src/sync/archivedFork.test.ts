@@ -41,6 +41,20 @@ function fixture() {
 }
 
 describe('archived Codex fork coordination', () => {
+    it('does not report a fork when another conversation history action owns the lock', async () => {
+        const f = fixture()
+        try {
+            const locks = (f.engine as unknown as { historyActionsInFlight: Set<string> }).historyActionsInFlight
+            locks.add(f.source.id)
+
+            await expect(f.engine.archiveSession(f.source.id)).rejects.toThrow('Conversation history action already in progress')
+            expect(await f.engine.resumeSession(f.source.id, 'ns')).toMatchObject({
+                type: 'error', message: 'Conversation history action already in progress'
+            })
+            expect(f.engine.getSession(f.source.id)?.metadata?.codexArchivedFork).toBeUndefined()
+        } finally { f.engine.stop() }
+    })
+
     it('refuses local resume discovery of a CLI-archived source while its fork child is starting', async () => {
         const f = fixture()
         let entered!: () => void
