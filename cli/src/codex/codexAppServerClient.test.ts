@@ -28,7 +28,7 @@ vi.mock('@/ui/logger', () => ({
     logger: { debug: vi.fn() }
 }));
 
-import { CodexAppServerClient, isIndeterminateError } from './codexAppServerClient';
+import { CodexAppServerClient, isIndeterminateError, resolveCodexAppServerCommand } from './codexAppServerClient';
 import { killProcessByChildProcess } from '@/utils/process';
 
 function fakeStream(): EventEmitter & { setEncoding: ReturnType<typeof vi.fn> } {
@@ -64,6 +64,19 @@ describe('CodexAppServerClient process cwd', () => {
         execFileSyncMock.mockClear();
         spawnMock.mockReset();
         vi.mocked(killProcessByChildProcess).mockClear();
+    });
+
+    it('does not open a console while resolving the CLI version for a background probe', () => {
+        vi.stubEnv('HAPI_CODEX_APP_SERVER_BIN', '');
+        try {
+            expect(resolveCodexAppServerCommand()).toBe('codex');
+            expect(execFileSyncMock).toHaveBeenCalledWith('codex', ['--version'], expect.objectContaining({
+                windowsHide: true,
+                timeout: 3_000
+            }));
+        } finally {
+            vi.unstubAllEnvs();
+        }
     });
 
     it('lets a completed read/fork helper exit on stdin EOF without process-tree probing', async () => {

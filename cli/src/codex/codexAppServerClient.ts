@@ -127,6 +127,7 @@ function getCodexVersion(command: string): number[] | null {
         const output = execFileSync(command, ['--version'], {
             encoding: 'utf8',
             timeout: 3_000,
+            windowsHide: true,
             stdio: ['ignore', 'pipe', 'ignore']
         });
         return parseCodexVersion(output);

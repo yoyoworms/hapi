@@ -60,6 +60,19 @@ const response: AgentQuotasResponse = {
     ]
 }
 
+const agyResponse: AgentQuotasResponse = {
+    fetchedAt: 0,
+    accounts: [{
+        agent: 'agy', available: true, status: 'ok', updatedAt: 0,
+        buckets: [
+            bucket({ id: 'gemini-weekly', label: 'Gemini Models · Weekly', group: 'Gemini Models', window: 'weekly', usedPercent: 11, remainingPercent: 89 }),
+            bucket({ id: 'gemini-5h', label: 'Gemini Models · 5h', group: 'Gemini Models', window: '5h', usedPercent: 14, remainingPercent: 86 }),
+            bucket({ id: '3p-weekly', label: 'Claude and GPT models · Weekly', group: 'Claude and GPT models', window: 'weekly', usedPercent: 50, remainingPercent: 50 }),
+            bucket({ id: '3p-5h', label: 'Claude and GPT models · 5h', group: 'Claude and GPT models', window: '5h', usedPercent: 0, remainingPercent: 100 })
+        ]
+    }]
+}
+
 describe('selectComposerQuotaBuckets', () => {
     it('picks the ungrouped 5h then weekly windows of the session agent', () => {
         expect(selectComposerQuotaBuckets(response, 'claude').map((b) => b.id))
@@ -73,6 +86,11 @@ describe('selectComposerQuotaBuckets', () => {
         expect(selectComposerQuotaBuckets(response, 'pi')).toEqual([])
         expect(selectComposerQuotaBuckets(response, null)).toEqual([])
         expect(selectComposerQuotaBuckets(undefined, 'claude')).toEqual([])
+    })
+
+    it('includes every AGY model group with 5h windows before weekly windows', () => {
+        expect(selectComposerQuotaBuckets(agyResponse, 'agy').map((b) => b.id))
+            .toEqual(['gemini-5h', '3p-5h', 'gemini-weekly', '3p-weekly'])
     })
 })
 
@@ -151,6 +169,25 @@ describe('AgentQuotaStatus', () => {
         expect(screen.getByText(/Resets in 2 days 14 hours/)).toBeTruthy()
         expect(screen.getByText('12% used')).toBeTruthy()
         expect(screen.getByText('40% used')).toBeTruthy()
+    })
+
+    it('shows AGY model groups and their reset countdowns in the chip and popover', async () => {
+        const resetsAt = Date.now() + 35 * 60_000 + 1_000
+        getMachineAgentQuotasMock.mockResolvedValue({
+            ...agyResponse,
+            accounts: agyResponse.accounts.map((account) => ({
+                ...account, buckets: account.buckets.map((b) => ({ ...b, resetsAt }))
+            }))
+        })
+        renderStatus('agy')
+
+        const chip = await screen.findByRole('button', {
+            name: 'Gemini Models 5h 14% (36m) · Claude and GPT models 5h 0% (36m) · Gemini Models 7d 11% (36m) · Claude and GPT models 7d 50% (36m)'
+        })
+        fireEvent.click(chip)
+        expect(await screen.findByText('Gemini Models · 5h')).toBeTruthy()
+        expect(screen.getByText('Claude and GPT models · Weekly')).toBeTruthy()
+        expect(screen.getAllByText(/Resets in 36 minutes/)).toHaveLength(4)
     })
 
     it('hides previously loaded quotas once a refetch fails', async () => {

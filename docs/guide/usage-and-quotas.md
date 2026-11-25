@@ -90,7 +90,7 @@ In a web chat, a compact chip next to the context meter shows the current agent'
 
 - The chip turns amber at 20% remaining or less, and red at 5% or less.
 - It refreshes every 2 minutes and hides itself if a read fails rather than show stale numbers.
-- It appears only when the account reports an account-wide 5-hour or weekly window — in practice **Claude Code** and **Codex**. Antigravity's per-model-group windows stay in Settings.
+- **Claude Code** and **Codex** show account-wide windows. **Antigravity** shows its 5-hour and weekly windows with model-group labels; tap the chip to see every group's bars and reset times.
 - It needs a runner with quota support on the session's machine.
 
 The iOS and Android apps do not show account quotas yet.

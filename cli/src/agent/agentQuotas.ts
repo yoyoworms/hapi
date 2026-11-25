@@ -25,7 +25,8 @@ import { getAgentLaunchCommand } from './agentLaunchCommand'
 
 const CACHE_TTL_MS = 60_000
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_MS = 5_000
-const AGY_PROBE_TIMEOUT_MS = DEFAULT_PROVIDER_PROBE_TIMEOUT_MS
+// AGY cold starts can exceed 5s; leave headroom under the hub's 20s RPC budget.
+const AGY_PROBE_TIMEOUT_MS = 15_000
 const CLAUDE_PROBE_TIMEOUT_MS = DEFAULT_PROVIDER_PROBE_TIMEOUT_MS
 const CLAUDE_INIT_REQ_ID = 'hapi-claude-quota-init'
 const CLAUDE_STATUS_REQ_ID = 'hapi-claude-quota-status'
@@ -720,7 +721,12 @@ function runAgyHeadlessCommand(command: string, promptCommand: string, env: Node
     return new Promise((resolve, reject) => {
         const child = spawn(command, ['-p', promptCommand, '--output-format', 'json'], {
             cwd: homedir(),
-            env: buildAgyAcpEnv(env),
+            env: {
+                ...buildAgyAcpEnv(env),
+                // The updater starts its own console on Windows, even when its
+                // parent is hidden. Read-only quota probes must not launch it.
+                AGY_CLI_DISABLE_AUTO_UPDATE: '1'
+            },
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: false,
             windowsHide: process.platform === 'win32'

@@ -17,7 +17,7 @@ const WINDOW_SHORT_LABELS: Record<string, string> = {
     weekly: '7d'
 }
 
-/** The account-wide 5h and weekly windows for this agent, in that order. */
+/** 5h then weekly windows; AGY reports separate windows per model group. */
 export function selectComposerQuotaBuckets(
     response: AgentQuotasResponse | undefined,
     agentFlavor: string | null | undefined
@@ -26,8 +26,10 @@ export function selectComposerQuotaBuckets(
     const account = response.accounts.find((entry) => entry.agent === agentFlavor)
     if (!account || account.status !== 'ok') return []
     return Object.keys(WINDOW_SHORT_LABELS).flatMap((window) => {
-        const bucket = account.buckets.find((entry) => !entry.group && entry.window === window)
-        return bucket ? [bucket] : []
+        const buckets = account.buckets.filter((entry) => (
+            (agentFlavor === 'agy' || !entry.group) && entry.window === window
+        ))
+        return agentFlavor === 'agy' ? buckets : buckets.slice(0, 1)
     })
 }
 
@@ -106,7 +108,8 @@ export function AgentQuotaStatus(props: { machineId: string; agentFlavor: string
     if (buckets.length === 0) return null
 
     const parts = buckets.map((bucket) => {
-        const head = `${WINDOW_SHORT_LABELS[bucket.window ?? '']} ${Math.round(bucket.usedPercent)}%`
+        const group = bucket.group ? `${bucket.group} ` : ''
+        const head = `${group}${WINDOW_SHORT_LABELS[bucket.window ?? '']} ${Math.round(bucket.usedPercent)}%`
         return {
             id: bucket.id,
             text: bucket.resetsAt && bucket.resetsAt > now
@@ -133,7 +136,7 @@ export function AgentQuotaStatus(props: { machineId: string; agentFlavor: string
                         a zero-width bar of the same height gives this chip the same baseline. */}
                     <span className="sm:inline-flex sm:items-center">
                         <span aria-hidden="true" className="hidden h-1 w-0 sm:block" />
-                        {/* Narrow status bars only have room for the first (5h) window; the rest stay in the popover. */}
+                        {/* Narrow status bars show the first window; all model groups and windows stay in the popover. */}
                         {parts.map((part, index) => (
                             <span key={part.id} className={index === 0 ? undefined : 'hidden sm:inline'}>
                                 {index === 0 ? part.text : `\u00a0·\u00a0${part.text}`}
